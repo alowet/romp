@@ -40434,7 +40434,10 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 # shell's own core existed (it reads as standalone then), consumed the shell's marker while checking the path
 # only afterwards — the notification-center line was lost on every reload the pane won that race. If location.reload throws (a host that forbids it) the old banner is the fallback
 # (the `refused` hook) and the refusal LATCHES for that build/boot: no re-attempt on every gesture end or poll,
-# only a strictly newer dv or boot re-arms. The VS Code webview never runs this: the extension loads its bundle from the installed VSIX
+# only a strictly newer dv or boot re-arms. A reload HELD by a pane's reason wears a face (the `held` hook, fired once
+# per owed request and reason: the shell's notification center, a standalone pane's bar — T272 follow-up, the
+# manager's review 2026-09-08: nothing displayed `waiting`, and a hold could outlive the upload it protected),
+# The VS Code webview never runs this: the extension loads its bundle from the installed VSIX
 # and a webview reload cannot fix bundled-code drift, so its own reload prompt stays (vscode-extension/src/
 # extension.ts). Federated relay: a REMOTE kernel's restart must not reload the page — and cannot: the core reads
 # only THIS page's own socket and /version (federation.ts drops remote `ka` frames, so they never reach the shim's
@@ -40462,7 +40465,9 @@ function fire(){if(fired)return;fired=true;persist();
 try{location.reload();}catch(e){fired=false;refusedFor=key(owed);R.waiting='refused';if(R.refused)R.refused(owed);return;}
 try{sessionStorage.setItem('romp:reloaded',JSON.stringify({reason:owed.reason,detail:owed.detail||'',from:LOADED,path:location.pathname,t:Date.now()}));}catch(e){}
 try{document.body.classList.remove('settings-open','picker-open');}catch(e){}}
-function tryFire(){if(!owed||fired)return;if(refusedFor!==null&&refusedFor===key(owed))return;var b=busy();if(b){R.waiting=b;return;}R.waiting='';fire();}
+var heldFor=null;
+function tryFire(){if(!owed||fired)return;if(refusedFor!==null&&refusedFor===key(owed))return;var b=busy();
+if(b){R.waiting=b;var hk=key(owed)+'|'+b;if(hk!==heldFor){heldFor=hk;if(R.held)R.held(b,owed);}return;}R.waiting='';fire();}
 function request(reason,detail){var s=shell();if(s){s.request(reason,detail);return;}if(fired)return;
 var next={reason:reason,detail:detail||''};if(refusedFor!==null&&key(next)!==refusedFor){refusedFor=null;owed=next;}
 if(!owed)owed=next;tryFire();}
@@ -40489,7 +40494,7 @@ function ended(){setTimeout(function(){var s=shell();if(s)s.tryFire();else tryFi
 for(var k=0;k<END.length;k++)document.addEventListener(END[k],ended,true);
 window.addEventListener('blur',function(){ptr=0;pan=false;drag=false;ended();});
 var R={request:request,tryFire:tryFire,ended:ended,busyHere:busyHere,busy:busy,noteDv:noteDv,noteVersion:noteVersion,checkBoot:checkBoot,announce:announce,
-inShell:function(){return !!shell();},owed:function(){return owed;},fired:function(){return fired;},refusedFor:function(){return refusedFor;},refused:null,waiting:'',loaded:LOADED,boot:BOOT};
+inShell:function(){return !!shell();},owed:function(){return owed;},fired:function(){return fired;},refusedFor:function(){return refusedFor;},refused:null,held:null,waiting:'',loaded:LOADED,boot:BOOT};
 window.__rompReload=R;})();/*end-reload-core*/"""
 
 
@@ -40655,6 +40660,7 @@ var buildRaised=false,freshPending=false,restartAnnounced=0;   // freshPending: 
 window.__rompPaneBusy=function(){return (everConnected&&queue.length>queuedDiag)?"sends":"";};
 // …and a standalone page (no same-origin shell) consumes its own reload marker: nobody else would
 try{if(window.__rompReload&&!window.__rompReload.inShell())window.__rompReload.announce(null);}catch(e){}
+try{if(window.__rompReload&&!window.__rompReload.inShell()){window.__rompReload.held=function(b){var t=(b==='upload'?'The dashboard will reload once the upload in progress finishes.':b==='held-send'?'The dashboard will reload once the held message has been sent.':b==='sends'?'The dashboard will reload once the queued messages have left.':(b==='pointer'||b==='pan'||b==='drag'||b==='selection'||b==='typing'||!b)?null:'The dashboard will reload once the page is idle ('+b+').');if(t)selfBar(t,'held');};}}catch(e){}
 function raiseBuild(){if(buildRaised)return;buildRaised=true;var R=window.__rompReload;
 if(R){R.refused=function(){selfBar("A newer romp build is available.","build");};R.request("build","");}
 else selfBar("A newer romp build is available.","build");}
@@ -43457,6 +43463,9 @@ _STALE_JS = (
     # /version reading (a restart the socket never showed, a bundle newer than this page's).
     "var RL=window.__rompReload;"
     "if(RL){RL.refused=function(){buildStale=true;show(BUILDMSG);};"
+    # a reload HELD by a pane (an upload in flight, a held send, queued sends) says so, once per hold: the notification
+    # center line names what it waits for; momentary gesture holds (pointer, typing…) get no line (T272 follow-up)
+    "RL.held=function(b){var t=(b==='upload'?'The dashboard will reload once the upload in progress finishes.':b==='held-send'?'The dashboard will reload once the held message has been sent.':b==='sends'?'The dashboard will reload once the queued messages have left.':(b==='pointer'||b==='pan'||b==='drag'||b==='selection'||b==='typing'||!b)?null:'The dashboard will reload once the page is idle ('+b+').');if(t&&window.__rompNotify)window.__rompNotify('reload',t);};"
     "RL.announce(function(k,t){if(window.__rompNotify)window.__rompNotify(k,t);});}"
     "function check(){fetch('/version',{cache:'no-store'}).then(function(r){return r.json();}).then(function(v){"
     "if(v&&v.boot&&window.__rompUpdBoot)window.__rompUpdBoot(v.boot);"   # retire cross-boot update offers (2026-08-15)

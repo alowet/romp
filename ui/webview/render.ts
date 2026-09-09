@@ -40,6 +40,7 @@ import { NavHistory } from "./nav-history";
 import { StagedStack } from "./staged-messages";
 import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, queuedCopyToHide, dropPending, bareGroupLabel, sentAtLabel } from "./send-pending";
 import { reconcileHeld, heldAsQueued, type HeldCopy, type HeldQueued, type HeldMemory } from "./queued-held";
+import { reloadHoldReason } from "./reload-hold";
 import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional, focusResolvesProvisional } from "./provisional";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
@@ -13060,9 +13061,9 @@ let fireHeldSend: () => void = () => {};
   (window as any).__rompPaneBusy = (): string => {
     const b = shimBusy ? shimBusy() : "";
     if (b) return b;
-    if (pendingShips.size) return "upload";
-    if (shipGateSid) return "held-send";
-    return "";
+    // only ships whose ack can still arrive hold (reload-hold.ts): a ship to a host whose relay is down, or to a host
+    // no longer attached, would otherwise hold every reload of this tab for good (the review of this hold)
+    return reloadHoldReason([...pendingShips.keys()], shipGateSid, (window as any).__rompFed);
   };
 }
 // The ENDING event of those holds, told to the core the way the shim tells it its own (kernel.py ws.onopen →
