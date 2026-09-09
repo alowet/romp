@@ -46,6 +46,16 @@ sb = SourceFileLoader("romp_sdk_backend_treekill", os.path.join(BIN, "romp_sdk_b
 SID = "11111111-aaaa-0000-0000-00000000c276"
 OTHER = "22222222-bbbb-0000-0000-00000000c276"
 LINUX = sys.platform.startswith("linux") and shutil.which("ps") is not None and os.path.isdir("/proc")
+# Fake pids sit ABOVE pid_max, so no real process can ever wear one: the reaper's liveness poll (procfs) then
+# reads them as gone after the recorded SIGTERM, and never escalates to SIGKILL. A fake pid that happened to be a
+# live process on the box (4242 on a CI runner, 2026-09-09) made the recorded kills differ run to run.
+def _pid_max() -> int:
+    try:
+        return int(open("/proc/sys/kernel/pid_max").read().strip())
+    except (OSError, ValueError):
+        return 4194304
+P = _pid_max()
+CLI, TOOL, LOOP, BYSTANDER, MANAGER, KERNEL, TMUX, LIVE = (P + 42, P + 50, P + 60, P + 300, P + 901, P + 90210, P + 556, P + 557)
 
 
 def _backend(d=None):
@@ -105,27 +115,28 @@ class ScopePath(unittest.TestCase):
         runs, killed = [], []
         def run(argv, **kw):
             runs.append(list(argv)); return mock.Mock(stdout="", returncode=0)
-        cg = lambda pid: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/romp-session-11111111-4242-1757374800.scope\n"
-        ps = ("  4242 901 /x/claude --input-format stream-json --resume %s\n"
-              "  4300 901 sleep 300\n") % SID
-        out = be._end_cli_tree(4242, ps.splitlines(), kill=lambda p, s: killed.append((p, s)), run=run, cgroup=cg)
-        self.assertEqual(runs, [["systemctl", "--user", "stop", "romp-session-11111111-4242-1757374800.scope"]],
+        unit = "romp-session-11111111-%d-1757374800.scope" % CLI
+        cg = lambda pid: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/%s\n" % unit
+        ps = ("  %d %d /x/claude --input-format stream-json --resume %s\n"
+              "  %d %d sleep 300\n") % (CLI, MANAGER, SID, BYSTANDER, MANAGER)
+        out = be._end_cli_tree(CLI, ps.splitlines(), kill=lambda p, s: killed.append((p, s)), run=run, cgroup=cg)
+        self.assertEqual(runs, [["systemctl", "--user", "stop", unit]],
                          "the scope is stopped — systemd ends the cgroup, re-parented leftovers included")
-        self.assertEqual(killed, [(4242, signal.SIGTERM)], "the tree walk still signals the CLI (belt and braces), nothing else")
-        self.assertEqual(out["scope"], "romp-session-11111111-4242-1757374800.scope")
+        self.assertEqual(killed, [(CLI, signal.SIGTERM)], "the tree walk still signals the CLI (belt and braces), nothing else")
+        self.assertEqual(out["scope"], unit)
         self.assertEqual(out["tree"], 0)
 
     def test_a_cli_with_no_scope_falls_back_to_the_tree_children_first(self):
         be = _backend()
         runs, killed = [], []
-        ps = ("  4242 901 /x/claude --input-format stream-json --resume %s\n"
-              "  4250 4242 bash -c tool\n"
-              "  4260 4250 sleep 300\n"
-              "  4300 901 sleep 300\n") % SID
-        out = be._end_cli_tree(4242, ps.splitlines(), kill=lambda p, s: killed.append((p, s)),
+        ps = ("  %d %d /x/claude --input-format stream-json --resume %s\n"
+              "  %d %d bash -c tool\n"
+              "  %d %d sleep 300\n"
+              "  %d %d sleep 300\n") % (CLI, MANAGER, SID, TOOL, CLI, LOOP, TOOL, BYSTANDER, MANAGER)
+        out = be._end_cli_tree(CLI, ps.splitlines(), kill=lambda p, s: killed.append((p, s)),
                                run=lambda *a, **k: runs.append(a), cgroup=lambda pid: "0::/user.slice/user-1000.slice/user@1000.service/romp-manager.service\n")
         self.assertEqual(runs, [], "no scope → no systemctl")
-        self.assertEqual([p for p, _ in killed], [4250, 4260, 4242], "descendants (parents first) then the CLI; the bystander 4300 untouched")
+        self.assertEqual([p for p, _ in killed], [TOOL, LOOP, CLI], "descendants (parents first) then the CLI; the bystander untouched")
         self.assertTrue(all(s == signal.SIGTERM for _, s in killed), "fake pids are gone at once, so no SIGKILL escalation")
         self.assertIsNone(out["scope"])
         self.assertEqual(out["tree"], 2)
@@ -135,16 +146,16 @@ class ScopePath(unittest.TestCase):
         # a real child of THIS process stands in for "this kernel's live session": its unit is skipped
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(child.wait, timeout=10); self.addCleanup(child.kill)
-        listing = ("romp-session-11111111-424242-1757374800.scope loaded active running claude\n"     # our sid, CLI gone → stop
-                   "romp-session-11111111-%d-1757374801.scope loaded active running claude\n"           # our sid, our live child → keep
-                   "romp-session-22222222-424243-1757374802.scope loaded active running claude\n"      # another session → never ours
-                   ) % child.pid
+        listing = ("romp-session-11111111-%d-1757374800.scope loaded active running claude\n"          # our sid, CLI gone → stop
+                   "romp-session-11111111-%d-1757374801.scope loaded active running claude\n"          # our sid, our live child → keep
+                   "romp-session-22222222-%d-1757374802.scope loaded active running claude\n"          # another session → never ours
+                   ) % (CLI, child.pid, CLI + 1)
         runs = []
         def run(argv, **kw):
             runs.append(list(argv)); return mock.Mock(stdout=listing if argv == sb.SCOPE_LIST_ARGV else "", returncode=0)
         n = be._stop_leftover_scopes([SID], run=run)
         self.assertEqual(n, 1)
-        self.assertEqual(runs, [sb.SCOPE_LIST_ARGV, ["systemctl", "--user", "stop", "romp-session-11111111-424242-1757374800.scope"]])
+        self.assertEqual(runs, [sb.SCOPE_LIST_ARGV, ["systemctl", "--user", "stop", "romp-session-11111111-%d-1757374800.scope" % CLI]])
 
     def test_no_systemctl_means_nothing_to_sweep(self):
         be = _backend()
@@ -157,23 +168,24 @@ class BootReconcileEndsTheTree(unittest.TestCase):
         d = tempfile.mkdtemp(); be = _backend(d)
         _reg(d, SID)
         sb.append_state(Path(d), SID, "working")
-        ps = ("  555 1 /x/claude --output-format stream-json --resume %s --input-format stream-json\n"
-              "  560 555 bash -c tool\n"
-              "  561 560 sleep 300\n"
-              "  556 1 claude --resume %s --name termsess\n"
-              "  90210 1 /usr/bin/python3 /x/romp/bin/romp-kernel\n"
-              "  557 90210 /x/claude --output-format stream-json --resume %s --input-format stream-json\n") % (SID, SID, SID)
-        listing = "romp-session-11111111-555-1757374800.scope loaded active running claude\n"
+        ps = ("  %d 1 /x/claude --output-format stream-json --resume %s --input-format stream-json\n"
+              "  %d %d bash -c tool\n"
+              "  %d %d sleep 300\n"
+              "  %d 1 claude --resume %s --name termsess\n"
+              "  %d 1 /usr/bin/python3 /x/romp/bin/romp-kernel\n"
+              "  %d %d /x/claude --output-format stream-json --resume %s --input-format stream-json\n"
+              ) % (CLI, SID, TOOL, CLI, LOOP, TOOL, TMUX, SID, KERNEL, LIVE, KERNEL, SID)
+        listing = "romp-session-11111111-%d-1757374800.scope loaded active running claude\n" % CLI
         killed, runs = [], []
         def run(argv, **kw):
             runs.append(list(argv)); return mock.Mock(stdout=ps if argv == sb.PS_ARGV else (listing if argv == sb.SCOPE_LIST_ARGV else ""), returncode=0)
         with mock.patch.object(sb.subprocess, "run", side_effect=run), \
              mock.patch.object(sb.os, "kill", side_effect=lambda p, s: killed.append((p, s))):
             be._boot_reconcile([sb.read_reg(Path(d), SID)])
-        self.assertEqual([p for p, _ in killed], [560, 561, 555], "the orphan's tree, children first, then the CLI; the tmux CLI and the live CLI untouched")
+        self.assertEqual([p for p, _ in killed], [TOOL, LOOP, CLI], "the orphan's tree, children first, then the CLI; the tmux CLI and the live CLI untouched")
         self.assertEqual(runs[0], sb.PS_ARGV, "the listing is read first, with PS_ARGV")
         self.assertIn(sb.SCOPE_LIST_ARGV, runs, "…then our sessions' scopes are listed")
-        self.assertIn(["systemctl", "--user", "stop", "romp-session-11111111-555-1757374800.scope"], runs,
+        self.assertIn(["systemctl", "--user", "stop", "romp-session-11111111-%d-1757374800.scope" % CLI], runs,
                       "the dead CLI's scope is stopped: its children live on in the cgroup even after the CLI is gone")
 
 
