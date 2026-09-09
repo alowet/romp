@@ -194,13 +194,26 @@ class BuiltFeedIsClockInvariantApartFromTheClockItself(unittest.TestCase):
         module left for the placeholder sid at the run-wide GOALDIR used to be part of THIS feed (T281). A
         store planted there now changes nothing here: the feed reads this fixture's goals directory."""
         foreign = Path(self.saved_kernel_state) / "goals"
-        foreign.mkdir(parents=True, exist_ok=True)
         planted = foreign / (SID + ".json")
-        existed = planted.exists()
-        if not existed:
-            planted.write_text(json.dumps({"nodes": {"t281-foreign": {"id": "t281-foreign", "title": "a card another module left",
-                                                                      "parentId": None, "status": "open"}}, "status": {}}))
-            self.addCleanup(lambda: planted.exists() and planted.unlink())
+        original = planted.read_bytes() if planted.exists() else None     # another module's store, if one is there
+        made_dir = not foreign.exists()
+        foreign.mkdir(parents=True, exist_ok=True)
+        store = json.loads(original) if original else {"nodes": {}, "status": {}}
+        store.setdefault("nodes", {})["t281-foreign"] = {"id": "t281-foreign", "title": "a card another module left",
+                                                          "parentId": None, "status": "open"}
+        planted.write_text(json.dumps(store))                              # always planted, so the assertion has teeth
+
+        def restore():
+            if original is not None:
+                planted.write_bytes(original)
+            else:
+                planted.unlink(missing_ok=True)
+                if made_dir:
+                    try:
+                        os.rmdir(foreign)
+                    except OSError:
+                        pass
+        self.addCleanup(restore)
         self.assertNotIn("t281-foreign", json.dumps(km.build_feed(NOW, self.tmux), default=str),
                          "a store at the run-wide goals directory is not this feed's input")
         self.assertEqual(km.jd.GOALDIR, Path(self.td.name) / "goals", "the kernel's judge reads this fixture's goals")

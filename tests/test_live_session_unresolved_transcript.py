@@ -61,13 +61,13 @@ class _World(unittest.TestCase):
     def tearDown(self):
         self._proj_patch.stop()
         self._names_patch.stop()
-        jd._rebind_state(self._state)
         if hasattr(km, "_UNRESOLVED_LIVE_NOTED"):
             km._UNRESOLVED_LIVE_NOTED.discard(SID)
         for f in (jd.NAMES / SID,):
             try: f.unlink()
             except OSError: pass
         self.td.cleanup()
+        jd._rebind_state(self._state)   # last: everything above cleans under THIS test's root
 
     def _alive_sids(self):
         jd._discover_cache.clear()

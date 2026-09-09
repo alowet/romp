@@ -48,6 +48,8 @@ class NodeOverrideAck(unittest.TestCase):
         # the handler under test reads the same module, so it still sees the store.
         self._td = tempfile.TemporaryDirectory()
         self._state = jd.STATE
+        shared = Path(self._state) / "goals" / (SID + ".json")     # the run-wide store, as it is BEFORE this test writes
+        self._shared_before = (shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None)
         jd._rebind_state(Path(self._td.name))
         store = {"nodes": {
             TOP: {"id": TOP, "text": "ship the notes API", "parentId": None, "t": 1, "mt": 1},
@@ -65,8 +67,8 @@ class NodeOverrideAck(unittest.TestCase):
         # every later module's feed reads) carries nothing this module wrote.
         self.assertTrue((Path(self._td.name) / "goals" / (SID + ".json")).exists())
         shared = Path(self._state) / "goals" / (SID + ".json")
-        self.assertFalse(shared.exists() and json.loads(shared.read_text()).get("nodes", {}).get(TOP),
-                         "the run-wide goals directory holds no store from this module")
+        self.assertEqual((shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None), self._shared_before,
+                         "the run-wide goals directory is exactly as it was before this module's save")
 
     def _resolve(self, node_id):
         km.Handler._dispatch_ws(None, {"type": "nodeOverride", "sid": SID, "nodeId": node_id,
