@@ -2258,19 +2258,67 @@ _MODEL_VALUES = {m["value"] for m in MODEL_CHOICES}
 _EFFORT_VALUES = {e["value"] for e in EFFORT_CHOICES}
 
 
+_NAMES_REREAD_S = 0.05   # the pause before the ONE re-read of a names record that read with no name (below)
+
+
+def _names_problem(text):
+    """A names-registry problem, reported where someone sees it: the kernel log AND the dashboard's error
+    center (the bell), the path SDK problems take (_sdk_problem). Never a silent degrade."""
+    sys.stderr.write("[names] %s\n" % text)
+    _sdk_problem("names registry: %s" % text)
+
+
+def _names_fields_for_edit(sid, what):
+    """The tab fields of names/<sid> for a read-edit-publish by one of the kernel's three writers of the
+    record (_set_name, _set_session_color, _set_palette), or None for a record that reads with NO NAME,
+    which is left exactly as it is. Every writer puts the name first, so an empty first field is never a
+    real record: it is another writer's window (a writer that truncates before it writes, as bin/romp's
+    record writer did, behind the tmux after-rename hook that races _set_name's synchronous publish
+    after a live rename) or a damaged file. Padded to four fields and published over, it cost the
+    session its name, cwd and colors while the edit reported success. One re-read after a short pause
+    (_NAMES_REREAD_S, paid only on an empty read; the window is a printf's worth of time) tells a window
+    from damage: a record whole on the second read is edited as usual; one still without a name is
+    reported, naming the sid and `what` went unwritten. A record that cannot be read RAISES
+    (FileNotFoundError when there is none): each caller keeps its own policy for that."""
+    text = (NAMES / str(sid)).read_text()
+    parts = text.rstrip("\n").split("\t")
+    if not parts[0]:
+        time.sleep(_NAMES_REREAD_S)
+        text = (NAMES / str(sid)).read_text()
+        parts = text.rstrip("\n").split("\t")
+        if not parts[0]:
+            _names_problem("names/%s reads with no name (%d bytes, twice); %s not written: the record is being "
+                           "rewritten, or is damaged" % (sid, len(text), what))
+            return None
+    return parts
+
+
+def _names_refusal(sid):
+    """Why a names write answered False, for a door's one-line reply: no record at all, or a record that
+    reads with no name (left alone and reported by _names_fields_for_edit)."""
+    if not (NAMES / str(sid)).exists():
+        return "no names record for that session — is it known to this kernel?"
+    return ("that session's names record reads with no name (being rewritten, or damaged); nothing written. "
+            "Try again, and see the kernel log")
+
+
 def _set_session_color(sid, bg):
     """Override a session's identity color: rewrite the names registry's bg (3rd field) + fg word (4th),
     preserving the name + cwd. Only a value from a known palette is accepted (its own palette supplies
-    the fg). Returns True on a real write. The dashboard reads color from here (_name_color) and a resume
+    the fg). Returns True on a real write; False for a record that cannot be read, and for one that
+    reads with no name (_names_fields_for_edit: left alone and reported, where a publish over it erased
+    the session's name and cwd). The dashboard reads color from here (_name_color) and a resume
     reuses it, so this is the durable store; the live tmux status bar (a separate @identity-bg) refreshes
     on the session's next resume."""
     if not pal.find(bg):
         return False
     try:
-        parts = (NAMES / sid).read_text().rstrip("\n").split("\t")
+        parts = _names_fields_for_edit(sid, "the color")
     except Exception:
         return False
-    name = parts[0] if parts else ""
+    if parts is None:
+        return False
+    name = parts[0]
     cwd = parts[1] if len(parts) > 1 else ""
     _atomic_write(NAMES / sid, "\t".join([name, cwd, bg, pal.fg_for(bg)]) + "\n")
     return True
@@ -2296,9 +2344,11 @@ def _set_palette(name):
         sids = []
     for sid in sids:
         try:
-            parts = (NAMES / sid).read_text().rstrip("\n").split("\t")
+            parts = _names_fields_for_edit(sid, "the palette recolor")
         except Exception:
             continue
+        if parts is None:
+            continue                # reads with no name: left alone and reported; the rest recolor
         loc = pal.find(parts[2]) if len(parts) > 2 else None
         if loc:
             # palettes may differ in LENGTH now (the romp set grows append-only, 2026-08-28): a
@@ -16403,8 +16453,13 @@ def _set_name(sid, name):
     Returns True once the file is published; a names/ entry that cannot be read (absent, or not text)
     or a publish that fails RAISES, the way _atomic_write already does — the old silent `return` on an
     unreadable entry, and the unchecked write, let _rename_session answer the accepted name over a
-    file it never rewrote, and the doors told the user "renamed" (fail loudly, 2026-09-08)."""
-    parts = (NAMES / sid).read_text().rstrip("\n").split("\t")
+    file it never rewrote, and the doors told the user "renamed" (fail loudly, 2026-09-08). A record that
+    reads with NO NAME is another writer's window or a damaged file (_names_fields_for_edit): it is left
+    exactly as it is and the rename RAISES naming the sid, so the doors say why it did not take; padded
+    and published over, it lost the session's cwd and colors while the doors said "renamed"."""
+    parts = _names_fields_for_edit(sid, "the name")     # absent or unreadable: the read raises through, as before
+    if parts is None:
+        raise RuntimeError("names/%s reads with no name, twice: being rewritten, or damaged; nothing written" % sid)
     parts += [""] * (4 - len(parts))
     parts[0] = name
     _atomic_write(NAMES / sid, "\t".join(parts[:4]) + "\n")   # atomic publish
@@ -47882,8 +47937,7 @@ class Handler(BaseHTTPRequestHandler):
                         '"%s" is not a swatch of any palette — GET /palette lists the choosable ones' % bg}),
                                       "application/json")
                 if not _set_session_color(tsid, bg):
-                    return self._send(200, json.dumps({"ok": False, "error":
-                        "no names record for that session — is it known to this kernel?"}),
+                    return self._send(200, json.dumps({"ok": False, "error": _names_refusal(tsid)}),
                                       "application/json")
                 _mark_views_dirty()
                 return self._send(200, json.dumps({"ok": True, "id": tsid, "bg": bg,
