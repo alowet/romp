@@ -7194,6 +7194,7 @@ class LivePickerBrief(unittest.TestCase):
 
     def tearDown(self):
         (jd.GOALDIR, jd.STATESDIR, jd.STATE, jd.brief_llm, jd.distill_llm) = self._saved
+        jd._rebind_state(jd.STATE)   # the tuple restores STATE; every derived dir follows it (T282)
         shutil.rmtree(self._td, ignore_errors=True)
 
     _RECORDS = [uline(T0, "wire the picker", "u1", ps="typed"),
@@ -7603,6 +7604,7 @@ class LiveReplan(unittest.TestCase):
     def tearDown(self):
         (jd.GOALDIR, jd.GOALARCHDIR, jd.PCACHE, jd.STATE,
          jd.plan_llm, jd.opener_llm, jd._group_store) = self.saved
+        jd._rebind_state(jd.STATE)   # the tuple restores STATE; every derived dir follows it (T282)
         self.td.cleanup()
 
     @staticmethod
