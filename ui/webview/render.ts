@@ -5275,7 +5275,9 @@ function releaseTabStrip(): void {
 // unplanned; and the header holding the active tab is a labeled group, not a button — it takes no
 // action and no focus, and "button, expanded" promised both.
 function makeGroupHead(sec: TabSection, collapsed: boolean, holdsActive: boolean, hidden: readonly string[]): HTMLElement {
-  if (sec.name === null) return makeRowBreak(true);
+  // the untagged trail (unlabeled by the user's ruling): a row of its own under the one-group-per-row
+  // setting, else behind a divider
+  if (sec.name === null) return settings.stripGroupRows ? makeRowBreak(true) : makeTrailSep();
   const name = sec.name;
   const head = el("div", "tab-group-head" + (collapsed ? " collapsed" : "") + (holdsActive ? " holds-active" : ""));
   head.dataset.group = name;
@@ -5371,14 +5373,26 @@ function makeGroupHead(sec: TabSection, collapsed: boolean, holdsActive: boolean
  *  untagged trail's break also wears .tab-group-sep, the boundary sectionHeadOf reads (the trail
  *  stays unlabeled by the user's ruling — its own line, with no chip, says "in no tag"). Breaks are
  *  layout only: no drop, no hover, not a row for paintTabRowLines, and in the tab drag's virtual
- *  layout the box AFTER a break starts a row (`br`) so the simulation wraps where the strip does. */
+ *  layout the box AFTER a break starts a row (`br`) so the simulation wraps where the strip does.
+ *  Breaks are emitted only under the `stripGroupRows` setting (the gear's "One tag group per row in
+ *  the tab strip", on by default): with it off the groups follow one another and wrap as they need,
+ *  and the trail stands behind makeTrailSep's divider. */
 function makeRowBreak(untagged: boolean): HTMLElement {
   const brk = el("div", "tab-group-break" + (untagged ? " tab-group-sep" : ""));
   brk.setAttribute("aria-hidden", "true");
   return brk;
 }
+/** The untagged trail's DIVIDER with the one-group-per-row setting off: a visible 13px item, a 1px line
+ *  between 6px gutters, so the last group's tabs and the loose ones never read as one run. It wears
+ *  .tab-group-sep (the boundary sectionHeadOf reads, and the drop's group edge) and takes its width
+ *  in the layout (padding, not margin), so the tab drag's virtual layout measures it. */
+function makeTrailSep(): HTMLElement {
+  const sep = el("div", "tab-group-sep");
+  sep.title = "sessions in no tag";
+  return sep;
+}
 /** The section header a strip node belongs to: itself for a header, else the nearest header before
- *  it; null past the untagged boundary (the trail's row break) or on a flat strip. */
+ *  it; null past the untagged boundary (the trail's row break, or its divider) or on a flat strip. */
 function sectionHeadOf(node: HTMLElement): HTMLElement | null {
   let n: Element | null = node;
   while (n) {
@@ -5716,14 +5730,15 @@ function renderTabs() {
   // tag-lens menu's "Group tabs by tag") and some tag holding a visible tab, the strip renders one
   // header per tag in tagOrder holding a visible tab, each tab under EVERY tag it carries (T264b, the
   // user 2026-09-08: tags are equivalent — a session under N tags has a copy in N groups), then that
-  // section's tabs, and the untagged trail — the sessions in no tag — on its own line
-  // (tab-groups.ts owns the rule). A folded section renders its header alone, with the count and
-  // a pip when a member is working or blocked, so the gist survives the fold (progressive
-  // disclosure). The ACTIVE tab's section never renders folded — keyboard focus must never land
-  // on a hidden node — and visibleOrder() drops the folded ids so ←/→ skip them. DESKTOP ONLY: on
-  // the phone layout (phoneLayout — the kernel page's own media rule) the plan is the flat strip,
-  // since the phone's session list is scraped from every rendered tab and has no header to unfold.
-  // A create in flight (the provisional tab) sections under the tags its request named.
+  // section's tabs, and the untagged trail (the sessions in no tag) on its own line, or behind a
+  // divider with the one-group-per-row setting off (tab-groups.ts owns the rule). A folded section
+  // renders its header alone, with the count and a pip when a member is working or blocked, so the
+  // gist survives the fold (progressive disclosure). The ACTIVE tab's section never renders folded —
+  // keyboard focus must never land on a hidden node — and visibleOrder() drops the folded ids so ←/→
+  // skip them. DESKTOP ONLY: on the phone layout (phoneLayout — the kernel page's own media rule) the
+  // plan is the flat strip, since the phone's session list is scraped from every rendered tab and has
+  // no header to unfold. A create in flight (the provisional tab) sections under the tags its request
+  // named.
   const unions = viewTagUnion(effViews());
   const plan = planStrip(visibleIds, unions, readTabGroups(unions), activeId, phoneLayout(),
                          provisionalId ? { id: provisionalId, tags: provisionalTags } : null);
@@ -5734,7 +5749,8 @@ function renderTabs() {
   // it is folded or holds the active tab, and the members its folded header stands in for (the header's
   // chip, count and pip read those; the pip's state and names come from the per-id records) — and per
   // visible id either a placeholder's meta or the session's name, color, state and its tab class, faded,
-  // context and its tint, viewer flag, host-down mark and note; plus the context-gauge setting, the theme
+  // context and its tint, viewer flag, host-down mark and note; plus the context-gauge setting, the
+  // one-group-per-row setting (the row breaks and the trail's boundary read it), the theme
   // and the colormap (the gauge's tone and fallback read the theme — pickTone, ctxFallbackColor — and the
   // compacting sweep's gradient the colormap, so a settings change repaints through this signature), the +
   // tab's key hint, and the tag lens and unions the filter chips render. Equal string, same DOM: the guards
@@ -5747,7 +5763,7 @@ function renderTabs() {
   // input missing here is a repaint that never happens.
   const stripSig = JSON.stringify([
     activeId, peekId, ids, visibleIds, activeId ? tabInView(activeId) : null, plan.items,
-    settings.tabCtx, settings.theme, settings.colormap, titleWithKey("Open a session", "session.new"),
+    settings.tabCtx, settings.stripGroupRows, settings.theme, settings.colormap, titleWithKey("Open a session", "session.new"),
     surfaceLens(effViews(), "chat"), unions,
     visibleIds.map((id) => {
       const s = sessions.get(id), down = hostIsDown(id), note = down ? hostDownNote(id) : "";
@@ -5787,9 +5803,11 @@ function renderTabs() {
   let copyGroup: string | null | undefined;
   for (const item of plan.items) {
     if ("head" in item) {
-      // every group on its own line (T264): a row break ahead of each header — except the strip's
-      // first item, which already opens the first row; the untagged trail's header IS a break
-      if (item.head.name !== null && bar.childElementCount) bar.appendChild(makeRowBreak(false));
+      // every group on its own line (T264), under the one-group-per-row setting: a row break ahead of
+      // each header except the strip's first item, which already opens the first row; the untagged
+      // trail's header IS a break. With the setting off, heads and tabs follow one another and wrap
+      // as they need, and the trail stands behind its divider (makeGroupHead).
+      if (settings.stripGroupRows && item.head.name !== null && bar.childElementCount) bar.appendChild(makeRowBreak(false));
       bar.appendChild(makeGroupHead(item.head, item.folded, item.active, item.hidden));
       copyGroup = item.head.name;
       continue;
@@ -16837,11 +16855,13 @@ setupSettings();
     // the virtual layout: the OTHER tabs in current DOM order, widths from the dragstart snapshot —
     // boundaries that cannot move in response to the insert they cause (dragslot.ts owns the math)
     // …plus the section headers (tab groups): they take width in the real layout, so they join the
-    // virtual one as boxes — the simulated wrap then matches the strip's. One group per line (T264):
-    // a header preceded by a row break OPENS a row in the simulation (`br`), as does the untagged
-    // trail's break itself — a zero-width row opener, so the slot past a group's last tab (the end
-    // of its row) and the slot before the trail's first tab (the head of the next row) stay two
-    // distinct slots, as they were when the trail stood behind a visible separator. A drop changes
+    // virtual one as boxes — the simulated wrap then matches the strip's. One group per line (T264,
+    // under the one-group-per-row setting): a header preceded by a row break OPENS a row in the
+    // simulation (`br`), as does the untagged trail's break itself, a zero-width row opener, so the
+    // slot past a group's last tab (the end of its row) and the slot before the trail's first tab
+    // (the head of the next row) stay two distinct slots, as they were when the trail stood behind a
+    // visible separator. With the setting off the trail's divider is a real 13px box and no break
+    // exists, so the boxes below measure it as they did before T264. A drop changes
     // no membership (the tab re-sections on the next render); "Move to" in the tab menu is the
     // membership path.
     const others = Array.from(tabs.querySelectorAll<HTMLElement>(".tab[data-id], .tab-group-head, .tab-group-sep")).filter((t) => t !== dragged);
@@ -16884,11 +16904,12 @@ setupSettings();
     // the neighbours are TABS IN THE DRAGGED COPY'S OWN GROUP first (T264b): a drop at a group's head
     // used to anchor on the group above's last tab — a tab whose place in the global order says
     // nothing about the group dragged in — so the drop landed elsewhere and the session's other copy
-    // jumped. The walk stops at a header or a row break; only a group holding no other tab falls back
+    // jumped. The walk stops at a header, a row break or the trail's divider (.tab-group-sep, its
+    // boundary with the one-group-per-row setting off); only a group holding no other tab falls back
     // to the nearest tab across groups (the flat strip has no edges, so it walks as it always did).
     // Never the dragged SESSION's own copy: reorderTo against itself would move nothing.
     const own = (n: Element | null) => !!n && (n as HTMLElement).dataset?.id === draggedId;
-    const edge = (n: Element) => n.classList.contains("tab-group-head") || n.classList.contains("tab-group-break");
+    const edge = (n: Element) => n.classList.contains("tab-group-head") || n.classList.contains("tab-group-break") || n.classList.contains("tab-group-sep");
     const walk = (n: Element | null, step: (x: Element) => Element | null, inGroup: boolean): HTMLElement | null => {
       while (n && (!(n as HTMLElement).dataset?.id || own(n))) { if (inGroup && edge(n)) return null; n = step(n); }
       return n as HTMLElement | null;

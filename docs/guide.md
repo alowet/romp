@@ -99,8 +99,8 @@ instead; a PDF too large to show offers a download in its place.
 several. Right-click a tab and open **Tags** to add or remove them. Tags filter every
 surface (the tag button in the strip narrows the tabs to the tags you pick), and they group
 the tabs: as soon as any session carries a tag, the strip shows one section per tag, in your
-tag order, each with a header in the tag's color, and the untagged sessions after a divider
-at the end. A session with several tags appears under each of them; every copy is the same
+tag order, each with a header in the tag's color, and the untagged sessions on a row of their
+own at the end. A session with several tags appears under each of them; every copy is the same
 session (click either to open it, and closing either ends it). Each header shows a chevron, the tag's color, its name, and a
 member count. Click a header, or press Enter on it, to fold its section down to the header
 alone; the count then says how many tabs are folded away, and a small dot after it says when
@@ -116,7 +116,10 @@ reorders the tags on every surface (the timeline's tag table shows the same orde
 a tab into another group, right-click it and pick **Move to <tag>** under **Tags**: one click
 adds that tag and drops the tag of the group you right-clicked it in, leaving its other tags alone. The row's
 **+** adds the tag without moving the tab. **Group tabs by tag**, at the foot of the tag
-button's menu, turns the sections off for this browser.
+button's menu, turns the sections off for this browser. Every group starts on its own row; turning off
+the gear's **One tag group per row in the tab strip** lets the groups follow one another across the
+strip and wrap as they need, with the untagged sessions behind a thin divider, so a strip with many
+tags stays short.
 
 **Coming back after a dropped connection.** When the dashboard's link to the kernel
 drops and comes back (a laptop lid closed and opened, a network change, a phone that

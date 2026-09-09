@@ -417,11 +417,19 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
    or the untagged trail's first tab — opens a new line: the chip sits at the left edge and its tabs
    follow, wrapping onto further rows as they need. Zero height, so it adds no rhythm of its own
    (the Yatharth seam is a column gap only); no pointer, so it can neither take a drop nor a hover.
-   The visible separator the untagged trail used to stand behind is gone — a line of its own, with
-   no chip, already says "in no tag" (the trail stays unlabeled by the user's ruling); the element
-   keeps the .tab-group-sep class as the boundary sectionHeadOf reads. The tab drag's virtual layout
+   The breaks are emitted only while the gear's "One tag group per row in the tab strip" is on
+   (stripGroupRows, the default; render.ts renderTabs). Under it the untagged trail stands behind no
+   visible divider: a line of its own, with no chip, already says "in no tag" (the trail stays
+   unlabeled by the user's ruling); the element keeps the .tab-group-sep class as the boundary
+   sectionHeadOf reads. With the setting off the divider below returns. The tab drag's virtual layout
    (dragslot.ts) opens a row at the same places (`br`), so a drag wraps where the strip wraps. */
 .tab-group-break { flex: 0 0 100%; height: 0; margin: 0; padding: 0; pointer-events: none; }
+/* THE UNTAGGED TRAIL'S DIVIDER with the one-group-per-row setting off (render.ts makeTrailSep): a 1px
+   line between 6px gutters. The gutters are PADDING, not margin, and the line is the content box, so
+   its box is the full 13px it occupies in the row and the tab drag's virtual layout (which measures
+   getBoundingClientRect widths) wraps where the real strip wraps. Scoped off the row break above,
+   which wears .tab-group-sep too (the boundary sectionHeadOf reads) and must keep no box. */
+.tab-group-sep:not(.tab-group-break) { flex: 0 0 auto; box-sizing: border-box; width: 13px; padding: 8px 6px; background: var(--box-border); background-clip: content-box; }
 /* (the settings gear + modal live on the TIMELINE now — see ui/romp-timeline-view.js) */
 
 .tab {
