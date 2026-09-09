@@ -74,7 +74,7 @@ completed); the feed just paints columns. (Reflected in `docs/judges.md`.)
   by the kernel, loudly: one `ws: dropping` line in the kernel log, written where
   the drop is decided so every send path is covered, naming the pane, the
   dashboard, the backlog and the push slot whose frame tipped the budget when a
-  push did; and a row in the dashboard's bell (at most five drop rows, none older
+  push did; and a row in the dashboard's Log (at most five drop rows, none older
   than an hour, so they never crowd out a backend problem). Every close the
   browser reports for a socket that opened leaves a `wsclose` breadcrumb (code,
   reason, socket age) in `client-diag.jsonl` (rotated to `.1` at 8 MB); a socket
@@ -559,11 +559,11 @@ or "(over the cap)". The quiet stderr line for kept tags the client did not
 edit carries the same kind of label on every tag, "(differing copy)" among
 them; until the 2026-09-05 review a kept differing copy was the one
 entry on it without a cause. Both notices bound their lists to fit the 240 characters
-the dashboard's bell shows, under the 300 the kernel serves (`SYNC_NOTICE_FIT`,
+the dashboard's Log shows, under the 300 the kernel serves (`SYNC_NOTICE_FIT`,
 `_notice_list`): as many entries as fit, then "and M more" for the rest, and
 when not even the first fits, the head alone, which carries the count. Until
 the 2026-09-05 review both notices put the cause clause and the
-remedy last, after one entry per tag, and with two or more tags the bell cut
+remedy last, after one entry per tag, and with two or more tags the Log cut
 them away. A file written
 outside the kernel (the timeline's Electron branch writes `timeline-views.json`
 itself, with the seq it holds) can carry a seq behind the last one served. By its own seq the writer

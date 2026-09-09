@@ -451,7 +451,7 @@ own a direct path; the dashboard is then a plain URL on your tailnet.
     Tunnels the extension still relays each whole view payload to the local
     window as it changes. It does not yet take the deltas the browser panes do.
     A pane that falls 16 MB behind is dropped and reconnects on its own; the
-    drop is logged in the kernel log and shows in the dashboard's bell, so a
+    drop is logged in the kernel log and shows in the Log (the settings panel's "Open log" button carries the unread count on the desktop; the phone's bottom bar reddens its bell), so a
     link that cannot keep up reads as what it is rather than as a flaky network.
 
 ### From your phone

@@ -42536,7 +42536,7 @@ _LANDING_ERRS_JS = """
 back=document.getElementById('rerr-back'),list=document.getElementById('rerr-list'),
 clearBtn=document.getElementById('rerr-clear'),x=document.getElementById('rerr-x'),
 filtBar=document.getElementById('rerr-fgrid');
-if(!icon||!back||!list)return;
+if(!back||!list)return;   // the desktop bar carries no icon since T290; the panel and its openers stand without it
 var KEY='romp:notices',MAX=100,FKEY='romp:errFilters';
 function load(){try{var v=JSON.parse(localStorage.getItem(KEY)||'[]');return Array.isArray(v)?v:[];}catch(e){return[];}}
 var NOTES=load();
@@ -42563,7 +42563,12 @@ function paint(){var n=unseen();
 [icon,micon].forEach(function(el){if(!el)return;
 el.classList.toggle('has',n>0||(kindOn('conn')&&liveDown()));
 var t=el.querySelector('.rerr-n');if(t)t.textContent=n<=0?'!':(n>9?'+':String(n));});
-if(!back.hidden)renderList();}
+tell(n);if(!back.hidden)renderList();}
+// The bar's opener carried the unread count (T290 took it off the bar): the count now rides the gear's
+// "Open log" button, in the feed pane's document — told on every repaint and on the panel's own query.
+function tell(n){var f=document.getElementById('f-feed');
+try{f&&f.contentWindow&&f.contentWindow.postMessage({romp:'logUnseen',n:(n===undefined?unseen():n)},'*');}catch(e){}}
+window.addEventListener('message',function(e){var m=e.data;if(m&&m.romp==='logUnseenQuery')tell();});
 // each entry leads with the chip its card wears in the feed, so the vocabulary matches across surfaces
 var KINDS=['conn','limit','judge','warn','stalled','nudge','retry','apierror','sdk','sync','locate','cleared','refused','undelivered'];
 var KINDLBL={conn:'offline',limit:'limit',judge:'judge',warn:'warning',stalled:'stalled',
@@ -42650,7 +42655,7 @@ window.addEventListener('romp-panes',paint);
 // re-enabling its toggle re-reddens the bell if something happened while it was muted
 function open(){for(var i=0;i<NOTES.length;i++)if(kindOn(NOTES[i].kind))NOTES[i].seen=true;save();back.hidden=false;renderList();paint();}
 function close(){back.hidden=true;}
-icon.addEventListener('click',function(){back.hidden?open():close();});
+if(icon)icon.addEventListener('click',function(){back.hidden?open():close();});
 back.addEventListener('click',function(e){if(e.target===back)close();});
 if(x)x.addEventListener('click',close);
 if(clearBtn)clearBtn.addEventListener('click',function(){NOTES=[];save();renderList();paint();});
@@ -43404,6 +43409,8 @@ window.addEventListener('message',function(e){var m=e.data;if(m&&m.romp==='usage
 _LANDING_SETTINGS_JS = """
 (function(){window.addEventListener('message',function(e){var m=e.data;if(!m)return;
 if(m.romp==='settings')document.body.classList.toggle('settings-open',!!m.on);
+// the gear's "Open log" (T290): the settings modal closes itself first, then asks the shell for the Log panel
+if(m.romp==='openLog'&&window.__rompOpenErrs)window.__rompOpenErrs();
 // the /chat iframe's new-session picker asks the shell to lift it full-window (see body.picker-open CSS)
 if(m.romp==='picker')document.body.classList.toggle('picker-open',!!m.on);
 // "Browse files" from any pane surfaces the FILE BROWSER in the FEED pane, which is a different
@@ -44947,7 +44954,7 @@ def _rdrift_block():
             + "<script>" + _RDRIFT_JS + "</script>")
 
 
-# The errors glyph, shared by the desktop rail and the mobile bar: a warning TRIANGLE (was a bell
+# The errors glyph, the mobile bar's glyph (the desktop rail's copy left with T290): a warning TRIANGLE (was a bell
 # until 2026-07-28 — the bell now means the session/card notification toggles, so the error center
 # wears the unambiguous trouble shape instead). The unread COUNT lives INSIDE the triangle (the user
 # 2026-07-28 — the old corner badge clipped): an svg <text> the errs JS drives (.rerr-n), digits 1-9,
@@ -45650,7 +45657,7 @@ def _landing():
             # usage-limit / judge-degraded — which got in the way): the bell in the bottom bar's action
             # cluster goes RED when an error lands; clicking it opens the Log as a centered modal
             # (the one panel treatment, the user 2026-08-08), newest first, per-row clear + Clear all.
-            "#rail-errs.has,#merr.has{color:#ff6b6b}"   # red bell = something unread / a live problem; no count badge (it clipped, and the number added nothing — the user 2026-07-27)
+            "#merr.has{color:#ff6b6b}"   # red bell = something unread / a live problem; no count badge (it clipped, and the number added nothing — the user 2026-07-27)
             # centered like every other panel (the user 2026-08-08: one modal treatment — centered card,
             # 0.55 dim, dashboard unchanged behind it; it used to sit bottom-right over the feed)
             "#rerr-back{position:fixed;inset:0;z-index:210;display:flex;align-items:center;justify-content:center;"
@@ -45861,12 +45868,11 @@ def _landing():
             "</div>"   # /.rail-scroll
             # refresh + network + settings, pinned to the far RIGHT (settings last), always visible:
             "<div class=rail-acts>"
-            # the log's warning triangle (a bell until 2026-07-28 — the bell now means the
-            # notification toggles): monochrome outline like its neighbors; goes red with the unread
-            # count drawn INSIDE the triangle when an entry lands (see _ERRS_SVG + _LANDING_ERRS_JS).
-            "<div class=rail-act id=rail-errs data-keycmd=log.open title='Log — click to open' aria-label=Log>"
-            + _ERRS_SVG +
-            "</div>"
+            # The Log's opener LEFT this cluster (T290, the user 2026-09-09: the bar keeps only its few
+            # important controls): the Log opens from the gear's Updates & debug section ("Open log", which
+            # posts {romp:'openLog'} to the shell), from the command palette (log.open) and from the mobile
+            # bar's #merr, all through window.__rompOpenErrs. The desktop unread cue went with the element;
+            # _LANDING_ERRS_JS tolerates the missing icon (the mobile bar's #merr still paints its cue).
             # the refresh glyph is a REAL browser-style reload icon now (the user 2026-07-27: the ↻ text
             # glyph stopped at 11 o'clock and never read as refresh): a near-full circular arc sweeping
             # clockwise to 1 o'clock with the arrowhead there, drawn like its svg neighbors. QUOTED attrs.

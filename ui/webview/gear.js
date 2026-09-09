@@ -179,7 +179,8 @@ var GEAR_HTML =
   '</span></label>' +
   '</div>' +
   "<div class=rs-sep style='padding-top:8px'>" +
-  '<button id=ra-open class=ra-openbtn>Token usage analytics</button></div>' +
+  '<button id=ra-open class=ra-openbtn>Token usage analytics</button>' +
+  '<button id=rs-log-open class=ra-openbtn hidden>Open log<span class=rs-log-n hidden></span></button></div>' +   // T290: the Log moved here from the bottom bar (web shell only); the span is the unread count
   "<div class='rs-h rs-sep'>romp · version</div>" +
   '<div id=rsver>…</div></div></div>' +
   '<div id=rs-login-modal hidden>' +
@@ -1187,6 +1188,7 @@ function initGear(post) {
     // settings-open, which is what un-hides #feed-pane when the feed is toggled off — measuring first
     // burned the whole 5-frame retry against a display:none pane, latched rs-pane-gone, and the
     // full-viewport fallback box blacked out every pane behind the modal.
+    try { if (window.parent !== window) window.parent.postMessage({ romp: 'logUnseenQuery' }, '*'); } catch (e) { /* no shell to ask */ }   // T290: the Open log count
     p.hidden = false; feedFull(true); setModalCls(true); var s = load(); cc.checked = !!s.compact; jix.checked = (s.showIndexJudges !== undefined ? !!s.showIndexJudges : !!s.debug); jtr.checked = (s.showTriageJudges !== undefined ? !!s.showTriageJudges : !!s.debug); if (gb) gb.checked = s.showBranch === true; if (tc) tc.value = tabCtxMode(s.tabCtx); tcPaint(); csPaint(); ttPaint(); if (cg) cg.checked = s.collapseGaps !== false; if (ao) ao.checked = s.activeOnly !== false; if (fc) fc.checked = s.collapsed === true; cmBuild(); cmPaint(s.colormap || 'aurora'); paintBackendOffer(tb ? tb.checked : false); if (dd) dd.value = s.defaultDir || ''; plFill(); fill(); }
   if (g) g.onclick = function (e) { e.stopPropagation(); openSettings(); };   // hidden anchor; hosts open via the message below
   window.addEventListener('message', function (e) { if (e.data && e.data.romp === 'openSettings') openSettings(); });
@@ -1201,6 +1203,21 @@ function initGear(post) {
     if (vrow) vrow.hidden = web;
     var kb2 = document.getElementById('rs-keys-btn');
     if (kb2) kb2.onclick = function () { closeSettings(); try { window.parent.postMessage({ romp: 'openKeys' }, '*'); } catch (e) { /* no shell to ask */ } };
+    // "Open log" (T290, the user 2026-09-09): the Log left the bottom bar; this button, the last row of Updates &
+    // debug, opens the shell's Log panel (a centered modal over the dimmed dashboard, the panels rule). The modal
+    // closes first so the two never stack. Web shell only: VS Code's cross-origin parent has no Log panel.
+    var lg = document.getElementById('rs-log-open');
+    if (lg) { lg.hidden = !web; lg.onclick = function () { closeSettings(); try { window.parent.postMessage({ romp: 'openLog' }, '*'); } catch (e) { /* no shell to ask */ } }; }
+    // the unread count the bar's opener used to draw (T290): the shell posts {romp:'logUnseen', n} on every
+    // repaint of its Log and answers {romp:'logUnseenQuery'}; the label reads "Open log · N" (9+ past nine)
+    var lgn = lg ? lg.querySelector('.rs-log-n') : null;
+    window.__rompSetLogCount = function (n) {
+      if (!lgn) return;
+      n = Number(n) || 0;
+      lgn.hidden = n <= 0;
+      lgn.textContent = n <= 0 ? '' : ' \u00b7 ' + (n > 9 ? '9+' : String(n));
+    };
+    window.addEventListener('message', function (e) { var m = e.data; if (m && m.romp === 'logUnseen') window.__rompSetLogCount(m.n); });
   })();
   p.addEventListener('click', function (e) { if (e.target === p) closeSettings(); });   // click the dimmed backdrop (not the card) → close
   document.addEventListener('click', function (e) { if (!p.hidden && e.target !== g && !p.contains(e.target)) closeSettings(); });
