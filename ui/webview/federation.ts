@@ -75,6 +75,7 @@ const OBJ_ID = ["tabs"]; //                       an array of objects keyed by `
 // them).
 const KERNEL_SETTING = new Set(["setAutoNudge", "setJudgeModel", "setIndexModel",
                                 "setJudgeEffort", "setIndexEffort", "setUpdateMode",
+                                "setJudgeConcurrency",   // T277: the judges' pool width, one value across machines
                                 "setDistillModel", "setDistillEffort", "setFileEditing",
                                 "setCompactSuggest",
                                 "setCommentModel", "setCommentEffort", "setCommentFast"]);

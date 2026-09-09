@@ -122,7 +122,7 @@ class JudgeSystemPromptDistrust(unittest.TestCase):
     def test_judge_run_appends_it_to_the_system_prompt_not_the_payload(self):
         seen = {}
 
-        def fake_cmd(model, sys_prompt, effort=None):
+        def fake_cmd(model, sys_prompt, effort=None, **kw):
             seen["sys"] = sys_prompt
             return ["true"]                                    # a no-op argv; the call itself is not the point
 
@@ -141,7 +141,7 @@ class JudgeSystemPromptDistrust(unittest.TestCase):
         describing sections that aren't there."""
         seen = {}
         saved = jd._judge_cmd
-        jd._judge_cmd = lambda model, sys_prompt, effort=None: (seen.update(sys=sys_prompt) or ["true"])
+        jd._judge_cmd = lambda model, sys_prompt, effort=None, **kw: (seen.update(sys=sys_prompt) or ["true"])
         try:
             jd._judge_run("sonnet", "BASE PROMPT.", "plain payload", judge="closer")
         finally:
