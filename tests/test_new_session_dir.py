@@ -262,6 +262,12 @@ class CreateSessionTags(_Wire):
                                  setattr(km, "_spawn_session", saved[2]),
                                  setattr(km, "_create_codex_session", saved[3]),
                                  setattr(km, "_codex_ready", saved[4])))
+        # A private state root for the duration: the kernel's judge is one module object shared by every test
+        # module in the process, and the names entry, goal store and cleared rows the create flow writes at its
+        # import-bound root outlived this module and reached every later module's feed (T281).
+        self._saved_state = km.jd.STATE
+        km.jd._rebind_state(Path(tempfile.mkdtemp()))
+        self.addCleanup(lambda: km.jd._rebind_state(self._saved_state))
         (km.jd.STATE / "names").mkdir(parents=True, exist_ok=True)
         (km.jd.STATE / "names" / self.PARENT).write_text("web\t/tmp\t#123456\twhite\n")
 
@@ -341,10 +347,11 @@ class CreateSessionTags(_Wire):
         km._live_names = lambda *_: {"api": self.LIVE}
         km._reveal_chat_for = lambda client, m: focused.append(m)
         km._mark_views_dirty = lambda: None
-        km.jd.STATE = Path(tempfile.mkdtemp())
+        km.jd._rebind_state(Path(tempfile.mkdtemp()))   # every derived dir moves with STATE (T281), not STATE alone
         km._flags_cache.clear()
         def restore():
-            km._live_names, km._reveal_chat_for, km._mark_views_dirty, km.jd.STATE = saved
+            km._live_names, km._reveal_chat_for, km._mark_views_dirty = saved[:3]
+            km.jd._rebind_state(saved[3])
             km._flags_cache.clear()
         self.addCleanup(restore)
         km._set_timeline_views({"active": "all", "tags": [{"id": "g1", "name": "pool", "members": [self.PARENT]}]})
