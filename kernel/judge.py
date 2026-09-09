@@ -3710,6 +3710,21 @@ def append_override(fsid, node_id, op, t):
         f.write(json.dumps({"node": node_id, "op": op, "t": int(t)}) + "\n")
 
 
+def append_clear(fsid, node_id, src, why, t):
+    """Journal the user's cross-off (or a romp-authored clear: the episode boundary, a mute) BEFORE the
+    caller's store save, so a clobbered clear re-applies on the very next load (2026-09-09). Until now a
+    clear lived in two places only, the cleared.jsonl ledger and the store's own node verdict and flag: a
+    triage pass that loaded the store before the clear and saved after it erased the verdict and the flag,
+    the ledger kept hiding the live card so nothing showed, and the compaction then archived the node with
+    cleared false, where the archive projections trusted the flag alone and the card came back completed
+    and uncleared after a restart. The row carries its author and why, so the replay re-records the same
+    verdict the live write made."""
+    d = _overrides_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / (fsid + ".jsonl")).open("a") as f:
+        f.write(json.dumps({"node": node_id, "op": "clear", "src": src, "why": why, "t": int(t)}) + "\n")
+
+
 def append_block(fsid, node_id, src, why, t):
     """Journal a KERNEL-side block verdict (src "nudge"/"interrupt") — the same clobber protection
     append_override gives user clicks, for the blocks the kernel stamps BETWEEN judge passes. These are
@@ -3874,6 +3889,20 @@ def _replay_overrides(fsid, store, lines=None):
                 applied = True
                 if was_done and not nd.get("settledDone"):
                     record_verdict(store, nd, "romp", "settle", t)
+        elif op == "clear":
+            # The cross-off (_mark_nodes_cleared value=True, append_clear), replayed so a store a racing pass
+            # save clobbered re-seals exactly as the live one did (2026-09-09; the unclear arm's mirror).
+            # Voided by a LATER undo: a strictly-later user reopen (the undo-clear's own verdict, or its
+            # replayed "unclear" row) outranks this entry; the twin check keeps the survived write as is.
+            if nd.get("cleared") or _twin("clear") or any(e.get("kind") == "reopen"
+                                                          and int(e.get("ev_t") or 0) >= t for e in uev):
+                continue                               # sealed already, survived, or undone at or after it (an undo in
+                #                                        the clear's own second is the later gesture: the ledger's undo
+                #                                        row follows its clear row, so at-or-after voids, unlike the
+                #                                        unclear arm, where a later clear is the only voider)
+            if record_verdict(store, nd, ev.get("src") or "user", "clear", t,
+                              why=ev.get("why") or "cleared from the feed"):
+                applied = True
         elif op == "block":
             # A kernel-side block (append_block). The answer guard keeps AT-OR-AFTER (>= via later|eq):
             # a user reply in the same second as the nudge stamp genuinely answered it, so replaying

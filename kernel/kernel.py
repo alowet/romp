@@ -29067,7 +29067,7 @@ def _fleet_archived_tops(sid, cap=20):
         return []                                    # no archive → nothing to surface
     hit = _arch_tops_cache.get(str(p))
     if hit and hit[0] == mt:
-        return hit[1]
+        return _ledger_cleared_overlay(hit[1])
     arch = jd.load_goal_archive(sid)
     nodes, status = arch.get("nodes", {}), arch.get("status", {})
     kids = {}
@@ -29117,6 +29117,25 @@ def _fleet_archived_tops(sid, cap=20):
     if len(_arch_tops_cache) > 256:
         _arch_tops_cache.clear()
     _arch_tops_cache[str(p)] = (mt, out)
+    return _ledger_cleared_overlay(out)
+
+
+def _ledger_cleared_overlay(rows):
+    """The archive projection with cleared.jsonl applied over the node flags (2026-09-09): an archived top the
+    ledger clears reads cleared whatever its copied flag says (a racing pass save could have erased it), and
+    its subtree follows, the roll-down the live tree's top-only cross-off has. Applied AFTER the mtime cache,
+    so a clear that lands later than the archive's last write shows on the next build."""
+    vc = _cleared_ids()
+    if not vc:
+        return rows
+    out, root_cleared = [], False
+    for n in rows:
+        if n.get("depth") == 0:
+            root_cleared = bool(n.get("cleared")) or n.get("id") in vc
+            out.append(dict(n, cleared=root_cleared) if root_cleared != bool(n.get("cleared")) else n)
+        else:
+            c = bool(n.get("cleared")) or n.get("id") in vc or root_cleared
+            out.append(dict(n, cleared=c) if c != bool(n.get("cleared")) else n)
     return out
 
 
@@ -30780,6 +30799,13 @@ def _mark_nodes_cleared(item_ids, value, src="user", why=None):
                                             "clear" if value else "reopen", now,
                                             why=(why or "cleared from the feed") if value else "undo clear",
                                             undo=not value)   # an undo-restore asserts nothing about doneness
+                if value and applied:
+                    # Journal the CLEAR too (2026-09-09): a triage pass holding this store across a model call
+                    # saved after the cross-off and erased the verdict and the flag; the ledger kept hiding
+                    # the live card, and the compaction archived the node unflagged, where the archive
+                    # projections trusted the flag and the card came back after a restart. Journal-first,
+                    # like the unclear row: this precedes the save below.
+                    jd.append_clear(sid, iid, src, why or "cleared from the feed", now)
                 if not value and applied:
                     # Journal the UN-CLEAR (the user 2026-07-23, the restore-then-reply flicker): the
                     # restore journal row carries only the ARCHIVED node payload — still flag-cleared —
@@ -31116,9 +31142,17 @@ def _compact_goal_store(fsid):
         nd = nodes.get(nid) or {}
         return bool(nd.get("cleared")) or nid in cleared or status.get(nid) == "cleared"
 
-    move = []
+    move, resealed = [], False
     for r in children.get(None, []):                   # ROOTS only
         if _cleared_root(r):
+            if r in cleared and not nodes[r].get("cleared"):
+                # the ledger is authoritative (2026-09-09): a root the user cleared whose verdict and flag a racing
+                # pass save erased is re-sealed through the diary (the flag is diary-owned, derived by the rollup
+                # below) at the ledger row's own time before the copy, so no archive reader takes it for an
+                # uncleared card. Since the same day every clear also journals an override row, so a load heals
+                # it first; this covers a ledger row with no journal row (history, another writer of the ledger).
+                resealed = jd.record_verdict(store, nodes[r], "user", "clear", int(cleared[r] or time.time()),
+                                             why="cleared from the feed (re-applied from the ledger at compaction)") or resealed
             stack = [r]
             while stack:                               # the whole subtree
                 x = stack.pop()
@@ -31126,6 +31160,14 @@ def _compact_goal_store(fsid):
                 stack.extend(children.get(x, []))
     if not move:
         return 0
+    if resealed:
+        try:                                           # the flags are the rollup's (history to flags), and the settled
+            now = int(time.time())                     # gate wants the session's honest closed state, as the clear path reads it
+            path = next((sd["path"] for sd in _sessions(now) if sd["sid"] == fsid), None)
+            closed = jd._session_closed(_parse(path, fsid, now)) if path else False
+        except Exception:
+            closed = False
+        jd.rollup_status(store, closed)
     with jd._GOAL_ARCH_LOCK:                            # the archive is a blind RMW — see the lock's note
         arch = jd.load_goal_archive(fsid)
         a_nodes = arch.setdefault("nodes", {})

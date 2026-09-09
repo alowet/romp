@@ -167,5 +167,130 @@ class GoalCompactionTest(unittest.TestCase):
                         body.index("_mark_nodes_cleared(restored, False)"))
 
 
+
+
+class ClearedLedgerIsAuthoritativeAcrossTheCompaction(unittest.TestCase):
+    """The user (2026-09-09): after a restart, a batch of cards they had cleared came back. A clear lived in the
+    ledger (cleared.jsonl) and in the store's node verdict and flag; a triage pass that loaded the store before the
+    clear and saved after it erased the verdict and the flag, the ledger kept hiding the live card so nothing
+    showed, the boot compaction archived the node with cleared false, and the archive projection trusted the flag
+    alone, so the card rendered completed and uncleared. Three fixes, each pinned: the clear is journaled and a
+    clobbered clear heals on the next load; the compaction stamps the ledger's flag on the root it moves; the
+    projection reads the ledger over the copied flag, after its cache, with the roll-down to the subtree."""
+
+    def setUp(self):
+        self._saved_state = jd.STATE
+        self._td = tempfile.mkdtemp()
+        jd._rebind_state(Path(self._td))
+        km._compact_seen.clear()
+        km._arch_tops_cache.clear()
+        km._CLEARED_MEMO["slot"] = None
+        jd._GOALARCH_MEMO.clear()
+        self.g = lambda n: "%s:%s" % (SID, n)
+        (jd.STATE).mkdir(parents=True, exist_ok=True)
+        (jd.STATE / "cleared.jsonl").write_text("")
+
+    def tearDown(self):
+        jd._rebind_state(self._saved_state)
+        km._arch_tops_cache.clear()
+        km._CLEARED_MEMO["slot"] = None
+        shutil.rmtree(self._td, ignore_errors=True)
+
+    def _completed_top(self, n, with_child=False):
+        """A completed top the way a real one is: its completion is a done verdict in its log (rollup derives
+        nodeComplete from the log, so a bare flag would not survive a load)."""
+        nodes = {self.g(n): _node(self.g(n), None, t=100, mt=100)}
+        if with_child:
+            nodes[self.g(n + "a")] = _node(self.g(n + "a"), self.g(n), t=100, mt=100)
+        store = jd._guard_nodes({"rompUuid": SID, "seq": 1, "lastNode": self.g(n), "nodes": nodes,
+                                 "status": {}, "placements": {self.g(n) + "seg": self.g(n)}})
+        for nid in list(nodes):
+            jd.record_verdict(store, store["nodes"][nid], "closer", "done", 100, why="shipped")
+        jd.rollup_status(store, True)
+        jd.save_goals(SID, store)
+        self.assertEqual(jd.load_goals(SID)["status"].get(self.g(n)), "completed", "premise: a completed top")
+        return store
+
+    def _fresh_process(self):
+        """Every in-process memo the archive projection could serve from, dropped: what a restart drops."""
+        km._arch_tops_cache.clear()
+        km._CLEARED_MEMO["slot"] = None
+        jd._GOALARCH_MEMO.clear()
+        jd._shared_clear()
+
+    def _clobber_with(self, snapshot):
+        """A pass save from a pre-clear snapshot: the store file loses the verdict and the flag."""
+        (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(snapshot))
+        jd._shared_clear()
+
+    def test_the_users_sequence_clear_clobber_compact_restart_the_card_stays_cleared(self):
+        self._completed_top("g3", with_child=True)
+        snapshot = json.loads((jd.GOALDIR / (SID + ".json")).read_text())   # a pass holds this across its model call
+        km._clear_all([self.g("g3")])                                       # the user's cross-off
+        raw = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
+        self.assertTrue(raw["nodes"][self.g("g3")]["cleared"], "premise: the live write landed the flag")
+        self._clobber_with(snapshot)                                        # ...and the pass's save erased it
+        raw = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
+        self.assertFalse(raw["nodes"][self.g("g3")].get("cleared"), "premise: the flag is gone from the file")
+        moved = km._compact_goal_store(SID)
+        self.assertEqual(moved, 2, "the ledger-cleared root and its child leave the live store")
+        arch = json.loads((jd.GOALARCHDIR / (SID + ".json")).read_text())
+        self.assertTrue(arch["nodes"][self.g("g3")]["cleared"], "the archived copy carries the flag")
+        self.assertTrue(any(e.get("kind") == "clear" for e in arch["nodes"][self.g("g3")].get("log") or []),
+                        "...as a verdict in its log, not a bare flag")
+        self._fresh_process()
+        by_id = {n["id"]: n for n in km._fleet_archived_tops(SID)}
+        for nid in (self.g("g3"), self.g("g3a")):
+            n = by_id.get(nid)
+            self.assertTrue(n is None or n["cleared"],
+                            "after the restart the card is gone from Show completed (a cleared top is no longer a "
+                            "completed one) or reads cleared; it never comes back as completed and uncleared")
+
+    def test_a_clobbered_clear_heals_on_the_next_load_and_an_undo_still_wins(self):
+        self._completed_top("g6")
+        snapshot = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
+        km._clear_all([self.g("g6")])
+        rows = [json.loads(l) for l in (jd._overrides_dir() / (SID + ".jsonl")).read_text().splitlines()]
+        self.assertEqual([r["op"] for r in rows], ["clear"], "the clear is journaled, journal-first")
+        self.assertEqual((rows[0]["node"], rows[0]["src"]), (self.g("g6"), "user"))
+        self._clobber_with(snapshot)
+        st = jd.load_goals(SID)
+        self.assertTrue(st["nodes"][self.g("g6")].get("cleared"), "the replay re-seals the clobbered clear")
+        self.assertTrue(any(e.get("kind") == "clear" for e in st["nodes"][self.g("g6")].get("log") or []))
+        # the user undoes: the reopen at or after the clear outranks the replayed row from then on
+        km._undo_clear()
+        st = jd.load_goals(SID)
+        self.assertFalse(st["nodes"][self.g("g6")].get("cleared"), "undone")
+        jd._shared_clear()
+        self.assertFalse(jd.load_goals(SID)["nodes"][self.g("g6")].get("cleared"), "...and it stays undone on a reload")
+
+    def test_the_compaction_stamps_a_root_only_the_ledger_clears(self):
+        self._completed_top("g4")
+        with (jd.STATE / "cleared.jsonl").open("a") as f:                  # the ledger alone: no flag, no journal
+            f.write(json.dumps({"id": self.g("g4"), "t": 200, "op": "clear"}) + "\n")   # after its completion, as a cross-off is
+        km._CLEARED_MEMO["slot"] = None
+        self.assertEqual(km._compact_goal_store(SID), 1)
+        arch = json.loads((jd.GOALARCHDIR / (SID + ".json")).read_text())
+        self.assertTrue(arch["nodes"][self.g("g4")]["cleared"], "stamped before the copy")
+        self.assertEqual(arch["status"][self.g("g4")], "completed", "the status is history, untouched")
+
+    def test_the_projection_reads_the_ledger_over_the_copied_flag_after_its_cache(self):
+        jd.GOALARCHDIR.mkdir(parents=True, exist_ok=True)
+        (jd.GOALARCHDIR / (SID + ".json")).write_text(json.dumps({
+            "rompUuid": SID,
+            "nodes": {self.g("g5"): _node(self.g("g5"), None, nodeComplete=True, t=100, mt=100),
+                      self.g("g5a"): _node(self.g("g5a"), self.g("g5"), nodeComplete=True, t=100, mt=100)},
+            "status": {self.g("g5"): "completed"}}))
+        first = {n["id"]: n for n in km._fleet_archived_tops(SID)}
+        self.assertFalse(first[self.g("g5")]["cleared"], "no ledger row: the flag stands")
+        with (jd.STATE / "cleared.jsonl").open("a") as f:                  # a clear lands after the archive's write
+            f.write(json.dumps({"id": self.g("g5"), "t": 200, "op": "clear"}) + "\n")
+        km._CLEARED_MEMO["slot"] = None
+        second = {n["id"]: n for n in km._fleet_archived_tops(SID)}
+        self.assertTrue(second[self.g("g5")]["cleared"], "the ledger applies over the cached projection")
+        self.assertTrue(second[self.g("g5a")]["cleared"], "and rolls down to the subtree")
+        self.assertFalse(first[self.g("g5")]["cleared"], "the cached rows themselves are not mutated")
+
+
 if __name__ == "__main__":
     unittest.main()
