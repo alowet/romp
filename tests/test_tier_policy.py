@@ -36,6 +36,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 import urllib.error
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -669,10 +670,12 @@ class WorkflowPins(unittest.TestCase):
     def test_the_job_name_is_NOT_the_check_name(self):
         # the job's own check run must not share the required check's name: two same-named runs per
         # head (the job's, frozen at push time, and the API-posted verdict the hourly sweep moves) leave
-        # it undocumented which one the ruleset honors - so only the API-posted verdict carries the name
+        # it undocumented which one the ruleset honors - so only the API-posted verdict carries the name.
+        # The pin covers the bare and the quoted spellings (the file quotes names now), anchored to the
+        # end of the value: "Tier policy: post verdict" passes, `name: "Tier policy"` does not
         jobs = self.wf[self.wf.index("\njobs:"):]
         self.assertIn('    name: "Tier policy: post verdict"', jobs)   # T273c: the row says what the job does (quoted: the colon)
-        self.assertNotRegex(jobs, r"name: Tier policy[ \t]*\n")
+        self.assertNotRegex(jobs, r"""name: ["']?Tier policy["']?[ \t]*(?:#.*)?\n""")
 
     def test_the_three_tier_label_lists_agree(self):
         wf = open(os.path.join(os.path.dirname(HERE), ".github", "workflows", "pr-tier.yml")).read()
@@ -989,6 +992,37 @@ class FetcherShapes(unittest.TestCase):
         self.assertEqual(len(failed), 1)
         self.assertEqual(failed[0]["conclusion"], "failure")
         self.assertIn("evaluation failed", failed[0]["output"]["title"])
+
+    def test_a_failed_verdict_post_fails_the_job(self):
+        # the POST half of "a fetch or post error fails the job" (T273c): the verdict is the check run, so a
+        # /check-runs POST the API refuses (a 502, a token without checks:write) must reach the job as the
+        # error it is, never as exit 0 beside a verdict nobody posted. The final post_check sits outside
+        # run_one's try, so its error propagates straight through main; nothing retries or swallows it
+        real = self.tc._req
+        attempted = []
+
+        def refusing(method, path, token, body=None):
+            if method == "POST" and path.endswith("/check-runs"):
+                attempted.append(body)
+                raise urllib.error.HTTPError(path, 502, "Bad Gateway", {}, None)
+            return real(method, path, token, body)
+        self.tc._req = refusing
+        with unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "tok", "GITHUB_REPOSITORY": "romp-on/romp"}):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.tc.main(["--pr", "42"])
+            self.assertEqual(cm.exception.code, 502, "the post's own error is what reaches the job")
+            self.assertEqual([b["conclusion"] for b in attempted], ["success"],
+                             "one attempt, the real verdict: the refused post is neither retried nor swallowed")
+            # when the evaluation ALSO failed, the "evaluation failed" verdict is attempted (never a silent gap
+            # on a required check), its post fails the same way, and that error, not exit 0, reaches the job
+            attempted.clear()
+            self.served = set()
+            self.files_error = 500
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.tc.main(["--pr", "42"])
+            self.assertEqual(cm.exception.code, 502)
+            self.assertEqual(len(attempted), 1)
+            self.assertIn("evaluation failed", attempted[0]["output"]["title"])
 
     def test_build_record_survives_the_documented_shapes_and_has_no_time_field(self):
         rec = self.tc.build_record("romp-on/romp", 42, "tok")
