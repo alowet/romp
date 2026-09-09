@@ -241,15 +241,17 @@ class GateMemo(_Gate):
 class WalkReadsTheSharedView(_Gate):
     def test_the_walk_reads_through_the_shared_view_and_never_a_fresh_load(self):
         """The walk's own read is the shared view; every writer downstream reloads at its write moment
-        (_wake_goal's fresh load, the fire list's, the fire path's), so a fresh load per idle session per cycle
-        bought nothing. A write through the view raises FrozenStoreError, so a future writer that forgets the
-        reload fails loudly instead of landing."""
+        (_wake_goal's fresh load, _file_wake_answer's own load, the fire list's, the fire path's), so a fresh
+        load per idle session per cycle bought nothing. A write through the view raises FrozenStoreError, files
+        a frozen-store-write row and switches the cache off, so a writer that forgets the reload is refused
+        and recorded instead of landing. The answered wake's filing is pinned by behaviour, not by source text,
+        in tests/test_wake_answer_files_under_shared_view.py: a text pin on _wake_goal's load matched the due
+        leg's reload and stayed green while the answered leg wrote through the view."""
         import inspect
         src = inspect.getsource(km._auto_nudge_session)
         self.assertIn("store, fault = jd.load_goals_shared_or_fault(sid)", src)
         self.assertNotIn("jd.load_goals_or_fault(sid)", src, "no fresh load for the walk's own read")
         self.assertIn("_nudge_placement_gate(sid, turns, store)", src, "the gate is the memoized one")
-        self.assertIn("jd.load_goals(sid)", inspect.getsource(km._wake_goal), "the wake reloads fresh before it writes")
         self.assertIn("_nudge_fire_list(jd.load_goals(sid)", src, "the fire list judges a FRESH store, never the view")
         self.assertIn("_nodes = jd.load_goals(sid)", src, "the fire path re-reads fresh too")
 
