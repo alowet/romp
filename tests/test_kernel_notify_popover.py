@@ -287,7 +287,8 @@ class PushTestRoute(_LoopbackMixin, unittest.TestCase):
         self.assertEqual(d["tag"], "romp:" + SID_WEB)
         # a turn's routing shape under kind test: the shell POSTs /reveal for the sid, no card to scroll to
         self.assertEqual(d["data"], {"sid": SID_WEB, "host": "", "kind": "test", "cardId": "",
-                                     "url": "/?push-reveal=" + SID_WEB})
+                                     "url": "/?push-reveal=" + SID_WEB,
+                                     "name": "web"})   # the same name the answer carries (2026-09-09: the shell's offer chip reads it off the payload)
         self.assertNotIn("badge", d, "the count rides its own push")
 
     def test_every_test_push_leaves_a_line_in_the_kernel_log(self):
