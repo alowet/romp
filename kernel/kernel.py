@@ -10064,7 +10064,7 @@ def _dead_wait_block(sid, gid, at, why, nudged, now, blk_why=None):
     return False
 
 
-def _file_wake_answer(store, sid, gid, now):
+def _file_wake_answer(sid, gid, now):
     """The answered wake's outcome becomes a FILED event (the user 2026-08-25, closing the awaiting
     audit's last live mechanism): the answer IS new information, and new information that files no
     diary row is invisible to every reader that matters — the response segment was often placed
@@ -10074,8 +10074,15 @@ def _file_wake_answer(store, sid, gid, now):
     and patience never churn) — the row's arrival moves _newest_filed past closerLookT, so the
     closer re-audits WITH the answer in view and rules it — done, lift, block, or keep — from real
     evidence. Runs once per answer by construction (the answered leg itself runs once per record).
-    Returns True when the row landed."""
+    Returns True when the row landed.
+    Takes no store from its callers: both hold read-only views (the walk's, _awaiting_wake_outcomes'),
+    and everything here is bound to the one object that gets saved (the node filed on must belong to
+    the store record_verdict appends to and save_goals publishes), so the helper loads its own writer
+    copy (jd.load_goals) at the write moment. A write through the shared view would raise
+    FrozenStoreError into the catch below, landing no row and switching the shared cache off for the
+    process; loading here rules that out by construction."""
     try:
+        store = jd.load_goals(sid)
         nodes = store.get("nodes", {})
         kids = {}
         for x, n in nodes.items():
@@ -10121,7 +10128,8 @@ def _wake_goal(sid, gid, stamp, nudged, turns, store, now, lt, tmux, wake_only=F
                 the stamp still stands → the wait was re-affirmed; keep the record with answeredAt so the
                 NEXT wake measures from the answer — NOT the anchor, which a same-why re-assert
                 deliberately freezes (judge apply_close's coalesce rule; keying episodes on the anchor is
-                what made the one-shot design terminal).
+                what made the one-shot design terminal), and file the answer into the diary
+                (_file_wake_answer, on its own writer load: `store` here is the walk's read-only view).
       silent    no response within the same window (from the FIRE, rec["at"]) → _mark_nudge_failed(wake=True):
                 the block rides the normal ladder to Needs-you. A failed/moot record re-arms only on a
                 genuinely NEW stamp episode (anchor newer than the one that failed).
@@ -10165,7 +10173,7 @@ def _wake_goal(sid, gid, stamp, nudged, turns, store, now, lt, tmux, wake_only=F
             # the judges ruled on the answer and the stamp still stands → the wait was re-affirmed
             nudged[gid] = dict(rec, answeredAt=(resp.get("t") or int(now)))
             _put_nudged(gid, nudged[gid])
-            _file_wake_answer(store, sid, gid, now)   # the answer becomes a FILED event → the closer
+            _file_wake_answer(sid, gid, now)         # the answer becomes a FILED event → the closer
             return False                              #   re-audits with it in view (see the helper)
         _sdefer = _revivers_pending(sid, store, turns, gid)
         if _sdefer and not _nudge_deferred_ok(gid, _sdefer, now, sid):
@@ -10310,8 +10318,8 @@ def _awaiting_wake_outcomes(now, walked=None):
                 # answered and ruled — re-arm from the answer, exactly as the walk's eval would have (the
                 # walk never got to: its session gates held, e.g. an api-error AFTER the judged response)
                 _put_nudged(gid, dict(rec, answeredAt=(resp.get("t") or int(now))))
-                _file_wake_answer(jd.load_goals(sid), sid, gid, now)   # …and the answer files, same as the walk's leg: the
-                #                                              filing saves, so it takes a writer load; the view is frozen
+                _file_wake_answer(sid, gid, now)     # …and the answer files, same as the walk's leg (the filing
+                #                                      saves, so the helper takes its own writer load; the view is frozen)
                 continue
             if resp is not None:
                 continue                             # visible but not ruled yet — the judges own it
@@ -10949,8 +10957,10 @@ def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None, wake_only
     # The walk's READ of the store (2026-09-09): the shared read-only view every pusher builder reads, one
     # parse per file version instead of a fresh load per idle session per cycle (66 loads a cycle on the
     # maintainer's box, most of them this line). Every writer downstream reloads at its write moment
-    # (_wake_goal's _fresh, _nudge_fire_list's and the fire path's jd.load_goals), and a write through the
-    # view raises FrozenStoreError rather than landing, so a future writer that forgets fails loudly.
+    # (_wake_goal's _fresh, _file_wake_answer's own load, _nudge_fire_list's and the fire path's
+    # jd.load_goals), and a write through the view raises FrozenStoreError rather than landing, files a
+    # frozen-store-write row and switches the cache off for the process, so a writer that forgets is refused
+    # and recorded rather than landing a write.
     store, fault = jd.load_goals_shared_or_fault(sid)
     if fault is not None:
         return None                                  # its row is filed; nothing fires or stamps on a store we cannot read
