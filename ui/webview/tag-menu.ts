@@ -95,15 +95,12 @@ export function openTagMenu(anchor: HTMLElement, opts: TagMenuOpts): void {
     const lens = opts.lens();
     // (the scope caption retired 2026-08-25 — the user: the button tooltip already names the
     // surface, so it is the ONE scope carrier and the menu opens straight onto its rows)
-    const row = (label: string, current: boolean, dot?: string | null, dim?: boolean) => {
+    // a plain row (All, (no tags), the group switch, Configure tags…): the label, the ✓ when current; the
+    // tags are not rows any more but chips (below), so the colour dot the tag rows wore is gone (T283)
+    const row = (label: string, current: boolean, dim?: boolean) => {
       const r = document.createElement("div");
       r.setAttribute("style", "padding:4px 22px 4px 8px;border-radius:4px;cursor:pointer;position:relative;white-space:nowrap;"
         + (dim ? "opacity:0.85;" : ""));
-      if (dot) {
-        const d = document.createElement("span");
-        d.setAttribute("style", "display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;background:" + dot + ";");
-        r.appendChild(d);
-      }
       r.appendChild(document.createTextNode(label));
       if (current) {
         const c = document.createElement("span");
@@ -143,9 +140,9 @@ export function openTagMenu(anchor: HTMLElement, opts: TagMenuOpts): void {
       menu.appendChild(s);
     }
     if (opts.groupToggle)
-      row(opts.groupToggle.label, opts.groupToggle.on(), null, true).addEventListener("click", () => { opts.groupToggle!.toggle(); build(); });
+      row(opts.groupToggle.label, opts.groupToggle.on(), true).addEventListener("click", () => { opts.groupToggle!.toggle(); build(); });
     if (opts.onConfigure)
-      row("Configure tags…", false, null, true).addEventListener("click", () => { closeTagMenu(); opts.onConfigure!(); });
+      row("Configure tags…", false, true).addEventListener("click", () => { closeTagMenu(); opts.onConfigure!(); });
   };
   build();
   document.body.appendChild(menu);
