@@ -1113,10 +1113,35 @@ class DeclaredTier(unittest.TestCase):
         self.assertEqual(tp.declared_tier(None), (None, ""))
         self.assertEqual(tp.declared_tier("fixes #7\n\nthe tier is fix, really\n## Tier\n"), (None, ""))
 
-    def test_the_value_must_be_the_whole_line(self):
-        tier, why = tp.declared_tier("Tier: fix and a bit more")
-        self.assertIsNone(tier)
-        self.assertIn("fix and a bit more", why)
+    def test_the_first_word_is_the_tier_and_trailing_prose_is_allowed(self):
+        # T273b (the manager, 2026-09-08): a contributor wrote the tier word and then a sentence on the same
+        # line, and the line declared nothing until a maintainer labeled by hand. The FIRST word after
+        # "Tier:" (markup stripped) is the declaration; prose after it is ignored unless it names another tier
+        for body in ("Tier: `fix` — a maintainer needs to add the label, I cannot",
+                     "Tier: fix (see the test below)",
+                     "Tier: fix. This closes the parser gap.",
+                     "Tier: **fix** since it comes with a failing test",
+                     "Tier: fix and a bit more",
+                     "Tier: fix - a fix for the parser"):
+            self.assertEqual(tp.declared_tier(body), ("fix", ""), body)
+        self.assertEqual(tp.declared_tier("Tier: major-feature: it changes the contract")[0], "major-feature")
+        self.assertEqual(tp.declared_tier("Tier: tests-only, docs only")[0], "docs", "the alias as first word")
+
+    def test_a_line_naming_two_tiers_declares_nothing_and_says_so(self):
+        for body in ("Tier: fix or feature", "Tier: fix (maybe feature?)", "Tier: docs — not a fix"):
+            tier, why = tp.declared_tier(body)
+            self.assertIsNone(tier, body)
+            self.assertIn("more than one tier", why, body)
+        tier, why = tp.declared_tier("Tier: fix or feature")
+        for word in ("fix", "feature"):
+            self.assertIn(word, why)
+
+    def test_a_first_word_that_is_no_tier_declares_nothing_whatever_follows(self):
+        for body in ("Tier: fixes the parser", "Tier: a fix", "Tier: the tier is fix"):
+            tier, why = tp.declared_tier(body)
+            self.assertIsNone(tier, body)
+            self.assertIn("names no tier", why, body)
+        self.assertIn("fixes the parser", tp.declared_tier("Tier: fixes the parser")[1])
 
     def test_a_value_that_is_not_a_tier_declares_nothing_and_names_itself(self):
         tier, why = tp.declared_tier("Tier: bugfix")
@@ -1159,7 +1184,8 @@ class DeclaredTier(unittest.TestCase):
         # the summary is rendered as Markdown in the Checks tab under the gate's own identity: a link, a
         # tracking image or text that reads like an approval must come back as literal text (a code span,
         # with any backtick of its own removed so the span cannot be broken out of)
-        for raw in ("<img src=https://x.example/p.png>", "[fix](https://x.example) approved", "fix` **APPROVED** `"):
+        # (first words that are no tier: under T273b a tier word followed by prose is a declaration)
+        for raw in ("<img src=https://x.example/p.png>", "[fix](https://x.example) approved", "notatier` **APPROVED** `"):
             tier, why = tp.declared_tier("Tier: " + raw)
             self.assertIsNone(tier)
             shown = raw.replace("`", "").strip()          # the excerpt drops the value's own backticks, then trims

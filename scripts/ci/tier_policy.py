@@ -88,6 +88,19 @@ _HTML_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
 _CODE_FENCE = re.compile(r"^(```|~~~)[^\n]*\n.*?(?:^\1[ \t]*$|\Z)", re.S | re.M)
 _TIER_LINE = re.compile(r"^ {0,3}(?:[-*]\s+)?[*_`]*tier[*_`]*\s*:[*_`]*\s*(.*?)\s*$", re.I)
 _ODD_MAX, _ODD_LEN = 3, 40    # the check summary quotes a bounded excerpt of a line that names no tier
+_WORD_TRIM = "`*_.,;:!?()[]{}<>\"'—–-/"   # markup and punctuation around a word of the tier line's value
+
+
+def _tier_words(raw):
+    """The words of a tier line's value, each read as a tier or None: markup and punctuation trimmed from both
+    ends (an inner hyphen survives: major-feature), the alias mapped, lower-cased. Empty words (a lone dash)
+    are dropped. Pure."""
+    out = []
+    for w in (raw or "").split():
+        w = w.strip(_WORD_TRIM).lower()
+        if w:
+            out.append(TIER_ALIASES.get(w, w) if TIER_ALIASES.get(w, w) in TIERS else None)
+    return out
 
 
 def _excerpt(raw):
@@ -104,9 +117,12 @@ def declared_tier(body):
     """The tier the PR body declares on a `Tier: <tier>` line, as (tier, why): (tier, "") when exactly one
     tier is named (the same tier on two lines still agrees; the tests-only alias reads as docs); (None, "")
     when no line declares anything; (None, why) when a line exists but declares nothing, and why says so
-    for the check's summary: lines naming different tiers disagree, a value that is no tier (the template's
-    untouched placeholder, a typo, an empty line) is quoted back. Pure over the body text; HTML comments are
-    not read."""
+    for the check's summary: lines naming different tiers disagree, a line naming more than one tier is
+    ambiguous, a value whose first word is no tier (the template's untouched placeholder, a typo, an empty
+    line) is quoted back. The FIRST word after "Tier:" is the declaration and prose after it is allowed
+    (T273b: a contributor wrote the tier word and then a sentence, and the line declared nothing until a
+    maintainer labeled by hand), unless that prose names another tier. Pure over the body text; HTML comments
+    and fenced code are not read."""
     found, odd = [], []
     # line endings first: GitHub's web editor writes CRLF, and a fence's closing line ending in \r would
     # miss a `$`-anchored close, reading as unclosed and swallowing the declaration (the manager's review)
@@ -117,12 +133,17 @@ def declared_tier(body):
         if not m:
             continue
         raw = m.group(1).strip()
-        val = raw.strip("`*_ .,;").lower()
-        tier = TIER_ALIASES.get(val, val)
-        if tier in TIERS:
-            found.append(tier)
-        elif len(odd) < _ODD_MAX:
-            odd.append(_excerpt(raw))
+        words = _tier_words(raw)
+        first = words[0] if words else None
+        if first is None:
+            if len(odd) < _ODD_MAX:
+                odd.append(_excerpt(raw))
+            continue
+        others = [w for w in words[1:] if w and w != first]
+        if others:
+            named = list(dict.fromkeys([first] + others))
+            return None, "the body's tier line names more than one tier (%s): one tier" % ", ".join(named)
+        found.append(first)
     distinct = list(dict.fromkeys(found))
     if len(distinct) > 1:
         return None, "the body's tier lines disagree (%s): one line, one tier" % ", ".join(distinct)
