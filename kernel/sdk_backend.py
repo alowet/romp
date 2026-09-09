@@ -821,7 +821,7 @@ def cost_state_watermarks(o):
     return {"total": float(total), "tokens": tokens}
 
 
-def last_cost_state(path, scan_bytes: int = 8 << 20):
+def last_cost_state(path, scan_bytes: int = 8 << 20, max_line: int = 4 << 20):
     """The resumed transcript's LAST `cost-state` record, as the watermarks a CLI that restores it would
     hold (cost_state_watermarks), or None when the file has no such record or cannot be read.
 
@@ -841,45 +841,66 @@ def last_cost_state(path, scan_bytes: int = 8 << 20):
     restores nothing. The /clear saver runs before the rotation, so the SECOND and later /clear in one
     process appends a record to the conversation that /clear abandons; the conversation romp resumes
     (the reg's lastSid, the current one) never carries one. So every seed today reads zero, and the
-    CLI's counters start at zero on the same resume: the two agree. The one way a record reaches a
-    resumed file is a lastSid left on an abandoned conversation (the kernel dying between the saver's
-    write and the init flip); the print-mode CLI still starts at zero there, and the shrunken-counter
-    rule records the first turn whole while its own total sits below the seed. The residual: a first
+    CLI's counters start at zero on the same resume: the two agree. A record reaches a resumed file two
+    ways: a lastSid left on an abandoned conversation (the kernel dying between the saver's write and
+    the init flip), and a transcript the interactive CLI wrote (its writer runs from startup) that romp
+    later resumes; the print-mode CLI still starts at zero in both, and the shrunken-counter rule
+    records the first turn whole while its own total sits below the seed. The residual: a first
     turn costlier than the whole recorded history is under-counted by the seed, and the same holds per
     token field (_turn_usage diffs each field on its own), so a first turn whose count in one field
     exceeds the recorded history's is under-counted in that field.
 
-    Scans BACKWARDS in 64 KB chunks (a line split by a chunk edge is carried into the earlier chunk and
-    reassembled) and stops at the first hit, so a transcript that carries the record costs a chunk or
-    two. The scan is BOUNDED to the last `scan_bytes` (8 MB by default; last_record_uuid's tail read has
-    the same reason: a transcript can be tens of MB and this runs on the event loop at every connect):
-    a record older than that is treated as absent, which is the answer the print-mode CLI gives for its
-    own counters today (it restores nothing), so the two sides still agree (review find, 2026-09-09)."""
+    Scans BACKWARDS in 64 KB chunks and stops at the first hit, so a transcript that carries the record
+    costs a chunk or two. A line split across chunks is reassembled ONCE, when the scan reaches the
+    newline before it: its pieces are kept in a list as the chunks arrive and joined there, so each byte
+    read is copied a fixed number of times however long the line is (concatenating the carried fragment
+    onto every chunk copied it once per chunk, quadratic in the line; review find, 2026-09-09). A line
+    longer than `max_line` (4 MB by default) is not a record, since a record is under 1 KB: its pieces
+    are dropped as they arrive and the line is skipped unjoined, which also bounds the memory the scan
+    holds by the cap rather than by the line. The scan is BOUNDED to the last `scan_bytes` (8 MB by
+    default; last_record_uuid's tail read has the same reason: a transcript can be tens of MB and this
+    runs on the event loop at every connect): a record older than that is treated as absent, which is
+    the answer the print-mode CLI gives for its own counters today (it restores nothing), so the two
+    sides still agree (review find, 2026-09-09); the line the bound cuts through is a fragment and is
+    never joined."""
     marker = b'"cost-state"'
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             pos = f.tell()
             floor = max(0, pos - int(scan_bytes))   # the oldest byte the bounded scan may reach
-            carry = b""
+            frags = []          # the pieces read so far of the line the last chunk opened with, in file
+            #                     order (each chunk read is earlier in the file than the one before)
+            carried = 0         # that line's length so far, counted whether or not its pieces are kept: past
+            #                     max_line the line is not a record, so its pieces are dropped as they
+            #                     arrive and the line is skipped without a join
             while pos > floor:
                 step = min(pos - floor, 1 << 16)
                 pos -= step
                 f.seek(pos)
-                chunk = f.read(step) + carry    # carry: the later chunk's first-line fragment, which this
-                #                                 chunk's last line continues into
-                head, nl, body = chunk.partition(b"\n")
-                if pos > 0:
-                    carry = head                # this chunk's first line is a fragment that completes in the
-                    #                             earlier chunk, so it travels there whole
-                    if not nl:
-                        continue                # no line boundary in this chunk at all
+                parts = f.read(step).split(b"\n")   # leading piece, complete lines, trailing piece; ONE
+                #                                      element when the chunk holds no newline at all
+                lines = []                          # the lines this chunk completes, newest first
+                if len(parts) > 1:
+                    # the carried line begins after this chunk's last newline: its pieces are joined here
+                    if carried + len(parts[-1]) <= max_line:
+                        lines.append(b"".join([parts[-1]] + frags))
+                    lines.extend(reversed(parts[1:-1]))
+                    frags, carried = [], 0
+                if pos == 0:
+                    # the file's head: the leading piece is the start of the carried line, or all of it
+                    if carried + len(parts[0]) <= max_line:
+                        lines.append(b"".join([parts[0]] + frags))
                 else:
-                    carry, body = b"", chunk    # the file's head: every line here is complete
-                if marker not in body:
-                    continue
-                for line in reversed(body.split(b"\n")):
-                    if marker not in line:
+                    # the leading piece continues into the earlier chunk: carried, not copied, while the
+                    # line is short enough to be a record
+                    carried += len(parts[0])
+                    if carried <= max_line:
+                        frags.insert(0, parts[0])
+                    else:
+                        frags = []
+                for line in lines:
+                    if len(line) > max_line or marker not in line:
                         continue
                     try:
                         rec = cost_state_watermarks(json.loads(line))
@@ -3902,7 +3923,9 @@ class SdkSession:
         #   the bundle: the result event's total_cost_usd sits beside total_duration/lines counters),
         #   so spend folds the DELTA between results — folding the raw value re-added the whole
         #   session-so-far cost every turn (the user 2026-08-08, whose spend line was fiction). Reset
-        #   at each connect: a fresh CLI process starts its counter at zero.
+        #   at each connect to what the CLI process it starts holds: zero for a fresh process, or the
+        #   totals of the resumed transcript's last cost-state record when it carries one
+        #   (_seed_spend_watermarks, last_cost_state).
         self._last_usage_totals = {}  # the TOKEN watermarks — kept against the result's `model_usage`
         #   map (the CLI's modelUsage), the per-model counter the CLI documents as cumulative like
         #   total_cost_usd, same lifecycle, so each field folds as a delta exactly like the dollars.
