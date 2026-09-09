@@ -987,14 +987,34 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   while they stand (`served`, `built`); `captions` and `goalArchive` are the
   per-file read memos behind the index tier's caption readers and the re-plan's
   cleared context, each parsed once per file state (`served`, `parsed` or
-  `loaded`); `plannerSkip` is the planner's change gate (`skipped`, `planned`,
-  `recorded`: a session whose parse, store, journal, archive, episode log,
-  its leaf's task store, captions file and reg have not moved since a pass
-  that had nothing to do, and none of whose running background launches has
-  crossed its deadline, is not planned again). The compaction sweep after
-  each judge pass evicts from `pass` and `shared` the entries of stores no
-  session in the discover window owns, so both stay bounded by the live
-  board; the gate memo is bounded by the session count.
+  `loaded`). `goalArchive` memoizes a readable archive only: an archive that
+  exists and cannot be read or parsed is answered empty, marks the running
+  judge stage incomplete, and is not memoized, so the next call reads the file
+  again. `plannerSkip` is the planner's inner change gate (`skipped`,
+  `planned`, `recorded`). The planner runs behind two gates. The outer gate is
+  the judge's evidence gate around `_plan_session` (`docs/judges.md`, "Ops and
+  knobs"): a session whose signature equals the one the planner stamped after
+  its last complete run is skipped before it is submitted. It keys on the
+  inner gate's inputs, the reg by its `spawnedAt` and backend values rather
+  than by identity, plus `cleared.jsonl`, the death marker and the session's
+  stall records. The inner gate
+  sits inside `_plan_session` and sees only the sessions the outer gate ran: a
+  session whose parse, store, journal, archive, episode log, its leaf's task
+  store, captions file and reg have not moved since a pass that had nothing to
+  do, and none of whose running background launches has crossed its deadline,
+  is not planned again. The inner gate records a pass only when it placed
+  nothing, left the store's key where it was, and ran to completion; a
+  deferral without a write, or a side file that exists and did not read,
+  marks the run incomplete, and that session is planned again next pass. So
+  `plannerSkip` counts the sessions the outer gate let through, not every
+  planner skip: an idle session stops at the outer gate and appears in neither
+  `skipped` nor `planned`. Outside a pass frame (`romp-judge --plan`) the
+  outer gate stamps nothing, and the inner gate does the skipping. The
+  compaction sweep after each judge pass evicts from `pass` and `shared` the
+  entries of stores no session in the discover window owns, so both stay
+  bounded by the live board; the courier's and the planner's change-gate
+  tables are pruned to the sessions each pass discovers, and the evidence
+  gate's stamps are cleared at a fixed cap.
 - `judge`: `passes`, `ms_sum`, `ms_last`, `ms_mean` (wall time; a pass waits
   on model calls), `cpu_ms_sum` (CPU time of the judge tier threads and every
   per-session worker they run; the workers' share is `cpu_ms_workers`).
