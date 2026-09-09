@@ -164,6 +164,7 @@ def _rebind_state(path):
     _lastsid_memo.clear()   # sdk-registry reads are mtime-memoized per sid — a rebind must not serve the old root's values
     _STORE_FAULTS.clear()   # unreadable-store episodes belong to the old root's files
     _CHAIN_MEMO.clear()     # the write-moment chain memo keys on paths under STATESDIR; a new root is a new world
+    _COURIER_SEEN.clear()   # the courier gate keys on the old root's files
     _episode_memo.clear()   # ...and so are the episode-log reads
     _head_memo.clear()      # transcript heads are immutable per path, but a rebind swaps the whole world of paths
     _namefp_memo.clear()    # names-entry content is memoized per SID against same-second mtimes — across a
@@ -2158,6 +2159,37 @@ def _fileset_key(files):
 
 
 _PARSE_CACHE = {}          # fsid -> (fileset_key, parsed_session)
+
+# ── the courier's change gate (2026-09-09) ──
+# run_courier scanned every session's transcript and goal store on every triage pass, loading the store
+# with the writer's loader: 1172 goal loads a pass across 18 sessions on the maintainer's box, 83% of
+# the judge tier thread's samples, most of the process's CPU. A session whose inputs have not moved since
+# a scan that found nothing to place has no new information for the courier by construction, so it is
+# skipped whole. The key is every input the per-session scan reads, taken BEFORE the store read (the
+# chain-memo rule): the parse cache's fileset key bound to the session object the scan holds, the store
+# file's key and its journal's and archive's (the shared view's inputs), the episode log's key (the
+# floor) and the transcript path. A session is recorded only when its scan added nothing pending; one
+# with rows to place is scanned again next pass however its inputs stand (its placements move the store
+# anyway). A parse the cache does not hold (a stubbed one) is never keyed, so never skipped. Pruned to
+# the pass's fleet, so bounded by it; a rebound state root clears it.
+_COURIER_SEEN = {}         # fsid -> the scan key of its last pass that found nothing to place
+_COURIER_STATS = {"skipped": 0, "scanned": 0, "recorded": 0}
+
+
+def courier_skip_stats():
+    """A copy of the courier gate's counters for /perf (memos.courierSkip)."""
+    return dict(_COURIER_STATS)
+
+
+def _courier_scan_key(fsid, path, session):
+    """Every input run_courier's per-session scan reads, or None when the parse is not the cache's own
+    (never skip what cannot be keyed). Taken before the store read, so a write landing during the scan
+    moves the key the next pass takes."""
+    pk = _PARSE_CACHE.get(fsid)
+    if pk is None or pk[1] is not session:
+        return None
+    return (str(path), pk[0], _file_key(str(GOALDIR / (fsid + ".json"))), _journal_key(fsid), _archive_key(fsid),
+            _file_key(str(EPIDIR / (fsid + ".jsonl"))))
 
 # ── the write-moment chain memo ──
 # _rewound_away builds a FRESH FileAdapter on every call by design (the pass frame pins a stale
@@ -14272,24 +14304,38 @@ def _attach_courier_link(store, seg_id, mid):
     planner-first placement orphaned the sender's handoff forever. The link rides `links[]` — never
     `origin`, which means "this goal was BORN from that delegation" and stays truthful — and
     run_propagate completes the sender's tracking node from either. Idempotent by msgId; a store
-    already carrying the msgId anywhere (origin or links) is left alone. Saves only on change."""
+    already carrying the msgId anywhere (origin or links) is left alone. Saves only on change.
+    `store` is a writer's load: the courier's scan asks _courier_link_wanted on its read-only view first
+    and loads for the write only when the link is missing (2026-09-09), so a pass over placed delegates
+    with their links in place loads nothing."""
+    wanted = _courier_link_wanted(store, seg_id, mid)
+    if wanted is None:
+        return False
+    top, peer_sid, peer_gid = wanted
+    store["nodes"][top].setdefault("links", []).append({"peer": peer_sid, "goalId": peer_gid, "msgId": mid})
+    save_goals(store["rompUuid"], store)
+    return True
+
+
+def _courier_link_wanted(store, seg_id, mid):
+    """Read-only: (top, peer_sid, peer_gid) when `mid`'s courier link is missing from the store and has a
+    placed top to attach to, else None. The idempotency half of _attach_courier_link, split out so the
+    scan can ask it of the shared view."""
     nodes = store.get("nodes", {})
     for nd in nodes.values():
         o = nd.get("origin")
         if isinstance(o, dict) and o.get("msgId") == mid:
-            return False
+            return None
         if any(isinstance(l, dict) and l.get("msgId") == mid for l in (nd.get("links") or [])):
-            return False
+            return None
     tgt = store.get("placements", {}).get(seg_id)
     if not tgt or tgt not in nodes:
-        return False
+        return None
     top = _top_ancestor(nodes, tgt)
     peer_sid, peer_gid = _handoff_backref(mid)
     if not (peer_sid and peer_gid):
-        return False
-    nodes[top].setdefault("links", []).append({"peer": peer_sid, "goalId": peer_gid, "msgId": mid})
-    save_goals(store["rompUuid"], store)
-    return True
+        return None
+    return (top, peer_sid, peer_gid)
 
 
 def _serving_dispatch(session, store, fsid, upto_seg_id):
@@ -15006,14 +15052,21 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=
         except Exception as e:                         # a poisoned transcript must not skip silently (T111)
             _log_judge_error("courier", fsid, "pass-crash", note="parse: %r" % e)
             continue
+        skey = _courier_scan_key(fsid, path, session)   # BEFORE the store read (the chain-memo rule)
+        if skey is not None and _COURIER_SEEN.get(fsid) == skey:
+            _COURIER_STATS["skipped"] += 1             # nothing moved since a scan that found nothing: no new information
+            continue
+        _COURIER_STATS["scanned"] += 1
         try:
-            cstore = load_goals(fsid)
+            cstore = load_goals_shared(fsid)           # the read-only view: the scan reads placements and seams; its one
+            #                                            writer (the link repair below) takes its own load at the write
         except Exception as e:                         # an unreadable store: this session's row, the next session's turn
             _log_judge_error("courier", fsid, "pass-crash", note="store: %r" % e)
             continue
         closed[fsid] = _session_settled(fsid, str(path), session, cstore)
         placed_ids = cstore["placements"]
         floor = episode_floor(fsid)
+        n_pending0 = len(pending)
         for turn in session["turns"]:
             for seg in _segs(turn, cstore):
                 if seg["id"] in placed_ids:
@@ -15025,8 +15078,10 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=
                     # that goal lands. No model call; idempotent by msgId.
                     try:
                         pm0 = _seg_peer(seg)
-                        if pm0 and pm0[0] and pm0[1] and _seg_peer_kind(seg) == "delegate":
-                            _attach_courier_link(cstore, seg["id"], pm0[1])
+                        if (pm0 and pm0[0] and pm0[1] and _seg_peer_kind(seg) == "delegate"
+                                and _courier_link_wanted(cstore, seg["id"], pm0[1]) is not None):
+                            _attach_courier_link(load_goals(fsid), seg["id"], pm0[1])   # a writer: its own load,
+                            #                                                              only when the view says the link is missing
                     except Exception as e:             # bookkeeping, but its failure is not nothing (T111)
                         _log_judge_error("courier", fsid, "pass-crash", note="link-attach: %r" % e)
                     continue
@@ -15048,6 +15103,14 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=
                     continue
                 pending.append((seg["t"], fsid, seg["id"], _unit_text(seg["atoms"]), pm[1], pm[0],
                                 _seg_peer_kind(seg), _seg_anchor(seg), str(path)))
+        if skey is not None:
+            if len(pending) == n_pending0:
+                _COURIER_SEEN[fsid] = skey             # nothing to place: the next pass skips it until an input moves
+                _COURIER_STATS["recorded"] += 1
+            else:
+                _COURIER_SEEN.pop(fsid, None)          # rows to place: scanned again next pass whatever the key says
+    for _gone in [f for f in _COURIER_SEEN if f not in {f for f, p, a, nm in fleet}]:
+        _COURIER_SEEN.pop(_gone, None)                 # bounded by the pass's fleet
     # CROSS-HOST delegates plant the SENDER-side tracking node here too (the user 2026-08-24, the
     # paused-cards investigation): the recipient lives on a remote kernel, so no inbound segment
     # ever reaches this courier and _plant_handoff_track never ran — the sender's goal waited on a

@@ -196,7 +196,9 @@ class _PerfStats:
                                    cycle_ms_last, cycle_cpu_ms_sum (the pusher thread's own CPU,
                                    time.thread_time, so a forked tmux read is excluded), and
                                    cycle_ms_p50 / cycle_ms_p90 / cycle_ms_ring_max / ring_n from a
-                                   ring of the last RING cycle durations
+                                   ring of the last RING cycle durations; sends (every client payload);
+                                   idle_cycles / idle_ms_sum / idle_cpu_ms_sum (cycles that set no wake,
+                                   sent no payload and saved no store: what a longer wait would skip)
       stages_ms                    jobs: the cycle's tick jobs outside _push_all; push: _push_all as
                                    the cycle calls it; push.chat (the tab strip, the build_session
                                    loop and the chat sends), push.feed (the view signature,
@@ -255,7 +257,8 @@ class _PerfStats:
             self.since = time.time()
             self.pusher = {"cycles": 0, "wakes": 0, "wakes_event": 0, "wakes_backstop": 0,
                            "cycle_ms_sum": 0.0, "cycle_ms_max": 0.0, "cycle_ms_last": 0.0,
-                           "cycle_cpu_ms_sum": 0.0}
+                           "cycle_cpu_ms_sum": 0.0, "sends": 0,
+                           "idle_cycles": 0, "idle_ms_sum": 0.0, "idle_cpu_ms_sum": 0.0}
             self.ring = collections.deque(maxlen=self.RING)
             self.stages = {k: 0.0 for k in self.STAGES}
             self.builds = {k: {"cached": 0, "built": 0, "ms": 0.0} for k in self.BUILDS}
@@ -272,8 +275,16 @@ class _PerfStats:
         with self.lock:
             self.pusher["wakes_event" if by_event else "wakes_backstop"] += 1
 
-    def cycle(self, dt, cpu_dt=0.0):
-        """dt: the cycle's wall seconds; cpu_dt: the pusher thread's own CPU seconds over it."""
+    def marks(self):
+        """(wakes, sends) so far: the cycle compares the pair before and after itself to tell an idle cycle."""
+        with self.lock:
+            return (self.pusher["wakes"], self.pusher["sends"])
+
+    def cycle(self, dt, cpu_dt=0.0, idle=False):
+        """dt: the cycle's wall seconds; cpu_dt: the pusher thread's own CPU seconds over it; idle: the cycle
+        sent nothing and changed nothing (no wake set, no client payload, no goal-store save or write over
+        it), so its wall and CPU also go to the idle sums (2026-09-09: the loop re-enters after a fixed 0.5 s
+        backstop, and the idle share is what a cadence change would be judged on)."""
         ms = dt * 1000.0
         with self.lock:
             p = self.pusher
@@ -281,6 +292,10 @@ class _PerfStats:
             p["cycle_ms_sum"] += ms
             p["cycle_ms_last"] = ms
             p["cycle_cpu_ms_sum"] += cpu_dt * 1000.0
+            if idle:
+                p["idle_cycles"] += 1
+                p["idle_ms_sum"] += ms
+                p["idle_cpu_ms_sum"] += cpu_dt * 1000.0
             if ms > p["cycle_ms_max"]:
                 p["cycle_ms_max"] = ms
             self.ring.append(ms)
@@ -301,6 +316,7 @@ class _PerfStats:
     def send(self, key, kind, nbytes):
         slot = key[0] if isinstance(key, tuple) else key
         with self.lock:
+            self.pusher["sends"] += 1
             d = self.sends[kind]
             e = d.get(slot)
             if e is None:
@@ -376,7 +392,7 @@ class _PerfStats:
         # chain memo. `goals.loads` is the writer's loader alone; the pusher's loads show under memos.shared.
         memos = {}
         for key, read in (("pass", _goals_memo_report), ("shared", jd.shared_store_stats),
-                          ("chain", jd.chain_memo_stats)):
+                          ("chain", jd.chain_memo_stats), ("courierSkip", jd.courier_skip_stats)):
             try:
                 memos[key] = read()
             except Exception:
@@ -40899,6 +40915,7 @@ def _pusher_cycle():
     ran before them."""
     _t_cycle = time.monotonic()
     _c_cycle = time.thread_time()           # this thread's CPU: the wall above includes the tmux fork and lock waits
+    _m_cycle = (_PERF_STATS.marks(), jd._GOAL_IO["saves"], jd._GOAL_IO["writes"])   # idle-cycle marks: see cycle()
     with _clients_lock:
         any_client = bool(_clients)
     now = int(time.time())
@@ -40923,7 +40940,8 @@ def _pusher_cycle():
         _live_scope.names = None
         _live_scope.paths = None
         _live_scope.sessions = None
-        _PERF_STATS.cycle(time.monotonic() - _t_cycle, time.thread_time() - _c_cycle)
+        _PERF_STATS.cycle(time.monotonic() - _t_cycle, time.thread_time() - _c_cycle,
+                          idle=(_PERF_STATS.marks(), jd._GOAL_IO["saves"], jd._GOAL_IO["writes"]) == _m_cycle)
 
 
 def _pusher_cycle_jobs(now, tmux, any_client):

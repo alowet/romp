@@ -125,7 +125,9 @@ class CourierLinkRepair(unittest.TestCase):
 
     def test_courier_scan_carries_the_repair_branch(self):
         src = open(os.path.join(BIN, "romp-judge")).read()
-        self.assertIn("_attach_courier_link(cstore, seg[\"id\"], pm0[1])", src)
+        # the scan asks the read-only view whether the link is missing and loads for the write only then (2026-09-09)
+        self.assertIn("_courier_link_wanted(cstore, seg[\"id\"], pm0[1]) is not None", src)
+        self.assertIn("_attach_courier_link(load_goals(fsid), seg[\"id\"], pm0[1])", src)
         self.assertIn('_seg_peer_kind(seg) == "delegate"', src)
 
 

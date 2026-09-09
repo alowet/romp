@@ -446,7 +446,9 @@ class TriagePassBoundary(_World):
         return sorted((r["fsid"], r["note"].split(":")[0]) for r in self._rows("pass-crash") if r["judge"] == judge)
 
     def test_run_courier_continues_past_a_faulting_session(self):
-        with _fault_on(self.a_file):
+        o_view = jd.load_goals_shared                 # the courier's scan reads the shared view (2026-09-09): record
+        view = lambda fsid: (self.seen.append(fsid), o_view(fsid))[1]   # its reads beside the writer's
+        with _fault_on(self.a_file), mock.patch.object(jd, "load_goals_shared", view):
             jd.run_courier(now=NOW)
         self.assertIn(B, self.seen, "the pass reached the healthy session after the fault")
         rows = self._rows("pass-crash")
@@ -472,7 +474,8 @@ class TriagePassBoundary(_World):
             if fsid == P or (fsid == A and calls[fsid] >= 2):
                 raise OSError(errno.EIO, "Input/output error", str(jd.GOALDIR / (fsid + ".json")))
             return orig(fsid)
-        with mock.patch.object(jd, "load_goals", faulting):
+        with mock.patch.object(jd, "load_goals", faulting), \
+                mock.patch.object(jd, "load_goals_shared", faulting):
             jd.run_courier(now=NOW)
         self.assertEqual(self._crashes("courier"),
                          sorted([(P, "store"), (P, "sender store"), (A, "store"), (B, "sender %s store" % P[:8])]),
@@ -498,7 +501,8 @@ class TriagePassBoundary(_World):
             return orig(fsid)
         with mock.patch.object(jd, "courier_llm",
                                lambda text, menu, declared=None: '{"verdict": "delegating", "goal": 1, "text": "the first piece"}'), \
-                mock.patch.object(jd, "load_goals", faulting):
+                mock.patch.object(jd, "load_goals", faulting), \
+                mock.patch.object(jd, "load_goals_shared", faulting):
             jd.run_courier(now=NOW)
         self.assertEqual(self._crashes("courier"), [(B, "root walk")], "the one arm that tripped, attributed to the recipient")
         self.assertGreaterEqual(calls.get(P, 0), 2, "premise: the walk did hop to the peer")

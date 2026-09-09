@@ -885,8 +885,11 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
 - `pusher`: `cycles`, `wakes` (every wake call; a burst of wakes runs one
   cycle), `wakes_event` and `wakes_backstop` (how the loop's wait ended),
   `cycle_ms_sum`, `cycle_ms_max` (since start), `cycle_ms_last`,
-  `cycle_cpu_ms_sum` (the pusher thread's own CPU time), and `cycle_ms_p50`,
-  `cycle_ms_p90`, `cycle_ms_ring_max`, `ring_n` from the last 256 cycles.
+  `cycle_cpu_ms_sum` (the pusher thread's own CPU time), `cycle_ms_p50`,
+  `cycle_ms_p90`, `cycle_ms_ring_max`, `ring_n` from the last 256 cycles,
+  `sends` (every client payload), and `idle_cycles`, `idle_ms_sum`,
+  `idle_cpu_ms_sum` (cycles that set no wake, sent no payload and saved no
+  goal store: what a longer wait between cycles would have skipped).
 - `stages_ms`: `jobs` (the cycle's tick jobs outside the push), `push`, and
   inside it `push.chat`, `push.feed`, `push.timeline`, `push.send`. The
   `push.*` stages count every push, including the one a connecting page gets,
@@ -910,7 +913,10 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   both stand (`served`, `derived`; a healthy quiet box serves almost every
   cycle); `cleared` is the feed's clear set, parsed once per state of
   `cleared.jsonl` (its stat, taken before the read) and served while the file
-  stands (`served`, `derived`). The compaction sweep after each judge pass evicts from `pass` and
+  stands (`served`, `derived`); `courierSkip` is the courier's change gate
+  (`skipped`, `scanned`, `recorded`: a session whose parse, store, journal,
+  archive and episode log have not moved since a scan that found nothing to
+  place is skipped whole). The compaction sweep after each judge pass evicts from `pass` and
   `shared` the entries of stores no session in the discover window owns, so
   both stay bounded by the live board; the gate memo is bounded by the session
   count.

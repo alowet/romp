@@ -115,11 +115,13 @@ class Collector(unittest.TestCase):
         self.assertIn("cpu_ms_workers", snap["judge"])
         self.assertEqual(set(snap["goals"]), {"loads", "saves", "writes"}, "read through jd.goal_io_stats")
         # the three identity memos' readers land here (review find, 2026-09-08: they had no consumer)
-        self.assertEqual(set(snap["memos"]), {"pass", "shared", "chain", "nudgeGate", "cleared"})
+        self.assertEqual(set(snap["memos"]), {"pass", "shared", "chain", "nudgeGate", "cleared", "courierSkip"})
         self.assertEqual(snap["memos"]["nudgeGate"], {"served": 0, "derived": 0},
                          "the nudge walk's placement gate: served vs re-derived (2026-09-09)")
         self.assertEqual(set(snap["memos"]["cleared"]), {"served", "derived"},
                          "the clear set: parsed once per file state, served while it stands (2026-09-09)")
+        self.assertEqual(snap["memos"]["courierSkip"], km.jd.courier_skip_stats(),
+                         "the courier gate: sessions skipped, scanned, recorded (2026-09-09)")
         self.assertEqual(snap["memos"]["pass"], km._goals_memo_report())
         self.assertEqual(snap["memos"]["shared"], km.jd.shared_store_stats())
         self.assertEqual(snap["memos"]["chain"], km.jd.chain_memo_stats())
@@ -486,6 +488,43 @@ class PusherRecords(unittest.TestCase):
 
     def _pusher(self):
         return km._PERF_STATS.snapshot()["pusher"]
+
+    def test_an_idle_cycle_is_one_that_set_no_wake_sent_nothing_and_saved_nothing(self):
+        # IDLE CYCLES (2026-09-09): the loop re-enters after a fixed 0.5 s backstop whether or not anything
+        # changed; the idle share is what a cadence change is judged on. A cycle whose jobs set no wake,
+        # sent no client payload and saved no goal store counts as idle, with its wall and CPU.
+        km._pusher_cycle_jobs = lambda now, tmux, any_client: time.sleep(0.003)
+        before = self._pusher()
+        km._pusher_cycle()
+        after = self._pusher()
+        self.assertEqual(after["idle_cycles"], before["idle_cycles"] + 1)
+        self.assertGreaterEqual(after["idle_ms_sum"] - before["idle_ms_sum"], 3.0)
+        self.assertGreaterEqual(after["idle_cpu_ms_sum"], before["idle_cpu_ms_sum"])
+        self.assertEqual(after["cycles"], before["cycles"] + 1, "an idle cycle is still a cycle")
+
+    def test_a_cycle_that_sends_a_payload_is_not_idle(self):
+        km._pusher_cycle_jobs = lambda now, tmux, any_client: km._PERF_STATS.send(("chat", "s1"), "full", 10)
+        before = self._pusher()
+        km._pusher_cycle()
+        after = self._pusher()
+        self.assertEqual(after["idle_cycles"], before["idle_cycles"])
+        self.assertEqual(after["sends"], before["sends"] + 1)
+
+    def test_a_cycle_that_sets_the_wake_is_not_idle(self):
+        km._pusher_cycle_jobs = lambda now, tmux, any_client: km._pusher_wake.set()
+        before = self._pusher()
+        km._pusher_cycle()
+        km._pusher_wake.clear()
+        self.assertEqual(self._pusher()["idle_cycles"], before["idle_cycles"])
+
+    def test_a_cycle_that_saves_a_goal_store_is_not_idle(self):
+        km._pusher_cycle_jobs = lambda now, tmux, any_client: km.jd._goal_io_bump("saves")
+        before = self._pusher()
+        km._pusher_cycle()
+        self.assertEqual(self._pusher()["idle_cycles"], before["idle_cycles"])
+        km._pusher_cycle_jobs = lambda now, tmux, any_client: km.jd._goal_io_bump("writes")
+        km._pusher_cycle()
+        self.assertEqual(self._pusher()["idle_cycles"], before["idle_cycles"])
 
     def test_a_cycle_is_counted_and_timed(self):
         km._pusher_cycle_jobs = lambda now, tmux, any_client: time.sleep(0.005)
