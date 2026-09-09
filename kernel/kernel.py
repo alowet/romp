@@ -1567,8 +1567,8 @@ _learned_announced = set()   # ids already announced on stderr as outside the ca
 # file both parse it and store equal tuples, and holding _catalog_lock around file I/O would stall the
 # catalog refresh thread.
 _learned_reg_cache = {}   # str(path) -> ((mtime_ns, size, ino), liveModelId or "") — see _reported_model_ids
-# Bumps on every pick-memory change and every catalog growth; rides the models frame (_models_changed) AND
-# the /models payload, so a picker can drop a response older than one it has applied. Seeded from the clock
+# Bumps on every pick-memory change, catalog growth and Codex landing; rides the models frame (_models_changed)
+# AND the /models payload, so a picker can drop a response older than one it has applied. Seeded from the clock
 # rather than 0: the counter is per process, and a kernel restart must never hand a page that kept its
 # high-water mark a LOWER rev, or that page would ignore every re-read until the count caught up — a silent
 # stale list. Milliseconds leave room for one bump per ms across a restart.
@@ -2042,7 +2042,14 @@ def _models_changed():
     itself, never a poll. A counter rides it so a client can tell frames apart, and the same counter stamps
     the /models payload so a late response never overwrites a newer one. (Without it, after Latest
     un-pinned a family on the kernel the same tab's next family click sent the STALE pinned id and silently
-    re-pinned; a second dashboard's pick moved the default without the first tab knowing.) The FEED app is
+    re-pinned; a second dashboard's pick moved the default without the first tab knowing.) Also sent when a
+    Codex session lands (the create door's spawn returned a sid; the revive door's resume answered True, as it
+    does for a dead row made live again and for a row already live): a live Codex row opens GET /models's
+    Codex consult for every dashboard, so every open picker's cached `codex.models` just went from [] to the
+    list. Sent per landing, not only on the closed-to-open flip: a door cannot observe the flip without the
+    backend counting closings (two first creates can both land before either checks; a kill between a door's
+    check and its landing hides a close-and-reopen), and a repeated frame costs one GET /models per open
+    picker, which the payload's rev reconciles. The FEED app is
     on the list because the settings gear lives in the feed bundle (feed.ts requires gear.js; the shell's
     rail gear and VS Code's settings command both open it in the feed pane). The feed shim and the VS Code
     pipe hand every non-keepalive frame to the window as a message; feed.ts's own listener ignores a type
@@ -12454,6 +12461,9 @@ def _create_codex_session_inner(nm, cwd, client=None, parent="", tags=()):
     kernel. Returns (sid, echo)."""
     bg, fg = _pick_identity_color()
     sid = _codex().spawn(nm, cwd, bg, fg)
+    # the row is live, so GET /models's Codex consult (gated on a live Codex session) is open; every open
+    # picker re-reads the list on this frame. Sent on every landing, not only the first: see _models_changed
+    _models_changed()
     extra = {}
     if parent or tags:
         extra.update(_tag_ack(sid, parent, tags))
@@ -15569,6 +15579,10 @@ def _revive_session_inner(sid, client=None):
             else:
                 ok = bool(cx.resume(name, sid, cwd=_cwd_of(sid)))
                 detail = "" if ok else "the Codex backend could not resume it (see the kernel log)"
+                if ok:
+                    # the row is live (a dead one made live again, or one already live: resume answers True for
+                    # any known sid), which opens the same /models consult as the create door's spawn
+                    _models_changed()
         else:
             cwd = _cwd_of(sid)
             workdir = cwd if cwd and os.path.isdir(cwd) else os.path.expanduser("~")
