@@ -13,6 +13,7 @@ rendered tip and anchors match what the old shape rendered: the round trip, each
 Synthetic only: invented prompts, placeholder ids."""
 import json
 import os
+import re
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -25,15 +26,34 @@ km = SourceFileLoader("kernel_bars_wire", os.path.join(os.path.dirname(HERE), "k
 
 FIXTURE = os.path.join(HERE, "fixtures", "timeline-bars-wire.json")
 SID = "11111111-2222-3333-4444-555555555555"
-DROPPED = ("tid", "uuid", "workUuid")
+DROPPED = ("tid", "uuid", "workUuid", "pending")
+SHORT = {name: short for short, (name, _d) in km._BAR_WIRE.items()}      # long name -> wire key
 
 
 def wire_bar(old, sid=SID):
-    """The wire shape of an old-shape bar: the encoder's rules, applied to a dict (the builder applies them at
-    construction; this is the same transformation for a fixture)."""
-    b = {k: v for k, v in old.items() if k not in DROPPED}
-    b["prompt"] = km._wire_prompt(old.get("prompt"))
+    """The wire shape of an old-shape bar (T278c): id, start and end by name, the rest under the short keys of
+    _BAR_WIRE with every default omitted, the prompt shaped by _wire_prompt. The test-side twin of the builder's
+    literal; _expand_bar is its inverse and the view's expandBars the JavaScript one."""
+    b = {"id": old["id"], "start": old["start"], "end": old["end"]}
+    for name, (short) in SHORT.items():
+        default = km._BAR_WIRE[short][1]
+        v = km._wire_prompt(old.get("prompt")) if name == "prompt" else old.get(name)
+        if v is None or v == default or (isinstance(default, list) and v == []):
+            continue
+        b[short] = v
     return b
+
+
+def long_bar(old):
+    """What every reader sees after the view expands a wire bar built from `old`."""
+    out = {k: v for k, v in old.items() if k not in DROPPED}
+    out["prompt"] = km._wire_prompt(old.get("prompt"))
+    out["pending"] = False
+    for name, short in SHORT.items():
+        default = km._BAR_WIRE[short][1]
+        if out.get(name) is None and default is not None:
+            out[name] = list(default) if isinstance(default, list) else default
+    return out
 
 
 class WirePrompt(unittest.TestCase):
@@ -73,21 +93,56 @@ class WirePrompt(unittest.TestCase):
 class BarLiteral(unittest.TestCase):
     def setUp(self):
         self.src = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
-        head, tail = '"id": seg["id"], "promptId": seg.get("trigger"), "workId": work_uuid,', '"replyUuid": reply_uuid})'
+        head, tail = 'bar = {"id": seg["id"], "start": bstart, "end": bend}', "bars.append(bar)"
         self.assertIn(head, self.src, "the bar literal's first line moved or was reflowed: re-anchor this pin")
         i = self.src.index(head)
-        self.assertIn(tail, self.src[i:], "the bar literal's last key moved: re-anchor this pin")
+        self.assertIn(tail, self.src[i:], "the bar literal's end moved: re-anchor this pin")
         self.literal = self.src[i:self.src.index(tail, i) + len(tail)]
 
-    def test_the_bar_carries_the_wire_prompt_and_none_of_the_duplicates(self):
-        self.assertIn('"prompt": _wire_prompt(full_prompt)', self.literal)
+    def test_the_bar_is_built_compact_with_every_default_omitted(self):
+        self.assertIn('q = _wire_prompt(full_prompt)', self.literal)
+        for short in km._BAR_WIRE:
+            self.assertIn('bar["%s"] = ' % short, self.literal, "the %s field rides under its short key" % km._BAR_WIRE[short][0])
+        for name in ("promptId", "workId", "replyUuid", "prompt", "summary", "msgCaption", "src", "mids",
+                     "pending", "nudgeAuto", "romp", "cont", "open", "tid", "uuid", "workUuid"):
+            self.assertNotIn('"%s": ' % name, self.literal, name + " is a long name: the wire carries the short key, the view expands it")
         self.assertIn('full_prompts[seg["id"]] = full_prompt = _seg_prompt(seg)', self.src, "the full text is kept beside the wire")
-        self.assertIn("_bind_message_execs(messages, turns, full_prompts)", self.src, "…and handed to the message binder")
-        for gone in ('"tid":', '"uuid":', '"workUuid":'):
-            self.assertNotIn(gone, self.literal, gone + " is derived by the view from the lane key / promptId / workId")
-        for kept in ('"id":', '"promptId":', '"workId":', '"replyUuid":', '"start":', '"end":', '"open":', '"cont":',
-                     '"summary":', '"msgCaption":', '"src":', '"mids":', '"pending":', '"nudgeAuto":', '"romp":'):
-            self.assertIn(kept, self.literal, kept + " is still read by the view")
+        self.assertIn("_bind_message_execs(messages, turns, full_prompts)", self.src, "...and handed to the message binder")
+
+    def test_the_view_expands_with_the_same_table(self):
+        # the view's BAR_WIRE literal is the kernel's _BAR_WIRE: short key -> long name and default, byte for byte
+        view = open(os.path.join(os.path.dirname(HERE), "ui", "romp-timeline-view.js")).read()
+        m = re.search(r"const BAR_WIRE = \{(.*?)\};", view, re.S)
+        self.assertTrue(m, "the view carries BAR_WIRE")
+        pairs = {short: (name, js) for short, name, js in re.findall(r"(\w+): \['(\w+)', (\[\]|null|''|'typed'|false)\]", m.group(1))}
+        self.assertEqual(set(pairs), set(km._BAR_WIRE))
+        for short, (name, default) in km._BAR_WIRE.items():
+            self.assertEqual(pairs[short][0], name, short)
+            want = "[]" if default == [] else {None: "null", "": "''", "typed": "'typed'", False: "false"}[default]
+            self.assertEqual(pairs[short][1], want, "%s default" % name)
+
+
+class ExpandIsTheInverse(unittest.TestCase):
+    def test_expand_bar_undoes_wire_bar(self):
+        fx = json.load(open(FIXTURE))
+        for old in fx["old"]:
+            self.assertEqual(km._expand_bar(wire_bar(old)), long_bar(old), old["id"])
+
+    def test_compact_judging_round_trips(self):
+        fx = json.load(open(FIXTURE))
+        wire = km._compact_judging(fx["judging_old"])
+        self.assertEqual(wire, fx["judging_wire"], "the fixture is the compactor's output")
+        back = km._expand_judging(wire)
+        self.assertEqual(back, fx["judging_long"], "the expansion is what every reader saw, text capped, defaults filled")
+        for lane in wire.values():
+            for c in lane:
+                self.assertIsInstance(c["k"], str, "the delta key is a string the shim reads as is")
+                for gone in ("sid", "judge", "kind", "text", "sent", "recv", "open"):
+                    self.assertNotIn(gone, c)
+        self.assertEqual(km._expand_judging([]), [])
+        self.assertEqual(km._expand_judging({}), [])
+        legacy = [{"judge": "closer", "sid": SID, "t": 1}]
+        self.assertEqual(km._expand_judging(legacy), legacy, "a legacy list passes through")
 
 
 def _old_bars(n_lanes=25, per_lane=320):
@@ -140,14 +195,36 @@ class MemoCarriesPrompts(unittest.TestCase):
         self.assertIn('full_prompts.update(cached.get("prompts") or {})', src)
 
 
+def _old_judging(n_lanes=25, per_lane=560):
+    """14,000 entries of the builder's flat shape: run spans with tokens, glossed by a caption, some in flight."""
+    out = []
+    for li in range(n_lanes):
+        sid = "%08d-2222-3333-4444-555555555555" % li
+        for i in range(per_lane):
+            t = 1700000000.0 + 7 * i + li * 0.25
+            out.append({"judge": ("captioner", "closer", "planner", "archiver")[i % 4], "sid": sid, "t": t, "t1": t + 3.5,
+                        "kind": ("run", "turn", "segment", "close")[i % 4], "text": ("invented gloss %d" % i) if i % 3 else "",
+                        "ms": 4000 + i, "in": 12000 + i, "out": 1600 + i, "sent": t, "recv": t + 3.5})
+    return out
+
+
 class FrameSize(unittest.TestCase):
-    def test_the_wire_shape_is_well_under_two_thirds_of_the_old_on_a_devbox_sized_payload(self):
-        old = _old_bars()
-        new = {sid: [wire_bar(b, sid) for b in bars] for sid, bars in old.items()}
+    def test_the_wire_frame_is_under_half_of_the_old_on_a_devbox_sized_payload(self):
+        # the old frame: long-named bars with the three duplicates, a flat judging list, and the delta key list a
+        # keyed full carried (one key per bar and per judging entry); the new: compact bars, per-lane compact judging,
+        # no key list. On the live devbox frame (8,577 bars, 14,051 entries) the same shape went 12.18 MB -> measured
+        # after the deploy; this pins the ratio on a synthetic payload of that size class
+        old_t, old_j = _old_bars(), _old_judging()
+        keys = {"turns": [sid + "\x1f" + b["id"] for sid, bars in old_t.items() for b in bars],
+                "judging": ["\x1f".join(str(e[f]) for f in ("sid", "t", "judge", "t1")) for e in old_j]}
+        old = {"type": "bars", "turns": old_t, "judging": old_j, "messages": [], "now": 1, "_keys": keys}
+        new = {"type": "bars", "turns": {sid: [wire_bar(b, sid) for b in bars] for sid, bars in old_t.items()},
+               "judging": km._compact_judging(old_j), "messages": [], "now": 1}
         n_old, n_new = len(json.dumps(old)), len(json.dumps(new))
-        self.assertEqual(sum(len(v) for v in new.values()), 8000)
-        self.assertLess(n_new / n_old, 0.65, "old %d B, new %d B: ratio %.2f" % (n_old, n_new, n_new / n_old))
-        self.assertGreater(n_new / n_old, 0.3, "the fixture is not a strawman: the ids and captions still ride")
+        self.assertEqual(sum(len(v) for v in new["turns"].values()), 8000)
+        self.assertEqual(sum(len(v) for v in new["judging"].values()), 14000)
+        self.assertLess(n_new / n_old, 0.5, "old %d B, new %d B: ratio %.2f" % (n_old, n_new, n_new / n_old))
+        self.assertGreater(n_new / n_old, 0.25, "the fixture is not a strawman: the ids, times and captions still ride")
 
 
 class Fixture(unittest.TestCase):
@@ -163,3 +240,4 @@ class Fixture(unittest.TestCase):
         self.assertTrue(any(len(o["prompt"]) > km._WIRE_PROMPT_MAX for o in fx["old"]), "the fixture covers a cut")
         self.assertTrue(any(o["prompt"].startswith("<!-- romp-") for o in fx["old"]), "…and an injected notice")
         self.assertTrue(any(o["prompt"].startswith("[romp]\n") for o in fx["old"]), "…and a label alone on line one")
+        self.assertEqual(fx["judging_wire"], km._compact_judging(fx["judging_old"]))

@@ -34601,6 +34601,84 @@ def _wire_prompt(text, cap=_WIRE_PROMPT_MAX):
     return first
 
 
+# The wire bar's short keys and the long names the view expands them to (T278c), with the default a missing
+# key means. ui/romp-timeline-view.js carries the same table (BAR_WIRE) and expands at its boundary; a test
+# reads both and fails on drift. `id`, `start` and `end` keep their names: the delta path keys bars by id, the
+# federation merge rebases start/end by name, and the kernel's own readers use them.
+_BAR_WIRE = {"p": ("promptId", None), "w": ("workId", None), "r": ("replyUuid", None), "q": ("prompt", ""),
+             "c": ("summary", ""), "m": ("msgCaption", ""), "s": ("src", "typed"), "d": ("mids", []),
+             "u": ("open", False), "t": ("cont", False), "a": ("nudgeAuto", False), "o": ("romp", False)}
+_BAR_LONG = {"id", "start", "end"}
+_BAR_EXPANDED_DEFAULTS = {"pending": False}    # a field the builder always wrote as its default: never on the wire
+
+
+def _expand_bar(b):
+    """A wire bar as every reader saw it before T278c: the long names, the defaults filled in. The Python twin
+    of the view's expandBars, for tests and for any kernel reader that wants the old shape."""
+    out = {k: b[k] for k in _BAR_LONG if k in b}
+    for short, (name, default) in _BAR_WIRE.items():
+        out[name] = b[short] if short in b else (list(default) if isinstance(default, list) else default)
+    out.update(_BAR_EXPANDED_DEFAULTS)
+    return out
+
+
+# The judging band on the wire (T278c): per LANE, a list of compact entries — {k, t, t1, j, kd, x, ms, in, out, s,
+# r, u}. `k` is the entry's key for the delta path, minted here as a string the shim reads as-is (the old
+# composite key spelled floats, which JavaScript and Python spell differently); the lane sid, repeated in every
+# one of 14,051 entries, rides once as the lane key; `text` is cut to the 90 characters the tip shows; zero and
+# empty fields are omitted, as is the default kind. The view expands a lane once (expandJudging), so every
+# reader keeps {judge, sid, t, t1, kind, text, ms, in, out, sent, recv, open}.
+_JUDGING_WIRE = {"j": ("judge", None), "kd": ("kind", "run"), "x": ("text", ""), "ms": ("ms", 0), "in": ("in", 0),
+                 "out": ("out", 0), "s": ("sent", None), "r": ("recv", None), "u": ("open", False)}
+_JUDGING_TEXT_MAX = 90
+
+
+def _compact_judging(entries):
+    """{lane sid: [compact entries]} from the builder's list of {judge, sid, t, t1, kind, text, ms, in, out, sent,
+    recv, open}. Pure. An entry without a sid lands under the empty lane key."""
+    out = {}
+    for e in entries or []:
+        c = {"k": "%s\x1f%s\x1f%s" % (e.get("t"), e.get("judge"), e.get("t1")), "t": e.get("t"), "j": e.get("judge")}
+        if e.get("t1") is not None:
+            c["t1"] = e["t1"]
+        kd = e.get("kind")
+        if kd and kd != "run":
+            c["kd"] = kd
+        x = e.get("text")
+        if x:
+            c["x"] = x[:_JUDGING_TEXT_MAX]
+        for f in ("ms", "in", "out"):
+            if e.get(f):
+                c[f] = e[f]
+        if e.get("sent") is not None:
+            c["s"] = e["sent"]
+        if e.get("recv") is not None:
+            c["r"] = e["recv"]
+        if e.get("open"):
+            c["u"] = True
+        out.setdefault(str(e.get("sid") or ""), []).append(c)
+    return out
+
+
+def _expand_judging(wire):
+    """The list of long-named entries a per-lane compact judging map stands for (the Python twin of the view's
+    expandJudging, for tests). A list is returned as is: the legacy shape, or an empty band."""
+    if not isinstance(wire, dict):
+        return list(wire or [])
+    out = []
+    for sid, lane in wire.items():
+        for c in lane or []:
+            e = {"judge": c.get("j"), "sid": sid, "t": c.get("t")}
+            if "t1" in c:
+                e["t1"] = c["t1"]
+            for short, (name, default) in _JUDGING_WIRE.items():
+                if short == "j":
+                    continue
+                e[name] = c[short] if short in c else default
+            out.append(e)
+    return out
+
+
 def _seg_prompt(seg):
     """The segment's request text (its trigger/opener atom) for the prompt-dot tooltip."""
     trig = seg.get("trigger")
@@ -34684,7 +34762,7 @@ def _bind_message_execs(messages, turns, prompts=None):
     idTurn = {}
     for sid, bars in turns.items():
         for bar in bars:
-            for mid in bar.get("mids") or []:
+            for mid in bar.get("d") or bar.get("mids") or []:      # the wire bar's mids ride under "d" (T278c)
                 k = (mid, sid)
                 if k not in idTurn or bar["start"] < idTurn[k]:
                     idTurn[k] = bar["start"]
@@ -34697,7 +34775,7 @@ def _bind_message_execs(messages, turns, prompts=None):
         for bar in sorted(turns.get(m.get("toId"), []), key=lambda b: b["start"]):
             if bar["start"] > m["sent"] + MSG_MAX_LAG:
                 break                                       # sorted: nothing further can match
-            p = (prompts or {}).get(bar.get("id")) or bar.get("prompt") or ""
+            p = (prompts or {}).get(bar.get("id")) or bar.get("q") or bar.get("prompt") or ""
             if bar["start"] >= m["sent"] - 5 and p and (m.get("fromOrig", "") in p or m.get("from", "") in p):
                 m["exec"], m["pending"] = bar["start"], False   # text-heuristic match → process-start
                 break
@@ -35565,31 +35643,48 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
                 author = (trig or {}).get("author")
                 src = "queued" if isinstance(author, dict) else "typed"
                 for sj, (bstart, bend) in enumerate(spans):
-                    bars.append({
-                        # promptId = the prompt atom (the DOT), workId = the first work atom (the BAR) — so a
-                        # chat message-hover lights only the dot and a work-hover only the bar (dotLit/barLit
-                        # in the view). Restores the old romp-events split lost in the kernel rewrite.
-                        "id": seg["id"], "promptId": seg.get("trigger"), "workId": work_uuid,
-                        "start": bstart, "end": bend,
-                        "open": turn_open and si == len(segs) - 1 and sj == len(spans) - 1 and bend == seg["end"],
-                        "cont": sj > 0,                   # a post-sleep continuation piece: NO new prompt dot (the one prompt was at the first piece)
-                        # the WIRE prompt (T278b): the first line, capped — the tip shows 90 chars of it and nothing
-                        # else reads it. Three fields that every bar carried were exact duplicates and are gone
-                        # from the wire: `tid` (the lane key this list sits under), `uuid` (= promptId) and
-                        # `workUuid` (= workId); the view reads the lane key, promptId and workId instead (workAnchorOf,
-                        # the dot and bar clicks, the focus anchor).
-                        # Measured on the devbox: 8,562 bars, prompts 8.2 MB and the three duplicates 1.2 MB of a
-                        # 20.4 MB frame that took 22 s to reach the laptop.
-                        "prompt": _wire_prompt(full_prompt), "summary": cap, "msgCaption": msg_cap,
-                        "src": src, "mids": _seg_mids(seg), "pending": False,
-                        "nudgeAuto": bool((trig or {}).get("rompAuto")),   # an AUTO-nudge specifically → the tip captions it 'romp · nudge'
+                    # THE WIRE BAR (T278c): three long keys the delta path, the federation merge and the
+                    # kernel's own readers need by name (id, start, end), then the rest under one-letter keys
+                    # with every default OMITTED (a false flag, an empty list or caption, the "typed" source):
+                    # 8,577 bars carried 1.1 MB of key names and 0.9 MB of defaults in a 12 MB frame. The view
+                    # expands a bar once at its boundary (expandBars in ui/romp-timeline-view.js, the twin of
+                    # _BAR_WIRE below, drift-guarded by tests) so every reader keeps its long names.
+                    # promptId = the prompt atom (the DOT), workId = the first work atom (the BAR) — so a chat
+                    # message-hover lights only the dot and a work-hover only the bar (dotLit/barLit in the view).
+                    # The wire prompt (T278b): the first line, capped; the tip shows 90 chars of it and nothing
+                    # else reads it. tid (= the lane key), uuid (= promptId) and workUuid (= workId) left the
+                    # wire in T278b: the view reads the lane key, promptId and workId instead.
+                    bar = {"id": seg["id"], "start": bstart, "end": bend}
+                    if seg.get("trigger"):
+                        bar["p"] = seg.get("trigger")
+                    if work_uuid:
+                        bar["w"] = work_uuid
+                    if reply_uuid:
+                        bar["r"] = reply_uuid
+                    q = _wire_prompt(full_prompt)
+                    if q:
+                        bar["q"] = q
+                    if cap:
+                        bar["c"] = cap
+                    if msg_cap:
+                        bar["m"] = msg_cap
+                    if src != "typed":
+                        bar["s"] = src
+                    mids = _seg_mids(seg)
+                    if mids:
+                        bar["d"] = mids
+                    if turn_open and si == len(segs) - 1 and sj == len(spans) - 1 and bend == seg["end"]:
+                        bar["u"] = True                        # open: the live turn's last piece
+                    if sj > 0:
+                        bar["t"] = True                        # a post-sleep continuation piece: NO new prompt dot
+                    if (trig or {}).get("rompAuto"):
+                        bar["a"] = True                        # an AUTO-nudge specifically → the tip captions it 'romp · nudge'
+                    if author == "romp":
                         # ANY romp-authored prompt (auto-nudge, Nudge button, auto-retry — author 'romp' via
                         # ROMP_INJECT_RE) wears the romp logo on its dot (the user 2026-07-16: an auto-retry
-                        # "rendered as a user prompt instead of a ROMP logo thing"). This mirrors the chat, where
-                        # the 2026-07-05 rule already superseded 2026-06-23's auto-only logo: at the data level a
-                        # retry and a nudge are both just romp-injected, and either way it wasn't the human typing.
-                        "romp": bool(author == "romp"),
-                        "replyUuid": reply_uuid})
+                        # "rendered as a user prompt instead of a ROMP logo thing"), mirroring the chat's 2026-07-05 rule
+                        bar["o"] = True
+                    bars.append(bar)
         if not with_bars and last_t is None:
             try:
                 last_t = os.stat(s["path"]).st_mtime     # lane `since` ≈ the transcript's last write (last activity), no parse
@@ -35714,12 +35809,12 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
         # glossed by the nearest artifact mark — so a judge that ran shows up WHEN it ran (incl. distiller lag +
         # coordinating-courier classifications the artifact marks miss), not back-placed onto the work.
         try:
-            judging = _run_judging(now - TL_HORIZON, set(id2name), semantic)
+            judging = _compact_judging(_run_judging(now - TL_HORIZON, set(id2name), semantic))   # per lane, compact (T278c)
         except Exception as e:
             _bars_complain("*", "judging", e)
-            judging = []
+            judging = {}
     else:                                                # SKELETON: the heavy time-plotted detail rides the {type:"bars"} message
-        messages, judging = [], []
+        messages, judging = [], {}
     # compaction-sweep gradient (widest→narrowest): the timeline's scan-bar has no client-side colormap, so
     # ship the GLOBAL map sampled at the same scaleX stops the chat surface uses (render.ts applyCompactSweep),
     # letting the bar slide through the map's hues as it compresses — mirroring the context battery fill.
@@ -36604,7 +36699,7 @@ _DELTA_SLOTS = {
     # item keyed by (object key, item field) — the timeline's lanes, where a lane of 200 bars must not
     # cross whole because one bar was appended (measured 2026-09-03: 507 KB per appended segment at lane
     # granularity, ~2 KB at bar granularity).
-    "bars": (("timelinebars",), {"turns": "dictlist:id", "judging": "bykeys:sid,t,judge,t1", "messages": "byid"}),
+    "bars": (("timelinebars",), {"turns": "dictlist:id", "judging": "dictlist:k", "messages": "byid"}),
     "feed": (("feed",), {"asks": "byid:itemId"}),   # a card's identity across builds is its itemId, not an id
 }
 _DELTA_SEP = "\u001f"          # joins composite keys; never appears in an id or a sid
@@ -36853,18 +36948,18 @@ def _send_slot_delta(c, key, ftype, payload, pre, sig, parts=None):
     st = states.get(ftype)
     now = time.time()
     if st is None:                                     # nothing held → the full frame, and remember it
-        # The frame carries the kernel's key list per collection (`_keys`, which the shim strips before the
-        # bundle sees the message): every key is minted HERE, once — a shim deriving keys from field values
-        # would spell null/None, true/True, 1/1.0 differently from Python and hold keys the kernel never sent.
-        keys = json.dumps({n: o for n, (_e, o) in colls.items()})
-        ps = _wire_text(pre)                           # a whole frame goes: the build's one whole encode, if not yet made
-        pre_k = (ps[:-1] + ',"_keys":' + keys + "}" if ps.endswith("}")
-                 else json.dumps(dict(payload, _keys=json.loads(keys)), default=_wire_default_in("_send_slot_delta")))
-        # The keyed full must actually GO: a whole frame sent moments ago without keys (the failure path, or an
-        # unkeyable build) filled the dedup slot with this same signature, and a deduped keyed full would leave
-        # the kernel holding state for a client that holds nothing (review 2026-09-03).
+        # The full carries NO key list (T278c; it was 2.3 MB of a 12 MB bars frame): the shim derives every
+        # key from the frame exactly as _delta_split minted it — a dictlist item's key is its lane, the
+        # separator and its id field; a byid item's is its id; an item without one, or a duplicate, takes the
+        # positional "#n"; an empty or non-list lane is one entry under its bare prefix. That is safe because
+        # every keyed field is a STRING on the wire (a bar's id, a message's id, a judging entry's kernel-minted
+        # `k`), and a string spells the same in both languages; the old judging composite spelled floats,
+        # which is why it carried a key list at all.
+        # The full must actually GO: a whole frame sent moments ago (the failure path, or an unkeyable build)
+        # filled the dedup slot with this same signature, and a deduped full would leave the kernel holding
+        # state for a client that holds nothing (review 2026-09-03).
         c.get("sent", {}).pop(key, None)
-        _send_client(c, key, payload, pre=pre_k, sig=sig)
+        _send_client(c, key, payload, pre=pre, sig=sig)
         if c.get("sent", {}).get(key, (None,))[0] == sig:      # it went (or was already held) → rebase
             states[ftype] = {"rev": 0, "rest": rest_sig,
                              "coll": {n: {kk: e[1] for kk, e in ents.items()} for n, (ents, _o) in colls.items()},
@@ -40517,7 +40612,7 @@ def _timeline_skeleton(tl):
     bars frame carries the same clock. A shallow copy, never a mutation: `tl` is the cached build
     (_built_timeline[1]), shared with every later cycle and the identity key of the bars and lanes wire
     caches."""
-    return {**tl, "turns": {}, "judging": [], "messages": []}
+    return {**tl, "turns": {}, "judging": {}, "messages": []}
 
 
 def _run_tier(fn):
@@ -41088,7 +41183,7 @@ if(returnAt){returnDiag("return-fresh",{ms:Date.now()-returnAt,bytesSince:return
 // entries; reassemble the full message from what this pane holds and hand the bundle exactly what it
 // used to receive. A delta whose base is not the revision held here cannot be applied → ask for a full.
 if(msg&&msg.type==="delta"){var full=applyDelta(msg);if(!full){send({type:"needSlot",slot:msg.slot});return;}msg=full;}
-else if(msg&&DELTA_KINDS[msg.type]){var keys=msg._keys;delete msg._keys;LAST[msg.type]=keys?{rev:0,msg:msg,maps:buildMaps(msg,keys)}:null;}
+else if(msg&&DELTA_KINDS[msg.type]){delete msg._keys;LAST[msg.type]={rev:0,msg:msg,maps:buildMaps(msg)};}
 enqueue(msg);};   // the handoff to the bundle is the ONE deferred step (see the FIFO below); everything above reacted to the wire, in wire order
 // onclose: flag the shell, RE-SHOW this pane's romp loader (the user 2026-06-29, who wanted the swirling loader on
 // kernel restart), + RETRY (don't blind-reload — on a real outage the reload just fails into a dead page).
@@ -41153,12 +41248,17 @@ function deliver(m){if(window.__rompFed){window.__rompFed.inbound("",m);}else{wi
 // lane and id). LAST holds, per slot, the revision, the last
 // full message handed to the bundle, and per-collection maps {order:[keys], items:{key:value}}. A delta
 // builds a NEW message object (the bundle may still hold the previous one) reusing every unchanged part.
-var DELTA_KINDS={bars:{turns:"dictlist:id",judging:"bykeys:sid,t,judge,t1",messages:"byid"},feed:{asks:"byid:itemId"}};var LAST={};var SEP="\u001f";
-function buildMaps(m,keys){var kinds=DELTA_KINDS[m.type]||{},maps={};for(var name in kinds){var kind=kinds[name],v=m[name],order=((keys||{})[name]||[]).slice(),items={},pos={};
-for(var i=0;i<order.length;i++){var kk=order[i];
-if(kind==="dict"){items[kk]=v[kk];}
-else if(kind.indexOf("dictlist:")===0){var cut=kk.indexOf(SEP),dk=cut<0?kk:kk.slice(0,cut),rest=cut<0?"":kk.slice(cut+1),lane=v[dk];if(rest===""){items[kk]=lane;}else{var j=pos[dk]||0;pos[dk]=j+1;items[kk]=lane[j];}}
-else{items[kk]=v[i];}}
+var DELTA_KINDS={bars:{turns:"dictlist:id",judging:"dictlist:k",messages:"byid"},feed:{asks:"byid:itemId"}};var LAST={};var SEP="\u001f";
+// KEYS ARE DERIVED HERE (T278c), not carried: the same rules as the kernel's _delta_split, item for item — a dictlist item is keyed
+// lane + SEP + its id field, a byid item by its id field, an item without one (or a duplicate) takes the positional "#n", and an
+// empty or non-list lane is one entry under its bare prefix. Every keyed field is a string on the wire, so String(v) spells it as
+// Python did. The old bykeys judging composite spelled floats and needed a carried key list; judging now keys by a kernel-minted k.
+function keyOf(kind,it,pre){if(!it||typeof it!=="object")return null;var f=kind==="byid"?"id":kind.slice(kind.indexOf(":")+1);var v=it[f];return(v===null||v===undefined||v==="")?null:(pre||"")+String(v);}
+function buildMaps(m){var kinds=DELTA_KINDS[m.type]||{},maps={};for(var name in kinds){var kind=kinds[name],v=m[name],order=[],items={};
+var put=function(kk,val,pre){if(kk===null||items.hasOwnProperty(kk)){var n=order.length;for(;;){kk=(pre||"")+"#"+n;if(!items.hasOwnProperty(kk))break;n++;}}items[kk]=val;order.push(kk);};
+if(kind==="dict"){if(v&&typeof v==="object"&&!Array.isArray(v))for(var dk in v)put(String(dk),v[dk],"");}
+else if(kind.indexOf("dictlist:")===0){if(v&&typeof v==="object"&&!Array.isArray(v))for(var lane in v){var pre=lane+SEP,lst=v[lane];if(!Array.isArray(lst)||!lst.length){put(pre,lst,"");continue;}for(var i=0;i<lst.length;i++)put(keyOf(kind,lst[i],pre),lst[i],pre);}}
+else{if(Array.isArray(v))for(var i2=0;i2<v.length;i2++)put(keyOf(kind,v[i2],""),v[i2],"");}
 maps[name]={order:order,items:items};}return maps;}
 // dictlist lanes keep their ARRAY IDENTITY across a delta that did not touch them: the lane prefix of
 // every set/del key names a touched lane, and an order that crosses touches every lane whose key

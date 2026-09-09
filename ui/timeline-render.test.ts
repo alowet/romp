@@ -49,7 +49,7 @@ g.window = g;   // the view reads window.* (event listeners / globals) in its co
 g.innerWidth = 1400; g.innerHeight = 800;   // moveTip() clamps the tooltip to the viewport
 
 const viewPath = path.resolve(process.cwd(), "..", "ui", "romp-timeline-view.js");
-const { TimelinePanel, fmtSpan } = createRequire(__filename)(viewPath);
+const { TimelinePanel, fmtSpan, expandBars } = createRequire(__filename)(viewPath);
 
 const DAY = 86400, WEEK = 7 * DAY, MONTH = 30 * DAY;
 test("fmtSpan: concise day/week/month label for long collapsed gaps", () => {
@@ -759,7 +759,7 @@ test("applyBars fills the deferred bars onto a lanes-only skeleton, and draw() e
   panel.update(skeletonOf(full));                                    // the {type:"data"} lanes skeleton
   assert.equal(Object.keys(panel.data.turns).length, 0, "the skeleton paints lanes with no bars yet");
   panel.applyBars({ type: "bars", turns: full.turns, judging: [], messages: [], nudges: [], now: full.now });
-  assert.deepEqual(panel.data.turns, full.turns, "applyBars merges the bars into the live data");
+  assert.deepEqual(panel.data.turns, expandBars(full.turns), "applyBars merges the bars into the live data");
   assert.ok(panel.svg.children.length > 10, "the bars render after applyBars (a populated SVG)");
 });
 test("a skeleton-only update preserves the bars from the last applyBars (no per-push blink)", () => {
@@ -769,7 +769,7 @@ test("a skeleton-only update preserves the bars from the last applyBars (no per-
   panel.applyBars({ type: "bars", turns: full.turns, judging: [], messages: [], nudges: [], now: full.now });
   const next = skeletonOf(full); next.now = full.now + 1;           // a fresh push: lanes skeleton again
   panel.update(next);
-  assert.deepEqual(panel.data.turns, full.turns, "the prior bars survive a lanes-only update (carried over)");
+  assert.deepEqual(panel.data.turns, expandBars(full.turns), "the prior bars survive a lanes-only update (carried over)");
 });
 
 // A message SENT before the visible window used to clamp its start to the left edge and hug the

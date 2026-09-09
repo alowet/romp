@@ -339,7 +339,8 @@ test("prefixInbound: timeline {type:data} payload — sessions, turns keys + bar
   assert.equal(d.turns["TESTHOST:" + U][0].id, "ev-1", "event uuids stay bare (globally unique)");
   assert.equal(d.messages[0].fromId, "TESTHOST:" + U);
   assert.equal(d.messages[0].toId, "TESTHOST:" + V);
-  assert.equal(d.judging[0].sid, "TESTHOST:" + U);
+  assert.deepEqual(Object.keys(d.judging), ["TESTHOST:" + U], "judging rides per lane; the lane key is prefixed (T278c)");
+  assert.equal(d.judging["TESTHOST:" + U][0].j, "planner");
   assert.equal(d.activeChat.tid, "TESTHOST:" + U, "the active-chat cue lights the prefixed lane");
   assert.equal(d.now, 1000, "scalar fields untouched");
 });
@@ -354,7 +355,7 @@ test("prefixInbound: timeline {type:bars} detail message (top-level turns/marks)
   });
   assert.deepEqual(Object.keys(out.turns), ["TESTHOST:" + U]);
   assert.equal(out.turns["TESTHOST:" + U][0].tid, "TESTHOST:" + U);
-  assert.equal(out.judging[0].sid, "TESTHOST:" + U);
+  assert.deepEqual(Object.keys(out.judging), ["TESTHOST:" + U]);
   assert.equal(out.now, 7);
 });
 
@@ -387,7 +388,7 @@ test("mergeHostBars: per-host bars union — one host's push can't clobber anoth
   };
   const m = mergeHostBars(perHost, ["", "TESTHOST"]);
   assert.deepEqual(Object.keys(m.turns).sort(), [U, "TESTHOST:" + V].sort());
-  assert.equal(m.judging.length, 1);
+  assert.equal(Object.keys(m.judging).length, 1, "one lane's judging, per lane (T278c)");
   assert.equal(m.now, 50, "local clock");
   // a host with no bars yet contributes nothing (no crash)
   const single = mergeHostBars({ "": perHost[""] }, ["", "TESTHOST"]);
@@ -686,7 +687,7 @@ test("a skewed host's bars, lanes, marks and sent-times re-base onto the local c
   const r = m.sessions.find((s: any) => s.id === "gpu1:R");
   assert.equal(r.since, 990, "lane since re-based (+60)");
   assert.deepEqual(m.turns["gpu1:R"][0], { start: 900, end: 950 }, "bars re-based (+60)");
-  assert.equal(m.judging.find((j: any) => j.sid === "gpu1:R").t, 940, "marks re-based (+60)");
+  assert.equal(m.judging["gpu1:R"][0].t, 940, "marks re-based (+60): judging rides per lane (T278c)");
   const msg = m.messages.find((x: any) => x.id === "m1");
   assert.equal(msg.sent, 960, "sent re-based by the EMITTING host (+60)");
   assert.equal(msg.exec, 960, "a pending exec is the emitter's copy of sent — it moves with it");

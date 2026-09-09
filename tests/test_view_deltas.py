@@ -37,6 +37,10 @@ S3 = "11111111-2222-3333-4444-aaaaaaaaaaa3"
 
 
 def _bars(turns, judging, messages, now=1000, warming=False):
+    # judging rides per lane, compact (T278c); the fixtures here write the builder's flat entries and the same
+    # compaction the builder applies turns them into the wire shape
+    if isinstance(judging, list):
+        judging = km._compact_judging(judging)
     return {"type": "bars", "turns": turns, "judging": judging, "messages": messages, "now": now, "warming": warming}
 
 
@@ -56,7 +60,7 @@ class _Client(dict):
         self["send"] = lambda s: self.frames.append(json.loads(s))
 
 
-KINDS = {"bars": {"turns": "dictlist:id", "judging": "bykeys:sid,t,judge,t1", "messages": "byid"}, "feed": {"asks": "byid:itemId"}}
+KINDS = {"bars": {"turns": "dictlist:id", "judging": "dictlist:k", "messages": "byid"}, "feed": {"asks": "byid:itemId"}}
 SEP = "\u001f"
 
 
@@ -105,22 +109,47 @@ def _py_apply(last, d):
     return m
 
 
-def _py_maps(msg, keys):
-    """The shim's buildMaps: the kernel's key list zipped onto the payload positionally, per kind."""
+def _py_maps(msg, keys=None):
+    """The shim's buildMaps (T278c): the keys DERIVED from the payload, per kind, exactly as the kernel's
+    _delta_split mints them — a dictlist item is lane + SEP + its id field, a byid item its id field, an item
+    without one (or a duplicate) takes the positional "#n", an empty or non-list lane is one entry under its
+    bare prefix. `keys` is accepted and ignored: no full carries a key list any more."""
     maps = {}
     for name, kind in KINDS[msg["type"]].items():
-        v = msg.get(name); order = list((keys or {}).get(name) or []); items = {}; pos = {}
-        for i, kk in enumerate(order):
-            if kind == "dict":
-                items[kk] = v[kk]
-            elif kind.startswith("dictlist:"):
-                dk, _, rest = kk.partition(SEP); lane = v[dk]
-                if rest == "":
-                    items[kk] = lane
-                else:
-                    j = pos.get(dk, 0); pos[dk] = j + 1; items[kk] = lane[j]
-            else:
-                items[kk] = v[i]
+        v = msg.get(name); order = []; items = {}
+
+        def put(kk, val, pre=""):
+            if kk is None or kk in items:
+                n = len(order)
+                while True:
+                    kk = pre + "#%d" % n
+                    if kk not in items:
+                        break
+                    n += 1
+            items[kk] = val; order.append(kk)
+
+        def key_of(it, pre=""):
+            if not isinstance(it, dict):
+                return None
+            f = "id" if kind == "byid" else kind.split(":", 1)[1]
+            x = it.get(f)
+            return None if x is None or x == "" else pre + str(x)
+        if kind == "dict":
+            if isinstance(v, dict):
+                for dk, val in v.items():
+                    put(str(dk), val)
+        elif kind.startswith("dictlist:"):
+            if isinstance(v, dict):
+                for lane, lst in v.items():
+                    pre = str(lane) + SEP
+                    if not isinstance(lst, list) or not lst:
+                        put(pre, lst)
+                        continue
+                    for it in lst:
+                        put(key_of(it, pre), it, pre)
+        elif isinstance(v, list):
+            for it in v:
+                put(key_of(it), it)
         maps[name] = {"order": order, "items": items}
     return maps
 
@@ -142,9 +171,8 @@ class _Stream:
                 assert out is not None, "the mirror rejected a delta the kernel sent: %r" % fr
             else:
                 self.fulls += 1
-                keys = fr.get("_keys")                       # the frame itself stays as the wire carried it
-                msg = {kk: v for kk, v in fr.items() if kk != "_keys"}
-                self.last = {"rev": 0, "msg": msg, "maps": _py_maps(msg, keys)} if keys is not None else None
+                assert "_keys" not in fr, "no full carries a key list (T278c)"
+                self.last = {"rev": 0, "msg": dict(fr), "maps": _py_maps(fr)}    # the client keys every full itself
         return self.c.frames[n0:]
 
     @property
@@ -256,7 +284,7 @@ class BarsDeltas(unittest.TestCase):
         st.c.setdefault("resync", set()).add("bars")
         p3 = _bars({S1: self._turn(S1, 3)}, [], [], now=1010)
         fr = st.push(p3)
-        self.assertEqual([f["type"] for f in fr], ["bars"]); self.assertIn("_keys", fr[0])
+        self.assertEqual([f["type"] for f in fr], ["bars"]); self.assertNotIn("_keys", fr[0], "a full carries no key list (T278c)")
         self.assertEqual(st.held, p3); self.assertEqual(st.c["resync"], set())
         src = open(km.__file__, encoding="utf-8").read()
         h = src[src.index('msg.get("type") == "needSlot"'):]
@@ -305,10 +333,10 @@ class BarsDeltas(unittest.TestCase):
             km._delta_parts = real
         self.assertEqual([f["type"] for f in fr], ["bars"]); self.assertNotIn("_keys", fr[0])
         self.assertIn("view-delta bars", err.getvalue()); self.assertIn("synthetic", err.getvalue())
-        self.assertNotIn("bars", st.c.get("dstate", {}))
-        self.assertIsNone(st.last, "a full frame without keys leaves the client holding nothing")
+        self.assertNotIn("bars", st.c.get("dstate", {}), "the kernel holds no base for it")
+        self.assertIsNotNone(st.last, "the client keys any full it receives (T278c); the kernel decides whether a base is held")
         fr = st.push(_bars({S1: self._turn(S1, 2)}, [], [], now=1005))
-        self.assertEqual([f["type"] for f in fr], ["bars"]); self.assertIn("_keys", fr[0], "the stream starts afresh")
+        self.assertEqual([f["type"] for f in fr], ["bars"]); self.assertIn("bars", st.c.get("dstate", {}), "the stream starts afresh: a full, and the kernel holds it")
 
     def test_m_after_a_keyless_whole_frame_the_keyed_full_still_goes_even_for_an_unchanged_payload(self):
         """The failure path sends the whole payload without keys, filling the dedup slot with its signature. If
@@ -324,9 +352,9 @@ class BarsDeltas(unittest.TestCase):
                 st.push(p1)
         finally:
             km._delta_parts = real
-        self.assertIsNone(st.last)
+        self.assertNotIn("bars", st.c.get("dstate", {}), "the whole frame left the kernel holding nothing")
         fr = st.push(dict(p1, now=1001))                            # the same payload, only the clock moved
-        self.assertEqual([f["type"] for f in fr], ["bars"]); self.assertIn("_keys", fr[0], "keyed full not deduped away")
+        self.assertEqual([f["type"] for f in fr], ["bars"]); self.assertIn("bars", st.c.get("dstate", {}), "the full went and is held; not deduped away")
         self.assertEqual(st.held, dict(p1, now=1001))
         self.assertEqual(st.c["dstate"]["bars"]["rev"], 0)
         fr = st.push(_bars({S1: self._turn(S1, 2)}, [], [], now=1005))
@@ -535,7 +563,7 @@ class ShimDecoderMatchesTheKernel(unittest.TestCase):
 var frames=JSON.parse(require("fs").readFileSync(process.argv[2],"utf8"));var out=[];
 for(var i=0;i<frames.length;i++){var msg=frames[i];
 if(msg.type==="delta"){var full=applyDelta(msg);if(!full){out.push({error:"rejected",at:i});break;}msg=full;}
-else if(DELTA_KINDS[msg.type]){var keys=msg._keys;delete msg._keys;LAST[msg.type]=keys?{rev:0,msg:msg,maps:buildMaps(msg,keys)}:null;}
+else if(DELTA_KINDS[msg.type]){delete msg._keys;LAST[msg.type]={rev:0,msg:msg,maps:buildMaps(msg)};}
 out.push(msg);}
 process.stdout.write(JSON.stringify(out));"""
         with open(os.path.join(fx, "run.js"), "w") as f:
@@ -589,7 +617,7 @@ for(var i=0;i<frames.length;i++){var msg=frames[i];
 if(msg.type==="delta"){var full=applyDelta(msg);if(!full){out.push({error:"rejected",at:i});break;}
 var same=[],renewed=[];for(var ln in full.turns){if(prev&&Object.prototype.hasOwnProperty.call(prev.turns,ln)&&prev.turns[ln]===full.turns[ln])same.push(ln);else renewed.push(ln);}
 same.sort();renewed.sort();out.push({same:same,renewed:renewed,turns:full.turns});prev=full;}
-else if(DELTA_KINDS[msg.type]){var keys=msg._keys;delete msg._keys;LAST[msg.type]={rev:0,msg:msg,maps:buildMaps(msg,keys)};prev=msg;out.push({full:true});}}
+else if(DELTA_KINDS[msg.type]){delete msg._keys;LAST[msg.type]={rev:0,msg:msg,maps:buildMaps(msg)};prev=msg;out.push({full:true});}}
 process.stdout.write(JSON.stringify(out));"""
         with open(os.path.join(fx, "run.js"), "w") as f:
             f.write(script)
@@ -635,7 +663,7 @@ process.stdout.write(JSON.stringify(out));"""
             json.dump(frames, f)
         script = self._shim_functions() + r"""
 var frames=JSON.parse(require("fs").readFileSync(process.argv[2],"utf8"));
-var full=frames[0],keys=full._keys;delete full._keys;LAST[full.type]={rev:0,msg:full,maps:buildMaps(full,keys)};
+var full=frames[0];delete full._keys;LAST[full.type]={rev:0,msg:full,maps:buildMaps(full)};
 var next=applyDelta(frames[1]);if(!next){process.stdout.write(JSON.stringify({error:"rejected"}));process.exit(0);}
 var same=[];for(var i=0;i<next.asks.length;i++)same.push(next.asks[i]===full.asks[i]);
 process.stdout.write(JSON.stringify({newMessage:next!==full,same:same,asks:next.asks}));"""
@@ -690,7 +718,7 @@ for(var i=0;i<frames.length;i++){var msg=frames[i];
 if(msg.type==="delta"){var full=applyDelta(msg);if(!full){out.push({error:"rejected",at:i});break;}
 var same=[],renewed=[];for(var ln in full.turns){if(prev&&Object.prototype.hasOwnProperty.call(prev.turns,ln)&&prev.turns[ln]===full.turns[ln])same.push(ln);else renewed.push(ln);}
 same.sort();renewed.sort();out.push({same:same,renewed:renewed,turns:full.turns});prev=full;}
-else if(DELTA_KINDS[msg.type]){var keys=msg._keys;delete msg._keys;LAST[msg.type]={rev:0,msg:msg,maps:buildMaps(msg,keys)};prev=msg;out.push({full:true});}}
+else if(DELTA_KINDS[msg.type]){delete msg._keys;LAST[msg.type]={rev:0,msg:msg,maps:buildMaps(msg)};prev=msg;out.push({full:true});}}
 process.stdout.write(JSON.stringify(out));"""
         with open(os.path.join(fx, "run.js"), "w") as f:
             f.write(script)
@@ -770,9 +798,8 @@ class TwoThreadsOneClient(unittest.TestCase):
                 out = _py_apply(last, fr)
                 self.assertIsNotNone(out, "the client could apply every delta it was sent")
             else:
-                keys = fr.get("_keys")
-                msg = {kk: v for kk, v in fr.items() if kk != "_keys"}
-                last = {"rev": 0, "msg": msg, "maps": _py_maps(msg, keys)}
+                self.assertNotIn("_keys", fr)
+                last = {"rev": 0, "msg": dict(fr), "maps": _py_maps(fr)}
         self.assertEqual([f["type"] for f in c.frames], ["bars", "delta"], "A's keyed full, then B's delta against it")
         self.assertEqual(last["msg"], pb, "the client holds the newer payload…")
         self.assertEqual(c["dstate"]["bars"]["rev"], 1, "…and the kernel's belief about it agrees")
@@ -1001,7 +1028,7 @@ class TupleSignatureForTheSlots(unittest.TestCase):
         r = json.loads(json.dumps(p)); r["turns"][S3] = r["turns"].pop(S1)
         self.assertNotEqual(_sig(p), _sig(r), "the same bars under another lane: the key order carries the lane")
         self.assertNotEqual(_sig(p), _sig(dict(p, warming=True)), "the remainder")
-        r = json.loads(json.dumps(p)); r["judging"][0]["t1"] = 3
+        r = json.loads(json.dumps(p)); next(iter(r["judging"].values()))[0]["t1"] = 3     # judging rides per lane (T278c)
         self.assertNotEqual(_sig(p), _sig(r), "a judging entry")
         r = json.loads(json.dumps(p)); r["messages"] = []
         self.assertNotEqual(_sig(p), _sig(r), "a message removed")
@@ -1054,7 +1081,7 @@ class TupleSignatureForTheSlots(unittest.TestCase):
         lazy = km._LazyWire(lambda: (calls.append("p"), json.dumps(p))[1], km._parts_est(parts))
         c = _Client()
         km._send_slot(c, "bars", p, lazy, km._parts_sig(parts), parts)      # the keyed full: made once, keyed
-        self.assertEqual(calls, ["p"]); self.assertIn("_keys", c.frames[0]); self.assertEqual(lazy.size(), len(json.dumps(p)))
+        self.assertEqual(calls, ["p"]); self.assertNotIn("_keys", c.frames[0]); self.assertEqual(lazy.size(), len(json.dumps(p)))
         km._send_slot(c, "bars", p, lazy, km._parts_sig(parts), parts)      # unchanged: the size only
         self.assertEqual(calls, ["p"])
         q = _bars({S1: [_bar(1), _bar(2)]}, [], [], now=1001); qparts = km._delta_parts("bars", q)
@@ -1082,7 +1109,7 @@ class TupleSignatureForTheSlots(unittest.TestCase):
         n0 = len(st.c.frames)
         km._send_slot(st.c, "bars", big, lazy, km._parts_sig(parts), parts)
         self.assertEqual([f["type"] for f in st.c.frames[n0:]], ["bars"], "a near-total change crosses whole")
-        self.assertEqual(calls, [1]); self.assertIn("_keys", st.c.frames[-1])
+        self.assertEqual(calls, [1]); self.assertEqual(st.c.frames[-1]["type"], "bars"); self.assertIn("bars", st.c.get("dstate", {}))
 
     def test_the_feed_slot_takes_the_same_tuple_and_a_reordered_card_re_sends_once_then_dedups(self):
         def card(i, **f):
