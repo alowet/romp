@@ -232,7 +232,7 @@ class BarsDeltas(unittest.TestCase):
         d = frames[0]
         self.assertEqual(d["coll"]["turns"].get("del"), [S2 + SEP + "seg-2-0"], "a removed lane deletes its bars")
         self.assertEqual(set(d["coll"]["turns"]["set"]), {S3 + SEP + "seg-3-1"}, "a grown lane adds only its new bar")
-        self.assertEqual(set(d["coll"]["judging"]["set"]), {SEP.join([S3, "9", "courier", "10"])}, "a judge call is one keyed item")
+        self.assertEqual(set(d["coll"]["judging"]["set"]), {S3 + SEP + "9" + SEP + "courier"}, "a judge call is one keyed item: lane, t, judge (T278c)")
         self.assertEqual(d["coll"]["messages"]["order"], ["m3", "m2", "m1"], "a reorder ships the key order")
         self.assertEqual(st.held, p2)
         # and a delta stream keeps going: a third push changes nothing but the clock

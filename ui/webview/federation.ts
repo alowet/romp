@@ -212,7 +212,7 @@ export function judgingToWire(j: any): Record<string, any[]> {
   const out: Record<string, any[]> = {};
   for (const e of j) {
     if (!e || typeof e !== "object") continue;
-    const c: any = { k: `${e.t}\u001f${e.judge}\u001f${e.t1}`, t: e.t, j: e.judge };
+    const c: any = { k: `${e.t}\u001f${e.judge}`, t: e.t, j: e.judge };   // (t, judge): the kernel's key, stable for an in-flight run
     if (e.t1 !== undefined && e.t1 !== null) c.t1 = e.t1;
     if (e.kind && e.kind !== "run") c.kd = e.kind;
     if (e.text) c.x = String(e.text).slice(0, 90);
@@ -619,12 +619,13 @@ export function mergeHostBars(perHost: Record<string, any>, hostSeq: readonly st
                               sessions: readonly any[] = []): any {
   const local = perHost[LOCAL] || {};
   const offsets = hostOffsets(perHost);   // each host's clock vs the local authority, this merge
-  const merged: any = { ...local, type: "bars", turns: {}, messages: [], judging: [], warming: false };
+  const merged: any = { ...local, type: "bars", turns: {}, messages: [], judging: {}, warming: false };
   for (const h of hostSeq) {
     const b = rebaseHostTimes(perHost[h], offsets[h] || 0);
     if (!b) continue;
     if (b.turns && typeof b.turns === "object") Object.assign(merged.turns, b.turns);
-    for (const k of ["messages", "judging", "nudges"]) if (Array.isArray(b[k])) merged[k].push(...b[k]);
+    for (const k of ["messages", "nudges"]) if (Array.isArray(b[k]) && Array.isArray(merged[k])) merged[k].push(...b[k]);
+    if (b.judging !== undefined) Object.assign(merged.judging, judgingToWire(b.judging));   // per lane, like turns (T278c)
     if (b.warming) merged.warming = true;   // still warming if ANY host's build is the cold partial (keep the loader)
   }
   merged.messages = rebaseExecs(stitchMessages(merged.messages, sessions), offsets);

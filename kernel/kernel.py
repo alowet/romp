@@ -34638,7 +34638,11 @@ def _compact_judging(entries):
     recv, open}. Pure. An entry without a sid lands under the empty lane key."""
     out = {}
     for e in entries or []:
-        c = {"k": "%s\x1f%s\x1f%s" % (e.get("t"), e.get("judge"), e.get("t1")), "t": e.get("t"), "j": e.get("judge")}
+        # the key is (t, judge), not (t, judge, t1): an in-flight run's t1 is the build clock, so a key carrying it
+        # changed every build and the run crossed as a delete plus a set per frame; with a stable key it is one
+        # changed entry. Two runs of one judge sent at the same instant would collide and take positional keys,
+        # which the delta path handles exactly (they just delta less well)
+        c = {"k": "%s\x1f%s" % (e.get("t"), e.get("judge")), "t": e.get("t"), "j": e.get("judge")}
         if e.get("t1") is not None:
             c["t1"] = e["t1"]
         kd = e.get("kind")
@@ -36732,6 +36736,8 @@ def _delta_keyer(kind):
             return None if v is None or v == "" else prefix + str(v)   # "" would spell a lane's bare-prefix marker
         return key
     if kind.startswith("bykeys:"):
+        # no slot uses a composite kind since T278c (judging keys by a kernel-minted string `k`): kept for a
+        # future list without an id field, but note the shim derives keys from STRING fields only
         fields = tuple(kind.split(":", 1)[1].split(","))
 
         def key(it, prefix=""):

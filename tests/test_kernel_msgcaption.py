@@ -80,7 +80,7 @@ class MsgCaption(unittest.TestCase):
             f.write(json.dumps({"id": uid, "grain": grain, "t": int(self.seg["t"]), "caption": caption}) + "\n")
 
     def _bar(self):
-        bars = km.build_timeline(NOW)["turns"][SID]
+        bars = [km._expand_bar(b) for b in km.build_timeline(NOW)["turns"][SID]]   # the wire bars, long-named (T278c)
         return next(b for b in bars if b["id"] == self.seg["id"])
 
     def test_bar_carries_separate_message_and_work_captions(self):

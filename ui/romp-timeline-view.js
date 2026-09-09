@@ -385,7 +385,8 @@ let MENU_STYLE = null, MENU_CHECK_STYLE = null;   // set by applyPal() below (da
 // Judging band: a compact second timeline UNDER the session lanes, on the SAME axis — one row per
 // summarizer judge (docs/judges.md). Each mark is FILLED with the colour of the SESSION it acted on and
 // OUTLINED in the judge's OWN colour (so a bar reads as "judge X on session Y"). Fed by
-// data.judging = [{judge, sid, t, kind, text}]. Each judge's colour is a distinct hue from the romp palette.
+// data.judging = [{judge, sid, t, t1, kind, text, ms, in, out, sent, recv, open}] once expanded (expandJudging); on the
+// wire it rides per lane as compact entries (T278c). Each judge's colour is a distinct hue from the romp palette.
 // Each judge belongs to a SET (the user 2026-06-29): 'index' = the captioner + archiver (caption/archive
 // bookkeeping); 'triage' = planner/grouper/closer/distiller/courier (goal triage). The two settings toggles
 // (showIndexJudges / showTriageJudges) gate each set's rows on the band — see judgesShown().
