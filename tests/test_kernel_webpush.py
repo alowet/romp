@@ -205,12 +205,13 @@ function frame(tag, frameType) {
   return w;
 }
 // a top-level client with the state a real WindowClient reports (2026-09-08): how visible it is after
-// focus(), its creation URL, and navigate() — the last-resort road for a stale entry
+// focus(), its creation URL, and a navigate method that LOGS if the worker ever calls it (the reload road it
+// served was removed 2026-09-09; nav:false is a browser without the method)
 function stateful(o) {
   const w = { frameType: 'top-level', visibilityState: o.vis, url: o.url,
               focus: () => { LOG.push(['focus']); return Promise.resolve(w); },
               postMessage: (m) => LOG.push(['post', strip(m)]) };
-  if (o.nav !== false) w.navigate = (u) => { LOG.push(['navigate', u]); return o.nav === 'refuse' ? Promise.reject(new TypeError('not controlled')) : Promise.resolve(w); };
+  if (o.nav !== false) w.navigate = (u) => { LOG.push(['navigate', u]); return Promise.resolve(w); };
   return w;
 }
 async function tap(data, windows) {
@@ -267,16 +268,17 @@ async function tap(data, windows) {
   META.length = 0;
   out.nested2 = await tap(fed, [frame('chat', 'nested'), frame('feed', 'nested'), frame('shell', 'top-level')]);
   out.nestedMeta = META[0];
-  // the last resort (2026-09-08): a top-level client focus() brought forward that STILL reports hidden is a
-  // stale entry for a page the browser no longer runs — set its URL to the deep link. Never a visible one
-  // (a live window that came forward), never one whose creation URL already carries the link, never for a
-  // sid-less tap; a refused navigate ends that road without a throw
-  out.stale = await tap(data, [stateful({ vis: 'hidden', url: 'https://romp.test/' })]);
-  out.staleLinked = await tap(data, [stateful({ vis: 'hidden', url: 'https://romp.test/?push-reveal=S1' })]);
+  // no reload road (review find, 2026-09-09, on #1127; the 'last resort' of 2026-09-08 set a hidden focused client's
+  // URL to the deep link): a top-level client that still reports hidden after focus() is TOLD like any other and
+  // never navigated, whatever its creation URL, with or without the method, sid or no sid
+  out.hidden = await tap(data, [stateful({ vis: 'hidden', url: 'https://romp.test/' })]);
+  out.hiddenLinked = await tap(data, [stateful({ vis: 'hidden', url: 'https://romp.test/?push-reveal=S1' })]);
   out.visible = await tap(data, [stateful({ vis: 'visible', url: 'https://romp.test/' })]);
-  out.staleRefused = await tap(data, [stateful({ vis: 'hidden', url: 'https://romp.test/', nav: 'refuse' })]);
-  out.staleNoNav = await tap(data, [stateful({ vis: 'hidden', url: 'https://romp.test/', nav: false })]);
-  out.staleNoSid = await tap({ sid: '', host: '', kind: 'test', cardId: '', url: '/' }, [stateful({ vis: 'hidden', url: 'https://romp.test/' })]);
+  out.hiddenNoNav = await tap(data, [stateful({ vis: 'hidden', url: 'https://romp.test/', nav: false })]);
+  out.hiddenNoSid = await tap({ sid: '', host: '', kind: 'test', cardId: '', url: '/' }, [stateful({ vis: 'hidden', url: 'https://romp.test/' })]);
+  META.length = 0;
+  await tap(data, [stateful({ vis: 'hidden', url: 'https://romp.test/' })]);
+  out.hiddenMeta = META[0];
   // the kept tap (2026-09-08): a shell that boots or comes back asks for it; the tap stays until a shell
   // says THAT tap landed; a sid-less tap keeps nothing
   META.length = 0;
@@ -427,19 +429,20 @@ class ServiceWorkerExecutes(unittest.TestCase):
         self.assertEqual(self.out["refusedHanded"]["log"], [["close"], self.MATCH, ["focus"], ["openWindow", self.URL], ["post", "opened", self.MSG]])
         self.assertEqual(self.out["refusedHandedMeta"]["diag"]["road"], "open-after-refused")
 
-    def test_a_stale_top_level_client_is_sent_to_the_deep_link_and_a_live_one_never_reloaded(self):
-        # the last resort: a client focus() brought forward that STILL reports hidden is a stale entry for a
-        # page the browser no longer runs — its URL is set to the deep link, after the message (a live page
-        # would have read it). A visible client is a live window and is never navigated (a full page load);
-        # one whose creation URL already carries the link has the boot road; a sid-less tap has nowhere to go
-        self.assertEqual(self.out["stale"]["log"], [["close"], self.MATCH, ["focus"], ["post", self.MSG], ["navigate", self.URL]])
-        self.assertEqual(self.out["visible"]["log"], [["close"], self.MATCH, ["focus"], ["post", self.MSG]])
-        self.assertEqual(self.out["staleLinked"]["log"], [["close"], self.MATCH, ["focus"], ["post", self.MSG]])
-        self.assertEqual(self.out["staleNoNav"]["log"], [["close"], self.MATCH, ["focus"], ["post", self.MSG]], "a browser without navigate(): the message alone")
-        self.assertEqual(self.out["staleRefused"]["log"][-1], ["navigate", self.URL], "a refused navigate ends that road quietly")
-        self.assertEqual(self.out["staleRefused"]["waited"], 1)
-        self.assertNotIn(["navigate", "/"], self.out["staleNoSid"]["log"])
-        self.assertEqual([x[0] for x in self.out["staleNoSid"]["log"]], ["close", "matchAll", "focus", "post"])
+    def test_a_hidden_top_level_client_is_told_like_any_other_and_never_navigated(self):
+        # review find (2026-09-09, on #1127): the 'last resort' of 2026-09-08 set a focused client's URL to the deep
+        # link when it STILL reported hidden after focus(), a visibility heuristic standing in for liveness. A live
+        # dashboard can report hidden in the very frame focus() resolves (the flip to visible lands after), and the
+        # road was a full page load of it, every pane's state gone, on every tap in that state. Gone: the client is
+        # told, its visibility rides the trail, and the roads for a page that missed the message are the replay
+        # and the stored tap. No road of the worker's loads a page
+        told = [["close"], self.MATCH, ["focus"], ["post", self.MSG]]
+        for k in ("hidden", "hiddenLinked", "visible", "hiddenNoNav"):
+            self.assertEqual(self.out[k]["log"], told, k)
+            self.assertEqual(self.out[k]["waited"], 1, k)
+        self.assertEqual([x[0] for x in self.out["hiddenNoSid"]["log"]], ["close", "matchAll", "focus", "post"])
+        self.assertEqual(self.out["hiddenMeta"]["diag"], {"clients": 1, "tops": 1, "road": "focus", "vis": "hidden"}, "what the worker saw is still on the trail")
+        self.assertNotIn(".navigate(", km._SW_JS)
 
     def test_the_kept_tap_replays_until_a_shell_says_it_landed(self):
         # a page suspended in the background can miss a message posted before it resumed; a page the browser
@@ -955,6 +958,25 @@ class RevealRoute(unittest.TestCase):
                                  "[reveal] sid=SID-x wid=W-x: consumed — the pane's ready"])
         self.assertEqual(len(got), 1)
 
+    def test_an_unknown_via_is_logged_as_other_never_verbatim(self):
+        # review find (2026-09-09, on #1127): `via` went from the request body straight into the stderr line, so a
+        # body could write anything into the line-oriented journal, a forged line included. The route admits the
+        # three roads (_REVEAL_ROADS) and logs any other word as 'other'; a shell of a build before the field sends
+        # none, and that stays the bare line
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            code, _ = self._post("/reveal", {"sid": "SID-x", "wid": "W-x", "via": "sw\n[reveal] forged sid=SID-z: delivered"})
+            self._post("/reveal", {"sid": "SID-y", "wid": "W-y", "via": "store"})
+            self._post("/reveal", {"sid": "SID-w", "wid": "W-w"})
+        self.assertEqual(code, 200)
+        lines = [l for l in buf.getvalue().splitlines() if l.startswith("[reveal]")]
+        self.assertEqual(lines, ["[reveal] other sid=SID-x wid=W-x: parked",
+                                 "[reveal] store sid=SID-y wid=W-y: parked",
+                                 "[reveal] shell sid=SID-w wid=W-w: parked"])
+        self.assertNotIn("forged", buf.getvalue())
+        self.assertEqual(km._REVEAL_ROADS, frozenset({"sw", "link", "store"}))
+
 
 class Badge(unittest.TestCase):
     """Proposal 3: the app icon wears the needs-you count."""
@@ -1013,6 +1035,17 @@ class LandingRevealPins(unittest.TestCase):
         self.assertIn("window.addEventListener('focus',function(){askReplay();resume('focus');});", js)
         self.assertIn("diag('tap-resume',", js)
         self.assertNotIn("setTimeout", js)
+
+    def test_the_boot_flag_follows_the_chat_panes_own_socket(self):
+        # review find (2026-09-09, on #1127): the two sides of the contract share the words. The pane's shim posts its
+        # socket state to the shell on every open (netState); the reveal script latches the chat pane's up and sends
+        # boot:true on every road until then. A drift here is a tap parked for a ready that never comes, or one
+        # 'delivered' to the previous page's socket
+        js = km._LANDING_REVEAL_JS
+        self.assertIn("if(m&&m.romp==='wsState'&&m.app==='chat'&&m.state==='up')chatUp=true;", js)
+        self.assertIn("boot=!!boot||!chatUp;", js)
+        self.assertEqual(js.count("chatUp=false"), 1, "declared once, never reset: latched")
+        self.assertIn('window.parent.postMessage({romp:"wsState",app:APP,state:s},"*")', km._shim("chat", 1))
 
     def test_shell_ws_trues_up_the_badge(self):
         html = km._landing()
@@ -1100,6 +1133,20 @@ const winMsg = (m) => WIN.forEach((f) => f({ data: m }));
   out.boot.postedAfterTimelineReady = POSTED.length;
   winMsg({ romp: 'ready', app: 'feed' });
   out.boot.postedAfterFeedReady = POSTED.slice();
+  // a tap reaching this page BEFORE its chat pane's socket is up (review find, 2026-09-09, on #1127): the message
+  // openWindow handed a window that booted on its start URL, or the replay answered at parse time. It lands with
+  // boot:true, so the kernel parks for THIS page's pane instead of aiming at the previous page's same-wid socket;
+  // another pane's socket coming up is not the chat pane's
+  FETCHES.length = 0; DIAG.length = 0; ACK.length = 0;
+  swMsg({ romp: 'notificationClick', sid: 'S0', host: '', kind: 'turn', cardId: '', id: 'T-0', diag: { clients: 0, tops: 0, road: 'open', vis: '' } });
+  await tick();
+  out.earlySw = { fetches: FETCHES.slice(), diag: DIAG.slice(), ack: ACK.slice() };
+  winMsg({ romp: 'wsState', app: 'feed', state: 'up' });
+  FETCHES.length = 0;
+  swMsg({ romp: 'notificationClick', sid: 'S0', host: '', kind: 'turn', cardId: '', id: 'T-0b' });
+  await tick();
+  out.earlySwFeedUp = { fetches: FETCHES.slice() };
+  winMsg({ romp: 'wsState', app: 'chat', state: 'up' });   // this page's chat pane connected: from here a tap is delivered live
   FETCHES.length = 0; POSTED.length = 0; DIAG.length = 0; ACK.length = 0;
   swMsg({ romp: 'notificationClick', sid: 'S2', host: '', kind: 'card', cardId: 'S2:g4', id: 'T-1', diag: { clients: 3, tops: 1, road: 'focus', vis: 'hidden' } });
   await tick();
@@ -1136,6 +1183,13 @@ const winMsg = (m) => WIN.forEach((f) => f({ data: m }));
   out.visibleAsks = CTRL.slice();
   CTRL.length = 0; PAGESHOW.forEach((f) => f());
   out.pageshowAsks = CTRL.slice();
+  // the pane's socket dropping later does not re-arm the flag: the pane posts its ready once per page life, so a
+  // park made now would wait for a ready that never comes; the redial is the kernel's business (superseded by iid)
+  winMsg({ romp: 'wsState', app: 'chat', state: 'down' });
+  fetchOk = true; FETCHES.length = 0;
+  swMsg({ romp: 'notificationClick', sid: 'S30', host: '', kind: 'turn', cardId: '', id: 'T-30' });
+  await tick();
+  out.afterDrop = { fetches: FETCHES.slice() };
   console.log(JSON.stringify(out));
 })();
 """
@@ -1243,6 +1297,22 @@ class LandingRevealExecutes(unittest.TestCase):
         self.assertEqual(d["diag"][0][1]["dup"], True, "the second arrival is filed as such, not landed again")
         self.assertEqual(self.out["legacy"]["ack"], [])
 
+    def test_a_tap_before_this_pages_chat_pane_is_up_says_booting_whatever_road_brought_it(self):
+        # review find (2026-09-09, on #1127): the worker's message and its replay posted no boot flag even when they
+        # reached a page whose chat pane had not connected (the message handed to the window openWindow opened on
+        # its start URL; the replay answered at parse time), so the kernel counted the previous page's same-wid
+        # socket as delivery, logged 'delivered', and the tap was lost. The flag now follows this page's own chat
+        # pane's socket ({romp:'wsState',app:'chat',state:'up'}, the shim's message to the shell): booting until it
+        # is up, so the kernel parks and the pane's ready delivers; live from then on, latched (the pane's ready
+        # comes once per page life, so a later drop must not re-arm a park nothing would consume)
+        e = self.out["earlySw"]
+        self.assertEqual(e["fetches"], [["/reveal", {"sid": "S0", "wid": "W-test", "via": "sw", "boot": True}]])
+        self.assertEqual(e["diag"][-1], ["reveal-post", {"status": 200, "via": "sw", "boot": True}], "the row says what was sent")
+        self.assertEqual(e["ack"], [{"romp": "tapLanded", "id": "T-0"}], "handed to the kernel: acked like any landing")
+        self.assertEqual(self.out["earlySwFeedUp"]["fetches"], [["/reveal", {"sid": "S0", "wid": "W-test", "via": "sw", "boot": True}]], "another pane's socket is not the chat pane's")
+        self.assertNotIn("boot", self.out["live"]["fetches"][0][1], "once the chat pane is up, a tap is delivered live")
+        self.assertEqual(self.out["afterDrop"]["fetches"], [["/reveal", {"sid": "S30", "wid": "W-test", "via": "sw"}]], "a later drop does not re-arm the flag")
+
     def test_the_shell_asks_the_worker_for_a_kept_tap_at_boot_and_on_coming_back(self):
         # the events a tap that brought the app forward produces: this page booting (a relaunched app), or
         # becoming visible again (a resumed one). Each asks the controlling worker; hidden asks nothing
@@ -1274,6 +1344,7 @@ _RESUME_WARM_DRIVER = _RESUME_LIB + r"""
   await settle();
   out.boot = snap();
   winMsg({ romp: 'ready', app: 'feed' });
+  winMsg({ romp: 'wsState', app: 'chat', state: 'up' });   // this page's chat pane connected (review find 2026-09-09 on #1127: the boot flag follows it)
   reset();
   // the phone's warm case: the worker stored the tap and iOS brought this suspended page forward — no load,
   // no message, no worker left to replay. The page becomes visible → reads the store → lands it once
@@ -1334,6 +1405,7 @@ _RESUME_BOOT_DRIVER = _RESUME_LIB + r"""
   out.boot = snap();
   winMsg({ romp: 'ready', app: 'feed' });
   out.postedAfterFeedReady = POSTED.slice();
+  winMsg({ romp: 'wsState', app: 'chat', state: 'up' });   // the chat pane connects after the boot's park
   reset();
   swMsg({ romp: 'notificationClick', sid: 'S20', host: '', kind: 'card', cardId: 'S20:g3', id: 'T-20', diag: { clients: 0, tops: 0, road: 'open', vis: '' } });   // the same tap, handed to the opened window
   await settle();
@@ -1347,6 +1419,7 @@ _RESUME_LINK_DRIVER = _RESUME_LIB + r"""
   const out = {};
   await settle();
   out.boot = snap();
+  winMsg({ romp: 'wsState', app: 'chat', state: 'up' });
   reset();
   swMsg({ romp: 'notificationClick', sid: 'S1', host: '', kind: 'card', cardId: 'S1:g1', id: 'T-22', diag: { clients: 0, tops: 0, road: 'open', vis: '' } });   // the stored tap's own message arrives after
   await settle();

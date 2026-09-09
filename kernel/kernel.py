@@ -39621,13 +39621,13 @@ e.waitUntil(Promise.all(work));
 // becomes visible again — the very events a tap that brought the app forward produces — the worker
 // answers with the kept tap, and the shell's {romp:'tapLanded', id} retires it, so a reload minutes
 // later cannot replay a tap that already landed. Events, no timers.
-// LAST RESORT: a top-level client focus() brought forward that STILL reports hidden is not a page that
-// came forward but a stale entry for one the browser no longer runs, so its URL is set to the deep link
-// (WindowClient.navigate — iOS has it) and the page that loads boots on the link. Only for a sid (a
-// sid-less tap has nowhere to land) and only when the client's creation URL carries no push-reveal yet
-// (one opened on the link has the boot road already). Never a live window: one that came forward is
-// visible by then, and navigate() is a full page load. A refused navigate is the end of that road; the
-// message and the replay above are the roads for a live page, the link the road for a fresh one.
+// NO RELOAD ROAD (review find, 2026-09-09, on #1127; it removes a 'last resort' of 2026-09-08 that set a focused
+// top-level client's URL to the deep link when it STILL reported hidden after focus()). visibilityState is not a
+// liveness test: a live dashboard can report hidden in the very frame focus() resolves (the flip to visible lands
+// after), and setting its URL is a full page load, every pane's state gone, on every tap in that state. A client
+// that reports hidden is told like any other; the roads for a page that missed the message are the replay above
+// (asked at boot, on visibilitychange, pageshow and focus) and the stored tap below, and no road of the worker's
+// loads a page. What the worker saw still rides the message's diag block (`vis`), so the trail says so.
 // THE STORED TAP (2026-09-09, the phone with the app alive in the BACKGROUND: the tap brought it forward and
 // changed nothing, while the same tap after a force-quit landed). The instruments said why: matchAll listed NO
 // client for the backgrounded Home Screen app — clients:0, tops:0 — so the worker took the openWindow road; iOS
@@ -39665,14 +39665,12 @@ function tell(c,road){msg.diag.road=road;msg.diag.vis=String((c&&c.visibilitySta
 // client back (null), or nothing to land on (no sid) → the link alone.
 function open(road){return clients.openWindow(url).then(function(c){if(sid&&c&&typeof c.postMessage==='function')tell(c,road);return c;});}
 function shell(w){return !w.frameType||w.frameType==='top-level'||w.frameType==='auxiliary';}
-function stale(c){return !!sid&&!!c&&c.visibilityState==='hidden'&&typeof c.navigate==='function'&&String(c.url||'').indexOf('push-reveal=')<0;}
 // the write first (a sid-less tap has nowhere to land, so nothing is kept), then the window lookup
 e.waitUntil((sid?keep(tap):Promise.resolve()).then(function(){return clients.matchAll({type:'window',includeUncontrolled:true});}).then(function(ws){
 var tops=ws.filter(shell);msg.diag.clients=ws.length;msg.diag.tops=tops.length;
 if(!tops.length)return open('open');
 var w=tops[0];
-return Promise.resolve().then(function(){return w.focus();}).then(function(fw){var c=fw||w;tell(c,'focus');
-if(stale(c))return c.navigate(url).then(null,function(){});},function(){return open('open-after-refused');});
+return Promise.resolve().then(function(){return w.focus();}).then(function(fw){tell(fw||w,'focus');},function(){return open('open-after-refused');});
 }));
 });
 """
@@ -39688,6 +39686,11 @@ if(stale(c))return c.navigate(url).then(null,function(){});},function(){return o
 # `sent` (2026-09-06): the clients a LIVE tap was already handed to while unproven — see
 # _reveal_request; a pong from one of them retires the slot, a redial's ready consumes it.
 _PENDING_REVEAL = [None]                     # {"sid": ..., "wid": ...[, "sent": [clients]]} or None
+# The roads a shell may name in /reveal's `via`, the log line's first word: the worker's message to a live window,
+# the deep link a cold start opened, the entry the worker wrote to the Cache API. Any other word the body carries
+# is logged as 'other' (review find, 2026-09-09, on #1127: the word went from the request body straight into the
+# line-oriented stderr journal); a shell of a build before the field sends none, and that stays the bare line.
+_REVEAL_ROADS = frozenset({"sw", "link", "store"})
 
 
 def _reveal_msg(sid):
@@ -39732,7 +39735,8 @@ def _reveal_request(sid, wid, boot=False, via=""):
     nothing anywhere recorded whether it had even reached the kernel). `via` is the road the shell
     says the tap took ('sw': the worker's message to a live window; 'link': the deep link a cold start
     opened; 'store': the entry the worker wrote to the Cache API, read by a page that came back —
-    2026-09-09); _consume_pending_reveal and _reveal_proven log a park's end the same way, so the journal
+    2026-09-09; the route admits those three, _REVEAL_ROADS, and logs any other word as 'other');
+    _consume_pending_reveal and _reveal_proven log a park's end the same way, so the journal
     answers the next such report: no line — the worker never posted or opened; parked and never
     consumed — the pane's ready never came for that wid; consumed — the pane got it. Ids clipped:
     enough to match rows, not a transcript of anything."""
@@ -43084,6 +43088,15 @@ if(!isOn)testOut.textContent+=" Real notifications won't arrive until the main s
 # one the link outranks. Age never retires a tap — only landing does. Every check files a 'tap-resume'
 # row (found; which event asked; age, clipped; whether it was a dup or dropped), the evidence that the
 # resume ran at all — the thing the 2026-09-09 journal could not say.
+# THE BOOT FLAG FOLLOWS THE CHAT PANE'S OWN SOCKET (review find, 2026-09-09, on #1127): every road posts boot:true
+# until this page's chat pane reports its socket up ({romp:'wsState',app:'chat',state:'up'}, the message the
+# pane's shim posts to the shell on every open, the one the notification center already reads). The link road
+# always said booting; the worker's message and the replay said live even when they reached a page whose pane
+# had not connected (the message handed to the window openWindow opened on its start URL; the replay answered
+# at parse time), so the kernel aimed at the previous page's same-wid socket, logged 'delivered', and the tap
+# was lost. The flag LATCHES on the first up: the pane posts its ready once per page life, so a park made after
+# that would wait for a ready that never comes; a later drop is the redial's business (the kernel retires the
+# superseded socket by instance id), not this flag's.
 # Its own <script>, like every shell behaviour (test_kernel_mobile's count pin): a throw in the
 # bell's script must not strand a tap, and a bell that bails where the Push API is missing must
 # not take the deep-link half with it.
@@ -43092,15 +43105,17 @@ _LANDING_REVEAL_JS = """
 function wid(){try{return sessionStorage.getItem('romp:wid')||'';}catch(e){return '';}}
 function fail(e){try{window.__rompNotify&&window.__rompNotify('error','Could not open the session this notification was about: '+((e&&e.message)||e));}catch(err){}}
 function diag(what,data){try{window.__rompShellDiag&&window.__rompShellDiag(what,data);}catch(e){}}
-var feedReady=false,pendingCard=null;
+var feedReady=false,pendingCard=null,chatUp=false;   // chatUp: this page's own chat pane has reported its socket up (latched; the block above)
 function revealCard(itemId,sid){if(!feedReady){pendingCard={itemId:itemId,sid:sid};return;}
 var f=document.getElementById('f-feed');
 try{f&&f.contentWindow&&f.contentWindow.postMessage({romp:'revealCard',itemId:itemId,sid:sid},'*');}catch(e){}}
 window.addEventListener('message',function(e){var m=e&&e.data;
+if(m&&m.romp==='wsState'&&m.app==='chat'&&m.state==='up')chatUp=true;   // the chat pane's shim, on its socket's open: from here a tap is delivered live
 if(!(m&&m.romp==='ready'&&m.app==='feed'))return;
 feedReady=true;if(pendingCard){var c=pendingCard;pendingCard=null;revealCard(c.itemId,c.sid);}});
 function land(sid,kind,cardId,boot,via){
-var body={sid:sid,wid:wid(),via:via};if(boot)body.boot=true;   // booting: our chat pane is not connected yet — park for it; via: which road the tap took, for the kernel's log line
+boot=!!boot||!chatUp;   // booting, or our chat pane has not connected yet: the kernel parks for it and its ready delivers, never a same-wid socket the previous page left; via: which road the tap took, for the kernel's log line
+var body={sid:sid,wid:wid(),via:via};if(boot)body.boot=true;
 if(sid)fetch('/reveal',{method:'POST',body:JSON.stringify(body)}).then(function(r){
 diag('reveal-post',{status:r.status,via:via,boot:!!boot});
 if(!r.ok)return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});},
@@ -45889,6 +45904,8 @@ class Handler(BaseHTTPRequestHandler):
                     wid = str(body.get("wid") or "")
                     boot = bool(body.get("boot"))
                     via = str(body.get("via") or "")   # 'sw' | 'link' | 'store': the road the tap took, for the log line
+                    if via not in _REVEAL_ROADS:       # whitelisted before it reaches the journal (_REVEAL_ROADS has the why)
+                        via = "other" if via else ""
                 except (ValueError, AttributeError):
                     return self._send(400, "bad json", "text/plain")
                 if not sid:
