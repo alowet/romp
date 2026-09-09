@@ -445,12 +445,16 @@ class TheCut(_Gate):
                          "the unit loop's own row, and no other stand-down")
 
     def test_the_plan_sync_stand_down_alone_leaves_no_stamp(self):
-        # the plan-sync stand-down's mark, isolated: a cleared row re-arms the planner with no new unit, so
-        # the unit loop checks nothing, and the latest segment's trigger reads as rewound away
+        # the plan-sync stand-down's mark, isolated: a clear re-arms the planner with no new unit, so the unit
+        # loop checks nothing, and the latest segment's trigger reads as rewound away. A clear is the cleared.jsonl
+        # row plus the journal row append_clear writes before the save (2026-09-09): the gate keys cleared.jsonl,
+        # the planner's own change gate inside _plan_session (_plan_key) keys the journal, and both must move
+        # for the run to reach the sync; the row names a node this store does not hold, so the replay skips it
         self._session(SID)
         self._converge()
         with open(jd.STATE / "cleared.jsonl", "a") as f:
             f.write(json.dumps({"id": SID3 + ":g1", "op": "clear", "t": NOW}) + "\n")
+        jd.append_clear(SID, SID3 + ":g1", "user", "cleared from the feed", NOW)
         jd._rewound_away = lambda fsid, p, uuid: "pending"
         self._reset()
         self._pass(tiers=("plan",))

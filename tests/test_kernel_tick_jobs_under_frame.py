@@ -56,6 +56,7 @@ class TickJobUnderAFrame(unittest.TestCase):
 
     def setUp(self):
         self.td = Path(tempfile.mkdtemp())
+        self._saved_state = jd.STATE                     # restored in tearDown: the shared judge's root is checked
         jd._rebind_state(self.td)
         self.path = self.td / (SID + ".jsonl")
         recs = [uline(T0, "start the work", "u1"),
@@ -76,6 +77,7 @@ class TickJobUnderAFrame(unittest.TestCase):
         jd.end_pass_frame(True)
         (km._working_notes, km._alive_sessions, km._open_top_goal, km._set_working_note,
          km._suspended_after) = self._saved
+        jd._rebind_state(self._saved_state)
 
     def _append(self, rec):
         with open(self.path, "a") as f:

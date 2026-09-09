@@ -2562,11 +2562,16 @@ _COURIER_SEEN = {}         # fsid -> the scan key of its last pass that found no
 # the leaf fsid's directory, which a /clear forks away from an SDK session's sid), the reg file's key, the
 # captions file's key (the floor-title heal reads it), each running background launch with whether it has
 # crossed its deadline under the pass clock (the settle's one input no file records; see _bg_expiry_key),
-# and the transcript path. Recorded only when the pass did nothing and the store's key after the pass
-# equals the one before it (a heal, a mint, a retirement or a rollup change moves it); a pass with units,
-# placements or a moved store is planned again next pass whatever the key says. A parse the cache does not
-# hold is never keyed, nor is an expiry view that cannot be computed. Pruned to the sessions the pass
-# discovered; a rebound root clears.
+# and the transcript path. Recorded only when the pass did nothing, the store's key after the pass
+# equals the one before it (a heal, a mint, a retirement or a rollup change moves it), and the pass was
+# COMPLETE by the evidence gate's bit (_judge_ctx.stage_incomplete, reset by _gated before the run: a
+# deferral without a write or a side file that exists and did not read sets it); a pass with units,
+# placements, a moved store or that bit is planned again next pass whatever the key says. A parse the cache
+# does not hold is never keyed, nor is an expiry view that cannot be computed. Pruned to the sessions the
+# pass discovered; a rebound root clears. This gate sits INSIDE _plan_session; the evidence gate
+# (GATED_TIERS, _gate_check and _gated in run_plan) sits around it and keys on a superset of these inputs
+# (cleared.jsonl, the death marker, the reg's spawnedAt value and the stall slice as well), so most skips
+# happen there and this table sees the sessions it let through.
 _PLANNER_SEEN = {}         # fsid -> the plan key of its last pass that had nothing to do
 _PLANNER_STATS = {"skipped": 0, "planned": 0, "recorded": 0}
 
@@ -10299,11 +10304,18 @@ def _plan_session(fsid, path, now):
     rollup_status(store, _session_settled(fsid, path, session, store, now))
     save_goals(fsid, store)
     if pkey is not None:
-        if placed == 0 and not units and not retired and _store_key(fsid) == pkey[2]:
+        if placed == 0 and not units and not retired and _store_key(fsid) == pkey[2] \
+                and not getattr(_judge_ctx, "stage_incomplete", False):
             _PLANNER_SEEN[fsid] = pkey               # nothing to do and nothing written: skipped until an input moves
             _PLANNER_STATS["recorded"] += 1
         else:
-            _PLANNER_SEEN.pop(fsid, None)            # work done or the store moved: planned again next pass
+            _PLANNER_SEEN.pop(fsid, None)            # work done, the store moved, or the pass was INCOMPLETE (the
+            #                                          completeness bit the evidence gate reads, _gated: a stand-down
+            #                                          without a write, or a side file that exists and did not read):
+            #                                          planned again next pass. A recorded incomplete pass would skip
+            #                                          the session until an input moved, which a permission bit never
+            #                                          does, and would let the outer gate stamp the short-circuit
+            #                                          as a complete run (2026-09-09).
     return placed
 
 
