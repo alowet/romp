@@ -15118,6 +15118,12 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=
                     # fired before). Defense in depth beside the fork's sealed-placements seed.
                     continue
                 pm = _seg_peer(seg)
+                if pm and pm[0] and _placed_key(placed_ids, seg["id"]):
+                    continue                           # placed under a DRIFTED key (the parse's t shifted after the
+                    #                                    placement was recorded): the placement loop's own _placed_key
+                    #                                    check dropped the row unwritten every pass, at a writer load per
+                    #                                    row per pass, and the row kept its session from ever recording
+                    #                                    in the change gate (2026-09-09). The same rule, applied here.
                 if not pm or not pm[0]:                # peer-triggered with a KNOWN sender only. This filter
                     #                                    is one half of a partition contract with plan_units:
                     #                                    the courier places exactly the peer segments it can
