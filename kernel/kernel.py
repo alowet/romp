@@ -39628,16 +39628,33 @@ e.waitUntil(Promise.all(work));
 // (one opened on the link has the boot road already). Never a live window: one that came forward is
 // visible by then, and navigate() is a full page load. A refused navigate is the end of that road; the
 // message and the replay above are the roads for a live page, the link the road for a fresh one.
+// THE STORED TAP (2026-09-09, the phone with the app alive in the BACKGROUND: the tap brought it forward and
+// changed nothing, while the same tap after a force-quit landed). The instruments said why: matchAll listed NO
+// client for the backgrounded Home Screen app — clients:0, tops:0 — so the worker took the openWindow road; iOS
+// brought the EXISTING page forward without a load (so no link) and without a client to message (so no message),
+// and then ended the worker, `pending` with it, before the page could ask for the replay. So the tap is also
+// WRITTEN where the page can read it without the worker: the Cache API (`caches`, shared by worker and window),
+// one entry, '/__romp/tap' in the 'romp-tap' cache, holding {id, sid, host, kind, cardId, url, t}. Written and
+// AWAITED before the matchAll, so the write is done before iOS moves on, whatever road the tap then takes; a write
+// that fails is swallowed — the other roads still run. The shell reads the entry on the events a resumed page
+// produces (boot, visible, pageshow, focus) and lands it once by id; its {romp:'tapLanded'} retires the kept copy
+// AND the entry — when the entry still holds THAT tap; an older tap's ack never deletes a newer one — and the shell
+// deletes the entry itself as well. One slot, latest wins, like `pending`. Never expired by age: a tap the user
+// made is a tap the user made, however long the page took to come back; landing retires it, nothing else does.
+var TAP='/__romp/tap',TAPC='romp-tap',cs=(typeof caches!=='undefined')?caches:null;
+function keep(tap){if(!cs)return Promise.resolve();return cs.open(TAPC).then(function(c){return c.put(TAP,new Response(JSON.stringify(tap)));})['catch'](function(){});}
+function forget(id){if(!cs)return Promise.resolve();return cs.open(TAPC).then(function(c){return c.match(TAP).then(function(r){return r?r.json():null;}).then(function(t){if(t&&String(t.id||'')===String(id))return c['delete'](TAP);});})['catch'](function(){});}
 var pending=null;   // the last tap addressed to a session, until a shell says it landed
 self.addEventListener('message',function(e){var m=(e&&e.data)||{},src=e&&e.source;
 if(m.romp==='tapReplay'){if(pending&&src){try{src.postMessage(pending);}catch(err){}}}
-else if(m.romp==='tapLanded'){if(pending&&m.id===pending.id)pending=null;}});
+else if(m.romp==='tapLanded'){if(pending&&m.id===pending.id)pending=null;var f=forget(m.id);if(e.waitUntil)e.waitUntil(f);}});
 self.addEventListener('notificationclick',function(e){
 e.notification.close();
 var d=e.notification.data||{};var sid=d.sid||'';
 var url=d.url||(sid?'/?push-reveal='+encodeURIComponent(sid):'/');
 var msg={romp:'notificationClick',sid:sid,host:d.host||'',kind:d.kind||'',cardId:d.cardId||'',
 id:String(Date.now())+'-'+Math.random().toString(36).slice(2,8),diag:{}};
+var tap={id:msg.id,sid:sid,host:msg.host,kind:msg.kind,cardId:msg.cardId,url:url,t:Date.now()};
 if(sid)pending=msg;
 function tell(c,road){msg.diag.road=road;msg.diag.vis=String((c&&c.visibilityState)||'');try{c.postMessage(msg);}catch(err){}}
 // The window openWindow hands back is ALSO given the routing block (2026-09-08): a message posted to a
@@ -39649,7 +39666,8 @@ function tell(c,road){msg.diag.road=road;msg.diag.vis=String((c&&c.visibilitySta
 function open(road){return clients.openWindow(url).then(function(c){if(sid&&c&&typeof c.postMessage==='function')tell(c,road);return c;});}
 function shell(w){return !w.frameType||w.frameType==='top-level'||w.frameType==='auxiliary';}
 function stale(c){return !!sid&&!!c&&c.visibilityState==='hidden'&&typeof c.navigate==='function'&&String(c.url||'').indexOf('push-reveal=')<0;}
-e.waitUntil(clients.matchAll({type:'window',includeUncontrolled:true}).then(function(ws){
+// the write first (a sid-less tap has nowhere to land, so nothing is kept), then the window lookup
+e.waitUntil((sid?keep(tap):Promise.resolve()).then(function(){return clients.matchAll({type:'window',includeUncontrolled:true});}).then(function(ws){
 var tops=ws.filter(shell);msg.diag.clients=ws.length;msg.diag.tops=tops.length;
 if(!tops.length)return open('open');
 var w=tops[0];
@@ -39713,7 +39731,8 @@ def _reveal_request(sid, wid, boot=False, via=""):
     One stderr line per tap, whatever became of it (2026-09-08: a phone's tap "did nothing" and
     nothing anywhere recorded whether it had even reached the kernel). `via` is the road the shell
     says the tap took ('sw': the worker's message to a live window; 'link': the deep link a cold start
-    opened); _consume_pending_reveal and _reveal_proven log a park's end the same way, so the journal
+    opened; 'store': the entry the worker wrote to the Cache API, read by a page that came back —
+    2026-09-09); _consume_pending_reveal and _reveal_proven log a park's end the same way, so the journal
     answers the next such report: no line — the worker never posted or opened; parked and never
     consumed — the pane's ready never came for that wid; consumed — the pane got it. Ids clipped:
     enough to match rows, not a transcript of anything."""
@@ -43051,6 +43070,22 @@ if(!isOn)testOut.textContent+=" Real notifications won't arrive until the main s
 # produces), so a message posted while the page was suspended, or to a page the browser had already
 # evicted, still lands — and acks each tap it lands so the worker retires it. A tap's id dedupes the
 # roads: message, replay and link can all deliver the same tap, and it lands once.
+# THE STORED TAP (2026-09-09, the phone with the app alive in the BACKGROUND: the tap brought it forward
+# and changed nothing, while the same tap after a force-quit landed). None of the roads above reaches a
+# backgrounded Home Screen app: iOS lists no window client for it, so the worker takes the openWindow
+# road; iOS then brings the EXISTING page forward without a load (no link) and without a client to
+# message (no message), and ends the worker with its kept tap before the page can ask (no replay). So
+# the worker WRITES every session-addressed tap to the Cache API before it tries anything — one entry,
+# '/__romp/tap' in the 'romp-tap' cache — and this page reads it on the events a resumed page produces:
+# boot, visibilitychange→visible, pageshow, window focus. A stored tap lands by the same land() path
+# (via 'store'; boot:true when the page is booting), once by id however many roads carry it; the entry
+# is then deleted here AND the worker acked, so neither copy can replay it. A page booting on the DEEP
+# LINK drops a stored tap instead of landing it: the worker opened this very page on the link, so the
+# link is the newest word on where to land, and the entry is either that same tap (landing by the link
+# already; its id is marked seen, so the message handed to the opened window is a dup too) or an older
+# one the link outranks. Age never retires a tap — only landing does. Every check files a 'tap-resume'
+# row (found; which event asked; age, clipped; whether it was a dup or dropped), the evidence that the
+# resume ran at all — the thing the 2026-09-09 journal could not say.
 # Its own <script>, like every shell behaviour (test_kernel_mobile's count pin): a throw in the
 # bell's script must not strand a tap, and a bell that bails where the Push API is missing must
 # not take the deep-link half with it.
@@ -43076,6 +43111,27 @@ if(sid&&kind==='card'&&cardId)revealCard(cardId,sid);}
 var swc=('serviceWorker' in navigator)&&navigator.serviceWorker||null,seen={};
 function toWorker(m,src){try{var t=src||(swc&&swc.controller);if(t)t.postMessage(m);}catch(e){}}
 function askReplay(){toWorker({romp:'tapReplay'});}
+// the stored tap (2026-09-09): the entry the worker writes before it tries to focus or open anything — the road
+// for a backgrounded Home Screen app, which iOS brings forward without a load and without listing it as a client
+var TAP='/__romp/tap',TAPC='romp-tap',cs=(typeof caches!=='undefined')?caches:null;
+function readTap(){return cs?cs.open(TAPC).then(function(c){return c.match(TAP);}).then(function(r){return r?r.json():null;})['catch'](function(){return null;}):Promise.resolve(null);}
+// retire a landed tap everywhere it is kept: the entry (while it still holds THAT record — never a newer one) and
+// the worker's kept copy (the ack; src: the worker that posted, else the one in control)
+function drop(id){readTap().then(function(t){if(t&&String(t.id||'')===id)return cs.open(TAPC).then(function(c){return c['delete'](TAP);});})['catch'](function(){});}
+function retire(id,src){drop(id);if(id)toWorker({romp:'tapLanded',id:id},src);}
+// via: the event asking ('boot' | 'visible' | 'pageshow' | 'focus'); linkSid: the deep link this page booted on,
+// if any — then the stored tap is dropped, not landed (the link is the newer word; see the block above), and the
+// row says whether the two named the same session. Landed once by id however many roads carry it.
+function resume(via,linkSid){
+if(!cs){diag('tap-resume',{found:false,via:via,store:false});return;}
+readTap().then(function(tap){
+if(!(tap&&typeof tap==='object'&&tap.sid)){diag('tap-resume',{found:false,via:via,store:true});if(tap)drop(String(tap.id||''));return;}   // no session: not a tap — cleared, never landed, nothing to ack
+var id=String(tap.id||''),dup=!!(id&&seen[id]),dropped=!dup&&!!linkSid;
+var age=+tap.t>0?Math.round((Date.now()-tap.t)/1000):-1;
+diag('tap-resume',{found:true,via:via,ageS:Math.max(-1,Math.min(86400,age)),dup:dup,dropped:dropped,sameSid:linkSid?String(tap.sid)===linkSid:null});
+if(id)seen[id]=1;
+if(!dup&&!dropped)land(String(tap.sid),String(tap.kind||''),String(tap.cardId||''),via==='boot','store');
+retire(id);});}
 if(swc&&swc.addEventListener){
 swc.addEventListener('message',function(ev){var m=ev&&ev.data;
 // notificationClick: this build's worker. pushReveal: the worker of builds before 2026-09-06, which a phone
@@ -43085,10 +43141,11 @@ var id=String(m.id||''),dup=!!(id&&seen[id]);
 diag('sw-message',{shape:m.romp,hasSid:!!m.sid,kind:String(m.kind||''),dup:dup,sw:m.diag||null});
 if(dup)return;if(id)seen[id]=1;
 land(String(m.sid||''),String(m.kind||''),String(m.cardId||''),false,'sw');
-if(id)toWorker({romp:'tapLanded',id:id},ev.source);});
+if(id)retire(id,ev.source);});
 askReplay();   // after the listener, so the answer has somewhere to land
-document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible')askReplay();});
-window.addEventListener('pageshow',askReplay);}
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'){askReplay();resume('visible');}});
+window.addEventListener('pageshow',function(){askReplay();resume('pageshow');});
+window.addEventListener('focus',function(){askReplay();resume('focus');});}
 var u=new URL(location.href),pr=u.searchParams.get('push-reveal'),pc=u.searchParams.get('push-card');
 // push-card is a goal id; a crafted link with a quote or bracket would reach the feed's
 // [data-key="a:..."] lookup as a selector and throw a SyntaxError that skips the openSession fallback
@@ -43098,6 +43155,7 @@ diag('deeplink',{hasSid:!!pr,hasCard:!!pc,controlled:!!(swc&&swc.controller)});
 if(pr||pc){land(pr||'',pc?'card':'',pc||'',true,'link');
 u.searchParams['delete']('push-reveal');u.searchParams['delete']('push-card');
 try{history.replaceState(null,'',u.pathname+(u.searchParams.toString()?'?'+u.searchParams.toString():'')+u.hash);}catch(e){}}
+resume('boot',pr||'');   // the stored tap: landed when this page is the relaunch iOS made on the start URL, dropped when the link above already says where to go
 })();
 """
 
@@ -45820,7 +45878,7 @@ class Handler(BaseHTTPRequestHandler):
                     sid = str(body.get("sid") or "")
                     wid = str(body.get("wid") or "")
                     boot = bool(body.get("boot"))
-                    via = str(body.get("via") or "")   # 'sw' | 'link': the road the tap took, for the log line
+                    via = str(body.get("via") or "")   # 'sw' | 'link' | 'store': the road the tap took, for the log line
                 except (ValueError, AttributeError):
                     return self._send(400, "bad json", "text/plain")
                 if not sid:
