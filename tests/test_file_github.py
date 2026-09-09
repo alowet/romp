@@ -93,27 +93,6 @@ def _git_version():
     return tuple(int(x) for x in out.split()[2].split(".")[:2])
 
 
-def _alive(pid):
-    """Whether `pid` is still a running process. A zombie counts as gone: it has been killed and only
-    awaits its reaper (init, once its parent died with it)."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    try:
-        with open("/proc/%d/stat" % pid) as f:
-            return f.read().rsplit(")", 1)[-1].split()[0] != "Z"
-    except OSError:
-        return True
-
-
-def _kill_quiet(pid):
-    try:
-        os.kill(pid, 9)
-    except OSError:
-        pass
-
-
 class _Repo(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

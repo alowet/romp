@@ -179,6 +179,7 @@ class ScopePath(unittest.TestCase):
         def sleep(s):
             slept.append(s); clock[0] += s
         out = be._end_cli_tree(CLI, ps.splitlines(), kill=lambda p, s: killed.append((p, s)),
+                               killpg=lambda g, s: killed.append(("pg", g, s)),   # a group kill would show up, not fire
                                run=lambda *a, **k: None, cgroup=lambda pid: "",
                                alive=alive, sleep=sleep, now=lambda: clock[0])
         self.assertEqual(killed, [(TOOL, signal.SIGTERM), (LOOP, signal.SIGTERM), (CLI, signal.SIGTERM),
