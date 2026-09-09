@@ -88,6 +88,26 @@ _HTML_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
 _CODE_FENCE = re.compile(r"^(```|~~~)[^\n]*\n.*?(?:^\1[ \t]*$|\Z)", re.S | re.M)
 _TIER_LINE = re.compile(r"^ {0,3}(?:[-*]\s+)?[*_`]*tier[*_`]*\s*:[*_`]*\s*(.*?)\s*$", re.I)
 _ODD_MAX, _ODD_LEN = 3, 40    # the check summary quotes a bounded excerpt of a line that names no tier
+# markup and punctuation that separate the words of a tier line's value, whitespace aside: an em dash or a
+# parenthesis set without spaces, smart quotes from a phone keyboard, an ellipsis, a slash. The ASCII hyphen
+# is NOT a separator (major-feature is one word) and is trimmed only at a word's ends
+_WORD_SPLIT = re.compile("[\\s`*_.,;:!?()\\[\\]{}<>\"'\u2018\u2019\u201c\u201d\u00ab\u00bb\u2026\u2014\u2013/]+")
+
+
+_HTML_TAG = re.compile(r"<[^<>\n]*>")   # inline HTML around the word (<b>fix</b>) renders as the word alone
+
+
+def _tier_words(raw):
+    """The words of a tier line's value, each read as a tier or None: inline HTML tags removed, then split on
+    whitespace, markup and punctuation (the alias mapped, lower-cased, an inner hyphen kept: major-feature; a
+    hyphen at a word's ends dropped). Empty words are dropped. Pure. The template's placeholder is one tag
+    and so reads as no words; the summary still quotes it, from the raw value."""
+    out = []
+    for w in _WORD_SPLIT.split(_HTML_TAG.sub(" ", raw or "")):
+        w = w.strip("-").lower()
+        if w:
+            out.append(TIER_ALIASES.get(w, w) if TIER_ALIASES.get(w, w) in TIERS else None)
+    return out
 
 
 def _excerpt(raw):
@@ -104,10 +124,13 @@ def declared_tier(body):
     """The tier the PR body declares on a `Tier: <tier>` line, as (tier, why): (tier, "") when exactly one
     tier is named (the same tier on two lines still agrees; the tests-only alias reads as docs); (None, "")
     when no line declares anything; (None, why) when a line exists but declares nothing, and why says so
-    for the check's summary: lines naming different tiers disagree, a value that is no tier (the template's
-    untouched placeholder, a typo, an empty line) is quoted back. Pure over the body text; HTML comments are
-    not read."""
-    found, odd = [], []
+    for the check's summary: lines naming different tiers disagree, a line naming more than one tier is
+    ambiguous, a value whose first word is no tier (the template's untouched placeholder, a typo, an empty
+    line) is quoted back. The FIRST word after "Tier:" is the declaration and prose after it is allowed
+    (T273b: a contributor wrote the tier word and then a sentence, and the line declared nothing until a
+    maintainer labeled by hand), unless that prose names another tier. Pure over the body text; HTML comments
+    and fenced code are not read."""
+    found, odd, ambiguous = [], [], []
     # line endings first: GitHub's web editor writes CRLF, and a fence's closing line ending in \r would
     # miss a `$`-anchored close, reading as unclosed and swallowing the declaration (the manager's review)
     text = (body or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -117,17 +140,26 @@ def declared_tier(body):
         if not m:
             continue
         raw = m.group(1).strip()
-        val = raw.strip("`*_ .,;").lower()
-        tier = TIER_ALIASES.get(val, val)
-        if tier in TIERS:
-            found.append(tier)
-        elif len(odd) < _ODD_MAX:
-            odd.append(_excerpt(raw))
+        words = _tier_words(raw)
+        first = words[0] if words else None
+        if first is None:
+            if len(odd) < _ODD_MAX:
+                odd.append(_excerpt(raw))
+            continue
+        others = [w for w in words[1:] if w and w != first]
+        if others:
+            # a line naming two tiers declares nothing, like a line whose first word is no tier: it never
+            # vetoes a clean line elsewhere, and alone it is what the summary explains
+            ambiguous.append(", ".join(dict.fromkeys([first] + others)))
+            continue
+        found.append(first)
     distinct = list(dict.fromkeys(found))
     if len(distinct) > 1:
         return None, "the body's tier lines disagree (%s): one line, one tier" % ", ".join(distinct)
     if distinct:
         return distinct[0], ""
+    if ambiguous:
+        return None, "the body's tier line names more than one tier (%s): one tier" % "; ".join(ambiguous[:_ODD_MAX])
     if odd:
         return None, "the body's tier line names no tier (%s): one of %s" % ("; ".join(odd), ", ".join(TIERS))
     return None, ""
