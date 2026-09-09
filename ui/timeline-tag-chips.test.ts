@@ -54,7 +54,7 @@ const { TimelinePanel } = createRequire(__filename)(viewPath);
 const SRC = fs.readFileSync(viewPath, "utf8");
 const MENU = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "tag-menu.ts"), "utf8");
 
-const TAGS = [{ id: "g1", name: "infra", color: "#DD42FF", members: ["s2"] }, { id: "g2", name: "qa", color: "#3355aa", members: ["s1"] }];
+const TAGS: any[] = [{ id: "g1", name: "infra", color: "#DD42FF", members: ["s2"] }, { id: "g2", name: "qa", color: "#3355aa", members: ["s1"] }];
 function panelWith(lens: any): any {
   const now = 1_781_000_000;
   const sess = (id: string, name: string, color: string) => ({ id, name, color, state: "working", live: true, model: "Opus", effort: "high",
