@@ -35544,15 +35544,19 @@ def _ws_accept(key):
 # stall being fixed here (caught by test_ws_send_bounded, which overran a 32-frame cap with 40 keepalives
 # a healthy client would have drained fine). Bytes track the thing that actually matters: a client behind
 # by 16 MB of view payloads has stopped reading, while any burst of ~40-byte keepalives is noise.
-# "Behind" is the bytes queued BEHIND the frame at the head of the queue, the one in flight or about to be
-# (T278, 2026-09-08): the budget bounds a peer that has stopped draining, not a frame that is simply big.
+# "Behind" is the bytes queued beyond the LARGEST frame in the queue (T278, 2026-09-08): one frame may be
+# arbitrarily big and is not the peer's fault; everything else waiting is the backlog, and the budget bounds a
+# peer that has stopped draining, not a frame that is simply big. The largest, not the head: a connect push
+# enqueues the small lanes skeleton, then the 17 MB bars, then two small frames within microseconds, and
+# whether the skeleton has left the queue by the time the small frames arrive is a scheduling accident.
 # The devbox's timeline-bars frame grew to 17.7 MB against this budget, so every fresh timeline connection
 # was dropped on its FIRST frame ("0 bytes behind"), reconnected, and was dropped again — 299 drops in one
 # evening, a 17 MB frame rebuilt and serialized several times a minute for nothing, and a laptop that never
 # saw this machine's bars. An empty queue accepts any frame; a healthy peer drains the head at wire speed
 # while the small deltas queue behind it; a wedged peer's stuck head lets the backlog behind it grow past
-# the budget, which is the drop. The head is tracked as a size deque beside the queue (qsizes): one sender
-# thread, one queue, so completions are FIFO and the head of the deque is the head of the queue.
+# the budget, which is the drop. Frame sizes ride a deque beside the queue (qsizes), appended and enqueued
+# as ONE step under the client's queue lock and popped as each frame completes: one sender thread, one
+# queue, so completions are FIFO and the deque mirrors the queue exactly.
 WS_QUEUE_BYTES = int(os.environ.get("ROMP_WS_QUEUE_BYTES", str(16 * 1024 * 1024)))
 
 
@@ -35607,20 +35611,22 @@ def _ws_sender(q, sock, lock, client):
                 client["qbytes"] -= len(s)
                 sizes = client.get("qsizes")
                 if sizes:
-                    sizes.popleft()            # this frame was the head; the next queued frame is now in flight
+                    sizes.popleft()            # this frame was the head of both; the next queued frame is now in flight
 
 
 def _mk_ws_send(q, sock, client):
-    """The client's `send`: enqueue, never block. With more than WS_QUEUE_BYTES queued BEHIND the frame at the
-    head of the queue the peer has stopped draining (T278: a frame that is merely big is delivered; see the
-    budget's comment), so the client is dropped and its socket shut down — which also unblocks its sender
-    thread, parked in a write that will now fail, instead of leaking it for the life of the kernel."""
+    """The client's `send`: enqueue, never block. With more than WS_QUEUE_BYTES queued beyond the largest queued
+    frame the peer has stopped draining (T278: a frame that is merely big is delivered; see the budget's
+    comment), so the client is dropped and its socket shut down — which also unblocks its sender thread,
+    parked in a write that will now fail, instead of leaking it for the life of the kernel. The size append and
+    the enqueue are one step under the queue lock: two producers (the pusher and the heartbeat, or a handler's
+    direct reply) interleaving between them would leave the deque in a different order from the queue."""
     def send(s):
         with client["qlock"]:
             sizes = client.get("qsizes")
             if sizes is None:
                 sizes = client["qsizes"] = collections.deque()
-            behind = client["qbytes"] - (sizes[0] if sizes else 0)
+            behind = client["qbytes"] - (max(sizes) if sizes else 0)
             if behind > WS_QUEUE_BYTES:
                 client["alive"] = False
                 try:
@@ -35635,7 +35641,7 @@ def _mk_ws_send(q, sock, client):
                 raise OSError("ws client %s is %s — dropping" % (client.get("app"), why))
             client["qbytes"] += len(s)
             sizes.append(len(s))
-        q.put(s)                               # unbounded; the byte budget above is the real bound
+            q.put(s)                           # unbounded, never blocks; the byte budget above is the real bound
     return send
 
 

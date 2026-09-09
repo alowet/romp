@@ -216,10 +216,10 @@ class WedgedClientCannotStallTheSendLoop(unittest.TestCase):
     # big. The devbox's timeline-bars frame grew to 17.7 MB against the 16 MiB budget, so every fresh
     # connection was dropped on its FIRST frame ("0 bytes behind"), reconnected, and was dropped again: 299
     # drops in one evening, a 17 MB frame rebuilt and serialized several times a minute for nothing, and a
-    # laptop that never saw this machine's bars. "Behind" is the bytes queued BEHIND the frame at the head
-    # of the queue (in flight, or about to be): an empty queue accepts any frame, a healthy peer drains the
-    # head at wire speed while small frames queue behind it, and a wedged peer's stuck head lets the
-    # backlog behind it grow past the budget, which is the drop.
+    # laptop that never saw this machine's bars. "Behind" is the bytes queued beyond the LARGEST frame in the
+    # queue (one frame may be arbitrarily big; the rest is the backlog): an empty queue accepts any frame, a
+    # healthy peer drains the big frame at wire speed while small frames queue behind it, and a wedged
+    # peer's stuck head lets the backlog behind it grow past the budget, which is the drop.
     def _budget(self, n):
         old = km.WS_QUEUE_BYTES
         km.WS_QUEUE_BYTES = n
@@ -287,11 +287,46 @@ class WedgedClientCannotStallTheSendLoop(unittest.TestCase):
             self.fail("an empty queue accepts any frame, got: %s" % e)
         self.assertTrue(c["alive"])
         self.assertEqual(c["qbytes"], len(big))
-        self.assertEqual(c["qsizes"][0], len(big), "the head of the queue is the frame in flight")
+        self.assertEqual(c["qsizes"][0], len(big), "the size deque mirrors the queue")
 
-    def test_bytes_behind_exclude_the_frame_being_written(self):
+    def test_a_small_frame_ahead_of_the_big_one_does_not_make_the_big_one_backlog(self):
+        """The connect push's shape: a small skeleton first, the big bars frame behind it, then two small
+        frames, all enqueued before the sender thread has necessarily written the skeleton. The big frame is
+        never the backlog whatever its position: the largest queued frame is the one that is merely big."""
+        self._budget(64 * 1024)
+        sock, _peer_never_reads = self._tcp_pair()
+        c, _q, _t = self._wire(sock)
+        c["send"]("s" * 4096)                                  # the skeleton, possibly still at the head
+        c["send"]("b" * (200 * 1024))                          # the bars, three times the budget
+        try:
+            c["send"]("t" * 512)                               # tabOrder
+            c["send"]("k" * 512)                               # caps
+        except OSError as e:
+            self.fail("the frames around a big one on a fresh connection must not be dropped, got: %s" % e)
+        self.assertTrue(c["alive"])
+
+    def test_the_size_append_and_the_enqueue_are_one_step_under_the_queue_lock(self):
+        """Two producers (the pusher and the heartbeat, or a handler's direct reply) interleaving between the
+        size append and the queue put would leave the size deque in a different order from the queue, and the
+        sender's positional pop would then credit the wrong frame. The put happens under the lock."""
+        test = self
+
+        class LockedPutQueue(queue.Queue):
+            def put(self, item, block=True, timeout=None):
+                test.assertTrue(c["qlock"].locked(), "q.put must run while the client's queue lock is held")
+                super().put(item, block, timeout)
+
+        q = LockedPutQueue()
+        c = {"app": "feed", "alive": True, "qbytes": 0, "qlock": threading.Lock()}
+        c["send"] = km._mk_ws_send(q, object(), c)             # no sender thread: the items stay queued
+        c["send"]("one")
+        c["send"]("two")
+        self.assertEqual(list(c["qsizes"]), [3, 3])
+        self.assertEqual([q.get_nowait(), q.get_nowait()], ["one", "two"])
+
+    def test_bytes_behind_exclude_the_largest_queued_frame(self):
         """A wedged peer with a big frame stuck at the head: the small frames queued BEHIND it are the
-        backlog, and the drop comes when that backlog, not the head, passes the budget."""
+        backlog, and the drop comes when that backlog, not the big frame, passes the budget."""
         self._budget(64 * 1024)
         sock, _peer_never_reads = self._tcp_pair()
         c, _q, _t = self._wire(sock)
