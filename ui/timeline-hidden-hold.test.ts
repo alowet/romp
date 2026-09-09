@@ -70,7 +70,7 @@ g.innerWidth = 1400; g.innerHeight = 800;
 
 const viewPath = path.resolve(process.cwd(), "..", "ui", "romp-timeline-view.js");
 const SRC = fs.readFileSync(viewPath, "utf8");
-const { TimelinePanel } = createRequire(__filename)(viewPath);
+const { TimelinePanel, expandBars } = createRequire(__filename)(viewPath);
 
 // The render test's two-lane payload: live lanes with in-window turns, so a real draw() emits a populated SVG.
 function synthData() {
@@ -94,11 +94,11 @@ function synthData() {
 }
 // The wire shape: a {type:"data"} lanes skeleton (no turns) and the {type:"bars"} detail that follows it.
 function skeletonOf(full: any, dNow = 0) {
-  return { now: full.now + dNow, sessions: full.sessions, turns: {}, judging: [], messages: [], nudges: [],
+  return { now: full.now + dNow, sessions: full.sessions, turns: {}, judging: {}, messages: [], nudges: [],
            activeChat: null, focus: null, hover: null, usage: null };
 }
 function barsOf(full: any, dNow = 0) {
-  return { type: "bars", turns: full.turns, judging: [], messages: [], nudges: [], now: full.now + dNow };
+  return { type: "bars", turns: full.turns, judging: {}, messages: [], nudges: [], now: full.now + dNow };
 }
 
 function mk() {
@@ -126,7 +126,7 @@ test("while the tab is hidden, update() and applyBars() apply their state but ne
   assert.equal(panel.data.sessions.length, 2, "…but the lanes ARE applied (state, not paint)");
   panel.applyBars(barsOf(full));
   assert.equal(c.draws, 0, "the bars frame is not drawn either");
-  assert.deepEqual(panel.data.turns, full.turns, "…yet the bars are merged into the live data");
+  assert.deepEqual(panel.data.turns, expandBars(full.turns), "…yet the bars are merged into the live data");
   assert.equal(panel._barsLoaded, true, "…and the loader latch flipped (a return must not show the loader)");
   assert.equal(panel._newestNow, full.now, "…and the live edge's clock adopted the frame's now");
   for (let i = 1; i <= 10; i++) { panel.update(skeletonOf(full, i)); panel.applyBars(barsOf(full, i)); }
@@ -167,7 +167,7 @@ test("a bars frame that outruns its skeleton is parked, not dropped, and lands w
   assert.equal(panel._pendingBars, newer, "a second early frame supersedes the first (newest wins)");
   panel.update(skeletonOf(full, 2));
   assert.equal(panel._pendingBars, null, "the skeleton arriving is the event that lands the parked frame");
-  assert.deepEqual(panel.data.turns, full.turns, "the parked bars are merged into the skeleton's data");
+  assert.deepEqual(panel.data.turns, expandBars(full.turns), "the parked bars are merged into the skeleton's data");
   assert.equal(panel._barsLoaded, true, "the loader latch flipped with them");
   assert.equal(c.draws, 1, "one paint carries lanes AND bars — not a loader paint then a bars paint");
   assert.ok(panel.svg.children.length > 10, "…and it is a populated SVG, not the loader");
@@ -181,7 +181,7 @@ test("a full one-shot payload carrying its own turns outranks a frame parked bef
   const stale: any = barsOf(full); stale.turns = { S1: [] };
   panel.applyBars(stale);
   panel.update(full);
-  assert.deepEqual(panel.data.turns, full.turns, "the later, complete payload's bars stand");
+  assert.deepEqual(panel.data.turns, expandBars(full.turns), "the later, complete payload's bars stand");
   assert.equal(panel._pendingBars, null, "the parked frame is dropped, not kept for a later skeleton");
   done(panel);
 });

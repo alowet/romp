@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 from unittest import mock
 from importlib.machinery import SourceFileLoader
 
+from tests.conftest import thread_census, wait_for_census
+
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
 os.environ["ROMP_KERNEL_NO_OPEN"] = "1"
@@ -87,6 +89,7 @@ def _tmux_row(state):
 
 class DeliveryRidesTheSettle(unittest.TestCase):
     def setUp(self):
+        self._census0 = thread_census()
         self.be = _FakeBackend()
         self._patches = [
             mock.patch.object(km.Sessions, "backend_for", staticmethod(lambda sid: self.be)),
@@ -112,6 +115,10 @@ class DeliveryRidesTheSettle(unittest.TestCase):
         km._moving.clear()
         km._drain_hold.clear()
         km._refresh_parse_failures.clear()
+        producer = getattr(self, "producer", None)
+        if producer is None or not producer.is_alive():
+            km._LOOPS_STOP.clear()                   # a producer still alive keeps the stop set: it exits at its next check
+        self.assertEqual(wait_for_census(self._census0), [], "no thread of this test outlives it (T282)")
 
     def test_parked_op_delivers_on_settle_while_a_judge_pass_is_stuck(self):
         gate = threading.Event()             # the judge tiers block here: a closer sweep that never returns
@@ -122,9 +129,9 @@ class DeliveryRidesTheSettle(unittest.TestCase):
             ran_on.append(threading.current_thread().name)
             return real_apply()
 
-        # The stuck pass stays stuck: a real _producer has no exit, and ending its thread by exception
-        # trips pytest's thread-exception hook — so the gate is never set and the three daemon threads
-        # (producer + two tiers) stay parked, touching nothing, until the process ends.
+        # The pass stays stuck for the whole test; at its end the stop seam is set FIRST and the gate released
+        # SECOND, so the tiers return, the pass completes under these same stubs, and the producer ends at its
+        # next turn of the wheel instead of outliving the module (T282).
         with mock.patch.object(km, "_run_tier", lambda fn: gate.wait()), \
              mock.patch.object(km, "_retry_paused_on", lambda: False), \
              mock.patch.object(km, "_episode_boundary_tick", lambda now: None), \
@@ -136,7 +143,7 @@ class DeliveryRidesTheSettle(unittest.TestCase):
              mock.patch.object(km.jd, "end_pass_frame", lambda f: None), \
              mock.patch.object(km.jd, "consume_judge_recovery", lambda: False), \
              mock.patch.object(km, "_apply_pending_ops", counting_apply):
-            producer = threading.Thread(target=km._producer, name="producer-under-test", daemon=True)
+            producer = self.producer = threading.Thread(target=km._producer, name="producer-under-test", daemon=True)
             producer.start()
             deadline = time.time() + 5
             while time.time() < deadline and not any(t.name == "triage" for t in threading.enumerate()):
@@ -163,6 +170,11 @@ class DeliveryRidesTheSettle(unittest.TestCase):
             self.assertNotIn(SID, km._pending_ops)
             self.assertEqual(ran_on, [threading.current_thread().name],
                              "the drain ran on this cycle and never on the producer")
+            km._LOOPS_STOP.set()                     # the loop ends at its next turn of the wheel...
+            gate.set()                               # ...which comes once the stuck tiers return and the pass completes
+            km._producer_wake.set()
+            producer.join(5)
+            self.assertFalse(producer.is_alive(), "the producer ended on the stop seam once its pass finished")
 
     def test_two_parks_drain_one_per_settle_in_park_order(self):
         self.assertTrue(km._send_or_park(self.be, SID, "one", echo="human"))   # tmux-shaped: a send parks mid-turn

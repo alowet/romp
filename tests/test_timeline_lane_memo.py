@@ -4,17 +4,20 @@
 The full timeline build ran every pusher cycle (the fleet signature's 5 s bucket turns over faster than a 6 s
 cycle) and re-parsed every lane's transcript and goals each time, dead lanes included. Now a dead lane's
 parse-derived parts (bars, compactions, the work end, its judging marks) are served from a memo keyed on
-every file they read, its parse is dropped from _parse_cache once cached (the resident-memory lever), and the
-served frame is byte-identical to a rebuilt one: the judging marks are derived once at horizon zero, stamped
-with the value the horizon test compares, and filtered per build on exactly that. The bars encoder reuses the
-strings of entry objects it already encoded.
+every file they read and the host's recorded suspensions, its parse is dropped from _parse_cache once cached
+(the resident-memory lever), and the served frame is byte-identical to a rebuilt one: the judging marks are
+derived once at horizon zero, stamped with the value the horizon test compares, and filtered per build on
+exactly that. The bars encoder reuses the strings of entry objects it already encoded.
 
 Synthetic transcript, states and captions under a temp root; a placeholder sid; the lane is dead because the
 liveness snapshot is empty."""
+import io
 import json
 import os
 import tempfile
+import time
 import unittest
+from contextlib import redirect_stderr
 from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -42,6 +45,21 @@ def _rec(kind, t, uuid, parent, text):
                 "message": {"role": "user", "content": text}}
     return {"type": "assistant", "timestamp": _iso(t), "uuid": uuid, "parentUuid": parent,
             "message": {"role": "assistant", "content": [{"type": "text", "text": text}], "stop_reason": "end_turn"}}
+
+
+def move_ctime(path):
+    """Move a file's ctime and nothing else: flip its mode between 0o600 and 0o644, checking the stat after
+    each chmod, until the ctime differs (a coarse filesystem clock can hand two chmods one timestamp). mtime,
+    size and inode stand. Bounded at 5 s: a filesystem that never ticks ctime under chmod fails the test
+    loudly rather than passing it."""
+    before = cur = os.stat(path)
+    deadline = time.monotonic() + 5
+    while cur.st_ctime_ns == before.st_ctime_ns:
+        if time.monotonic() > deadline:
+            raise AssertionError("ctime did not move under chmod within 5 s")
+        os.chmod(path, 0o644 if (cur.st_mode & 0o777) == 0o600 else 0o600)
+        cur = os.stat(path)
+    return cur
 
 
 class DeadLaneMemo(unittest.TestCase):
@@ -74,6 +92,7 @@ class DeadLaneMemo(unittest.TestCase):
     def tearDown(self):
         (km.jd.NAMES, km.jd.PROJECTS, km.jd.GOALDIR, km.jd.CAPDIR, km.jd.STATE, km.NAMES, km._tmux_sessions) = self.saved
         km._dead_lane_memo.clear()
+        km._downtime[:] = []
         self.td.cleanup()
 
     def _write(self, recs):
@@ -169,6 +188,93 @@ class DeadLaneMemo(unittest.TestCase):
                                            "context": None, "compactPct": None, "color": None, "mode": ""}}
         km.build_timeline(NOW, km._tmux_sessions(), with_bars=True)
         self.assertNotIn(SID, km._dead_lane_memo)
+
+    def test_a_chmod_alone_moves_the_transcripts_stat_key(self):
+        """A chmod, chown or rename moves a file's ctime while its mtime, size and inode stand, so the stat
+        key carries st_ctime_ns as its fourth member: the repair of a read the memo cached as the empty lane is
+        visible to the key."""
+        p = str(self.tpath)
+        k0 = km._stat_key(p)
+        move_ctime(p)
+        k1 = km._stat_key(p)
+        self.assertNotEqual(k0, k1, "ctime is in the key: a chmod or a rename moves it")
+        self.assertEqual(k0[:3], k1[:3], "mtime, size and inode stood")
+        self.assertIsNone(km._stat_key(p + ".absent"))
+
+    def test_a_failed_parse_is_served_once_cached_and_re_attempted_when_the_transcripts_stat_moves(self):
+        """A transcript that cannot be read parses as the empty lane (the read layer returns no records on an
+        OSError, silently) and a parse that raises leaves the same empty lane plus one stderr line; either is
+        cached like any other lane (a dead transcript has no writer, so the result would repeat). The lane is
+        derived again only when a keyed file moves, and a chmod or chown that repairs the read moves neither
+        mtime, size nor inode: the ctime in the key is what makes the repair visible. The vehicle here is a
+        raising stub, the path with an observable complaint; the chmod only moves the ctime."""
+        parses, failing = [], [True]
+        real = km._parse
+
+        def parse(path, sid, now):
+            parses.append(path)
+            if failing[0]:
+                raise OSError("unreadable")
+            return real(path, sid, now)
+        km._parse = parse
+        km._BARS_COMPLAINED.pop((SID, "parse"), None)   # the complaint latch: one line per distinct cause
+        err = io.StringIO()
+        try:
+            with redirect_stderr(err):
+                tl1 = self._build()
+                tl2 = self._build()
+            self.assertEqual(len(parses), 1, "parsed once: the failed parse is cached as the empty lane")
+            self.assertEqual(tl1["turns"][SID], [])
+            self.assertEqual(tl2["turns"][SID], [], "served as the empty lane it drew")
+            self.assertEqual(err.getvalue().count("timeline bars:"), 1, "one stderr line, none when served")
+            self.assertIn(SID, km._dead_lane_memo)
+            failing[0] = False
+            move_ctime(self.tpath)
+            tl3 = self._build()
+            self.assertEqual(len(parses), 2, "the transcript's stat moved: the parse is attempted again")
+            self.assertEqual(len(tl3["turns"][SID]), 1, "readable again: the bar is drawn")
+            self._build()
+            self.assertEqual(len(parses), 2, "and the repaired lane is served like any other")
+        finally:
+            km._parse = real
+
+    def test_a_suspension_recorded_after_the_lane_was_cached_re_derives_it(self):
+        """_awake_spans excises every recorded suspension from each segment's span, reading the in-memory list
+        (its jsonl mirror is appended best-effort, so the list, not the file, is the input), and the list
+        grows at run time when the producer's tick detects a sleep, on a thread other than the build's. The
+        key carries the list: a nap inside a cached segment splits its bar on the very next build; a
+        different nap of the same count is a different key; a nap outside every segment re-derives to equal
+        bars; the same list rebound is served."""
+        parses = []
+        real = km._parse
+        km._parse = lambda path, sid, now: (parses.append(path), real(path, sid, now))[1]
+        try:
+            self._build()
+            key0 = km._dead_lane_memo[SID][0]
+            self.assertEqual(len(parses), 1)
+            km._downtime[:] = [(T0 + 3, T0 + 7)]            # a nap inside the one segment, an atom on each side
+            tl = self._build()
+            self.assertEqual(len(tl["turns"][SID]), 2, "the bar is cut at the nap on the very next build")
+            self.assertEqual(len(parses), 2, "derived again, not served")
+            key1 = km._dead_lane_memo[SID][0]
+            self.assertNotEqual(key1, key0, "the suspensions are in the key")
+            km._downtime[:] = [(T0 + 2, T0 + 8)]            # a different nap, the same count
+            tl2 = self._build()
+            self.assertNotEqual(tl2["turns"][SID], tl["turns"][SID], "a different nap cuts the bar elsewhere")
+            key2 = km._dead_lane_memo[SID][0]
+            self.assertNotEqual(key2, key1, "a nap of the same count is a different key")
+            km._downtime.append((NOW - 20000, NOW - 19000))  # a sleep outside every segment: equal bars, a new key
+            tl3 = self._build()
+            key3 = km._dead_lane_memo[SID][0]
+            self.assertNotEqual(key3, key2)
+            self.assertEqual(tl3["turns"][SID], tl2["turns"][SID], "a nap outside every segment: the same bars")
+            self.assertEqual(len(parses), 4)
+            km._downtime[:] = list(km._downtime)            # the same content, rebound
+            self._build()
+            self.assertEqual(km._dead_lane_memo[SID][0], key3, "the same suspensions: the same key")
+            self.assertEqual(len(parses), 4, "served")
+        finally:
+            km._parse = real
 
 
 class HorizonFilterIsExact(unittest.TestCase):

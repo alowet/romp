@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 
+from tests.conftest import restore_env
+
 HERE = os.path.dirname(os.path.realpath(__file__))
 ROOT = os.path.dirname(HERE)
 BIN = os.path.join(ROOT, "bin")
@@ -39,8 +41,11 @@ def _set_live(rows):
 
 
 class LiveOnlyAddressing(unittest.TestCase):
+    def setUp(self):
+        self._prior_seam = os.environ.get("ROMP_SESSIONS_FILE")
+
     def tearDown(self):
-        os.environ.pop("ROMP_SESSIONS_FILE", None)
+        restore_env("ROMP_SESSIONS_FILE", self._prior_seam)
         pm.HEARTBEATS.clear()
 
     def test_live_name_resolves(self):
@@ -82,10 +87,11 @@ class RecallReachesParkedMailForTheDead(unittest.TestCase):
     two dead boxes wearing one name is not a guess the sender authorized."""
 
     def setUp(self):
+        self._prior_seam = os.environ.get("ROMP_SESSIONS_FILE")
         _set_live([{"id": ALPHA, "name": "alpha"}])
 
     def tearDown(self):
-        os.environ.pop("ROMP_SESSIONS_FILE", None)
+        restore_env("ROMP_SESSIONS_FILE", self._prior_seam)
         for rid in (GHOST, "99999999-8888-7777-6666-555555555556", PEER):
             box = pm.MAILROOT / rid / "new"
             if box.is_dir():
@@ -154,13 +160,13 @@ class KernelSilenceIsNotDeadness(unittest.TestCase):
     resolve_recipient now probes the source once on the refusal path and answers 503-honestly."""
 
     def setUp(self):
-        os.environ.pop("ROMP_SESSIONS_FILE", None)
+        self._prior_seam = os.environ.pop("ROMP_SESSIONS_FILE", None)   # no seam: the source is the kernel
         self._base = pm.KERNEL_BASE
         pm.KERNEL_BASE = "http://127.0.0.1:9"      # nothing listens: every fetch fails fast
 
     def tearDown(self):
         pm.KERNEL_BASE = self._base
-        os.environ.pop("ROMP_SESSIONS_FILE", None)
+        restore_env("ROMP_SESSIONS_FILE", self._prior_seam)
         pm.HEARTBEATS.clear()
 
     def test_unanswered_source_refuses_without_claiming_death(self):
@@ -187,13 +193,14 @@ class AnsweredButAbsentIsNotDeadness(unittest.TestCase):
     GHOST_SID = "99999999-8888-7777-6666-000000000001"
 
     def setUp(self):
+        self._prior_seam = os.environ.get("ROMP_SESSIONS_FILE")
         _set_live([{"id": ALPHA, "name": "alpha"}])     # answered listing, target absent
         self._sdk = pm.STATE.parent / "sdk"
         self._sdk.mkdir(parents=True, exist_ok=True)
         pm.NAMES_DIR.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self):
-        os.environ.pop("ROMP_SESSIONS_FILE", None)
+        restore_env("ROMP_SESSIONS_FILE", self._prior_seam)
         pm.HEARTBEATS.clear()
         for f in list(self._sdk.iterdir()) + list(pm.NAMES_DIR.iterdir()):
             f.unlink()

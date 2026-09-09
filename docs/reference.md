@@ -300,11 +300,32 @@ toggle says SDK: segmented buttons when the selected host offers both choices,
 and with only one real choice, the same spot writes out which applies,
 `Login (name@example.com)` or `API key`. The key choice exists when Claude
 Code's settings for the kernel's working directory carry a helper; romp reads
-the setting and never runs it for this. A live session additionally wears a
-statusline badge for *switching*, beside mode/model/effort, and that control
-keeps the stricter rule: it exists only when both choices are real (a
-one-option selector is noise). Switching reconnects the session to apply, with
-the same switching-dots the effort badge wears.
+the setting and never runs it for this. A live session's tab menu carries a
+**Billing** submenu that lists BOTH choices on every box (since 2026-09-08; it
+used to exist only when both were real): the choice this machine cannot bill
+is greyed and inert, with the reason in its hover, `no Claude login signed in
+on this machine`, `no apiKeyHelper configured`, or `the apiKeyHelper is set in
+managed settings, login cannot apply`. The status payload carries the same
+availability as `authAvail` (`authBoth` rides beside it for older clients).
+Switching reconnects the session to apply, with the same switching-dots the
+effort badge wears.
+
+On a one-auth box the picker never chooses the missing side. The remembered
+default falls to the side that exists, in both directions: a remembered login
+pick on a machine with no login seeds new sessions on the API key, exactly as
+a remembered key pick on a helper-less machine already fell to the login, and
+the fall is said once per process as a problem row. An explicit pick that
+names the missing side (a session picked "login" on a box that later lost its
+login) launches on the other side when one exists and says so once per session
+start, on the card's Billing sub-line as `⚠ login unavailable, billing API key`
+and in the log; the fall itself rides the status as `authPickFell`, so the hover
+and the sub-line never infer one. A pick with nothing to fall to (a box with
+neither side) launches as picked and the CLI decides; the sub-line then says
+the side is unavailable and claims no fall. A side whose availability cannot
+be read just now (the operator's settings file, or `~/.claude.json`, mid-rewrite
+or unreadable) is cannot-tell: the launch keeps the pick as is, says so once
+per session, and never falls on a read failure. `setAuth` refuses the
+missing side with that same reason in the toast.
 
 A pick reaches the CLI through the session's per-session settings layer, the
 file the SDK hands the CLI as its `--settings` argument. A login pick writes
@@ -885,8 +906,14 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
 - `pusher`: `cycles`, `wakes` (every wake call; a burst of wakes runs one
   cycle), `wakes_event` and `wakes_backstop` (how the loop's wait ended),
   `cycle_ms_sum`, `cycle_ms_max` (since start), `cycle_ms_last`,
-  `cycle_cpu_ms_sum` (the pusher thread's own CPU time), and `cycle_ms_p50`,
-  `cycle_ms_p90`, `cycle_ms_ring_max`, `ring_n` from the last 256 cycles.
+  `cycle_cpu_ms_sum` (the pusher thread's own CPU time), `cycle_ms_p50`,
+  `cycle_ms_p90`, `cycle_ms_ring_max`, `ring_n` from the last 256 cycles,
+  `sends` (every payload that went to a client; a deduped frame the client
+  already holds is not one), and `idle_cycles`, `idle_ms_sum`, `idle_cpu_ms_sum`
+  (cycles that set no wake, sent no payload and saved no goal store: what a
+  longer wait between cycles would have skipped; a conservative undercount,
+  since a wake set by another thread or a periodic repost of an unchanged
+  frame marks a cycle busy).
 - `stages_ms`: `jobs` (the cycle's tick jobs outside the push), `push`, and
   inside it `push.chat`, `push.feed`, `push.timeline`, `push.send`. The
   `push.*` stages count every push, including the one a connecting page gets,
@@ -908,10 +935,24 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   (`hit`, `miss`, `populate`, `bypass`); `nudgeGate` is the auto-nudge walk's
   planner-placement gate, derived once per (parse, store) and served while
   both stand (`served`, `derived`; a healthy quiet box serves almost every
-  cycle). The compaction sweep after each judge pass evicts from `pass` and
-  `shared` the entries of stores no session in the discover window owns, so
-  both stay bounded by the live board; the gate memo is bounded by the session
-  count.
+  cycle); `cleared` is the feed's clear set, parsed once per state of
+  `cleared.jsonl` (its stat, taken before the read) and served while the file
+  stands (`served`, `derived`); `courierSkip` is the courier's change gate
+  (`skipped`, `scanned`, `recorded`: a session whose parse, store, journal,
+  archive and episode log have not moved since a scan that found nothing to
+  place is skipped whole); `backref` is the sender-board walk behind the
+  courier's link repair, built once per state of the sender stores and served
+  while they stand (`served`, `built`); `captions` and `goalArchive` are the
+  per-file read memos behind the index tier's caption readers and the re-plan's
+  cleared context, each parsed once per file state (`served`, `parsed` or
+  `loaded`); `plannerSkip` is the planner's change gate (`skipped`, `planned`,
+  `recorded`: a session whose parse, store, journal, archive, episode log,
+  its leaf's task store, captions file and reg have not moved since a pass
+  that had nothing to do, and none of whose running background launches has
+  crossed its deadline, is not planned again). The compaction sweep after
+  each judge pass evicts from `pass` and `shared` the entries of stores no
+  session in the discover window owns, so both stay bounded by the live
+  board; the gate memo is bounded by the session count.
 - `judge`: `passes`, `ms_sum`, `ms_last`, `ms_mean` (wall time; a pass waits
   on model calls), `cpu_ms_sum` (CPU time of the judge tier threads and every
   per-session worker they run; the workers' share is `cpu_ms_workers`).

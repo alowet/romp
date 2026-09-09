@@ -152,7 +152,7 @@ class PushSplit(unittest.TestCase):
     def test_push_ships_the_lanes_skeleton_before_the_bars(self):
         sent, builds = [], []
         client = {"app": "timeline", "send": sent.append, "sent": {}, "alive": True}
-        SKEL = {"type": "timeline", "sessions": [{"id": "S"}], "turns": {}, "judging": [],
+        SKEL = {"type": "timeline", "sessions": [{"id": "S"}], "turns": {}, "judging": {},
                 "messages": [], "now": 1, "usage": {}}
         FULL = {"type": "timeline", "sessions": [{"id": "S"}], "turns": {"S": [{"id": "b1"}]},
                 "judging": [{"k": "planner"}], "messages": [{"m": 1}], "now": 1}
@@ -189,12 +189,12 @@ class PushSplit(unittest.TestCase):
         sent = []
         client = {"app": "timeline", "sent": {}, "alive": True, "delta": True}
         client["send"] = lambda s: sent.append((client.get("curSlot"), json.loads(s)))
-        SKEL = {"type": "timeline", "sessions": [{"id": "S"}], "turns": {}, "judging": [],
+        SKEL = {"type": "timeline", "sessions": [{"id": "S"}], "turns": {}, "judging": {},
                 "messages": [], "now": 1, "usage": {}}
         FULL1 = {"type": "timeline", "sessions": [{"id": "S"}], "turns": {"S": [{"id": "b1"}]},
-                 "judging": [], "messages": [], "now": 1}
+                 "judging": {}, "messages": [], "now": 1}
         FULL2 = {"type": "timeline", "sessions": [{"id": "S"}], "turns": {"S": [{"id": "b1"}, {"id": "b2"}]},
-                 "judging": [], "messages": [], "now": 2}
+                 "judging": {}, "messages": [], "now": 2}
         holder = {"tl": FULL1}
         calls = []
         o_bt, o_ct, o_tmux, o_sig, o_frac, o_order, o_wire = (km.build_timeline, km._cached_timeline, km._tmux_sessions,
@@ -295,7 +295,7 @@ class SkeletonFromCache(unittest.TestCase):
         self.assertEqual(data[0]["data"]["sessions"], self.FULL["sessions"], "…as the cached build's lanes")
         self.assertEqual(data[0]["data"]["now"], self.FULL["now"], "…stamped with the BUILD's clock, not the cycle's")
         self.assertEqual(data[0]["data"]["turns"], {})
-        self.assertEqual(data[0]["data"]["judging"], [])
+        self.assertEqual(data[0]["data"]["judging"], {})
         self.assertEqual(data[0]["data"]["messages"], [])
         self.assertEqual(data[0]["data"]["usage"], self.FULL["usage"], "usage rides the projected skeleton")
         second = frames[len(first):]
@@ -307,7 +307,7 @@ class SkeletonFromCache(unittest.TestCase):
     def test_the_projection_is_a_copy_with_the_build_clock_and_dedups_on_content(self):
         skel = km._timeline_skeleton(self.FULL)
         self.assertEqual(skel["now"], self.FULL["now"], "the projected frame carries the build's clock")
-        self.assertEqual((skel["turns"], skel["judging"], skel["messages"]), ({}, [], []))
+        self.assertEqual((skel["turns"], skel["judging"], skel["messages"]), ({}, {}, []))
         self.assertEqual(skel["sessions"], self.FULL["sessions"])
         self.assertIsNot(skel, self.FULL)
         self.assertEqual(self.FULL["turns"], {"S": [{"id": "b1"}]}, "a projection is a copy, not a mutation")
@@ -730,9 +730,9 @@ class DeadLaneWindow(unittest.TestCase):
     def test_cold_connect_builds_live_only_and_wakes_the_producer_for_the_rest(self):
         calls, sent = [], []
         client = {"app": "timeline", "send": sent.append, "sent": {}, "alive": True}
-        SK = {"type": "timeline", "sessions": [], "turns": {}, "judging": [], "messages": [],
+        SK = {"type": "timeline", "sessions": [], "turns": {}, "judging": {}, "messages": [],
               "now": 1, "usage": {}}
-        FB = {"type": "timeline", "sessions": [], "turns": {"S": []}, "judging": [],
+        FB = {"type": "timeline", "sessions": [], "turns": {"S": []}, "judging": {},
               "messages": [], "now": 1}
         o_bt, o_tmux, o_sig = km.build_timeline, km._tmux_sessions, km._fleet_view_sig
         o_built = list(km._built_timeline)

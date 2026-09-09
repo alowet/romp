@@ -491,11 +491,25 @@ class KeylessKeyBilledCalls(_JudgeAuthBase):
         jd._LOGIN_AUTH_ENV_FN = lambda: {"CLAUDE_CODE_OAUTH_TOKEN": "synthetic-login-token"}
         jd._judge_ctx.fsid = SID
         seen = {}
+        # the fake envelope carries the modelUsage map a current CLI reports, naming the version the bare
+        # alias resolved to (the one the alias table assumes, so nothing drifts); without the map the judge
+        # says once per process that the served version cannot be checked, and whether this test saw that
+        # line depended on which class in the module had already spent the notice
+        served_id = "claude-sonnet-%d-%d" % jd._ALIAS_HEAD["sonnet"]
+        prior_served = jd._ALIAS_SERVED.get("sonnet")     # the answered call records the served version per process
+
+        def put_back():
+            if prior_served is None:
+                jd._ALIAS_SERVED.pop("sonnet", None)
+            else:
+                jd._ALIAS_SERVED["sonnet"] = prior_served
+        self.addCleanup(put_back)
 
         def fake_run(cmd, input=None, env=None, **kw):
             seen["cmd"] = list(cmd)
             seen["env"] = env
-            return SimpleNamespace(stdout=json.dumps({"result": "ok", "usage": {}, "duration_ms": 3}),
+            return SimpleNamespace(stdout=json.dumps({"result": "ok", "usage": {}, "duration_ms": 3,
+                                                      "modelUsage": {served_id: {"outputTokens": 4}}}),
                                    stderr="", returncode=0)
         with patch.object(jd, "_judge_engine", return_value="claude"), \
                 patch.object(jd.subprocess, "run", side_effect=fake_run):

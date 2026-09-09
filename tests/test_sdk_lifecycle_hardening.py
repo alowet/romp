@@ -48,6 +48,18 @@ def _backend(d=None):
     return sb.SdkBackend(d or tempfile.mkdtemp(), "/bin/true", lambda *a, **k: None)
 
 
+def _pid_max() -> int:
+    """Fake pids above this can never be a live process on the box (T276c) — the reaper's liveness poll and
+    os.getpgid then answer deterministically for them on every runner."""
+    try:
+        return int(open("/proc/sys/kernel/pid_max").read().strip())
+    except (OSError, ValueError):
+        return 4194304
+
+
+_P = _pid_max()
+
+
 def _reg(d, sid, **extra):
     r = {"sid": sid, "name": "s-" + sid[:4], "cwd": "/tmp", "alive": True, "lastSid": sid}
     r.update(extra)
@@ -427,18 +439,24 @@ class BootReconcile(unittest.TestCase):
         _reg(d, sid)
         sb.append_state(Path(d), sid, "working")
         me = os.getpid()
-        ps = ("  901 1 /usr/lib/systemd/systemd --user\n"
-              "  %d 901 python3 ./kernel.py\n"
-              "  558 %d /x/claude --output-format stream-json --resume %s --input-format stream-json\n"
-              "  559 901 /x/claude --output-format stream-json --resume %s --input-format stream-json\n"
-              ) % (me, me, sid, sid)
+        # fake pids above pid_max (T276c): a live runner process wearing a small fake pid made the tree kill
+        # take a REAL process group (os.getpgid succeeded, killpg went unrecorded — an empty list on one
+        # interpreter) or escalate to SIGKILL (the liveness poll saw it alive — an extra signal on another)
+        MANAGER, OURS, ORPHAN = _P + 901, _P + 558, _P + 559
+        ps = ("  %d 1 /usr/lib/systemd/systemd --user\n"
+              "  %d %d python3 ./kernel.py\n"
+              "  %d %d /x/claude --output-format stream-json --resume %s --input-format stream-json\n"
+              "  %d %d /x/claude --output-format stream-json --resume %s --input-format stream-json\n"
+              ) % (MANAGER, me, MANAGER, OURS, me, sid, ORPHAN, MANAGER, sid)
         killed = []
         with mock.patch.object(sb.subprocess, "run", return_value=mock.Mock(stdout=ps)), \
-             mock.patch.object(sb.os, "kill", side_effect=lambda p, s: killed.append((p, s))):
+             mock.patch.object(sb.os, "kill", side_effect=lambda p, s: killed.append((p, s))), \
+             mock.patch.object(sb.os, "killpg", side_effect=lambda g, s: killed.append(("pg", g, s))), \
+             mock.patch.object(sb.SdkBackend, "_pid_alive", lambda self, p: False):   # nothing is alive after its SIGTERM: no grace, no SIGKILL
             be._boot_reconcile([sb.read_reg(Path(d), sid)])
-        self.assertEqual(killed, [(559, sb.signal.SIGTERM)],
+        self.assertEqual(killed, [(ORPHAN, sb.signal.SIGTERM)],
                          "a child this kernel already spawned is left alone whatever ps calls the kernel; "
-                         "the orphan under the user manager is still reaped")
+                         "the orphan under the user manager is reaped with exactly one SIGTERM — no group kill, no escalation")
 
     def test_reconcile_is_opt_in(self):
         # Constructing the backend plain (tests, ad-hoc) must NOT spawn a reconcile thread; the
