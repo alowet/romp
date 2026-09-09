@@ -27868,10 +27868,13 @@ def _route_meta_command(be, sid, text, client=None, floating=False, state=None):
     command, a bare "/model" (the CLI's own picker), plain text that merely contains one — is the
     caller's to send verbatim: the CLI owns what executes. A refused fast toggle is told to
     the client (fail loudly): a dormant SDK session has no live CLI to apply it, and the typed text
-    used to at least draw the CLI's own refusal. `state`, when given, receives {"queued": bool} — whether
-    the change PARKED: the effort/fast setters park under _ops_gate (read here), the model setter returns
-    its own verdict (_set_model_or_park) — so POST /send answers `queued` for a meta command exactly as for
-    a text send (2026-09-03: a parked /model read as plain 'ok')."""
+    used to at least draw the CLI's own refusal. `state`, when given, receives {"queued": bool}: whether
+    the change PARKED, taken from each setter's own return, so POST /send answers `queued` for a meta
+    command exactly as for a text send (2026-09-03: a parked /model read as plain 'ok'). The effort/fast
+    setters report whether they parked under _gate_or_park (the one _ops_gate evaluation those two pay),
+    the model setter has its own rule (_set_model_or_park), and this route never evaluates _ops_gate
+    itself: a read here cost every command a tmux fork, discover pass and usage read for a value nothing
+    used (#986, the review of #954, removed it; the #923 merge restored it)."""
     head, _, rest = (text or "").strip().partition(" ")
     value = rest.strip()
     # ONE token, and one the kernel can vouch for: the setters PERSIST their value — set_model's lands
@@ -27880,11 +27883,10 @@ def _route_meta_command(be, sid, text, client=None, floating=False, state=None):
     # ours to swallow: it stays the CLI's, verbatim, and the user sees the CLI's own error.
     if not value or len(value.split()) != 1:
         return False
-    gate = _ops_gate(sid)                  # the effort/fast setters park under exactly this gate; read here so `state` can say so
     if head == "/model" and _vouched_model(value):
         # the model setter has its OWN rule (an open turn fires it live only on a backend that declares
         # model_switches_live — none shipped does yet, so the SDK still parks; #923), so its verdict is
-        # read, not inferred from the gate — which would say `queued` for a pick that had already applied
+        # read, not inferred from _ops_gate, which would say `queued` for a pick that had already applied
         parked = _set_model_or_park(be, sid, value, floating=floating)
     elif head == "/effort" and value in _EFFORT_VALUES:
         parked = _set_effort_or_park(be, sid, value)    # mid-compaction → parked as a queued command
