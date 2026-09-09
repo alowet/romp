@@ -58,7 +58,7 @@ function open(lens: { all?: boolean; none?: boolean; tags?: string[] }, unions: 
   } catch (e) { restore(); throw e; }
 }
 
-const label = (n: Node) => n.kids.map((k) => k.tag === "#text" ? k.text : label(k)).join("");
+const label = (n: Node): string => n.kids.map((k) => k.tag === "#text" ? (k.text || "") : label(k)).join("");   // recursive: the return type is stated (tsc strict)
 const chipOf = (row: Node) => row.kids.find((k) => k.tag === "span" && "aria-pressed" in k.attrs) as Node | undefined;
 
 test("each union tag is its own chip acting as a toggle: selected full colour + aria-pressed=true, unselected faded + the off class", () => {
