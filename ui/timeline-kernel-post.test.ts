@@ -451,8 +451,12 @@ const sess = (id: string, name: string, color: string) => ({
   id, name, color, state: "working", live: true, model: "Opus", effort: "high",
   context: 40, since: 1_781_000_000 - 60, awaiting: [], compacting: [], pendingMail: 0, compactions: [], faded: false, stale: false,
 });
+// the harness's textContent already walks a node's children, so a tag row reads as its CHIP's text (since
+// T283b the text lives on the chip span, the shared menu's shape); a tag row's selected state is the chip's
+// aria-pressed, a plain row's the trailing ✓
 const rows = (menu: any) => menu.children.map((c: any) => c.textContent as string);
 const rowNamed = (menu: any, label: string) => menu.children.find((c: any) => c.textContent === label || c.textContent === label + "✓");
+const selected = (row: any) => !!row && ((row.children || []).some((c: any) => c._attrs && c._attrs["aria-pressed"] === "true") || String(row.textContent).endsWith("✓"));
 
 test("executed: the Filter menu shows a refused lens write's reason, keeps an unsaved filter and says so, and clears the note once a kernel takes one (review find, 2026-09-08)", async () => {
   await withDom(() => asObsidian({}, async () => {
@@ -479,14 +483,14 @@ test("executed: the Filter menu shows a refused lens write's reason, keeps an un
     assert.equal(p._viewsMenu, menu, "the menu stayed open (a settings panel, not a command)");
     assert.ok(rows(menu).some((t: string) => t === "⚠ " + err + "✕"), "the refusal's reason, with ✕, in the menu: " + JSON.stringify(rows(menu)));
     assert.deepEqual([p._pendingViews, p._localLens], [null, null], "refused: nothing kept");
-    assert.ok(rowNamed(menu, "web") && !rowNamed(menu, "web").textContent.endsWith("✓"), "the row reads unselected again");
+    assert.ok(rowNamed(menu, "web") && !selected(rowNamed(menu, "web")), "the row reads unselected again");
     p._tagEditErr = null; menu._build();
 
     // NO kernel takes it: the filter stays applied, and the menu says it is not saved and why
     answers.push({ ok: false, unreachable: true, error: KERNEL_DOWN });
     rowNamed(menu, "web")._listeners.click();
     await tick();
-    assert.ok(rowNamed(menu, "web").textContent.endsWith("✓"), "the filter is on: " + JSON.stringify(rows(menu)));
+    assert.ok(selected(rowNamed(menu, "web")), "the filter is on: " + JSON.stringify(rows(menu)));
     assert.deepEqual(timelineLens(p._curViews()).tags, ["web"], "…and applies to the lanes");
     assert.ok(rows(menu).includes("⚠ this filter is not saved — " + KERNEL_DOWN), "the not-saved note, with the reason: " + JSON.stringify(rows(menu)));
     assert.equal(p._tagEditErr, null, "not an error: the viewer's own filter, just unsaved");
@@ -822,7 +826,7 @@ test("executed: the not-saved note is reconciled on the store read: a poll that 
     assert.equal(p._takeViews(saved), true);
     assert.equal(p._localLens, null, "nothing held: the store has it");
     assert.ok(!rows(menu).some((t: string) => t.startsWith("⚠")), "the note went with it: " + JSON.stringify(rows(menu)));
-    assert.ok(rowNamed(menu, "web").textContent.endsWith("✓"), "the filter shows, as the store's now");
+    assert.ok(selected(rowNamed(menu, "web")), "the filter shows, as the store's now");
     assert.deepEqual(timelineLens(p._curViews()).tags, ["web"]);
     p._closeViewsMenu();
   }));
