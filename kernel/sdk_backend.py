@@ -2643,6 +2643,102 @@ def find_orphan_clis(ps_lines: list[str], lastsids: list[str], own_pid: int) -> 
     return out
 
 
+# ENDING A CUT TURN'S WHOLE TREE (T276, the user 2026-09-08). Reaping the orphaned CLI alone left its Bash
+# tool's processes alive: a stress harness's 32 busy loops and a benchmark's 11 (setsid'd from tool shells,
+# re-parented to the user manager once the shells died) burned cores for over an hour after restarts.
+# The CLI runs in a transient scope of its own when bin/romp-cli-scope is in use (`romp-session-<sid8>-
+# <pid>-<t>.scope`), and a scope holds EVERY process the CLI ever spawned — setsid changes the session,
+# not the cgroup — so stopping the unit ends the tree, dead intermediates included. Without a scope the
+# fallback walks the process tree from the CLI in the `ps` listing and signals each descendant's process
+# group (a tool shell's setsid child leads its own group), then the CLI; a descendant whose parent died
+# before the walk is out of reach there — the scope is what closes that gap, which is why it is tried
+# first. Nothing outside the CLI's own scope or tree is ever signaled: the walk is by ppid from the CLI,
+# and the scope list is filtered to OUR sessions' units whose pid is not a live child of this kernel.
+SESSION_SCOPE_PREFIX = "romp-session-"
+_SESSION_SCOPE_RE = re.compile(r"romp-session-([0-9a-fA-F]{1,8})-(\d+)-\d+\.scope\Z")
+SCOPE_LIST_ARGV = ["systemctl", "--user", "list-units", "--all", "--plain", "--no-legend", "--no-pager",
+                   SESSION_SCOPE_PREFIX + "*.scope"]
+SCOPE_STOP_TIMEOUT = 15.0     # systemd's own stop: SIGTERM to the cgroup, SIGKILL at its TimeoutStopSec
+TREE_KILL_GRACE = 1.0         # seconds for SIGTERM to land on the tree before SIGKILL
+
+
+def scope_unit_of(cgroup_text: str) -> str | None:
+    """The romp session scope a /proc/<pid>/cgroup listing places the process in (cgroup v2: one
+    `0::/user.slice/…/romp-session-<sid8>-<pid>-<t>.scope` line; the legacy hierarchy's lines carry the
+    same path per controller), or None when the process runs in no such scope."""
+    for ln in cgroup_text.splitlines():
+        path = ln.rsplit(":", 1)[-1]
+        for comp in path.split("/"):
+            if comp.startswith(SESSION_SCOPE_PREFIX) and comp.endswith(".scope"):
+                return comp
+    return None
+
+
+def scope_pid(unit: str) -> int | None:
+    """The pid a session scope's name carries — the pid its CLI ran as (bin/romp-cli-scope's naming)."""
+    m = _SESSION_SCOPE_RE.match(unit.strip())
+    return int(m.group(2)) if m else None
+
+
+def session_scope_units(list_lines: list[str], lastsids: list[str]) -> list[str]:
+    """The session scopes in a `systemctl --user list-units 'romp-session-*.scope' --plain --no-legend`
+    listing that belong to one of OUR sessions (the name's sid8 is the first 8 characters of a lastSid),
+    in listing order. Another kernel's sessions (other sids) never match. Pure."""
+    sid8 = {s[:8].lower() for s in lastsids if s}
+    out = []
+    for ln in list_lines:
+        head = ln.strip().split(None, 1)
+        if not head:
+            continue
+        m = _SESSION_SCOPE_RE.match(head[0])
+        if m and m.group(1).lower() in sid8:
+            out.append(head[0])
+    return out
+
+
+def descendants(ps_lines: list[str], root: int) -> list[int]:
+    """Every process under `root` in a PS_ARGV listing (`pid ppid command`), by the ppid chain, parents
+    before their children. A process whose parent died before the listing has re-parented away from
+    the tree and is NOT found here — the scope path covers those. Pure."""
+    kids: dict[int, list[int]] = {}
+    for ln in ps_lines:
+        parts = ln.strip().split(None, 2)
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        kids.setdefault(int(parts[1]), []).append(int(parts[0]))
+    out: list[int] = []
+    stack = [root]
+    seen = {root}
+    while stack:
+        p = stack.pop()
+        for c in kids.get(p, []):
+            if c in seen:
+                continue
+            seen.add(c)
+            out.append(c)
+            stack.append(c)
+    return out
+
+
+def _read_cgroup(pid: int) -> str:
+    """/proc/<pid>/cgroup, or "" where it cannot be read (no procfs, the pid gone)."""
+    try:
+        with open("/proc/%d/cgroup" % pid) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _read_ppid(pid: int) -> int | None:
+    """The parent pid from /proc/<pid>/stat, or None where it cannot be read."""
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            tail = f.read().rsplit(")", 1)[1].split()   # the comm field may hold spaces and parens
+        return int(tail[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def find_session_cli(ps_lines: list[str], sids: list[str], parent_pid: int) -> int | None:
     """The LIVE CLI pid holding one of `sids` as a child of `parent_pid` (this kernel), or None.
     The interrupt escalation's (and the drain reap's) target: same signature match as
@@ -7013,6 +7109,98 @@ class SdkBackend:
             self._log("session cli pid (%s): %s" % (session.name, e))
             return None
 
+    def _pid_alive(self, pid: int) -> bool:
+        """Does `pid` still exist? procfs where there is one (no signal sent, so a patched os.kill in
+        tests records only the real signals); `kill(pid, 0)` elsewhere."""
+        if os.path.isdir("/proc"):
+            return os.path.exists("/proc/%d" % pid)
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def _end_cli_tree(self, pid: int, ps_lines: list[str], kill=None, run=None, cgroup=None) -> dict:
+        """End an orphaned session CLI and EVERYTHING it left behind (T276): its scope unit when it runs
+        in one (systemd ends every process in the cgroup, a tool shell's setsid children and any
+        re-parented leftover included), and, always, the process tree the `ps` listing still shows
+        under it — each descendant's own process group where it leads one (a setsid child), else the
+        process; children before the CLI, SIGTERM first, SIGKILL after TREE_KILL_GRACE for whatever
+        stayed. Nothing outside the tree is signaled: this kernel's own group is never a target, and a
+        group is signaled only when a descendant of THIS CLI leads it. `kill`, `run` and `cgroup` are
+        the test seams, resolved at call time so a patched os.kill / subprocess.run is honoured. Returns
+        what happened, for the reconcile's log line."""
+        kill = kill or os.kill
+        run = run or subprocess.run
+        cgroup = cgroup or _read_cgroup
+        unit = scope_unit_of(cgroup(pid) or "")
+        stopped = False
+        if unit:
+            try:
+                run(["systemctl", "--user", "stop", unit], capture_output=True, text=True, timeout=SCOPE_STOP_TIMEOUT)
+                stopped = True
+            except Exception as e:
+                self._log("cut-turn reap: stopping %s failed (%s); falling back to the process tree" % (unit, e))
+        own_pg = None
+        try:
+            own_pg = os.getpgid(0)
+        except OSError:
+            pass
+        targets = [p for p in descendants(ps_lines, pid) if p != os.getpid()] + [pid]
+        def signal_all(sig, only_alive: bool) -> int:
+            n = 0
+            for p in targets:
+                if only_alive and not self._pid_alive(p):
+                    continue
+                try:
+                    pg = os.getpgid(p)
+                except OSError:
+                    pg = None
+                try:
+                    if pg is not None and pg == p and pg != own_pg:
+                        os.killpg(pg, sig)          # a setsid'd tool child leads its own group: take the group
+                    else:
+                        kill(p, sig)
+                    n += 1
+                except (ProcessLookupError, PermissionError):
+                    pass
+            return n
+        signaled = signal_all(signal.SIGTERM, False)   # unconditionally: the OS answers for a pid already gone
+        deadline = time.time() + TREE_KILL_GRACE
+        while time.time() < deadline and any(self._pid_alive(p) for p in targets):
+            time.sleep(0.05)
+        forced = signal_all(signal.SIGKILL, True) if any(self._pid_alive(p) for p in targets) else 0
+        return {"scope": unit if stopped else None, "signaled": signaled, "forced": forced, "tree": len(targets) - 1}
+
+    def _stop_leftover_scopes(self, lastsids: list[str], run=None) -> int:
+        """Stop the session scopes of OUR sessions whose CLI is not a live child of this kernel (T276):
+        a scope outlives its CLI when a tool's setsid children keep running — exactly the loops the
+        pid-only reap left behind once their shells had died and re-parented. Every process in the
+        scope belongs to that session by construction. A unit whose pid is this kernel's own child
+        (a session already started before this sweep) is left alone. No systemctl (macOS, a box without
+        the user manager) → nothing to sweep. `run` is the test seam, resolved at call time."""
+        run = run or subprocess.run
+        try:
+            listing = run(SCOPE_LIST_ARGV, capture_output=True, text=True, timeout=10).stdout or ""
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return 0
+        except Exception as e:
+            self._log("cut-turn reap: listing session scopes failed: %s" % e)
+            return 0
+        stopped = 0
+        for unit in session_scope_units(listing.splitlines(), lastsids):
+            sp = scope_pid(unit)
+            if sp is not None and (sp == os.getpid() or (self._pid_alive(sp) and _read_ppid(sp) == os.getpid())):
+                continue            # this kernel's live session
+            try:
+                run(["systemctl", "--user", "stop", unit], capture_output=True, text=True, timeout=SCOPE_STOP_TIMEOUT)
+                stopped += 1
+            except Exception as e:
+                self._log("cut-turn reap: stopping leftover %s failed: %s" % (unit, e))
+        return stopped
+
     def _boot_reconcile(self, regs: list[dict]) -> None:
         """The kernel just booted — reconcile what the previous kernel's death left behind. Event-keyed
         on the boot itself plus each session's state tail, never on ages or timers:
@@ -7039,18 +7227,23 @@ class SdkBackend:
         try:
             alive = [r for r in regs if r.get("alive") and r.get("sid")]
             reaped = 0
+            scopes_stopped = 0
             lastsids = [str(r.get("lastSid") or "") for r in alive if r.get("lastSid")]
             if lastsids:
                 try:
                     ps = subprocess.run(PS_ARGV, capture_output=True, text=True, timeout=10).stdout
-                    for pid in find_orphan_clis(ps.splitlines(), lastsids, os.getpid()):
+                    ps_lines = ps.splitlines()
+                    for pid in find_orphan_clis(ps_lines, lastsids, os.getpid()):
                         if pid == os.getpid():
                             continue
+                        # the CLI AND its tree (T276): its scope unit, then every process still under it
                         try:
-                            os.kill(pid, signal.SIGTERM)
+                            self._end_cli_tree(pid, ps_lines)
                             reaped += 1
                         except (ProcessLookupError, PermissionError):
                             pass
+                    # …and the scopes whose CLI already died but whose children live on
+                    scopes_stopped = self._stop_leftover_scopes(lastsids)
                 except Exception:
                     self._log("boot reconcile: orphan reap failed: %s" % traceback.format_exc())
             resumed, restored, notified = 0, 0, 0
@@ -7137,10 +7330,11 @@ class SdkBackend:
                 except Exception:
                     self._log("boot reconcile: session %s failed (sweep continues): %s"
                               % (r.get("sid"), traceback.format_exc()))
-            if reaped or resumed or restored or notified:
+            if reaped or resumed or restored or notified or scopes_stopped:
                 self._log("boot reconcile: resumed %d cut turn(s), restored %d queued message(s), "
-                          "notified %d session(s) of dead background tasks, reaped %d orphaned CLI(s)"
-                          % (resumed, restored, notified, reaped))
+                          "notified %d session(s) of dead background tasks, reaped %d orphaned CLI(s) with their "
+                          "process trees, stopped %d leftover session scope(s)"
+                          % (resumed, restored, notified, reaped, scopes_stopped))
                 self._poke()
             # STAGGERED spawn (see BOOT_RESUME_CONCURRENCY): every reg above is already fixed —
             # queues persisted, heals applied — so even a death mid-stagger loses nothing (the next
