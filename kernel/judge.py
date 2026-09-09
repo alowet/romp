@@ -12301,6 +12301,13 @@ def mint_fallback_card(sid, from_model, to_model, ev_t=None):
                     and prev.get("text") == text and not prev.get("cleared") \
                     and prev.get("id") not in vc:
                 return None
+            # T279: the same swap is already on the board WITH its cause — a safeguards refusal the CLI
+            # retried on the fallback (a CLI that streams that notice ahead of the reply); the capacity
+            # reading of the down-tier transition stands down rather than filing a second card.
+            if prev.get("why") == REFUSAL_FALLBACK_WHY and not prev.get("cleared") \
+                    and prev.get("id") not in vc \
+                    and prev.get("swap") == {"from": from_model or "?", "to": to_model or "?"}:
+                return None
         n = store.get("seq", 0) + 1
         store["seq"] = n
         gid = "%s:g%d" % (sid, n)
@@ -12309,7 +12316,7 @@ def mint_fallback_card(sid, from_model, to_model, ev_t=None):
                "capacity fallback, not a pick. Work continued on the fallback; switch back from the "
                "statusline if that isn't what you want."
                % (from_model or "the pinned model", to_model))
-        nd = GuardedNode({"id": gid, "text": text,
+        nd = GuardedNode({"id": gid, "text": text, "swap": {"from": from_model or "?", "to": to_model or "?"},
                           "parentId": None, "nodeComplete": False, "blocked": False, "cleared": False,
                           "trail": [], "promptUuid": "", "quote": "", "t": t, "mt": t,
                           "why": "kernel-observed API model fallback", "log": []})
@@ -12322,6 +12329,151 @@ def mint_fallback_card(sid, from_model, to_model, ev_t=None):
         sys.stderr.write("fallback-card mint (%s): %r\n" % (sid[:8], e))
         return None
 
+
+REFUSAL_FALLBACK_WHY = "kernel-observed safeguards refusal fallback"     # the refusal card's why key (T279)
+CAPACITY_FALLBACK_WHY = "kernel-observed API model fallback"            # mint_fallback_card's, as it spells it
+
+
+def _refusal_fallback_texts(from_model, to_model, category, explanation, scope):
+    """The refusal card's title and done-why. The title carries the swap and the category (the head the
+    chat notice shows); the why carries the cause, the API's explanation when it sent one (the notice's
+    fold), and what to do about it. 'local' scope: only that reply came from the fallback model."""
+    to = to_model or "a fallback model"
+    cat = (category or "").strip()
+    expl = (explanation or "").strip()
+    local = (scope or "session") == "local"
+    cat_part = (" (%s)" % cat) if cat else ""
+    if local:
+        text = "A reply came from %s after a safeguards refusal%s" % (to, cat_part)
+    else:                                    # the swap LAST: mint_fallback_card's stand-down matches on it
+        text = "Model changed after a safeguards refusal%s: %s → %s" % (cat_part, from_model or "?", to)
+    why = ("The model's safeguards flagged a message%s and the request was retried on %s: a refusal "
+           "fallback, not a pick." % ((" (category: %s)" % cat) if cat else "", to))
+    if expl:
+        why += " The API's explanation: %s%s" % (expl, "" if expl.endswith((".", "!", "?")) else ".")
+    if local:
+        why += (" Only that reply (a subagent's or a side question's) came from %s; the session's model "
+                "is unchanged." % to)
+    else:
+        why += " Work continued on %s; switch back from the statusline if that isn't what you want." % to
+    return text, why
+
+
+def _swap_of(nd):
+    """(from, to) of a fallback card: the `swap` field, or, for a capacity card minted before the field
+    existed, the two names its title spells ("Model changed automatically: A → B")."""
+    sw = nd.get("swap")
+    if isinstance(sw, dict) and sw.get("from") and sw.get("to"):
+        return str(sw["from"]), str(sw["to"])
+    text = str(nd.get("text") or "")
+    if ": " in text and " → " in text:
+        a, _, b = text.split(": ", 1)[1].partition(" → ")
+        if a and b:
+            return a.strip(), b.strip()
+    return None
+
+
+def _chain_cards(cards, origin, target):
+    """The fallback cards that lie on a path origin → … → target through `cards` (each a (from, to)
+    pair keyed by id): a card is on the chain when its `from` is reachable from the origin and the
+    target is reachable from its `to`. A multi-hop refusal (the first fallback refused too) learned a
+    card per hop; a card off the path (another swap this turn) is never claimed."""
+    fwd = {origin}
+    changed = True
+    while changed:
+        changed = False
+        for a, b in cards.values():
+            if a in fwd and b not in fwd:
+                fwd.add(b); changed = True
+    bwd = {target}
+    changed = True
+    while changed:
+        changed = False
+        for a, b in cards.values():
+            if b in bwd and a not in bwd:
+                bwd.add(a); changed = True
+    return [cid for cid, (a, b) in cards.items() if a in fwd and b in bwd]
+
+
+def _claimable(store, nd, vc):
+    """A fallback card the bookkeeping may fold: uncleared, and untouched by the user (no follow-up in
+    flight, no user stamp) — the user's gesture outranks the bookkeeping."""
+    return not nd.get("cleared") and nd.get("id") not in vc \
+        and not _floor_of(store, nd) and not nd.get("followupPending")
+
+
+def mint_refusal_fallback_card(sid, from_model, to_model, category=None, explanation=None,
+                               scope="session", ev_t=None, capacity_gids=None, episode=None):
+    """A COMPLETED card recording a SAFEGUARDS refusal the CLI retried on a fallback model (T279): the
+    model's classifier declined the request (the API's stop_reason "refusal") and the CLI re-ran the
+    call on the configured fallback, so the reply that followed came from a different model, for a
+    reason the user should see: the refusal category, and the API's explanation when it sent one.
+    Same shape as mint_fallback_card (kernel-authored bookkeeping, minted done, never a question;
+    existence-keyed dedupe while an identical uncleared card is on the board), with its own why key,
+    the swap as data (`swap`, for both mints' dedupes), the episode key (`episode`: the refused prompt's
+    uuid) and prose that names the refusal, never "capacity".
+
+    ONE card per swap. The fallback model's own reply streams BEFORE the CLI's end-of-turn refusal
+    notice, and its model learn has already filed the swap as a capacity fallback (a down-tier
+    transition nobody asked for is all _learn_model can see). The backend names the cards its own
+    learn minted THIS turn (`capacity_gids`; never an older card that reads the same), and those that
+    lie on the chain from the refused model to the answering one (_chain_cards: a multi-hop refusal
+    learned a card per hop) are FOLDED into the fresh refusal card with the store's merge
+    (_merge_nodes): the refusal node is new, so a concurrent writer's save adopts it wholesale, and
+    each folded card's deletion is a durable tombstone (mergedFrom) the rebase honors from either
+    side — no field of an existing node is rewritten, so no stale snapshot can half-revert it. The
+    same fold retires an earlier refusal card of the SAME episode (a CLI that files an intermediate
+    hop unmarked): the final frame's card is the record. The user's gesture outranks the bookkeeping:
+    a card the user cleared, followed up on, or otherwise stamped (_claimable) is left exactly as they
+    left it and the refusal files fresh beside it. `scope` per the CLI's schema: 'session' (the
+    session's model is swapped) or 'local' (a subagent's or a side question's reply only; the
+    session's model is unchanged; absent on older CLIs = session); a 'local' refusal claims no
+    capacity card. The rollup runs with session_closed=False: the card completes on its own (it is
+    never the session's focus), and a swap's information must not force the settle of the focus
+    card."""
+    try:
+        store = load_goals(sid)
+        nodes = store.setdefault("nodes", {})
+        text, why = _refusal_fallback_texts(from_model, to_model, category, explanation, scope)
+        swap = {"from": from_model or "?", "to": to_model or "?"}
+        local = (scope or "session") == "local"
+        vc = _view_cleared()
+        for prev in nodes.values():
+            if prev.get("why") == REFUSAL_FALLBACK_WHY and prev.get("text") == text \
+                    and not prev.get("cleared") and prev.get("id") not in vc:
+                return None                          # the board already says exactly this
+        t = int(ev_t or time.time())
+        n = store.get("seq", 0) + 1
+        store["seq"] = n
+        gid = "%s:g%d" % (sid, n)
+        nd = GuardedNode({"id": gid, "text": text, "swap": swap, "episode": episode or "",
+                          "parentId": None, "nodeComplete": False, "blocked": False, "cleared": False,
+                          "trail": [], "promptUuid": "", "quote": "", "t": t, "mt": t,
+                          "why": REFUSAL_FALLBACK_WHY, "log": []})
+        nodes[gid] = nd
+        record_verdict(store, nd, "romp", "done", t, why=why)
+        fold = []
+        if not local:
+            cands = {}
+            for cid in (capacity_gids or []):
+                cap = nodes.get(cid)
+                sw = _swap_of(cap) if cap is not None else None
+                if sw and cap.get("why") == CAPACITY_FALLBACK_WHY and _claimable(store, cap, vc):
+                    cands[cid] = sw
+            fold += _chain_cards(cands, swap["from"], swap["to"])
+        if episode:
+            fold += [pid for pid, prev in list(nodes.items())
+                     if pid != gid and prev.get("why") == REFUSAL_FALLBACK_WHY
+                     and prev.get("episode") == episode and _claimable(store, prev, vc)]
+        for did in fold:
+            _merge_nodes(store, did, gid, t, "the same swap, filed with its cause: a safeguards refusal "
+                                             "the CLI retried on the fallback model")
+        rollup_status(store, False)                # the fold materializes nodeComplete/doneWhy from the diary
+        save_goals(sid, store)
+        return gid
+    except Exception as e:
+        sys.stderr.write("refusal-fallback card mint (%s): %r\n" % (sid[:8], e))
+        return None
 
 NUDGE_REDUNDANT_SYS = (
     "You answer one question about a working session, from its own latest message. The user message "

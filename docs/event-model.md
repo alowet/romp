@@ -140,11 +140,16 @@ interface Trigger {
 interface Atom {
   // Parity with the streaming API:
   type: "assistant" | "user" | "system" | "result" | "idle";   // "idle" is ours
-  subtype?: "compact_boundary" | "status" | "task_notification"; // when type==="system"
+  subtype?: "compact_boundary" | "status" | "task_notification"
+          | "model_refusal_fallback";                          // when type==="system"
   uuid: string;             // message id (same value in stream and transcript)
   session_id: string;       // = rompUuid
   message?: ApiMessage;     // assistant/user: the Anthropic message object (below)
   compact_metadata?: { trigger: "auto" | "manual"; pre_tokens: number }; // system:compact_boundary
+  content?: string; fallback_from?: string; fallback_to?: string;   // system:model_refusal_fallback — the CLI's
+  refusal_category?: string; refusal_explanation?: string;          //   line, the swap, the refusal's category and
+  scope?: "session" | "local";                                      //   the API's explanation ("" when the record
+                                                                    //   carried none), the scope (absent = session)
   result?: {                // type==="result"
     subtype: "success" | "error_during_execution" | "error_max_turns" | string;
     num_turns: number; stop_reason: string | null;

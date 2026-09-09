@@ -34,6 +34,8 @@ T0 = NOW - 3600
 
 NOTICE = ("The model's safeguards flagged this message. Switched to a fallback model. "
           "Send feedback with /feedback.")
+CATEGORY = "synthetic-category"
+EXPLANATION = "a synthetic explanation of the refusal"
 
 
 def iso(t):
@@ -58,7 +60,10 @@ def refusal_turn_records():
         {"type": "system", "subtype": "model_refusal_fallback", "timestamp": iso(T0 + 5),
          "uuid": "sfb", "parentUuid": "a1", "direction": "retry", "trigger": "refusal",
          "level": "warning", "content": NOTICE,
-         "originalModel": "claude-fable-5", "fallbackModel": "claude-opus-5"},
+         "originalModel": "claude-fable-5", "fallbackModel": "claude-opus-5",
+         # T279: the refusal's category (an open string; null when neither lane carried one) and the
+         # API's explanation (display-only prose; null on server-lane banners), plus the scope
+         "scope": "session", "apiRefusalCategory": CATEGORY, "apiRefusalExplanation": EXPLANATION},
     ]
 
 
@@ -77,6 +82,15 @@ class ParseEmitsTheFallbackAtom(unittest.TestCase):
         self.assertEqual(fb[0]["fallback_from"], "claude-fable-5")
         self.assertEqual(fb[0]["fallback_to"], "claude-opus-5")
         self.assertEqual(fb[0]["content"], NOTICE)
+
+    def test_the_atom_carries_the_refusal_category_explanation_and_scope(self):
+        # T279: the head and fold of the chat notice, and the card's cause — dropped at the parse before
+        parsed = self._parse()
+        atoms = [a for t in parsed["turns"] for a in t["atoms"]]
+        fb = [a for a in atoms if a.get("subtype") == "model_refusal_fallback"][0]
+        self.assertEqual(fb["refusal_category"], CATEGORY)
+        self.assertEqual(fb["refusal_explanation"], EXPLANATION)
+        self.assertEqual(fb["scope"], "session")
 
     def test_the_notice_sorts_before_the_fallback_models_reply(self):
         # its timestamp is the retry START, so the atom order reads: flagged -> switched -> the reply
@@ -141,6 +155,24 @@ class BuildSessionEmitsTheNoticeEvent(unittest.TestCase):
                        if "README covers install" in (e.get("md") or ""))
         self.assertLess(kinds.index("modelFallback"), i_reply,
                         "the notice reads before the fallback model's reply")
+
+    def test_the_event_carries_the_category_explanation_and_scope(self):
+        # T279: the client renders the category in the head and the explanation in the fold
+        m = km.build_session(SID, NOW)
+        ev = next(e for e in m["events"] if e.get("kind") == "modelFallback")
+        self.assertEqual(ev["category"], CATEGORY)
+        self.assertEqual(ev["explanation"], EXPLANATION)
+        self.assertEqual(ev["scope"], "session")
+
+    def test_the_notice_is_never_the_users_bubble(self):
+        # a STANDING guard on the routing, green before T279 too (the system atom is never a user
+        # event): the record's user-facing text belongs to the notice, never to a user bubble
+        m = km.build_session(SID, NOW)
+        for e in m["events"]:
+            if e.get("kind") == "user":
+                self.assertNotIn(NOTICE, e.get("md") or "")
+                self.assertNotIn(EXPLANATION, e.get("md") or "")
+        self.assertEqual([e.get("kind") for e in m["events"]].count("modelFallback"), 1)
 
 
 if __name__ == "__main__":
