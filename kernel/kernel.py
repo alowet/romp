@@ -25647,7 +25647,8 @@ _judge_gen = [0]                                 # bumped when a producer pass C
 _goals_snap = [None]                             # {sid: store} while a judge pass is mid-flight, else None
 _goals_snap_at = [0.0]                           # when that snapshot's file reads STARTED (see _feed_goals)
 _goals_snap_done = {}                            # sid → the user-write mark already punched onto THIS snapshot
-_goals_snap_owned = set()                        # sids whose snapshot entry is THIS pass's private copy (copy-on-punch)
+_goals_snap_owned = set()                        # sids whose snapshot entry is THIS pass's private copy (copy-on-punch;
+#                                                  the punch counter's once-per-pass guard, not the copy's: see _feed_goals)
 _goals_snap_lock = threading.Lock()
 # STAT-KEYED STORE MEMO (2026-09-06). The snapshot used to json.loads EVERY goals/<fsid>.json at the
 # start of every pass — on one busy kernel 72 files of up to 1.3 MB, about 3% of its interpreter time
@@ -25810,18 +25811,22 @@ def _feed_goals(sid):
     ladder the judge already encodes (user > judges) applied to the view, and it is how a CLEAR has always
     behaved (cleared.jsonl is read live, outside the snapshot). Replay is idempotent, but rollup_status is
     not free, so a sid re-punches only when its mark MOVES — a second gesture in the same pass must land
-    too, which a plain already-done flag would have swallowed."""
+    too, which a plain already-done flag would have swallowed. Every replay lands on a fresh copy of the
+    snapshot entry: an object this function has served is a fixed value (COPY-ON-PUNCH below)."""
     with _goals_snap_lock:
         snap = _goals_snap[0]
         if snap is not None and sid in snap:
             store, mark = snap[sid], _user_goal_write.get(str(sid), 0.0)
             if mark >= _goals_snap_at[0] and _goals_snap_done.get(sid) != mark:
+                # COPY-ON-PUNCH, a fresh copy per gesture: the entry is the memo's object, shared with
+                # every later pass that finds the file unchanged, so the replay and rollup below land on
+                # a copy of it (the _apply_rewind_hold idiom). And an object this function has handed
+                # out is a fixed value: a reader that kept it, or keyed anything on its identity, must
+                # never see it change under it. So a second gesture in the same pass, and a retry after
+                # a failed replay, copy again instead of re-punching the first copy in place. One json
+                # round trip per gesture; `punch` counts the sids copied, once per pass each.
+                store = snap[sid] = json.loads(json.dumps(store))
                 if sid not in _goals_snap_owned:
-                    # COPY-ON-PUNCH: the entry is the memo's object, shared with every later pass that
-                    # finds the file unchanged, so the replay and rollup below must land on a copy of it
-                    # (the _apply_rewind_hold idiom). Once per pass per sid: a second gesture in the
-                    # same pass punches the copy this one made.
-                    store = snap[sid] = json.loads(json.dumps(store))
                     _goals_snap_owned.add(sid)
                     _goals_memo_stats["punch"] += 1
                 try:
