@@ -940,7 +940,9 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   stands (`served`, `derived`); `courierSkip` is the courier's change gate
   (`skipped`, `scanned`, `recorded`: a session whose parse, store, journal,
   archive and episode log have not moved since a scan that found nothing to
-  place is skipped whole). The compaction sweep after each judge pass evicts from `pass` and
+  place is skipped whole); `backref` is the sender-board walk behind the
+  courier's link repair, built once per state of the sender stores and served
+  while they stand (`served`, `built`). The compaction sweep after each judge pass evicts from `pass` and
   `shared` the entries of stores no session in the discover window owns, so
   both stay bounded by the live board; the gate memo is bounded by the session
   count.
