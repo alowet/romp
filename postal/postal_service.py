@@ -40,6 +40,7 @@ import errno
 import fcntl
 import hashlib
 import hmac
+import http.client
 import itertools
 import json
 import os
@@ -3361,11 +3362,12 @@ def _mark_carried(host, mid):
     refused connection during a restart), refusing a recall for bytes that never left. The
     events, per side: the DIALER marks when its dial returns a response (peer_exchange_apply,
     after the acks and bounces, so a record the ack just deleted is simply not there to mark) or
-    fails only AFTER the request went out — a read timeout, a dropped connection, an undecodable
-    body: the far bus may have taken the relays and answered into the void (_peer_exchange_once);
-    the DIALED side marks once its response write returned (the /peer-exchange route). A dial the
-    far bus refused with a status (any HTTP error precedes relay intake) or that never connected
-    (urllib.error.URLError) marks nothing. From the listing to that outcome the record is IN FLIGHT
+    fails only AFTER the request went out (a read timeout, an undecodable body): the far bus may
+    have taken the relays and answered into the void (_peer_exchange_once); the DIALED side marks
+    once its response write returned (the /peer-exchange route). A dial the far bus refused with a
+    status (any HTTP error precedes relay intake), that never connected (urllib.error.URLError), or
+    whose socket closed before any status line came back (through the ssh forward, a far bus not
+    listening; review find 2026-09-09) marks nothing. From the listing to that outcome the record is IN FLIGHT
     (_inflight), which the recall refuses as on its way — so no recall is granted for a record on
     the wire, and none is told "left" for one that never did.
 
@@ -4275,11 +4277,13 @@ def _peer_exchange_once(host, port, token):
     - 'ok': a response. peer_exchange_apply folds it in and marks the relays carried after the acks
       and bounces; if the fold itself fails the relays are marked here (the far bus answered, so it
       processed them) and the failure is said.
-    - 'lost': raised AFTER the request went out (a read timeout, a dropped connection, an undecodable
-      body — anything urllib does not wrap): the far bus may have taken the relays and answered into
-      the void, so they are marked carried; the re-relay next round is deduped over there.
+    - 'lost': raised AFTER the request went out (a read timeout, an undecodable body, anything else
+      urllib does not wrap): the far bus may have taken the relays and answered into the void, so
+      they are marked carried; the re-relay next round is deduped over there.
     - 'unsent': urllib.error.URLError — the connect or the send failed (refused, unresolved, a connect
-      timeout, a pipe broken mid-send): the request never arrived; nothing is marked.
+      timeout, a pipe broken mid-send): the request never arrived; nothing is marked. Also a socket
+      that closed before any status line came back (RemoteDisconnected, a reset): through the ssh
+      forward that is a far bus not listening, not an answer lost (the arm below has the shape).
     - 'drift': HTTP 409, the protocol handshake refused it before any relay was read; nothing marked.
     - 'refused': any other HTTP status — the token gate, the unsafe-host check, a bad body — all of
       which precede relay intake (a handler exception over there yields no response at all, not a
@@ -4313,6 +4317,19 @@ def _peer_exchange_once(host, port, token):
         return "refused"
     except urllib.error.URLError:
         _end(False)                                  # the request never arrived
+        return "unsent"
+    except (http.client.RemoteDisconnected, http.client.BadStatusLine, ConnectionResetError, BrokenPipeError):
+        # The socket closed before any status line came back. urllib wraps only the connect and the
+        # send (h.request) in URLError; a failure in getresponse propagates raw, and through the
+        # kernel's ssh -L forward that is the shape of a far bus that is not listening (its restart
+        # window, a crash): the LOCAL ssh listener accepts the TCP connection, the request goes out
+        # to it, ssh fails the channel and closes the socket, and no bus ever read a byte. The generic
+        # arm below took that for a lost answer and marked every record in the flight carried, a
+        # durable mark, so through every far-bus restart the sender was refused a recall for messages
+        # still in its own outbox (review find, 2026-09-09). A far handler that died AFTER delivering
+        # also closes without a status line, but the re-relay next round is deduped over there by id:
+        # re-sending is safe where a false carried mark is not, so nothing is marked.
+        _end(False)
         return "unsent"
     except Exception:
         _end(True)                                   # it went out; the answer was lost

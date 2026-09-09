@@ -1747,6 +1747,41 @@ class RecallAfterTheCarry(_TwoBusHarness):
         self.assertIsNone(pm.outbox_get("srv", "c1").get("carried"))
         self.assertEqual([r["id"] for r in pm._recall("sid-a", "", "c1")], ["c1"], "still here, still the sender's")
 
+    def test_a_connection_closed_before_any_status_line_marks_nothing(self):
+        # through the kernel's ssh -L forward a far bus that is not listening (its restart window, a
+        # crash) looks like this: the local ssh listener accepts, the request goes out to it, ssh fails
+        # the channel and closes the socket, and getresponse raises RAW (urllib wraps only the connect
+        # and the send in URLError). The generic arm took it for a lost answer and marked the flight
+        # carried, so through every far-bus restart the sender was refused a recall for a message still
+        # in its own outbox (review find, 2026-09-09)
+        import http.client
+        self._park()
+
+        def closed(req):
+            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+        outcome, req = self._dial(closed)
+        self.assertEqual(outcome, "unsent")
+        self.assertEqual([m["mid"] for m in req["relays"]], ["c1"], "the request listed it…")
+        self.assertIsNone(pm.outbox_get("srv", "c1").get("carried"), "…but no bus read it: no mark")
+        self.assertEqual(self._open(pm, "srv"), set(), "the flight is closed, not left open")
+        kept = []
+        self.assertEqual([r["id"] for r in pm._recall("sid-a", "", "c1", kept=kept)], ["c1"], "still here, still the sender's")
+        self.assertEqual(kept, [])
+        self.assertEqual(len(self._recall_rows()), 1)
+        self.assertEqual(pm.outbox_list("srv"), [])
+
+    def test_a_reset_connection_marks_nothing(self):
+        # the same shape when the tunnel's close arrives as a reset rather than a clean EOF
+        self._park()
+
+        def reset(req):
+            raise ConnectionResetError(104, "Connection reset by peer")
+        outcome, _ = self._dial(reset)
+        self.assertEqual(outcome, "unsent")
+        self.assertIsNone(pm.outbox_get("srv", "c1").get("carried"))
+        self.assertEqual(self._open(pm, "srv"), set())
+        self.assertEqual([r["id"] for r in pm._recall("sid-a", "", "c1")], ["c1"], "still here, still the sender's")
+
     def test_a_lost_response_marks_the_relays_carried(self):
         # a read timeout is raised after the request went out: the far bus may hold the message
         self._park()
