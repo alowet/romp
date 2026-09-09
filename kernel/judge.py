@@ -165,7 +165,9 @@ def _rebind_state(path):
     _STORE_FAULTS.clear()   # unreadable-store episodes belong to the old root's files
     _CHAIN_MEMO.clear()     # the write-moment chain memo keys on paths under STATESDIR; a new root is a new world
     _COURIER_SEEN.clear()   # the courier gate keys on the old root's files
+    _PLANNER_SEEN.clear()   # ...and the planner gate
     _BACKREF_MEMO["slot"] = None   # ...and so does the sender-board walk's map
+    _CAPTIONS_MEMO.clear(); _GOALARCH_MEMO.clear()   # ...and the per-file read memos
     _episode_memo.clear()   # ...and so are the episode-log reads
     _head_memo.clear()      # transcript heads are immutable per path, but a rebind swaps the whole world of paths
     _namefp_memo.clear()    # names-entry content is memoized per SID against same-second mtimes — across a
@@ -945,8 +947,10 @@ def _log_judge_error(judge, fsid, err, note=None, goal=None, seg=None):
              behind and the shape of the menu that died), "store-quarantined" (a goals store that
              could not be parsed was moved aside to <file>.corrupt-<stamp> and the session started fresh),
              "store-unreadable" (a goals store that cannot be READ — EACCES, EIO — filed once per fault
-             episode by load_goals_or_fault; inside a judge pass the raise instead reaches the pass
-             wrapper's "pass-crash" row), "store-unwritable" (a goals store that read but whose publish
+             episode by load_goals_or_fault and the readers that share its boundary, run_propagate's
+             recipient read and the courier's sender-board walk among them; a reader inside a judge pass
+             that loads a store strictly instead raises into the pass wrapper's "pass-crash" row),
+             "store-unwritable" (a goals store that read but whose publish
              then failed under a user gesture, the save path's own strict read or the write itself; filed
              once per fault episode by save_goals_or_fault, and the gesture is answered on its socket)
       note   the evidence — reply tail, error message, exception name, or the give-up scope + re-arm
@@ -2174,6 +2178,67 @@ _PARSE_CACHE = {}          # fsid -> (fileset_key, parsed_session)
 # anyway). A parse the cache does not hold (a stubbed one) is never keyed, so never skipped. Pruned to
 # the pass's fleet, so bounded by it; a rebound state root clears it.
 _COURIER_SEEN = {}         # fsid -> the scan key of its last pass that found nothing to place
+
+# ── the planner's change gate (2026-09-09) ──
+# _plan_session re-derived every session's segmentation, plan units and placement normalization on every
+# planner pass; on the maintainer's box the planner worker pool was 37% of the process's samples. A
+# session whose inputs have not moved since a pass that placed nothing, collected no unit and left its
+# store where it was has no new information for the planner by construction, so the pass returns at once.
+# The key is every input the pass reads, taken BEFORE the store read (the chain-memo rule): the parse
+# cache's fileset key bound to the session object, the store file's key with its journal's and archive's,
+# the episode log's key, the LEAF's task-store files (each name with its key: the declared-plan sync reads
+# the leaf fsid's directory, which a /clear forks away from an SDK session's sid), the reg file's key, the
+# captions file's key (the floor-title heal reads it), each running background launch with whether it has
+# crossed its deadline under the pass clock (the settle's one input no file records; see _bg_expiry_key),
+# and the transcript path. Recorded only when the pass did nothing and the store's key after the pass
+# equals the one before it (a heal, a mint, a retirement or a rollup change moves it); a pass with units,
+# placements or a moved store is planned again next pass whatever the key says. A parse the cache does not
+# hold is never keyed, nor is an expiry view that cannot be computed. Pruned to the sessions the pass
+# discovered; a rebound root clears.
+_PLANNER_SEEN = {}         # fsid -> the plan key of its last pass that had nothing to do
+_PLANNER_STATS = {"skipped": 0, "planned": 0, "recorded": 0}
+
+
+def planner_skip_stats():
+    """A copy of the planner gate's counters for /perf (memos.plannerSkip)."""
+    return dict(_PLANNER_STATS)
+
+
+def _task_store_key(fsid):
+    """A Claude task store (<config>/tasks/<fsid>/*.json) as a key: each file's name with its stat, or None when
+    the directory is absent; a listing error is a fresh sentinel (never equal), so a store that cannot be read
+    is never skipped over. The planner hands in the LEAF fsid, the directory em.task_store_plan reads for the
+    declared-plan sync: an SDK session's /clear forks its transcript to a new fsid under the same romp sid, and
+    the agent's to-dos live under the fsid it is running as, not the sid."""
+    d = Path(os.environ.get("CLAUDE_CONFIG_DIR") or str(em.HOME / ".claude")) / "tasks" / fsid
+    try:
+        names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return object()
+    return tuple((n, _file_key(str(d / n))) for n in names)
+
+
+def _plan_key(fsid, path, session, now):
+    """Every input _plan_session reads, or None when the parse is not the cache's own (never skip what cannot
+    be keyed). Taken before the store read. Index 2 is the store key: the record rule compares it after the
+    pass, so new terms go after the existing ones. Three terms beyond the files the pass opens by sid: the
+    LEAF's task store (the directory the declared-plan sync reads, which differs from the sid's for every SDK
+    session after a /clear), the captions file (the floor-title heal reads it), and each running background
+    launch with whether it has crossed its deadline under the pass clock `now` (_bg_expiry_key: the settle
+    reads that crossing and no file records it)."""
+    pk = _PARSE_CACHE.get(fsid)
+    if pk is None or pk[1] is not session:
+        return None
+    return (str(path), pk[0], _store_key(fsid), _file_key(str(EPIDIR / (fsid + ".jsonl"))),
+            _task_store_key(session.get("leafFsid") or fsid), _file_key(str(SDKDIR / (fsid + ".json"))),
+            _file_key(str(CAPDIR / (fsid + ".jsonl"))), _bg_expiry_key(path, now))
+
+
+def _store_key(fsid):
+    """The goal store's three inputs as one key: the store file, its override journal, its archive."""
+    return (_file_key(str(GOALDIR / (fsid + ".json"))), _journal_key(fsid), _archive_key(fsid))
 _COURIER_STATS = {"skipped": 0, "scanned": 0, "recorded": 0}
 
 
@@ -2554,23 +2619,94 @@ def tasks_for(fsid, leaf, files, now):
 
 
 # ───────────────────────── the caption store ─────────────────────────
-def captioned_ids(fsid):
-    """The set of unit ids already captioned for this transcript (id-keyed dedup, no window). LIVE
-    in-progress captions (the open segment's provisional work caption, the user 2026-06-21 via link_audit)
-    are SKIPPED: they're not 'done', so run_index keeps re-captioning the open segment until it closes and
-    writes the final non-live record — which then dedups normally and supersedes (the reader is last-wins)."""
-    done = set()
+# ── per-file read memos for the index tier and the re-plan's context (2026-09-09) ──
+# Measured on the maintainer's box (py-spy, the judge tier thread): captioned_ids, _live_natoms and
+# session_turn_captions each read and JSON-decoded the whole captions/<sid>.jsonl for every session on
+# every index pass (19% of the thread), and load_goal_archive decoded goals-archive/<sid>.json per call
+# (11%). Each file is now parsed once per file state: the key is _file_key (inode, mtime_ns, size) taken
+# BEFORE the read (the chain-memo rule), so a row appended during the read moves the key the next call
+# takes and content read mid-write is served no further than that call; an absent file is never cached
+# (its key is None); a stat error (a fresh sentinel key) never matches. An existing file that cannot be
+# read is [] and never cached by the captions memo; the archive memo caches load_goal_archive's answer
+# for it, the empty shape, the same answer the fresh loader gives every archiver for that file. Bounded
+# at _FILE_MEMO_MAX entries, oldest-inserted out, the eviction and the insert under _FILE_MEMO_LOCK; a
+# rebound state root clears both. The captions memo serves the three readers from one parse; the archive
+# memo serves READERS only (load_goal_archive_shared): every archiver keeps load_goal_archive, a fresh
+# private object it mutates and saves.
+_CAPTIONS_MEMO = {}        # fsid -> (file key taken before the read, the parsed rows)
+_CAPTIONS_STATS = {"served": 0, "parsed": 0}
+_GOALARCH_MEMO = {}        # fsid -> (file key taken before the read, the guarded archive store: read-only)
+_GOALARCH_STATS = {"served": 0, "loaded": 0}
+_FILE_MEMO_MAX = 256
+_FILE_MEMO_LOCK = threading.Lock()   # the two memos are filled from the index tier, the planner workers and
+#                                      every load_goals caller (a journaled restore row): the eviction's
+#                                      iterate-and-pop and the insert of a new key run under it. Reads do not:
+#                                      a served entry is one dict read of a whole tuple, and a stale or missing
+#                                      read re-derives (the chain memo's two-misses-both-build rule). A LEAF
+#                                      lock: nothing inside _memo_put takes another, so reaching it under
+#                                      _GOAL_ARCH_LOCK (an archiver whose load_goals replays a restore row) is
+#                                      safe; keep it that way.
+
+
+def captions_memo_stats():
+    return dict(_CAPTIONS_STATS)
+
+
+def goal_archive_memo_stats():
+    return dict(_GOALARCH_STATS)
+
+
+def _memo_put(memo, fsid, key, val):
+    """Memoize `val` under `fsid` at `key`, evicting the oldest-inserted entry when a NEW key arrives at the
+    cap. The whole step holds _FILE_MEMO_LOCK: unlocked, two fills for new sids at the cap chose the same
+    oldest key (the second pop raised KeyError) or one changed the size under the other's iteration
+    (RuntimeError); the raise passed _or_fault (OSError only) into every load_goals caller, and in the index
+    tier's serial caption loop, which has no per-session guard, it ended the pass for every session (review
+    find on #1171, 2026-09-09). With every size change under the lock a single eviction per fill suffices, so
+    the `if` stays. The counters and the served checks in the two readers stay outside it on purpose: the
+    served read is one dict read, and a lost `+= 1` under-counts a diagnostic and raises nothing."""
+    with _FILE_MEMO_LOCK:
+        if fsid not in memo and len(memo) >= _FILE_MEMO_MAX:
+            memo.pop(next(iter(memo)))                    # oldest-inserted out: bounded by construction
+        memo[fsid] = (key, val)
+
+
+def _captions_rows(fsid):
+    """The parsed rows of captions/<fsid>.jsonl (dict rows only; a malformed or non-object line is skipped, as
+    the readers skipped it), once per file state and served while the file stands. The key is the file's stat
+    taken before the read; an absent or unreadable file is [] and never cached."""
+    p = CAPDIR / (fsid + ".jsonl")
+    key = _file_key(str(p))
+    if key is None:
+        return []
+    ent = _CAPTIONS_MEMO.get(fsid)
+    if ent is not None and isinstance(key, tuple) and ent[0] == key:
+        _CAPTIONS_STATS["served"] += 1
+        return ent[1]
+    rows = []
     try:
-        for line in (CAPDIR / (fsid + ".jsonl")).read_text(errors="replace").splitlines():
+        for line in p.read_text(errors="replace").splitlines():
             try:
                 o = json.loads(line)
             except Exception:
                 continue
-            if o.get("id") and not o.get("live"):
-                done.add(o["id"])
+            if isinstance(o, dict):
+                rows.append(o)
     except OSError:
-        pass
-    return done
+        return []
+    _CAPTIONS_STATS["parsed"] += 1
+    if isinstance(key, tuple):
+        _memo_put(_CAPTIONS_MEMO, fsid, key, rows)
+    return rows
+
+
+def captioned_ids(fsid):
+    """The set of unit ids already captioned for this transcript (id-keyed dedup, no window). LIVE
+    in-progress captions (the open segment's provisional work caption, the user 2026-06-21 via link_audit)
+    are SKIPPED: they're not 'done', so run_index keeps re-captioning the open segment until it closes and
+    writes the final non-live record — which then dedups normally and supersedes (the reader is last-wins).
+    Derived from the one parse _captions_rows holds per file state (2026-09-09)."""
+    return {o["id"] for o in _captions_rows(fsid) if o.get("id") and not o.get("live")}
 
 
 LIVE_CAPTION_ATOM_CHUNK = 8   # re-caption an OPEN segment's live work caption only every ~8 NEW atoms (a
@@ -2581,18 +2717,12 @@ LIVE_CAPTION_ATOM_CHUNK = 8   # re-caption an OPEN segment's live work caption o
 def _live_natoms(fsid):
     """{id: natoms} for the LIVE in-progress captions — the atom count each was built from. run_index
     re-captions an open segment only once its atoms grow by a full LIVE_CAPTION_ATOM_CHUNK past this (event-
-    based cadence, no timer), so a busy segment re-captions once per chunk of work, not per atom."""
+    based cadence, no timer), so a busy segment re-captions once per chunk of work, not per atom. Derived
+    from the one parse _captions_rows holds per file state (2026-09-09)."""
     out = {}
-    try:
-        for line in (CAPDIR / (fsid + ".jsonl")).read_text(errors="replace").splitlines():
-            try:
-                o = json.loads(line)
-            except Exception:
-                continue
-            if o.get("live") and o.get("id"):
-                out[o["id"]] = o.get("natoms", 0)         # last-wins: the latest live caption's size
-    except OSError:
-        pass
+    for o in _captions_rows(fsid):
+        if o.get("live") and o.get("id"):
+            out[o["id"]] = o.get("natoms", 0)             # last-wins: the latest live caption's size
     return out
 
 
@@ -2729,18 +2859,9 @@ def archive_llm(session_log):
 
 
 def session_turn_captions(fsid):
-    """The session's TURN captions, oldest first — the archiver's input."""
-    caps = []
-    try:
-        for line in (CAPDIR / (fsid + ".jsonl")).read_text(errors="replace").splitlines():
-            try:
-                o = json.loads(line)
-            except Exception:
-                continue
-            if o.get("grain") == "turn" and o.get("caption"):
-                caps.append((o.get("t", 0), o["caption"]))
-    except OSError:
-        pass
+    """The session's TURN captions, oldest first — the archiver's input. Derived from the one parse
+    _captions_rows holds per file state (2026-09-09)."""
+    caps = [(o.get("t", 0), o["caption"]) for o in _captions_rows(fsid) if o.get("grain") == "turn" and o.get("caption")]
     caps.sort()
     return [c for _, c in caps]
 
@@ -3670,7 +3791,7 @@ def _replay_overrides(fsid, store, lines=None):
         op, t = ev.get("op"), int(ev.get("t") or 0)
         if op == "restore":
             if arch_nodes is None:
-                arch_nodes = (load_goal_archive(fsid) or {}).get("nodes", {})
+                arch_nodes = (load_goal_archive_shared(fsid) or {}).get("nodes", {})   # read-only: membership
             for nid, nddata in (ev.get("nodes") or {}).items():
                 if nid in store.get("nodes", {}) or nid in arch_nodes:
                     continue                           # alive, or re-cleared into the archive → nothing lost
@@ -4495,15 +4616,37 @@ def save_goals(fsid, store):
 
 
 def load_goal_archive(fsid):
-    """The CLEARED-goal archive for a session (goals-archive/<fsid>.json) — dismissed top goals + their
-    subtrees moved out of the live store by the kernel's compaction sweep. Same shape as the live store
-    (nodes/status). The judge reads this ONLY as read-only context (_cleared_context, for the live re-plan's
-    <recently-cleared> block) — its placements dedup + view-cleared sealing keep it from ever re-minting an
-    archived node; the kernel's undo-clear restore and the ledger merge are the mutating readers."""
+    """The CLEARED-goal archive for a session (goals-archive/<fsid>.json): dismissed top goals and their
+    subtrees moved out of the live store, in the live store's shape (nodes/status). This is the FRESH loader,
+    a private object per call: the archivers (archive_goal_nodes here, for the rewind take and the dead-branch
+    reconciliation; the kernel's store compaction and undo restore) load through it and save under
+    _GOAL_ARCH_LOCK. The judge's readers (_cleared_context for the live re-plan's <recently-cleared> block,
+    the override replay, the peer-node joins, the propagate pass) take load_goal_archive_shared, its twin,
+    which serves one loaded object per file state; the re-plan's placements dedup and view-cleared sealing
+    keep it from ever re-minting an archived node. Any failure to read or decode an existing file answers the
+    empty shape, and the shared twin memoizes that answer for the file as it stands."""
     try:
         return _guard_nodes(json.loads((GOALARCHDIR / (fsid + ".json")).read_text()))
     except Exception:
         return {"rompUuid": fsid, "nodes": {}, "status": {}}
+
+
+def load_goal_archive_shared(fsid):
+    """load_goal_archive for READERS: the guarded archive store, loaded once per file state and served while
+    the file stands (2026-09-09), the key its stat taken before the read. The object is shared and read-only
+    by contract; every archiver (a compaction, a rewind sweep, an undo restore) keeps load_goal_archive, a
+    fresh private object it mutates and saves under the archive lock."""
+    p = GOALARCHDIR / (fsid + ".json")
+    key = _file_key(str(p))
+    ent = _GOALARCH_MEMO.get(fsid)
+    if ent is not None and isinstance(key, tuple) and ent[0] == key:
+        _GOALARCH_STATS["served"] += 1
+        return ent[1]
+    store = load_goal_archive(fsid)
+    _GOALARCH_STATS["loaded"] += 1
+    if isinstance(key, tuple):
+        _memo_put(_GOALARCH_MEMO, fsid, key, store)
+    return store
 
 
 def save_goal_archive(fsid, store):
@@ -7130,16 +7273,39 @@ def _session_closed(session):
 _BG_SCAN_CACHE = {}                       # path -> em.fold_records entry (running tasks) — mirrors the kernel's _bg_scan_cached
 
 
-def _bg_unresolved(path):
+def _bg_unresolved(path, now=None):
     """The transcript's still-RUNNING background launches (em._scan_bg_tasks pairing), folded append-incrementally.
     The DURABLE awaited-work source: the pairing lives in the transcript, so unlike any live backend
-    snapshot it survives a kernel restart and covers tmux CLIs whose tasks outlive the kernel."""
+    snapshot it survives a kernel restart and covers tmux CLIs whose tasks outlive the kernel.
+    `now`: the pass's clock when the planner hands it in (one clock for its key's expiry term and the
+    settle that term gates, so the two cannot disagree at the crossing); the wall clock otherwise."""
     # folds append-incrementally since 2026-09-03: a changed transcript steps only its appended records
     tasks = em.scan_bg_tasks_cached(path, _BG_SCAN_CACHE)
     # expiry is applied OUTSIDE the cache with a fresh now: a monitor whose CLI died mid-watch has no
     # terminal record, and an idle transcript never busts the mtime key — a cached verdict would say
     # "running" forever (see em._bg_expired)
-    return [t for t in tasks if not em._bg_expired(t, time.time())]
+    if now is None:
+        now = time.time()
+    return [t for t in tasks if not em._bg_expired(t, now)]
+
+
+def _bg_expiry_key(path, now):
+    """The settle's one input no file records, as a term of the planner gate's key: each running background
+    launch the transcript pairs (the judge's running-only fold, the set _awaiting_bg_hold filters) with
+    WHETHER its recorded deadline has passed under `now`, sorted. A clock fact keyed as the boolean it
+    resolves to, the shape of the kernel's awaiting-lift gate (_lift_spent_awaiting): the term moves once,
+    at the crossing, and the crossing itself re-plans the session, so a done focus top that a watch whose
+    CLI died mid-watch held at 'working' completes when the watch can no longer return. A launch with no
+    recorded ceiling (a backgrounded Bash, a dev server) is a stable False and never re-plans an idle
+    session; a ghost launch (before the live CLI's epoch) is a superset entry that costs one re-plan at a
+    crossing that cannot change the verdict, as the kernel's gate accepts. A scan that raises answers a
+    fresh sentinel (never equal, _task_store_key's listing-error rule), so a session whose view cannot be
+    computed is planned every pass; the settle's own call then raises as it does today."""
+    try:
+        return tuple(sorted((str(t.get("id") or ""), bool(em._bg_expired(t, now)))
+                            for t in em.scan_bg_tasks_cached(path, _BG_SCAN_CACHE)))
+    except Exception:
+        return object()
 
 
 def _death_marker(sid):
@@ -7176,7 +7342,7 @@ def _cli_epoch(sid):
     return max(sp or 0, mt or 0)
 
 
-def _awaiting_bg_hold(fsid, path, session, store):
+def _awaiting_bg_hold(fsid, path, session, store, now=None):
     """True while the session is awaiting its own dispatched background work — the settle must hold.
 
     A turn that ends with a live awaited task has NOT handed back the floor: the harness re-invokes the
@@ -7195,8 +7361,8 @@ def _awaiting_bg_hold(fsid, path, session, store):
         same placed-unstamped-is-a-service rule as the kernel's _bg_split, translated to judge-native
         events. A live awaitingWhy stamp re-affirms the hold past that audit; its lift releases it.
     Pre-verdict the hold is conservative (a launch whose turn nothing has swept always holds), matching
-    _bg_split's PENDING→awaited prior."""
-    tasks = _bg_unresolved(path)
+    _bg_split's PENDING→awaited prior. `now`: the pass's clock for the expiry view (see _bg_unresolved)."""
+    tasks = _bg_unresolved(path, now)
     if not tasks:
         return False
     sp = _cli_epoch(fsid)
@@ -7222,11 +7388,11 @@ def _awaiting_bg_hold(fsid, path, session, store):
     return any(launch_turn.get(t["id"]) not in swept for t in tasks)
 
 
-def _session_settled(fsid, path, session, store):
+def _session_settled(fsid, path, session, store, now=None):
     """The rollup's settled gate: the turn ended AND nothing the session dispatched is still awaited.
     _session_closed alone read the 'ended' proxy; this keys the settle on the event it was
     approximating — the session actually handing back the floor."""
-    return _session_closed(session) and not _awaiting_bg_hold(fsid, path, session, store)
+    return _session_closed(session) and not _awaiting_bg_hold(fsid, path, session, store, now)
 
 
 def _prompt_anchor_uuid(seg):
@@ -7776,7 +7942,7 @@ def _cleared_context(fsid, store, cap=6):
     mine = [iid for iid in times if iid.startswith(fsid + ":")]
     if not mine:
         return ""
-    arch = load_goal_archive(fsid).get("nodes", {})
+    arch = load_goal_archive_shared(fsid).get("nodes", {})   # read-only context: the re-plan's <recently-cleared> block
     nodes = store.get("nodes", {})
     out = []
     for iid in sorted(mine, key=lambda i: times[i], reverse=True)[:cap]:
@@ -8854,6 +9020,11 @@ def _plan_session(fsid, path, now):
     re-examinable — until the courier plants a real goal). Returns placements made."""
     _judge_ctx.fsid = fsid                            # usage logging: attribute this session's judge calls
     session = parsed_session(fsid, [path], now)
+    pkey = _plan_key(fsid, path, session, now)        # BEFORE the store read (the chain-memo rule)
+    if pkey is not None and _PLANNER_SEEN.get(fsid) == pkey:
+        _PLANNER_STATS["skipped"] += 1               # nothing moved since a pass that had nothing to do
+        return 0
+    _PLANNER_STATS["planned"] += 1
     store = load_goals(fsid)
     if _heal_quote_titles(store) + _heal_floor_titles(fsid, store) \
             + _heal_ticket_titles(store):              # + ticket-led titles (T146, the live-failure heal)
@@ -9330,8 +9501,14 @@ def _plan_session(fsid, path, now):
     _latch_ask_anchors(fsid, session, store)          # durable ask-unit anchor verdicts — no LLM,
     #                                                   idempotent (latched nodes skip), persisted
     #                                                   by the save just below
-    rollup_status(store, _session_settled(fsid, path, session, store))
+    rollup_status(store, _session_settled(fsid, path, session, store, now))
     save_goals(fsid, store)
+    if pkey is not None:
+        if placed == 0 and not units and not retired and _store_key(fsid) == pkey[2]:
+            _PLANNER_SEEN[fsid] = pkey               # nothing to do and nothing written: skipped until an input moves
+            _PLANNER_STATS["recorded"] += 1
+        else:
+            _PLANNER_SEEN.pop(fsid, None)            # work done or the store moved: planned again next pass
     return placed
 
 
@@ -9355,6 +9532,8 @@ def run_plan(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=Fal
     if now is None:
         now = int(time.time())
     fleet = [s for s in discover(now) if not _hidden_from_feed(s[0])][:sessions_cap]   # muted sessions are out of task tracking
+    for _gone in [f for f in _PLANNER_SEEN if f not in {s[0] for s in fleet}]:
+        _PLANNER_SEEN.pop(_gone, None)                # the planner gate, bounded by the sessions this pass discovered
     placed = 0
     with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_plan_session, fsid, str(path), now): fsid for fsid, path, anchor, name in fleet}
@@ -10849,7 +11028,7 @@ def _deleg_report_lines(store, nid):
             sub = ""                                   # the bare pre-fix form carries none
         if not sub and ":" not in str(h.get("peer") or ""):
             try:                                       # read-only recipient join (local peers only)
-                r_nodes = dict(load_goal_archive(h["peer"]).get("nodes") or {})
+                r_nodes = dict(load_goal_archive_shared(h["peer"]).get("nodes") or {})   # a copy of the map; the nodes are read
                 r_nodes.update(load_goals(h["peer"]).get("nodes") or {})
                 for rn in r_nodes.values():
                     o = rn.get("origin")
@@ -12916,7 +13095,7 @@ def _deleg_frame(store, nid):
     parts = [str(nd["frame"])]
     if o.get("goalId") and not o.get("peerHost"):
         try:
-            snodes = dict(load_goal_archive(o["peer"]).get("nodes") or {})
+            snodes = dict(load_goal_archive_shared(o["peer"]).get("nodes") or {})   # a copy of the map; the nodes are read
             snodes.update(load_goals(o["peer"]).get("nodes") or {})
             tr = snodes.get(o["goalId"]) or {}
             ask = (snodes.get(tr.get("parentId") or "") or {}).get("text") or ""
@@ -14436,22 +14615,42 @@ def _handoff_backref(mid):
     walk over the read-only view; its key is _backref_key, taken before the reads, so a store written
     during the walk moves the key the next call takes (a set read mid-write is served no further than
     that call). The first sender in discover order wins, as the walk answered; a completed handoff node
-    is no backref. A store that raises leaves nothing cached (the caller's own boundary logs it)."""
+    is no backref.
+
+    A sender store that cannot be read (EACCES, EIO, a directory at the path) is SKIPPED for this call
+    through the per-session boundary (load_goals_shared_or_fault: one store-unreadable row per fault
+    episode, as every other reader of a goal store files it), and the other senders answer. The fault is
+    one sender's; left to raise it failed the lookup for every message id and every recipient, so the
+    courier filed a link-attach pass-crash row per placed unlinked delegate per pass and landed no link
+    anywhere (the walk the memo replaced had answered every sender before the fault). The map is then
+    NOT published: a fault moves no file key (a permission fix changes neither inode, mtime nor size),
+    so a cached map missing a sender would be served after the store reads again. While the fault lasts,
+    a call whose key no longer matches the published map walks the read-only views again, which the shared
+    store cache serves (a map published before the fault keeps serving while its key stands: the content it
+    describes has not changed); a recipient whose sender is the faulted store gets the '' pair, attaches
+    nothing, and the courier gate keeps it scanned until the sender reads again, the wait it already models
+    for a sender that does not yet track the message. The boundary catches OSError only, as every reader
+    boundary does: any other raise out of a sender's read leaves the walk as before, cached nowhere and
+    filed by the courier's own catch."""
     fleet = discover(int(time.time()))
     key = _backref_key(fleet)
     slot = _BACKREF_MEMO["slot"]
     if slot is not None and slot[0] == key:
         _BACKREF_STATS["served"] += 1
         return slot[1].get(mid, ("", ""))
-    mp = {}
+    mp, partial = {}, False
     for fsid, path, anchor, name in fleet:
-        st = load_goals_shared(fsid)
+        st, fault = load_goals_shared_or_fault(fsid)
+        if fault is not None:
+            partial = True                           # this sender's row is filed; the others still answer
+            continue
         for nid, nd in st.get("nodes", {}).items():
             h = nd.get("handoff")
             if isinstance(h, dict) and h.get("msgId") is not None and not nd.get("nodeComplete"):
                 mp.setdefault(h["msgId"], (fsid, nid))
     _BACKREF_STATS["built"] += 1
-    _BACKREF_MEMO["slot"] = (key, mp)
+    if not partial:
+        _BACKREF_MEMO["slot"] = (key, mp)            # a map missing a sender is not published (see above)
     return mp.get(mid, ("", ""))
 
 
@@ -14868,7 +15067,7 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbos
     def _arch(sid):
         a = archives.get(sid)
         if a is None:
-            a = archives[sid] = load_goal_archive(sid)
+            a = archives[sid] = load_goal_archive_shared(sid)   # read-only: the pass never saves an archive
         return a
 
     def _publish(sid):

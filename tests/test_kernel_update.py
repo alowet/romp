@@ -905,6 +905,23 @@ class Wiring(unittest.TestCase):
         self.assertIn("setShow(upm, v.updateMode)", self.gear)
         self.assertIn('msg.get("type") == "setUpdateMode"', self.src)
 
+    def test_the_copy_says_an_automatic_update_restarts_at_once_or_converges_in_place(self):
+        # The help line for Install automatically said the converge restarts "at the next quiet
+        # moment". Since T269 every deploy restart is immediate (_run_main_update's immediate=True
+        # default; the auto caller passes no override), and a pulled range that touches no kernel
+        # code converges in place with the kernel left up (_kernel_code_changed + _in_place_converge).
+        # The copy names both routes. The route line is pinned too, so a change to the route flags
+        # the copy for re-reading.
+        self.assertIn("if not _kernel_code_changed(_kernel_sha(), pulled) and _in_place_converge(pulled):",
+                      self.src)
+        self.assertNotIn("quiet moment", self.gear,
+                         "the gear still promises a quiet-window restart; since T269 every deploy restart "
+                         "is immediate and romp refresh --quiet is the only door to the quiet window")
+        self.assertIn("Install automatically converges by itself: a change to kernel code restarts it at "
+                      "once (turns in flight are cut and resume with their history); anything else (the "
+                      "UI, the docs, the postal bus) converges in place with the kernel left up;",
+                      self.gear)
+
     def test_the_banner_names_the_restart_the_user_must_run_when_the_update_landed_on_disk(self):
         # `updated` from /update-check means ON DISK, not running: the banner carries the reason
         # the restart did not happen and names the step that runs the new code

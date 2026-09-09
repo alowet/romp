@@ -398,7 +398,8 @@ class _PerfStats:
         memos = {}
         for key, read in (("pass", _goals_memo_report), ("shared", jd.shared_store_stats),
                           ("chain", jd.chain_memo_stats), ("courierSkip", jd.courier_skip_stats),
-                          ("backref", jd.backref_memo_stats)):
+                          ("backref", jd.backref_memo_stats), ("captions", jd.captions_memo_stats),
+                          ("goalArchive", jd.goal_archive_memo_stats), ("plannerSkip", jd.planner_skip_stats)):
             try:
                 memos[key] = read()
             except Exception:
@@ -1568,8 +1569,8 @@ _learned_announced = set()   # ids already announced on stderr as outside the ca
 # file both parse it and store equal tuples, and holding _catalog_lock around file I/O would stall the
 # catalog refresh thread.
 _learned_reg_cache = {}   # str(path) -> ((mtime_ns, size, ino), liveModelId or "") — see _reported_model_ids
-# Bumps on every pick-memory change and every catalog growth; rides the models frame (_models_changed) AND
-# the /models payload, so a picker can drop a response older than one it has applied. Seeded from the clock
+# Bumps on every pick-memory change, catalog growth and Codex landing; rides the models frame (_models_changed)
+# AND the /models payload, so a picker can drop a response older than one it has applied. Seeded from the clock
 # rather than 0: the counter is per process, and a kernel restart must never hand a page that kept its
 # high-water mark a LOWER rev, or that page would ignore every re-read until the count caught up — a silent
 # stale list. Milliseconds leave room for one bump per ms across a restart.
@@ -2043,7 +2044,14 @@ def _models_changed():
     itself, never a poll. A counter rides it so a client can tell frames apart, and the same counter stamps
     the /models payload so a late response never overwrites a newer one. (Without it, after Latest
     un-pinned a family on the kernel the same tab's next family click sent the STALE pinned id and silently
-    re-pinned; a second dashboard's pick moved the default without the first tab knowing.) The FEED app is
+    re-pinned; a second dashboard's pick moved the default without the first tab knowing.) Also sent when a
+    Codex session lands (the create door's spawn returned a sid; the revive door's resume answered True, as it
+    does for a dead row made live again and for a row already live): a live Codex row opens GET /models's
+    Codex consult for every dashboard, so every open picker's cached `codex.models` just went from [] to the
+    list. Sent per landing, not only on the closed-to-open flip: a door cannot observe the flip without the
+    backend counting closings (two first creates can both land before either checks; a kill between a door's
+    check and its landing hides a close-and-reopen), and a repeated frame costs one GET /models per open
+    picker, which the payload's rev reconciles. The FEED app is
     on the list because the settings gear lives in the feed bundle (feed.ts requires gear.js; the shell's
     rail gear and VS Code's settings command both open it in the feed pane). The feed shim and the VS Code
     pipe hand every non-keepalive frame to the window as a message; feed.ts's own listener ignores a type
@@ -12455,6 +12463,9 @@ def _create_codex_session_inner(nm, cwd, client=None, parent="", tags=()):
     kernel. Returns (sid, echo)."""
     bg, fg = _pick_identity_color()
     sid = _codex().spawn(nm, cwd, bg, fg)
+    # the row is live, so GET /models's Codex consult (gated on a live Codex session) is open; every open
+    # picker re-reads the list on this frame. Sent on every landing, not only the first: see _models_changed
+    _models_changed()
     extra = {}
     if parent or tags:
         extra.update(_tag_ack(sid, parent, tags))
@@ -15570,6 +15581,10 @@ def _revive_session_inner(sid, client=None):
             else:
                 ok = bool(cx.resume(name, sid, cwd=_cwd_of(sid)))
                 detail = "" if ok else "the Codex backend could not resume it (see the kernel log)"
+                if ok:
+                    # the row is live (a dead one made live again, or one already live: resume answers True for
+                    # any known sid), which opens the same /models consult as the create door's spawn
+                    _models_changed()
         else:
             cwd = _cwd_of(sid)
             workdir = cwd if cwd and os.path.isdir(cwd) else os.path.expanduser("~")
@@ -30686,12 +30701,12 @@ def _cleared_ids():
     Parsed once per file state and served while the file stands (2026-09-09): the nudge walk read it for
     every session on every pusher cycle, and once the placement gate was memoized this replay of the whole
     log (two thousand rows on the maintainer's box) was 60% of the nudge tick. The key is the file's path
-    and stat (mtime_ns, size, inode), taken BEFORE the read (the chain-memo rule): a row appended during the
-    read moves the stat the next call takes, so a set parsed mid-write is served no further than that call;
-    every writer appends, so a same-second append moves the size (the kernel's file clock is coarse, so
-    mtime alone would not see it); a rebound state root is a different path. An absent or unreadable file
-    is the empty set, never cached. One slot, replaced whole, so two threads deriving at once can never pair
-    one's key with the other's set. Callers read the returned dict and never mutate it."""
+    and stat (mtime_ns, size, inode, ctime_ns), taken BEFORE the read (the chain-memo rule): a row appended
+    during the read moves the stat the next call takes, so a set parsed mid-write is served no further than
+    that call; every writer appends, so a same-second append moves the size (the kernel's file clock is
+    coarse, so mtime alone would not see it); a rebound state root is a different path. An absent or
+    unreadable file is the empty set, never cached. One slot, replaced whole, so two threads deriving at
+    once can never pair one's key with the other's set. Callers read the returned dict and never mutate it."""
     path = jd.STATE / "cleared.jsonl"
     st = _stat_key(path)
     key = (str(path),) + st if st is not None else None
@@ -35107,18 +35122,27 @@ def _derive_judging(sid, caps, goals, t0, out, seg_ends=None, stamp=False):
 # 6 s cycle), and every rebuild parsed every lane's transcript and goals again — dead lanes included, the
 # majority within the 12 h window, none of which had changed. The memo holds the PARSE-DERIVED parts of a
 # dead lane (bars, compactions, the work end, and its judging marks stamped for the horizon filter) under a
-# key of every file they read; the clock-dependent parts (awaiting/compacting intervals, `since`) are
-# derived per build as before, so a cached lane's frame is byte-identical to a rebuilt one. Once a dead
-# lane is cached, its PARSE is dropped from _parse_cache: nothing else reads a dead session's parse per
-# cycle, and those parses were the bulk of a multi-GB resident set (a 166 MB transcript parses to ~220 MB).
+# key of every file they read and of the host's recorded suspensions (the in-memory list _awake_spans reads;
+# its jsonl mirror is appended best-effort, so the list, not the file, is the input). A transcript that
+# cannot be read parses as the empty lane (the read layer returns no records on an OSError) and a parse that
+# raises is stored the same way; either is parsed again when the transcript's stat moves, which a chmod or
+# chown that repairs the read does through the ctime in _stat_key. The clock-dependent parts
+# (awaiting/compacting intervals, `since`) are derived per build as before, so a cached lane's frame is
+# byte-identical to a rebuilt one. Once a dead lane is cached, its PARSE is dropped from _parse_cache:
+# nothing else reads a dead session's parse per cycle, and those parses were the bulk of a multi-GB
+# resident set (a 166 MB transcript parses to ~220 MB).
 _dead_lane_memo = {}      # sid -> (key, {"bars", "compactions", "last_t", "marks"})
 _DEAD_LANE_MEMO_MAX = 512
 
 
 def _stat_key(p):
+    """A file's identity for the memos keyed on it: mtime_ns, size, inode and ctime_ns. The ctime is there
+    because a chmod, chown or rename moves it while mtime, size and inode stand, and the dead-lane memo
+    caches a lane whose transcript could not be read as the empty lane, so a permission fix must move its
+    key. None when the file cannot be stat'd."""
     try:
         st = os.stat(p)
-        return (st.st_mtime_ns, st.st_size, st.st_ino)
+        return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
     except OSError:
         return None
 
@@ -35126,7 +35150,10 @@ def _stat_key(p):
 def _dead_lane_key(sid, path, branch):
     """Every input the parse-derived parts of a dead lane read: the transcript and its states file (the
     parse), the goals store (seams, judging), the captions and the archive (judging), the session flags
-    (the blocked state), and the branch clip. None when the transcript cannot be stat'd (never cache)."""
+    (the blocked state), the branch clip, and the host's recorded suspensions (tuple(_downtime)), which
+    _awake_spans excises from every bar; a suspension recorded after the lane was cached would otherwise
+    leave the un-excised bar served until a keyed file moved, which a dead transcript never does. None when
+    the transcript cannot be stat'd (never cache)."""
     tk = _stat_key(path)
     if tk is None:
         return None
@@ -35135,7 +35162,8 @@ def _dead_lane_key(sid, path, branch):
             _stat_key(jd.CAPDIR / (sid + ".jsonl")),                # the file _captions(sid) reads
             _stat_key(jd.STATE / "archive" / (sid + ".json")),
             _stat_key(jd.STATE / "session-flags.json"),
-            (branch or {}).get("fromId"), (branch or {}).get("t"), (branch or {}).get("cut"))
+            (branch or {}).get("fromId"), (branch or {}).get("t"), (branch or {}).get("cut"),
+            tuple(_downtime))
 
 
 def _dead_lane_marks(marks, t0):

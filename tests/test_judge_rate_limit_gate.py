@@ -19,6 +19,8 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 import os
 
+from tests.conftest import restore_env
+
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
 # Hermetic state BEFORE the loads — they resolve their state root at import time, and only
@@ -194,6 +196,12 @@ class SegKeyUnified(unittest.TestCase):
     def test_kernel_delegates_to_the_judge_seg_key(self):
         # the two copies had to never drift; since 2026-07-07 the kernel's is a delegation, so they cannot.
         import inspect
+        prior = {name: os.environ.get(name) for name in ("ROMP_KERNEL_NO_OPEN", "ROMP_SERVE_TOKEN")}
+
+        def put_back():
+            for name, value in prior.items():
+                restore_env(name, value)
+        self.addCleanup(put_back)      # the kernel's import needs both set; this process keeps neither
         os.environ.setdefault("ROMP_KERNEL_NO_OPEN", "1")
         os.environ.setdefault("ROMP_SERVE_TOKEN", "testtok")
         km = SourceFileLoader("romp_kernel_segkey", os.path.join(BIN, "romp-kernel")).load_module()

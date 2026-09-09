@@ -40,6 +40,7 @@ def _node(nid, parent, **kw):
 
 class GoalCompactionTest(unittest.TestCase):
     def setUp(self):
+        self._saved_state = jd.STATE
         self._td = tempfile.mkdtemp()
         jd._rebind_state(Path(self._td))
         km._compact_seen.clear()
@@ -66,6 +67,7 @@ class GoalCompactionTest(unittest.TestCase):
         self.g = g
 
     def tearDown(self):
+        jd._rebind_state(self._saved_state)   # the judge module is shared process-wide: never leave it on a removed dir
         shutil.rmtree(self._td, ignore_errors=True)
 
     def test_a_cleared_root_and_subtree_leave_the_live_store_for_the_archive(self):

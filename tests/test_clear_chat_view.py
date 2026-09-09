@@ -65,8 +65,10 @@ def _write_jsonl(path, rows):
 
 class ClearChatViewTest(unittest.TestCase):
     def setUp(self):
-        self._saved_state = jd.STATE       # restored in tearDown: the judge is one module shared by every test module
-        self._td = tempfile.mkdtemp()      # in the process, and it was left aimed at this tmp after rmtree (T282)
+        # both restored in tearDown: the judge is one module shared by every test module in the process, and
+        # it was left aimed at this tmp after rmtree (T282)
+        self._saved_state, self._saved_projects = jd.STATE, jd.PROJECTS
+        self._td = tempfile.mkdtemp()
         jd._rebind_state(Path(self._td))
         jd.PROJECTS = Path(self._td) / "projects"
         jd._discover_cache["fp"] = None
@@ -102,6 +104,7 @@ class ClearChatViewTest(unittest.TestCase):
 
     def tearDown(self):
         jd._rebind_state(self._saved_state)
+        jd.PROJECTS = self._saved_projects
         shutil.rmtree(self._td, ignore_errors=True)
 
     def _events(self):
@@ -235,8 +238,10 @@ class PreClearNotesStayInTheirEpisode(unittest.TestCase):
     card's fold, with the rest of the pre-clear conversation). Synthetic data only."""
 
     def setUp(self):
-        self._saved_state = jd.STATE       # restored in tearDown: the judge is one module shared by every test module
-        self._td = tempfile.mkdtemp()      # in the process, and it was left aimed at this tmp after rmtree (T282)
+        # both restored in tearDown: the judge is one module shared by every test module in the process, and
+        # it was left aimed at this tmp after rmtree (T282)
+        self._saved_state, self._saved_projects = jd.STATE, jd.PROJECTS
+        self._td = tempfile.mkdtemp()
         jd._rebind_state(Path(self._td))
         jd.PROJECTS = Path(self._td) / "projects"
         jd._discover_cache["fp"] = None
@@ -273,6 +278,7 @@ class PreClearNotesStayInTheirEpisode(unittest.TestCase):
 
     def tearDown(self):
         jd._rebind_state(self._saved_state)
+        jd.PROJECTS = self._saved_projects
         shutil.rmtree(self._td, ignore_errors=True)
 
     def test_live_render_shows_only_the_current_episodes_notes(self):

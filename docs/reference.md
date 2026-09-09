@@ -942,10 +942,17 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   archive and episode log have not moved since a scan that found nothing to
   place is skipped whole); `backref` is the sender-board walk behind the
   courier's link repair, built once per state of the sender stores and served
-  while they stand (`served`, `built`). The compaction sweep after each judge pass evicts from `pass` and
-  `shared` the entries of stores no session in the discover window owns, so
-  both stay bounded by the live board; the gate memo is bounded by the session
-  count.
+  while they stand (`served`, `built`); `captions` and `goalArchive` are the
+  per-file read memos behind the index tier's caption readers and the re-plan's
+  cleared context, each parsed once per file state (`served`, `parsed` or
+  `loaded`); `plannerSkip` is the planner's change gate (`skipped`, `planned`,
+  `recorded`: a session whose parse, store, journal, archive, episode log,
+  its leaf's task store, captions file and reg have not moved since a pass
+  that had nothing to do, and none of whose running background launches has
+  crossed its deadline, is not planned again). The compaction sweep after
+  each judge pass evicts from `pass` and `shared` the entries of stores no
+  session in the discover window owns, so both stay bounded by the live
+  board; the gate memo is bounded by the session count.
 - `judge`: `passes`, `ms_sum`, `ms_last`, `ms_mean` (wall time; a pass waits
   on model calls), `cpu_ms_sum` (CPU time of the judge tier threads and every
   per-session worker they run; the workers' share is `cpu_ms_workers`).
