@@ -131,14 +131,17 @@ test("drift pins: the inlined chip is the shared tagChip's pill up to the colour
   assert.equal(chipStyle, shared![1] + "border-radius:9px;font-size:0.82em;border:1px solid ", "the pill, byte for byte up to the colour");
   assert.match(SRC, /const TAG_CHIP_OFF_OPACITY = '0\.45';/);
   assert.match(SRC, /const TAG_CHIP_OFF_CLASS = 'tag-chip-off';/);
-  // the shared menu's own constants and chip row, once its T283 change is on this branch (it lands separately);
-  // until then the values above are pinned to the numbers T283 chose
+  // the shared menu's own constants and chip row (T283, on main): each pin fails LOUDLY when its anchor moves,
+  // never skips, so a reformat of the shared loop cannot leave a later padding or radius change uncaught
   const off = /export const TAG_CHIP_OFF_OPACITY = "([^"]+)";/.exec(MENU);
-  if (off) assert.equal(off[1], "0.45", "the shared fade");
+  assert.ok(off, "the shared fade constant is where the pin expects it");
+  assert.equal(off![1], "0.45", "the shared fade");
   const cls = /export const TAG_CHIP_OFF_CLASS = "([^"]+)";/.exec(MENU);
-  if (cls) assert.equal(cls[1], "tag-chip-off", "the shared state class");
-  const row = /r\.setAttribute\("style", "(padding:3px 8px;[^"]+)"\);\s*\n\s*const chip = tagChip\(u\.name/.exec(MENU);
-  if (row) assert.equal(/const TAG_CHIP_ROW_STYLE = '([^']+)';/.exec(SRC)![1], row[1], "the chip row's shape");
+  assert.ok(cls, "the shared state class is where the pin expects it");
+  assert.equal(cls![1], "tag-chip-off", "the shared state class");
+  const row = /r\.setAttribute\("style", "([^"]+)"\);\s*\n\s*const chip = tagChip\(u\.name/.exec(MENU);
+  assert.ok(row, "the shared chip row is where the pin expects it");
+  assert.equal(/const TAG_CHIP_ROW_STYLE = '([^']+)';/.exec(SRC)![1], row![1], "the chip row's shape");
   // the shared tag rows never carried a dot after T283; this copy's plain rows carry none either
   const views = SRC.slice(SRC.indexOf("  _openViewsMenu(anchorEl) {"), SRC.indexOf("  _openDisplayMenu(anchorEl) {"));
   assert.doesNotMatch(views, /border-radius:50%/, "no colour dot in the views menu");
