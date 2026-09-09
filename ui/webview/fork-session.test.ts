@@ -63,7 +63,8 @@ test("the fork button sits INLINE, right of the worked-seconds label — never i
 
 test("the modal defaults to <session>-fork and posts forkSession {id, uuid, name}", () => {
   assert.match(RENDER, /function showForkPrompt\(sid: string, uuid: string\): void \{/);
-  assert.match(RENDER, /input\.value = base \+ "-fork";/);
+  assert.match(RENDER, /const base = defaultForkName\(sess\?\.name, sid\);/);   // <bare session>-fork (T289: never the viewer's host label)
+  assert.match(RENDER, /input\.value = base;/);
   assert.match(RENDER, /if \(!\/\^\[A-Za-z0-9._-\]\+\$\/\.test\(name\)\) \{ input\.classList\.add\("bad"\); input\.focus\(\); return; \}/);
   assert.match(RENDER, /vscodeApi\?\.postMessage\(\{ type: "forkSession", id: sid, uuid, name \}\);/);
   // the instant acknowledgement is the provisional tab, name-joined like a picker create
