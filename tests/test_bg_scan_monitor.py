@@ -158,8 +158,11 @@ class ConsumersApplyExpiry(unittest.TestCase):
                       "the awaiting-stamp lift must not wait forever on a dead monitor")
         self.assertIn("em._bg_expired(tk, time.time())", kernel,
                       "source 0.75's normalized rows must drop expired monitors")
-        self.assertIn("em._bg_expired(t, time.time())", judge,
-                      "the judge's settled gate must apply expiry with a fresh now, not the cached one")
+        body = judge.split("def _bg_unresolved(", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("em._bg_expired(t, now)", body,
+                      "the judge's settled gate must apply expiry outside the cache, with the caller's now")
+        self.assertIn("now = time.time()", body,
+                      "...a fresh wall clock when no pass clock is handed in, not the cached one")
 
 
 if __name__ == "__main__":
