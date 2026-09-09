@@ -908,7 +908,9 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   (`hit`, `miss`, `populate`, `bypass`); `nudgeGate` is the auto-nudge walk's
   planner-placement gate, derived once per (parse, store) and served while
   both stand (`served`, `derived`; a healthy quiet box serves almost every
-  cycle). The compaction sweep after each judge pass evicts from `pass` and
+  cycle); `cleared` is the feed's clear set, parsed once per state of
+  `cleared.jsonl` (its stat, taken before the read) and served while the file
+  stands (`served`, `derived`). The compaction sweep after each judge pass evicts from `pass` and
   `shared` the entries of stores no session in the discover window owns, so
   both stay bounded by the live board; the gate memo is bounded by the session
   count.

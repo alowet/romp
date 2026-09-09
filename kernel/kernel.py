@@ -382,6 +382,7 @@ class _PerfStats:
             except Exception:
                 memos[key] = {}
         memos["nudgeGate"] = dict(_NUDGE_GATE_STATS)   # the nudge walk's placement gate: served vs re-derived (2026-09-09)
+        memos["cleared"] = dict(_CLEARED_STATS)       # the clear set: parsed once per file state, served while it stands (2026-09-09)
         now = time.time()
         return {"now": now, "since": since, "uptime_s": now - _STARTED, "log": _PERF,
                 "process": _process_stats(), "pusher": pusher, "stages_ms": stages,
@@ -9165,6 +9166,9 @@ def _auto_nudge_pass(now, tmux, run_dead_wait):
     alive_ids = {s["sid"] for s in alive}
     waitfor = _wait_for_graph(now, alive_ids)             # {sid:{peerSid,name,inCycle}} — the peer-wait gate
     fired = False
+    cleared = _cleared_ids()                              # one parsed clear set for every session this pass walks (2026-09-09):
+    #                                                       a clear landing mid-pass reaches the later sessions next pass; the
+    #                                                       node's own cleared flag, written in the same gesture, covers the gap
     for s in alive:
         # PER-SESSION ISOLATION (2026-07-16): one session's failure — a bad backend snapshot, a
         # malformed store — must not abort the whole tick and silence nudging fleet-wide. A
@@ -9172,7 +9176,7 @@ def _auto_nudge_pass(now, tmux, run_dead_wait):
         # ticks over two days before anyone noticed; every session after the bad one in the
         # iteration lost its nudges. The failure still logs loudly, per session.
         try:
-            r = _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids, wake_only=not on)
+            r = _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids, wake_only=not on, cleared=cleared)
             fired = (r is True) or fired
             # the walk->sweep handoff journal (the user 2026-08-24): a session gate names itself as
             # the return value; the sweep owns gate-held records by the GATE'S CLASS, never by age
@@ -10255,7 +10259,8 @@ def _awaiting_wake_outcomes(now, walked=None):
             if (walked is not None and sid in walked) and _gate not in WALK_GATES_WEDGE:
                 continue                             # the walk owns it: no gate, or one whose ending
                 #                                      event re-runs the walk (transient/judge-owned)
-            store = jd.load_goals(sid)
+            store = jd.load_goals_shared(sid)         # the read-only view: nodes, status, confirming, placements (a fresh
+            #                                              writer load per record was the pusher's remaining goal loads, 2026-09-09)
             nd = store.get("nodes", {}).get(gid)
             if (nd is None or store.get("status", {}).get(gid, "working") != "working"
                     or gid in set(store.get("confirming") or ())):
@@ -10270,7 +10275,8 @@ def _awaiting_wake_outcomes(now, walked=None):
                 # answered and ruled — re-arm from the answer, exactly as the walk's eval would have (the
                 # walk never got to: its session gates held, e.g. an api-error AFTER the judged response)
                 _put_nudged(gid, dict(rec, answeredAt=(resp.get("t") or int(now))))
-                _file_wake_answer(store, sid, gid, now)   # …and the answer files, same as the walk's leg
+                _file_wake_answer(jd.load_goals(sid), sid, gid, now)   # …and the answer files, same as the walk's leg: the
+                #                                              filing saves, so it takes a writer load; the view is frozen
                 continue
             if resp is not None:
                 continue                             # visible but not ruled yet — the judges own it
@@ -10819,7 +10825,7 @@ def _nudge_placement_gate(sid, turns, store):
     return unplanned
 
 
-def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None, wake_only=False):
+def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None, wake_only=False, cleared=None):
     """One session's slice of the auto-nudge tick: the session-level gates, then the fire/stamp
     walk over its still-'working' top goals. Split from _auto_nudge_tick so the tick isolates
     failures per session (see the tick's loop). Mutates `nudged` (the tick's in-memory mirror);
@@ -10932,7 +10938,7 @@ def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None, wake_only
     if _unplanned:
         return "planner-queue"
     nodes, status = store.get("nodes", {}), store.get("status", {})
-    cleared = _cleared_ids()
+    cleared = _cleared_ids() if cleared is None else cleared   # the pass hands every session the one parsed set
     _kids = {}                                       # child map for the FORK-stalled check below
     for _nid, _nd in nodes.items():
         _kids.setdefault(_nd.get("parentId"), []).append(_nid)
@@ -30554,13 +30560,35 @@ def build_episode(sid, now):
 
 
 # ───────────────────────── feed clear / undo (inbox-zero) ─────────────────────────
+_CLEARED_MEMO = {"slot": None}     # (key, parsed set) or None: the clear log's stat taken BEFORE the read, and the set read under it
+_CLEARED_STATS = {"served": 0, "derived": 0}   # bumped from the pusher AND socket threads (undo, connect-time builds) with
+#                                                no lock: a lost count under a race is tolerated, these are diagnostics only
+
+
 def _cleared_ids():
     """The set of currently-cleared feed itemIds (asks + stream), replayed from the append-only
     cleared.jsonl: a 'clear' row adds an id, an 'undo' row removes it (newest-wins). Mirrors the old
-    kernel's shared cleared.jsonl so one Clear hides both an ask card and its stream deliverable."""
+    kernel's shared cleared.jsonl so one Clear hides both an ask card and its stream deliverable.
+
+    Parsed once per file state and served while the file stands (2026-09-09): the nudge walk read it for
+    every session on every pusher cycle, and once the placement gate was memoized this replay of the whole
+    log (two thousand rows on the maintainer's box) was 60% of the nudge tick. The key is the file's path
+    and stat (mtime_ns, size, inode), taken BEFORE the read (the chain-memo rule): a row appended during the
+    read moves the stat the next call takes, so a set parsed mid-write is served no further than that call;
+    every writer appends, so a same-second append moves the size (the kernel's file clock is coarse, so
+    mtime alone would not see it); a rebound state root is a different path. An absent or unreadable file
+    is the empty set, never cached. One slot, replaced whole, so two threads deriving at once can never pair
+    one's key with the other's set. Callers read the returned dict and never mutate it."""
+    path = jd.STATE / "cleared.jsonl"
+    st = _stat_key(path)
+    key = (str(path),) + st if st is not None else None
+    slot = _CLEARED_MEMO["slot"]
+    if key is not None and slot is not None and slot[0] == key:
+        _CLEARED_STATS["served"] += 1
+        return slot[1]
     cur = {}
     try:
-        for line in (jd.STATE / "cleared.jsonl").read_text().splitlines():
+        for line in path.read_text().splitlines():
             try:
                 o = json.loads(line)
             except Exception:
@@ -30573,7 +30601,11 @@ def _cleared_ids():
             else:
                 cur[iid] = o.get("t", 0)
     except OSError:
-        pass
+        _CLEARED_STATS["derived"] += 1
+        return cur                                       # absent, vanished after the stat, or unreadable: empty, uncached
+    _CLEARED_STATS["derived"] += 1
+    if key is not None:
+        _CLEARED_MEMO["slot"] = (key, cur)
     return cur
 
 
