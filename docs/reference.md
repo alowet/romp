@@ -887,9 +887,12 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   `cycle_ms_sum`, `cycle_ms_max` (since start), `cycle_ms_last`,
   `cycle_cpu_ms_sum` (the pusher thread's own CPU time), `cycle_ms_p50`,
   `cycle_ms_p90`, `cycle_ms_ring_max`, `ring_n` from the last 256 cycles,
-  `sends` (every client payload), and `idle_cycles`, `idle_ms_sum`,
-  `idle_cpu_ms_sum` (cycles that set no wake, sent no payload and saved no
-  goal store: what a longer wait between cycles would have skipped).
+  `sends` (every payload that went to a client; a deduped frame the client
+  already holds is not one), and `idle_cycles`, `idle_ms_sum`, `idle_cpu_ms_sum`
+  (cycles that set no wake, sent no payload and saved no goal store: what a
+  longer wait between cycles would have skipped; a conservative undercount,
+  since a wake set by another thread or a periodic repost of an unchanged
+  frame marks a cycle busy).
 - `stages_ms`: `jobs` (the cycle's tick jobs outside the push), `push`, and
   inside it `push.chat`, `push.feed`, `push.timeline`, `push.send`. The
   `push.*` stages count every push, including the one a connecting page gets,

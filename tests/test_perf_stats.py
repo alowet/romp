@@ -510,6 +510,16 @@ class PusherRecords(unittest.TestCase):
         self.assertEqual(after["idle_cycles"], before["idle_cycles"])
         self.assertEqual(after["sends"], before["sends"] + 1)
 
+    def test_a_deduped_frame_does_not_break_an_idle_cycle(self):
+        # with a dashboard connected the push builds and compares the per-cycle chat frames every cycle; a
+        # frame the client already holds is reported as "deduped" and is not a payload that went out
+        km._pusher_cycle_jobs = lambda now, tmux, any_client: km._PERF_STATS.send(("chat", "taborder"), "deduped", 10)
+        before = self._pusher()
+        km._pusher_cycle()
+        after = self._pusher()
+        self.assertEqual(after["idle_cycles"], before["idle_cycles"] + 1, "still idle")
+        self.assertEqual(after["sends"], before["sends"], "a deduped frame is not a send")
+
     def test_a_cycle_that_sets_the_wake_is_not_idle(self):
         km._pusher_cycle_jobs = lambda now, tmux, any_client: km._pusher_wake.set()
         before = self._pusher()

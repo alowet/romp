@@ -14321,17 +14321,28 @@ def _courier_link_wanted(store, seg_id, mid):
     """Read-only: (top, peer_sid, peer_gid) when `mid`'s courier link is missing from the store and has a
     placed top to attach to, else None. The idempotency half of _attach_courier_link, split out so the
     scan can ask it of the shared view."""
+    top = _courier_link_target(store, seg_id, mid)
+    if top is None:
+        return None
+    peer_sid, peer_gid = _handoff_backref(mid)
+    if not (peer_sid and peer_gid):
+        return None
+    return (top, peer_sid, peer_gid)
+
+
+def _courier_link_target(store, seg_id, mid):
+    """Read-only, and reading this store alone: the TOP a missing courier link for `mid` would attach to, or
+    None when the store already carries the msgId or the segment's placement is not a live node (filed
+    "fyi", retired, or a target since compacted away: nothing to attach to, so nothing to repair). The
+    scan's change gate asks this to tell an open repair, which depends on the sender's store as well,
+    from a placement with no repair possible, which it may record and skip."""
     if _courier_link_present(store, mid):
         return None
     nodes = store.get("nodes", {})
     tgt = store.get("placements", {}).get(seg_id)
     if not tgt or tgt not in nodes:
         return None
-    top = _top_ancestor(nodes, tgt)
-    peer_sid, peer_gid = _handoff_backref(mid)
-    if not (peer_sid and peer_gid):
-        return None
-    return (top, peer_sid, peer_gid)
+    return _top_ancestor(nodes, tgt)
 
 
 def _courier_link_present(store, mid):
@@ -15088,10 +15099,12 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=
                     try:
                         pm0 = _seg_peer(seg)
                         if (pm0 and pm0[0] and pm0[1] and _seg_peer_kind(seg) == "delegate"
-                                and not _courier_link_present(cstore, pm0[1])):
-                            repair_open = True     # the link is missing; whether it can attach depends on the
-                            #                        SENDER's store (_handoff_backref), outside this session's key,
-                            #                        so the session is scanned again next pass, as before
+                                and _courier_link_target(cstore, seg["id"], pm0[1]) is not None):
+                            repair_open = True     # a missing link with a live node to attach to: whether it CAN
+                            #                        attach depends on the SENDER's store (_handoff_backref), outside
+                            #                        this session's key, so the session is scanned again next pass, as
+                            #                        before. A placement with no node (filed fyi, retired) has no
+                            #                        repair to wait for and records like any settled session.
                             if _courier_link_wanted(cstore, seg["id"], pm0[1]) is not None:
                                 _attach_courier_link(load_goals(fsid), seg["id"], pm0[1])   # a writer: its own load
                     except Exception as e:             # bookkeeping, but its failure is not nothing (T111)

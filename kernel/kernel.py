@@ -284,7 +284,9 @@ class _PerfStats:
         """dt: the cycle's wall seconds; cpu_dt: the pusher thread's own CPU seconds over it; idle: the cycle
         sent nothing and changed nothing (no wake set, no client payload, no goal-store save or write over
         it), so its wall and CPU also go to the idle sums (2026-09-09: the loop re-enters after a fixed 0.5 s
-        backstop, and the idle share is what a cadence change would be judged on)."""
+        backstop, and the idle share is what a cadence change would be judged on). A conservative undercount:
+        a wake another thread sets during the cycle, or the periodic repost of an unchanged frame past the
+        dedup window, marks that cycle busy though the cycle itself changed nothing."""
         ms = dt * 1000.0
         with self.lock:
             p = self.pusher
@@ -316,7 +318,10 @@ class _PerfStats:
     def send(self, key, kind, nbytes):
         slot = key[0] if isinstance(key, tuple) else key
         with self.lock:
-            self.pusher["sends"] += 1
+            if kind != "deduped":
+                self.pusher["sends"] += 1             # a payload that went to a client; a deduped frame (built,
+                #                                       compared, already held byte for byte) is not one, or the
+                #                                       per-cycle chat frames would mark every cycle busy
             d = self.sends[kind]
             e = d.get(slot)
             if e is None:

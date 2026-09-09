@@ -56,14 +56,14 @@ class _World(unittest.TestCase):
     def setUp(self):
         self._rooted_saved = jd._delegate_user_rooted
         jd._delegate_user_rooted = lambda *a, **k: True       # chain-rooted minting is orthogonal here
-        self.saved = (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.CAPDIR, jd.ARCHDIR, jd.PCACHE,
+        self.saved = (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.CAPDIR, jd.ARCHDIR, jd.GOALARCHDIR, jd.PCACHE,
                       jd.MESSAGES, jd.ERRORS, jd.courier_llm)
         jd.courier_llm = lambda *a, **k: DELEGATING
         self._make_world()
 
     def tearDown(self):
         self._drop_world()
-        (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.CAPDIR, jd.ARCHDIR, jd.PCACHE,
+        (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.CAPDIR, jd.ARCHDIR, jd.GOALARCHDIR, jd.PCACHE,
          jd.MESSAGES, jd.ERRORS, jd.courier_llm) = self.saved
         jd._delegate_user_rooted = self._rooted_saved
 
@@ -82,6 +82,7 @@ class _World(unittest.TestCase):
         jd.NAMES, jd.PROJECTS = names, proj
         jd.GOALDIR = td / "goals"
         jd.CAPDIR, jd.ARCHDIR, jd.PCACHE = td / "captions", td / "archive", td / "pcache"
+        jd.GOALARCHDIR = td / "goals-archive"           # the goal archive, one of the skip key's inputs, under this root too
         jd.MESSAGES = tl / "messages.jsonl"
         jd.ERRORS = td / "judge-errors.jsonl"
         jd.MESSAGES.write_text("")
@@ -288,6 +289,19 @@ class CourierSkip(_World):
         self.assertEqual(self.run_pass(), (1, 3, 1), "A's store moved with the link: scanned once more and recorded; "
                                                      "B, C and the sender skipped")
         self.assertEqual(self.run_pass(), (0, 4, 0), "and now every session is settled")
+
+    def test_a_delegate_filed_quiet_has_no_repair_to_wait_for_and_is_recorded(self):
+        # An UNROOTED dispatch files "fyi" (the recipient gets no standalone top): the placement is not a
+        # node, so no courier link can ever attach and there is no repair to keep the session scanned.
+        # Exactly the worker sessions that receive team dispatches; they must settle and skip like any other.
+        jd._delegate_user_rooted = lambda *a, **k: False
+        self.assertEqual(self.run_pass(), (3, 0, 0), "first pass: every delegate filed quiet")
+        for sid in self.SIDS:
+            st = jd.load_goals(sid)
+            self.assertIn("fyi", set(st["placements"].values()), "the placement is the fyi mark, not a node")
+            self.assertFalse(any(isinstance(nd.get("origin"), dict) for nd in st["nodes"].values()), "no top planted")
+        self.assertEqual(self.run_pass(), (3, 0, 3), "second pass: nothing to place, no repair open, all recorded")
+        self.assertEqual(self.run_pass(), (0, 3, 0), "third pass: all skipped")
 
     def test_a_parse_the_cache_does_not_hold_is_never_skipped(self):
         real = jd.parsed_session
