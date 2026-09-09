@@ -327,6 +327,10 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 #freeze-selfnote { position: fixed; z-index: 6; pointer-events: none; color: var(--accent);
   font-size: 10.5px; font-weight: 600; background: rgba(30, 30, 30, 0.85);
   border-radius: 4px; padding: 1px 6px; }
+/* the HOVERED session header's churn badge (T285): the self-note's body-mounted, pointer-inert dress, so the
+   row the pointer rests on keeps its shape — an in-row badge slid Clear all out from under the pointer */
+#freeze-headnote { position: fixed; z-index: 6; pointer-events: none; background: rgba(30, 30, 30, 0.85);
+  border-radius: 4px; padding: 1px 6px; margin-left: 0; }
 /* margin-top, NOT header padding: the liveness rings are outlines drawn ~2.5px
    OUTSIDE the first card's top edge, and the sticky header paints its padding as
    opaque background over them — only unpainted margin space lets them show */
@@ -1653,6 +1657,9 @@ a.fileview-gh-note { border-style: dashed; }
 .ctx-item-toggle .ctx-icon.off { color: var(--dim); }
 .ctx-item-body { display: flex; flex-direction: column; line-height: 1.25; }
 .ctx-item-sub { font-size: 0.82em; opacity: 0.6; }
+/* a tag chip standing for an UNSELECTED toggle (the tag-lens menu, T283): faded, its colour kept —
+   the state class; tag-menu.ts paints the same opacity inline for a sheet-less host (TAG_CHIP_OFF_OPACITY) */
+.tag-chip-off { opacity: 0.45; }
 /* the bell BUTTON (the user 2026-07-28, round 4): inline in row1's metadata cluster, right after the
    timestamp — shown only once the card is hovered or it's armed. Off = slashed dim bell; armed (.on) =
    accent bell, always visible. Accent = mechanics chrome, never a status colour.
