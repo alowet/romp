@@ -316,10 +316,10 @@ EOF2
 }
 
 @test "install carries a non-default env-file path into the unit (quoted) and the plist (escaped); a default install does not" {
-    # kernel/keysource.py resolves the env file from the SERVICE's environment, which never sees the
-    # installing shell's ROMP_SERVICE_ENV_FILE — so a non-default path baked into EnvironmentFile= alone
-    # was read by systemd and not by the kernel's live key read (romp keyswap rewrote a file the kernel
-    # never looked at). The resolved path now rides the unit and the plist whenever it is not the default.
+    # kernel/credentials.py resolves the env file from the SERVICE's environment, which never sees the
+    # installing shell's ROMP_SERVICE_ENV_FILE, so a non-default path baked into EnvironmentFile= alone
+    # was read by systemd and not by the kernel's own read of the same file (its boot check today). The
+    # resolved path rides the unit and the plist whenever it is not the default.
     # every character class systemd or XML would mangle: a space (word-split), a double quote and a
     # backslash (quoting), a percent sign (specifier expansion), an ampersand (XML)
     local odd='alt "q" \b %z & dir'

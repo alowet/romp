@@ -17,6 +17,7 @@ import asyncio
 import ast
 import inspect
 import textwrap
+import hashlib
 import json
 import os
 import stat
@@ -39,9 +40,11 @@ sb = SourceFileLoader("romp_sdk_backend_apihealth", os.path.join(BIN, "romp_sdk_
 SID = "11111111-2222-3333-4444-555555555555"
 SID2 = "11111111-2222-3333-4444-666666666666"
 KEY_MATERIAL = "test-key-material-" + "q" * 28   # invented; not shaped like any provider's key
-KEY_FP = sb._keysrc.fingerprint(KEY_MATERIAL)      # what _options records at a keyed launch (_launched_key_fp)
+KEY_FP = hashlib.sha256(KEY_MATERIAL.encode()).hexdigest()[:12]   # a synthetic launch fingerprint for the pure label
 # A resolved bucket label, as a session would cache it — DERIVED at run time from the real function,
 # never written out: a literal `key:<hex>` is exactly what the credential scanner reads this repo for.
+# The fingerprint arm of the label is exercised as a pure function below; since 2026-09-08 romp records
+# no key identity at launch, so the session-level tests expect the source-word labels (key:env, key:helper).
 LABEL = sb.api_health_auth_label("ANTHROPIC_API_KEY", salt="test-salt", key_fp=KEY_FP, launched_keyed=True)
 T0 = 1_756_800_000.0                # a fixed synthetic epoch (the derivation is pure in `now`)
 KEY = LABEL + "|fable"
@@ -991,16 +994,20 @@ class SaltedLabels(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(d)), sorted([sb.API_HEALTH_SALT_FILE, live]))
 
     def test_the_init_resolves_the_label_once_onto_the_session(self):
+        """romp records no key identity at launch (2026-09-08: it holds no key), so a CLI-found key labels
+        by its source word: key:env for ANTHROPIC_API_KEY, key:helper for apiKeyHelper."""
         be = _backend()
         s = _session(be, label="unknown")
         s._launched_keyed = True
-        s._launched_key_fp = KEY_FP          # what _options recorded at the keyed launch
         s.auth = ""
         s.api_key_auth = False
         s.auth_live = ""
         be._note_auth_source(s, "ANTHROPIC_API_KEY")
-        self.assertRegex(s.auth_label, r"^key:[0-9a-f]{12}$")
-        self.assertEqual(s.auth_label, "key:" + sb._api_health_digest(be.api_health.salt(), KEY_FP))
+        self.assertEqual(s.auth_label, "key:env")
+        s_h = _session(be, label="unknown")
+        s_h._launched_keyed, s_h.auth, s_h.api_key_auth, s_h.auth_live = True, "", False, ""
+        be._note_auth_source(s_h, "apiKeyHelper")
+        self.assertEqual(s_h.auth_label, "key:helper")
         # the frames that follow file under it
         _feed(s, FakeSystemMessage("api_retry", retry_frame()))
         snap = be.api_health_snapshot()
@@ -1016,38 +1023,35 @@ class SaltedLabels(unittest.TestCase):
             self.assertNotIn(KEY_MATERIAL[i:i + 5], blob)
         self.assertNotIn(KEY_FP, blob, "salted: the fingerprint the log prints is not the bucket's name")
 
-    def test_the_init_never_resolves_the_key_source(self):
-        """The label is built from the launch's recorded fingerprint. A work_key read here would resolve
-        the configured source — on a machine whose key is a 1Password reference, one `op read` per
-        init — so the hook must not touch it, and a source that cannot resolve must not matter."""
+    def test_the_init_never_runs_the_helper(self):
+        """The label comes from the init's own source word; the hook resolves no credential (2026-09-08: the
+        kernel's helper runner is for its two API calls only, never an init)."""
         be = _backend()
-        be.work_key = ""                    # a pinned EMPTY source: resolving it yields no key
         s = _session(be, label="unknown")
         s._launched_keyed = True
-        s._launched_key_fp = KEY_FP
-        s.auth = ""
-        s.api_key_auth = False
-        s.auth_live = ""
-        reads = []
-        be.__class__ = type("Spy", (sb.SdkBackend,), {"work_key": property(lambda self: reads.append(1) or "")})
-        be._note_auth_source(s, "ANTHROPIC_API_KEY")
-        self.assertEqual(reads, [], "the hook never read work_key")
-        self.assertEqual(s.auth_label, "key:" + sb._api_health_digest(be.api_health.salt(), KEY_FP))
-        # a login launch carries no fingerprint and labels as env-found when the CLI reports a key
+        s.auth, s.api_key_auth, s.auth_live = "", False, ""
+        runs = []
+        real = sb._cred.helper_key
+        sb._cred.helper_key = lambda *a, **k: runs.append(1) or ""
+        try:
+            be._note_auth_source(s, "ANTHROPIC_API_KEY")
+        finally:
+            sb._cred.helper_key = real
+        self.assertEqual(runs, [], "the hook never ran the helper")
+        self.assertEqual(s.auth_label, "key:env")
         s2 = _session(be, label="unknown")
         s2._launched_keyed = False
-        s2._launched_key_fp = ""            # a login launch records no fingerprint
         s2.auth, s2.api_key_auth, s2.auth_live = "", False, ""
         be._note_auth_source(s2, "ANTHROPIC_API_KEY")
-        self.assertEqual(s2.auth_label, "key:env")
+        self.assertEqual(s2.auth_label, "key:env", "a login launch that landed on a key labels the same way")
 
     def test_the_label_source_reuses_the_existing_auth_knowledge(self):
-        # not a re-derivation: the same init word _note_auth_source already judges, the kernel's
-        # work_api_key material, the usage bars' account digest
+        # not a re-derivation: the same init word _note_auth_source already judges, and the usage bars'
+        # account digest; no key material and no helper run
         src = inspect.getsource(sb.SdkBackend._note_auth_source)
-        self.assertIn("self.api_health.auth_label(", src)
-        self.assertIn('key_fp=getattr(sess, "_launched_key_fp", "")', src, "the launch's own record")
-        self.assertNotIn("self.work_key", src, "never a source resolution at init time")
+        self.assertIn("self.api_health.auth_label(source)", src)
+        self.assertNotIn("helper_key(", src, "never a credential resolution at init time")
+        self.assertNotIn("_launched_key_fp", src, "romp records no key identity")
         self.assertIn("acct_digest()", inspect.getsource(sb.ApiHealth.auth_label))
 
     def test_a_login_init_labels_from_the_account_digest_it_reads(self):

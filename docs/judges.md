@@ -121,17 +121,17 @@ handles four more phases: a live re-plan after you clear a card mid-work,
 nudge resolution (resolve the named goal, done or block, no plain step),
 delegation follow-on (file the recipient's work under the courier's plant),
 and tagged follow-ups (file under the cited goal unless the reply starts a
-different thread — the pivot's goal is then its own card with `pivotFrom`
+different thread; the pivot's goal is then its own card with `pivotFrom`
 provenance; the structural tie retired with containers, T101). A segment opened by an
 untargeted kernel notice (restart or resume) carries a housekeeping note:
 pure verification sweeps file nothing. Since 2026-08-25 that is also a
 mechanical floor, not just a request: a work-run whose segment was opened by
-romp's own bookkeeping — a kernel notice, or the CLI's `[Request
-interrupted…]` stop artifact — never mints a fresh top-level goal (its
+romp's own bookkeeping (a kernel notice, or the CLI's `[Request
+interrupted…]` stop artifact) never mints a fresh top-level goal (its
 menu-targeted ops still apply, so the work keeps advancing existing cards),
 and no mint anywhere roots its promptUuid at a record that files nothing (a
 coordinate/question mail, a bookkeeping record): the anchor substitutes the
-segment's first assistant atom. The clear wrap-up is exempt — its one
+segment's first assistant atom. The clear wrap-up is exempt: its one
 blocked card is the designed needs-you escape.
 
 **placer.** The second, scoped call, only when the chosen card already has
@@ -154,12 +154,12 @@ rarely say "done". Since 2026-08-25 a delegated goal's report-back rides its
 audit: when a "delegated to" tracking item completes, the recipient's own
 resolution travels into the sender's tree (run_propagate) and the
 steps-finished nomination shows it to the closer as a marked
-"Delegation reports" section — before that, a delegated ask's only visible
+"Delegation reports" section; before that, a delegated ask's only visible
 history was the dispatch, the closer correctly omitted, and the look-stamp
 sealed a finished question open forever (the auto-nudge then re-asked it
 seven times in 75 minutes). Two guardrails ride the same fix: the closer
 never completes a "delegated to" tracking item itself (its ending event is
-the recipient's completion — a dispatch-time done consumed the slot and
+the recipient's completion; a dispatch-time done consumed the slot and
 starved the report), and on a status-reporting turn (nudge / follow-up /
 wrap-up) every open working top rides the audit (the cited-umbrella
 descendants channel served containers and retired with them, T103: a
@@ -172,15 +172,15 @@ from evidence at or before your last reply loses.
 
 **unblocker.** The stale-block backstop; it exists because answers arrive
 in passing and work overtakes asks. A goal blocked on a question is only
-ever unblocked by work filed on that exact node — but the answer usually
+ever unblocked by work filed on that exact node, but the answer usually
 files wherever the planner judges the segment to serve, so a dormant
 blocked goal never hears it and holds its card in Needs you (a card can
 otherwise sit for hours on a buried sub whose question the very next
-stretch of conversation already answered — or on an approval whose work
+stretch of conversation already answered, or on an approval whose work
 the session then visibly did anyway). Given each open blocked goal's
-question (subs and tops both) plus two evidence sections — the
+question (subs and tops both) plus two evidence sections (the
 conversation since its block, and the goals the session has completed
-since then with why each counts as done — it verdicts lift or hold, "when
+since then with why each counts as done) it verdicts lift or hold, "when
 unsure, hold"; a lift lands as a normal `unblock` diary event,
 why-prefixed "answered in passing". The completed-since section is the
 durable half: the conversation tail scrolls past its 9k-char window and a
@@ -188,7 +188,7 @@ hold is never re-examined against the same turns, so an ask superseded by
 later completions used to rot in Needs you until cleared by hand (the
 2026-08-08 study: 400 card-hours across 302 manual clears). Event-gated
 per node on both streams: `blockCheckT` remembers the newest ended turn
-examined (turn-time domain — the feed's re-judging latch reads it against
+examined (turn-time domain; the feed's re-judging latch reads it against
 reply times, so it never carries a filing time), and `blockCheckDoneT`
 remembers the newest done-verdict filing, so a completion arms a
 re-examination even when no new turn ever arrives (a late closer filing
@@ -208,8 +208,8 @@ stretch after your follow-up, so the takeaway is the update, never a recap.
 May cite a `SOURCE: mN` line, parsed into the summary's deep link; a cite
 that misses logs and chips the card instead of failing.
 
-**Distiller notes.** Every judge that writes prose you read — distiller,
-briefer, staller, captioner, gister, archiver — also carries your standing
+**Distiller notes.** Every judge that writes prose you read (distiller,
+briefer, staller, captioner, gister, archiver) also carries your standing
 style notes, when you keep any: `~/.config/romp/distiller-notes.md` is read
 at call time (no restart needed) and appended to the prompt, notes winning
 over prompt defaults on conflict. Plain language, e.g. "never cite PR or
@@ -217,7 +217,7 @@ commit numbers; say what the change does". Delete the file and the next
 call runs bare. The placement judges and the courier never see it: those
 emit verdicts and agent-directed copy, not prose for you. The path is a
 plain read that follows symlinks, so the durable setup is the content in
-your dotfiles with a symlink here — one edit then reaches every machine's
+your dotfiles with a symlink here; one edit then reaches every machine's
 judges through your normal dotfiles sync (the user 2026-08-15), instead
 of each kernel keeping its own hand-seeded copy.
 
@@ -230,7 +230,7 @@ the distiller.
 
 Since 2026-08-26 (T101, the user's ruling) the board's unit is the
 INDIVIDUAL ASK: every top-level goal is its own card, tops never nest under
-other tops, and container ("umbrella") goals are retired — a store-level
+other tops, and container ("umbrella") goals are retired: a store-level
 container is unavoidably a tracked unit (it owns rollup and, measured in the
 provenance audit, swallowed the chain evidence of every stranded ask), while
 the visual-grouping job belongs to the feed's display-side group fold, which
@@ -240,7 +240,7 @@ structure, never status.
 
 **grouper.** Given the open top-level cards: merge true twins into one line,
 split a drifted tangent out to its own card, retitle a card its thread
-outgrew — and "doing nothing is a valid, common outcome". Called only when
+outgrew, and "doing nothing is a valid, common outcome". Called only when
 the open-top set actually changed. Hard rules in `apply_group`: never touch
 a view-cleared card, same-session only; the retired `mint`/`group` ops are
 parsed away and ignored if hand-built. A to-do-mirror top that duplicates a
@@ -250,7 +250,7 @@ line already inside another card is explicitly the grouper's to merge.
 retitle housekeeping only. Legacy umbrellas from either judge DISSOLVE in
 every writer's rollup (the pre-pass beside the handoff-children lift):
 children re-parent to top level with their own provenance intact, the empty
-container leaves the store, and placements that pointed at it retire —
+container leaves the store, and placements that pointed at it retire:
 idempotent, self-healing against save-rebase republishes.
 
 ## Peer mail: the courier
@@ -261,11 +261,11 @@ declared each message delegate, coordinate, or question at send time
 body for whether work actually changed hands. Since 2026-08-25 minting is
 CHAIN-ROOTED (the user's verdict, replacing a one-day view-side split):
 delegating plants a real goal in the recipient's tree (origin-stamped) only
-when the sender's linked goal traces to a human prompt — self-then-ancestors
+when the sender's linked goal traces to a human prompt (self-then-ancestors
 in the sender's store, origin hops into a local grand-sender's chain, the
-root record read against the sender's own session — AND no ask card already
+root record read against the sender's own session) AND no ask card already
 exists: since 2026-08-26 (T101) a dispatch whose chain roots to an ask the
-courier LINKED (the sender's ask node) never mints a recipient top — the
+courier LINKED (the sender's ask node) never mints a recipient top; the
 tracking node plants under that ask, fan-out lives inside the ask card
 (several dispatches, one card; several asks to one worker, several cards),
 and the recipient files quietly with the reply-sweep ending. Only a rooted
@@ -274,16 +274,16 @@ the recipient card IS the ask's card. An untraceable delegate
 files quietly instead: no recipient top (its work lives in that session's
 view and transcript, and a needs-you state still surfaces through the
 goal-independent hard-block floor), while the sender's "delegated to"
-tracking node plants either way — so the delegation stays one glance away on
+tracking node plants either way, so the delegation stays one glance away on
 the sender's board. At mint time uncertainty files quiet; the burden of
 proof is on the mint, the inverse of a display filter's. Coordinating makes
 no card, ever. A planted goal also stores the delegating mail's cleaned
 first line as the additive node field `frame` (2026-08-25, part of the
-goal-node consumer contract): the distiller and briefer prepend it — with
-the sender's linked-ask title — to their prompts as a marked
+goal-node consumer contract): the distiller and briefer prepend it, with
+the sender's linked-ask title, to their prompts as a marked
 `<delegating-request>` section. One hop down a team that framing is a
 MANAGER's restatement in implementation nouns, so the trace's root record
-(the human prompt the chain proved — text plus sid, returned in place of
+(the human prompt the chain proved: text plus sid, returned in place of
 the old boolean) is stored too, shaped, as the additive field `userAsk`
 (2026-08-26): the writers render it as a marked `<user-ask>` section beside
 the frame and open the card's prose in the asker's own terms; a board's own
@@ -298,7 +298,7 @@ distills byte-identically to before.
 The companion `run_propagate` is deterministic: when the
 recipient completes the plant, the sender's tracker checks itself off
 through the origin pointer; a quiet-filed delegation's tracker (which no
-recipient goal can ever back-link) completes on the recipient's reply — the
+recipient goal can ever back-link) completes on the recipient's reply, the
 report-back event, the same rule cross-host handoffs have always used.
 
 ## When a judge fails
@@ -321,7 +321,7 @@ event).
 - **An empty reply never counts.** `parse` means the model's own text was
   rejected, and the row carries the reply tail so the log says why. Empty
   replies (the rate gate, a failed call) log nothing at the caller and
-  never burn a retry cap — with two exceptions, both the closer's, both
+  never burn a retry cap, with two exceptions, both the closer's, both
   adopting a turn loudly on their own event: a safeguards refusal of the
   turn's content, and a *killed* call (one the timer ended; never an API
   error or a process that ended any other way), each counted against the
@@ -370,33 +370,32 @@ toward nothing.
 
 ## Billing, and when the credential itself is broken
 
-A judge call bills **the account of the session it judges** — the same pick the
+A judge call bills **the account of the session it judges**: the same pick the
 session's own Billing selector holds, read from the same registry, with the same
-selection (an explicit login pick → the login; otherwise the configured API
-key source when one exists, else the login). With a key provider configured
-(`ROMP_API_KEY_CMD`, or the 1Password shorthand `ROMP_API_KEY_REF`), each
-key-billed judge call runs the provider (the key command, or `op read --no-newline`); a
-retrieval that fails is not retried by later calls in the same judging pass, and the first
-call of a pass to reach the key gates the others until its retrieval returns. The next pass,
-or a changed source, retries.
-The resolved key is used for that call without a provider cache or a plaintext
-file. The same source selection applies to standalone `romp-judge --once`.
-Every judge child environment strips ambient Anthropic credentials and injects
-the selected key only for a key-mode call. A provider failure fails that call
-with a credential error; it cannot silently use the machine login or a stale
-key. An explicitly login-billed call does not run `op`.
-
-Legacy `ANTHROPIC_API_KEY` and Claude login remain supported when no runtime
-provider is selected. See [Service environment and credentials](reference.md#service-environment-and-credentials)
-for setup, service PATH and authentication requirements, and migration.
+default (an explicit login pick, the login; otherwise the API key when Claude
+Code's settings carry an `apiKeyHelper`, else the login). Judges run on Claude
+Code's own credential resolution, and romp holds no key (the user 2026-09-08).
+Every judge child (`claude -p`) launches with no credential in its environment.
+A key-billed call resolves the helper itself, inside its own CLI, the way a
+session does. A login-billed call passes `--settings '{"apiKeyHelper": ""}'`,
+which disables the helper for that one process, and gets back the login tokens
+the kernel claimed out of its own environment at boot. The same selection
+applies to standalone `romp-judge --once`. A helper that fails inside a judge's
+CLI cannot silently use the login or a stale key; what the call files depends on
+how the CLI fails: a credential error the CLI reports within the call's 120 s
+alarm latches judge-auth-down below, and a call the CLI never answers (a helper
+that hangs, or a rejected key the CLI keeps retrying) is killed at the alarm and
+files as a timeout row. See [Service environment and
+credentials](reference.md#service-environment-and-credentials) for the helper's
+setup and the billing declaration.
 
 A **credential-class** failure (not logged in, an invalid key, an expired OAuth
-token) is one no retry can fix — only the user can. The first such error
+token) is one no retry can fix; only the user can. The first such error
 envelope latches judge-auth-down for that session (`STATE/judge-auth.json`), and
 the session's next successful call clears it; both edges are events, nothing is
 re-derived per build. While latched, the feed floors the session's focus card to
 needs-you wearing a filled-red "Can't analyze" chip that names the refused
-credential, and the card face carries the story and the fix — the session may be
+credential, and the card face carries the story and the fix: the session may be
 fine; it is romp's analysis of it that is down, and every card of that session is
 frozen until the credential works again. The floor yields to the live
 permission/API-error floors: one interrupt at a time, the present event first.
@@ -412,12 +411,12 @@ permission/API-error floors: one interrupt at a time, the present event first.
   the session serves a linked dispatch is stamped `serving` ({peer, msgId,
   goalId}, latched at mint on the newest delegate-kind segment at or before
   the declaration) plus the dispatch's frame and root-ask, and the feed
-  folds it into the sender's ask card at render — fan-out inside the ask
+  folds it into the sender's ask card at render: fan-out inside the ask
   card, with needs-you breaking through (T137). A dispatch-less step
   threads the session's own prompt record instead. The grouper may still
   merge a duplicate mirror.
   It reads the live task store (`~/.claude/tasks/<fsid>/`, the same source
-  the chat TO-DO card reads) — never the transcript, whose record of a
+  the chat TO-DO card reads), never the transcript, whose record of a
   TaskUpdate can fall off the live chain when an api-error retry forks the
   graph. A missing store falls back to the transcript fold; an unreadable
   one logs a `task-store` row and skips the pass rather than silently
@@ -425,13 +424,13 @@ permission/API-error floors: one interrupt at a time, the present event first.
 - **auto-nudge**: a kernel trigger, not an LLM. Detects a genuinely stalled
   session and injects one nudge prompt; the planner's nudge phase does the
   judging, and a failed nudge records the block.
-- **awaiting**: layered. The LIVE sources are event-derived — subagents,
-  the pending background-task set, the delegation graph — and the CLOSER files a
+- **awaiting**: layered. The LIVE sources are event-derived (subagents,
+  the pending background-task set, the delegation graph) and the CLOSER files a
   durable awaiting verdict (the goal store's ⏳ stamp) carrying a KIND naming
   what the wait is on: agents, task, job (an external computation), peer, timer.
   The kind scopes the rules: a peer's answer supersedes only peer waits, and a
   job stamp survives its watcher dying. The wake's clock is a DEAD-MAN'S SWITCH
-  for waits whose ending romp cannot observe — kind=job (external compute),
+  for waits whose ending romp cannot observe: kind=job (external compute),
   cross-host peers, legacy kindless stamps, hung-forever agents/tasks, and
   prose-declared timer check-backs; every observable ending (a notification
   pairing, the restart epoch, a tool's declared deadline, a peer's answer or
@@ -463,8 +462,8 @@ permission/API-error floors: one interrupt at a time, the present event first.
 - Logs: `STATE/judge-usage.jsonl` (per-call cost, one name per prompt),
   `STATE/judge-errors.jsonl` (the row contract above; kinds are parse,
   call, give-up, sweep-cut, cite-miss, rate-limited, task-store, history-unreadable,
-  task-key-collision — a duplicated to-do mirror key, reconciled per node
-  and surfaced loudly, store-unreadable: a goals file that cannot be read,
+  task-key-collision (a duplicated to-do mirror key, reconciled per node
+  and surfaced loudly), store-unreadable: a goals file that cannot be read,
   filed once per fault episode and ended by the next successful read,
   store-unwritable: a goals file whose publish failed under a user gesture,
   store-quarantined: a goals file whose bytes did not parse, moved aside,
@@ -476,7 +475,7 @@ permission/API-error floors: one interrupt at a time, the present event first.
   before a fresh one is written, so the bytes survive for inspection, and the
   `*.json` globs that enumerate stores skip it; the same sidecar convention
   applies to any other state file romp moves aside as unparseable.
-  `STATE/judge-auth.json` (the per-session judge-auth-down latch — see
+  `STATE/judge-auth.json` (the per-session judge-auth-down latch; see
   "Billing" above).
 - Debugging: run the judge's own code against the live store
   (`SourceFileLoader` on `kernel/judge.py`) rather than inferring from logs.

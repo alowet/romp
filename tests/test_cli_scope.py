@@ -230,8 +230,6 @@ class _Backend(unittest.TestCase):
 
     def setUp(self):
         self.d = tempfile.mkdtemp()
-        self._stash_before = sb._WORK_KEY
-        sb._WORK_KEY = ""
         self._fetch_before = sb._fetch_key_fast_org
         sb._fetch_key_fast_org = lambda key: None
         self._fake_sdk = "claude_agent_sdk" not in sys.modules and not sb.sdk_importable()
@@ -247,7 +245,6 @@ class _Backend(unittest.TestCase):
         self.be = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None, log=self.logged.append)
 
     def tearDown(self):
-        sb._WORK_KEY = self._stash_before
         sb._fetch_key_fast_org = self._fetch_before
         if self._fake_sdk:
             sys.modules.pop("claude_agent_sdk", None)

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """The suite-wide ROMP_SUPERVISED floor (tests/conftest.py, 2026-09-05): every shell under a romp-managed
-session inherits ROMP_SUPERVISED=1 from the kernel (the service unit exports it), and kernel/keysource.py
-gives that variable authority — a supervised manager reads the env file only and ignores a startup key.
-Twenty-five tests that stage a startup key went red when the suite ran from inside a romp session while
-CI stayed green. conftest pops the variable at import and before every test, and resets keysource's
-per-process memory of which path selected which source so modules cannot leak selection state into each
-other. Source pins, in the style of test_model_catalog_floor.py, plus the floor observed from inside a test."""
+session inherits ROMP_SUPERVISED=1 from the kernel (the service unit exports it); the retired key-source
+module gave that variable authority over a startup key, and twenty-five tests that staged one went red when
+the suite ran from inside a romp session while CI stayed green. conftest pops the variable at import and
+before every test, and resets the credentials module's per-process helper memo so modules cannot leak a
+helper's value into each other (2026-09-08). Source pins, in the style of test_model_catalog_floor.py, plus
+the floor observed from inside a test."""
 import os
 import unittest
 
@@ -19,11 +19,8 @@ class SupervisedFloor(unittest.TestCase):
         self.assertTrue(body, "the fixture header moved — re-anchor this pin")
         self.assertIn('os.environ.pop("ROMP_SUPERVISED", None)', head, "the import-time floor")
         self.assertIn('os.environ.pop("ROMP_SUPERVISED", None)', body, "the per-test re-assert")
-        self.assertIn("_reset_keysource_state()", body, "keysource memory is per test")
-        import re
-        self.assertRegex(src, r"_AUTHORITATIVE_PATHS\.clear\(\)")
-        self.assertRegex(src, r"_ENV_PROVIDER_PATHS.*\.clear\(\)")
-        self.assertRegex(src, r'_CACHE = \(\(\), ""\)')
+        self.assertIn("_reset_credential_state()", body, "the helper memo is per test")
+        self.assertIn("m.forget_helper_key()", src, "every loaded copy of credentials.py forgets its helper value")
 
     def test_the_floor_holds_for_a_bare_run_under_a_supervised_shell(self):
         """Independent of the sibling modules whose preambles also pop the variable: a subprocess with the
