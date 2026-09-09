@@ -1003,6 +1003,7 @@ def _version_info():
             "updateAvail": _UPDATE_AVAIL[0],   # newer release the boot check found ("" = none/unknown)
             "judgeModel": jd._triage_model(), "indexModel": jd._index_model(),      # current per-tier judge models → the gear dropdowns
             "judgeEffort": jd._triage_effort(), "indexEffort": jd._index_effort(),  # current per-tier judge efforts ("" = default/none)
+            "judgeConcurrency": jd._state_str("judge-concurrency", ""),   # RAW ("" = ROMP_JUDGE_CONCURRENCY, else 6) → the gear select (T277)
             "distillModel": jd._state_str("distill-model", "triage"),   # RAW ("triage" = follow the triage pick) — the gear shows the choice, not the resolution
             "distillEffort": jd._state_str("distill-effort", "triage"),
             # the default-comment trio, RAW too ("session" = same as the session) — the gear shows
@@ -1023,6 +1024,7 @@ def _version_info():
                          "fileEditing": _mv["fileEditing"],
                          "judgeModel": jd._triage_model(), "judgeEffort": jd._triage_effort(),
                          "indexModel": jd._index_model(), "indexEffort": jd._index_effort(),
+                         "judgeConcurrency": jd._state_str("judge-concurrency", ""),
                          "distillModel": jd._state_str("distill-model", "triage"),
                          "distillEffort": jd._state_str("distill-effort", "triage"),
                          "commentModel": jd._state_str("comment-model", "session"),
@@ -37004,6 +37006,13 @@ def _set_judge_model(v, gt=None):  return _set_judge_state("judge-model", v, _ju
 def _set_index_model(v, gt=None):  return _set_judge_state("index-model", v, _judge_model_values(), gt=gt)
 def _set_judge_effort(v, gt=None): return _set_judge_state("judge-effort", v, _EFFORT_VALUES, allow_empty=True, gt=gt)
 def _set_index_effort(v, gt=None): return _set_judge_state("index-effort", v, _EFFORT_VALUES, allow_empty=True, gt=gt)
+# Judge concurrency (T277): how many judge calls run at once, every tier. The select offers exactly the
+# judge's range (1..16, jd.CONCURRENCY_MIN/MAX), so anything else is a bad client and is refused unwritten —
+# the judge trusts the file. The EMPTY value is the gear's Default: it clears the setting, and the judge
+# falls back to ROMP_JUDGE_CONCURRENCY as read at its load, else 6 (jd._judge_concurrency). Read fresh on
+# every pass, so a pick lands on the judges' next pass with no restart; the setting wins over the variable.
+_CONCURRENCY_VALUES = {str(n) for n in range(jd.CONCURRENCY_MIN, jd.CONCURRENCY_MAX + 1)}
+def _set_judge_concurrency(v, gt=None): return _set_judge_state("judge-concurrency", v, _CONCURRENCY_VALUES, allow_empty=True, gt=gt)
 # The distilling pair accepts extra sentinels (resolved by jd._distill_model/_distill_effort at call
 # time): "triage" (the default) means FOLLOW the triage pick live — exactly what the distiller/briefer/
 # staller did before the split (the user 2026-08-14) — and effort's "none" pins no-flag. "none" exists
@@ -37038,6 +37047,7 @@ def _set_comment_fast(v, gt=None):   return _set_judge_state("comment-fast", v, 
 
 _JUDGE_SETTING_FIELDS = (("judgeModel", _set_judge_model), ("indexModel", _set_index_model),
                          ("judgeEffort", _set_judge_effort), ("indexEffort", _set_index_effort),
+                         ("judgeConcurrency", _set_judge_concurrency),   # T277: one width for every tier's pool
                          ("distillModel", _set_distill_model), ("distillEffort", _set_distill_effort),
                          # the comment-thread defaults ride the same cross-kernel door: kernel-side
                          # settings follow to every machine (the 2026-08-14 gear rule), and
@@ -37089,6 +37099,7 @@ def _apply_judge_settings(body):
         _push_soon()   # ack-fast (the 2026-08-30 wedge: inline fleet builds piled 53 POST handlers; the pusher coalesces)
     return {"ok": True, "judgeModel": jd._triage_model(), "indexModel": jd._index_model(),
             "judgeEffort": jd._triage_effort(), "indexEffort": jd._index_effort(),
+            "judgeConcurrency": jd._state_str("judge-concurrency", ""),   # RAW: "" = the variable, else 6
             "distillModel": jd._state_str("distill-model", "triage"),
             "distillEffort": jd._state_str("distill-effort", "triage"),
             "commentModel": jd._state_str("comment-model", "session"),
@@ -37302,7 +37313,7 @@ def _adopt_peer_settings(host, rver):
 # Every gt-gated store, by the name _setting_stale is called with — the vocabulary the settingStale
 # frame and the gear's STALE_LABELS already share, so /version's settingsGt speaks the same one.
 _GT_STORES = ("auto-nudge", "compact-suggest", "file-editing", "update-mode", "thinking-summaries",
-              "judge-model", "index-model", "judge-effort", "index-effort",
+              "judge-model", "index-model", "judge-effort", "index-effort", "judge-concurrency",
               "distill-model", "distill-effort", "comment-model", "comment-effort", "comment-fast")
 
 
@@ -48198,6 +48209,13 @@ class Handler(BaseHTTPRequestHandler):
             if _jgt is not None:
                 threading.Thread(target=_propagate_judge_settings,
                                  args=({"indexEffort": str(msg.get("effort") or ""), "gt": _jgt},), daemon=True).start()
+            else:
+                _tell_stale_gesture(client, msg)
+        elif msg and msg.get("type") == "setJudgeConcurrency":
+            _jgt = _set_judge_concurrency(str(msg.get("value") or ""), gt=_gesture_ms(msg))   # gear "Judge concurrency" ("" = Default: the variable, else 6)
+            if _jgt is not None:
+                threading.Thread(target=_propagate_judge_settings,
+                                 args=({"judgeConcurrency": str(msg.get("value") or ""), "gt": _jgt},), daemon=True).start()
             else:
                 _tell_stale_gesture(client, msg)
         elif msg and msg.get("type") == "setDistillModel" and msg.get("model"):

@@ -422,6 +422,19 @@ through to `install.sh`:
   falling back to `main` when none is published.
 - `ROMP_NO_PATH=1` leaves your shell rc alone.
 
+### Judge concurrency
+
+- `ROMP_JUDGE_CONCURRENCY=<1..16>` sets how many judge calls run at once,
+  across every tier; the default is 6. The judges read it once, when they
+  load, so set it where the kernel's service sees it (`service.env`, then a
+  restart). A value outside the range is applied at the nearer bound; a value
+  that is not an integer is ignored, with one line on the kernel's stderr. The
+  same knob is a kernel setting, **Judge concurrency**, the last row of the
+  gear's Judges section below the model and effort picks: a pick there
+  applies on the judges' next pass with no restart, wins over the variable,
+  and follows to every connected machine like the other judge settings; its
+  Default option clears the setting back to the variable, else 6.
+
 ### Ports
 
 - `ROMP_KERNEL_PORT=<port>` moves the kernel and its dashboard off the default

@@ -206,8 +206,8 @@ def _state_str(name, default=""):
     if not c or c["mt"] != mt:
         try:
             v = f.read_text().strip()
-        except OSError:
-            v = ""
+        except (OSError, ValueError):   # ValueError: an undecodable file (UnicodeDecodeError) reads as the
+            v = ""                      # default too, like a missing one — a hand edit must never fail a pass
         _state_cache[name] = c = {"val": v or default, "mt": mt}
     return c["val"]
 
@@ -550,7 +550,50 @@ CLOSE_RIDER_CAP = 6                      # RIDERS per closer call — the steps-
                                          # reply stamps them, so what is cut rides a later landed call. STATUS
                                          # riders are never cut — one-shot per status turn, they would be lost,
                                          # not deferred — and take their room off the cap first (why: _close_turn).
-CONCURRENCY = 6                          # concurrent claude -p calls
+CONCURRENCY_DEFAULT = 6                  # concurrent claude -p calls, unless configured (below)
+CONCURRENCY_MIN, CONCURRENCY_MAX = 1, 16   # the knob's range; the kernel's select offers exactly this
+
+
+def _concurrency_from_env(raw, default=CONCURRENCY_DEFAULT):
+    """ROMP_JUDGE_CONCURRENCY as read ONCE at module load (T277): an integer, clamped to
+    CONCURRENCY_MIN..CONCURRENCY_MAX (a value at either bound is applied at the bound, silently — it is a
+    value); unset or blank → `default`; anything that is not an integer is IGNORED with one stderr line,
+    never a crash — a typo in a service.env must not take the judges down with it."""
+    if raw is None or not raw.strip():
+        return default
+    try:
+        n = int(raw.strip())
+    except ValueError:
+        sys.stderr.write("romp-judge: ROMP_JUDGE_CONCURRENCY=%r is not an integer; using %d\n" % (raw, default))
+        return default
+    return max(CONCURRENCY_MIN, min(CONCURRENCY_MAX, n))
+
+
+CONCURRENCY = _concurrency_from_env(os.environ.get("ROMP_JUDGE_CONCURRENCY"))   # the variable's value, else 6
+
+
+def _judge_concurrency():
+    """The EFFECTIVE judge concurrency at this moment: the kernel setting `judge-concurrency` (the gear's
+    "Judge concurrency" select, validated to 1..16 by the kernel before it is written, read fresh each call
+    through the same mtime-cached STATE reader as the tier picks — so a change lands on the judges' NEXT
+    pass, no restart), else CONCURRENCY (the variable at module load, else 6). The setting wins over the
+    variable. An unparseable file (a hand edit) falls back rather than crashing a pass; the clamp here is
+    belt-and-braces — the kernel refuses anything outside the range."""
+    v = _state_str("judge-concurrency", "")
+    if v:
+        try:
+            return max(CONCURRENCY_MIN, min(CONCURRENCY_MAX, int(v)))
+        except ValueError:
+            pass
+    return CONCURRENCY
+
+
+def _conc(concurrency):
+    """A run_* function's `concurrency` argument, resolved: an explicit value stands (tests, the A/B tools);
+    None — every entry point's default — reads the setting at CALL time. A def-time default (the old
+    `=CONCURRENCY` in every signature) would have frozen the setting out of the long-lived kernel, which imports
+    this module once."""
+    return concurrency if concurrency is not None else _judge_concurrency()
 # The CLOSER: the turn-end completion backstop (judge.md HYBRID; named the "closer" 2026-06-16 — it
 # closes out goals whose outcome is delivered). SHIPPED as the default 2026-06-15 after the fleet A/B
 # (25→30 completed top-goals, zero false-positives — `romp-judge --ab-close` re-measures). Kept
@@ -6908,7 +6951,7 @@ def _archive_call(fsid, caps):
     return archive_llm("\n".join("- " + c for c in caps))
 
 
-def run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=CONCURRENCY, verbose=False):
+def run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=None, verbose=False):
     """One INDEX-TIER pass over the fleet: caption ready units, then refresh per-session archives whose
     turn set grew. Returns {"captions": n, "archives": m}. Frame-wrapped like run_triage: under the
     kernel producer it joins the producer's pass frame; standalone it owns one."""
@@ -6919,7 +6962,7 @@ def run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=CONCURRENC
         end_pass_frame(own)
 
 
-def _run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=CONCURRENCY, verbose=False):
+def _run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=None, verbose=False):
     if now is None:
         now = int(time.time())
     fleet = discover(now)
@@ -6951,7 +6994,7 @@ def _run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=CONCURREN
     captions = 0
     struck = set()                                        # one strike per unit per PASS (grains share ids)
     gave = {}                                             # fsid → units tombstoned this pass (one log row each)
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_caption_call, t): t for t in selected}
         for fut in as_completed(futs):
             task = futs[fut]
@@ -7002,7 +7045,7 @@ def _run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=CONCURREN
     if verbose:
         sys.stderr.write("romp-judge: %d sessions need (re)archiving\n" % len(arch_tasks))
     archives = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_archive_call, fsid, caps): (fsid, len(caps))
                 for fsid, caps in arch_tasks}
         for fut in as_completed(futs):
@@ -9272,7 +9315,7 @@ def _hidden_from_feed(fsid):
         return False
 
 
-def run_plan(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_plan(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One TRIAGE-TIER planner pass: advance each session's goal tree. Per-session sequential
     (the tree accretes); sessions concurrent. Returns total placements made. (Global cross-session
     time-order is the courier's need; the planner's tree is per-session.)"""
@@ -9280,7 +9323,7 @@ def run_plan(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verb
         now = int(time.time())
     fleet = [s for s in discover(now) if not _hidden_from_feed(s[0])][:sessions_cap]   # muted sessions are out of task tracking
     placed = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_plan_session, fsid, str(path), now): fsid for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
             try:
@@ -9915,7 +9958,7 @@ def _group_session(fsid, path, now):
     return relinks
 
 
-def run_group(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_group(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One GROUPER pass (triage tier), run after run_plan: nest each session's related open top goals into
     coherent trees. Event-gated per session (see _group_session) so it only calls the model when a
     session's open-top set changed. Per-session sequential, sessions concurrent. Returns total relinks."""
@@ -9923,7 +9966,7 @@ def run_group(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, ver
         now = int(time.time())
     fleet = discover(now)[:sessions_cap]
     n = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_group_session, fsid, str(path), now): fsid
                 for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
@@ -10009,7 +10052,7 @@ def _consolidate_session(fsid, path, now):
     return 1 if changed else 0
 
 
-def run_consolidate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_consolidate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One CONSOLIDATOR pass (triage tier), run after run_group / before run_distill so a card the
     housekeeping touched re-distills this same cycle. Event-gated per session. Returns the number
     of sessions whose completed column changed."""
@@ -10017,7 +10060,7 @@ def run_consolidate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENC
         now = int(time.time())
     fleet = discover(now)[:sessions_cap]
     n = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_consolidate_session, fsid, str(path), now): fsid
                 for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
@@ -11431,6 +11474,9 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
 
 
 DEATH_DRAIN_PER_PASS = CONCURRENCY   # a QUEUE-DRAIN bound on death-pending finalizes per closer pass —
+#   sized to the module-load concurrency (the variable, else 6), deliberately not the live setting: it
+#   spreads a one-time backfill, it is not a parallelism lever, and a bound that moved between passes
+#   would make the drain's progress unreadable. The pool that runs the finalizes follows the setting.
 #   NOT a fairness cap on live sessions (those were removed 2026-06-30 and stay removed): the pending
 #   set is a finite backlog that strictly shrinks (every drained marker gains endedAt, superseded ones
 #   retire), so the bound only spreads the one-time upgrade backfill over successive passes instead of
@@ -11556,7 +11602,7 @@ def _death_finalize(fsid, store, settled):
         append_episode_settle(fsid, "ended:%d" % mt, int(time.time()), open_tops)
 
 
-def run_close(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_close(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One CLOSER pass (the turn-end completion backstop), triage tier, run after run_plan.
     Per-session sequential (the tree accretes), sessions concurrent. Returns nodes completed.
     The fleet is the discover set PLUS a bounded drain of death-pending sids (markers without
@@ -11583,7 +11629,7 @@ def run_close(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, ver
                     m["noTranscript"] = True
                     _write_death_marker(sid, m)
     n = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_close_session, fsid, str(path), now): fsid
                 for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
@@ -11853,14 +11899,14 @@ def _unblock_session(fsid, path, now):
     return lifted
 
 
-def run_unblock(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_unblock(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One UNBLOCKER pass (stale sub-block re-examination), triage tier, run after run_close.
     Per-session sequential (one call covers all its due blocks), sessions concurrent."""
     if now is None:
         now = int(time.time())
     fleet = [s for s in discover(now) if not _hidden_from_feed(s[0])][:sessions_cap]
     n = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_unblock_session, fsid, str(path), now): fsid
                 for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
@@ -11908,7 +11954,7 @@ def _ab_close(sessions_cap=PLAN_SESSIONS):
     tot_a = tot_b = 0
     all_new, all_samples = [], []
     # Parallel ACROSS sessions (each session sweeps its own turns sequentially for clean attribution).
-    with ThreadPoolExecutor(max_workers=min(len(fleet) or 1, 2 * CONCURRENCY)) as ex:
+    with ThreadPoolExecutor(max_workers=min(len(fleet) or 1, 2 * _judge_concurrency())) as ex:
         futs = {ex.submit(_ab_close_session, fsid, str(path), now): (name or fsid[:8])
                 for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
@@ -11959,7 +12005,7 @@ def _latest_subtree_segment(nid, nodes, children, seg_by_id):
     return max(segs, key=lambda s: s["t"]) if segs else None
 
 
-def _ab_classify(sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY):
+def _ab_classify(sessions_cap=PLAN_SESSIONS, concurrency=None):
     """Measure-only: re-run the planner's BLOCKED/WORKING verdict on the current uncleared top-goals
     (working + blocked) under 3 arms — sonnet / sonnet+effort medium / opus+effort medium — and diff vs
     the live status, WITHOUT mutating goal state. The question: do the soft blocks hold under
@@ -11997,7 +12043,7 @@ def _ab_classify(sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY):
             ops = _parse_plan(plan_llm(job["text"], job["menu_text"], model=model, effort=effort), job["menu_len"])
             v[arm] = ("blocked" if any(o["do"] == "block" for o in ops) else "working") if ops else "?"
         return dict(job, v=v)
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         rows = list(ex.map(classify, jobs))
 
     armnames = [a[0] for a in CLASSIFY_ARMS]
@@ -13567,7 +13613,7 @@ def _drain_undiscovered(now, fleet_sids):
     return n
 
 
-def run_distill(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_distill(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One DISTILLER pass (triage tier), run after the closer/grouper: store a key-takeaway summary on each
     newly-(re)completed top goal's card. Event-gated per goal. Also drains stores the fleet walk
     can't reach (_drain_undiscovered) and logs a session pass that dies instead of swallowing it —
@@ -13577,7 +13623,7 @@ def run_distill(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
         now = int(time.time())
     fleet = discover(now)[:sessions_cap]
     n = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_distill_session, fsid, str(path), now): fsid for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
             try:
@@ -13590,7 +13636,7 @@ def run_distill(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
     return n
 
 
-def run_triage(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_triage(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """The TRIAGE-tier sequence as ONE unit, so the kernel can run it in PARALLEL with the always-on INDEX
     tier (run_index) — they share no store and triage never reads the captioner's output, so the only cost
     of overlap is each tier parsing a transcript instead of sharing one parse. Order matters: the planner
@@ -14523,7 +14569,7 @@ def _presumed_closed(sid, now):
     return sid not in remote
 
 
-def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """DETERMINISTIC delegation completion link-back (the user 2026-06-22). When a courier-planted goal G
     (origin.peer + origin.goalId) is COMPLETE on the recipient B's tree, mark the SENDER's tracking node
     origin.goalId DONE too — so a '↪ delegated to B' item checks off the instant B finishes and reports. NO
@@ -14790,7 +14836,7 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
     return n
 
 
-def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One TRIAGE-TIER courier pass: place peer-message (postal) segments as delegations, GLOBAL
     oldest-first across sessions. Idempotent (msgId + seg_id). COORDINATING segments are marked processed
     without a goal-edit; a declared coordinate/question files that way outright, no model call (demote-
@@ -15143,7 +15189,7 @@ def _test(path):
     tasks.sort(key=lambda t: max(w["t"] for w in t["writes"]), reverse=True)
     tasks = tasks[:TEST_UNITS]
     print("transcript %s — %d recent caption tasks (newest first)\n" % (fsid[:8], len(tasks)))
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
+    with ThreadPoolExecutor(max_workers=_judge_concurrency()) as ex:   # the live setting, like every pass pool
         caps = list(ex.map(lambda t: caption_llm(t["text"]), tasks))
     from datetime import datetime
     for t, cap in zip(tasks, caps):
