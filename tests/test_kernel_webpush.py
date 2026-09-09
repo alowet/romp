@@ -1127,11 +1127,13 @@ class RevealRoute(unittest.TestCase):
         with contextlib.redirect_stderr(buf):
             code, _ = self._post("/reveal", {"sid": "SID-x", "wid": "W-x", "via": "sw\n[reveal] forged sid=SID-z: delivered"})
             self._post("/reveal", {"sid": "SID-y", "wid": "W-y", "via": "store"})
+            self._post("/reveal", {"sid": "SID-v", "wid": "W-v", "via": "offer"})   # the chip's road: admitted by name, never 'other' (review find, 2026-09-09, on #1157)
             self._post("/reveal", {"sid": "SID-w", "wid": "W-w"})
         self.assertEqual(code, 200)
         lines = [l for l in buf.getvalue().splitlines() if l.startswith("[reveal]")]
         self.assertEqual(lines, ["[reveal] other sid=SID-x wid=W-x: parked",
                                  "[reveal] store sid=SID-y wid=W-y: parked",
+                                 "[reveal] offer sid=SID-v wid=W-v: parked",
                                  "[reveal] shell sid=SID-w wid=W-w: parked"])
         self.assertNotIn("forged", buf.getvalue())
         self.assertEqual(km._REVEAL_ROADS, frozenset({"sw", "link", "store", "offer"}))
@@ -1683,6 +1685,12 @@ _OFFER_DRIVER = _RESUME_LIB + r"""
 _BOOT_DRIVER = _RESUME_LIB + r"""
 (async () => { await settle(); console.log(JSON.stringify({ boot: snap() })); })();
 """
+# the offer taken at once, BEFORE this page's chat pane has reported its socket up: the relaunch iOS makes on the
+# start URL, the chip up at boot, the user tapping it straight away (review find, 2026-09-09, on #1157: the road
+# the offer exists for, and the one the boot latch has to cover)
+_OFFER_EARLY_DRIVER = _RESUME_LIB + r"""
+(async () => { await settle(); CHIP['tap-offer-go'].click(); await settle(); console.log(JSON.stringify({ early: snap() })); })();
+"""
 
 
 class LandingRevealOffers(unittest.TestCase):
@@ -1707,6 +1715,8 @@ class LandingRevealOffers(unittest.TestCase):
         cls.no_reg = _run_reveal(_BOOT_DRIVER, href="http://localhost:7777/", no_reg=True)
         cls.active_at_boot = _run_reveal(_BOOT_DRIVER, href="http://localhost:7777/", active="S9",
                                          seed={"/__romp/shown": dict(cls.SHOWN, t=now - 5000)})
+        cls.early = _run_reveal(_OFFER_EARLY_DRIVER, href="http://localhost:7777/",
+                                seed={"/__romp/shown": dict(cls.SHOWN, t=now - 5000)})
 
     @staticmethod
     def _rows(snap, what):
@@ -1739,6 +1749,18 @@ class LandingRevealOffers(unittest.TestCase):
         self.assertTrue(t["chip"]["hidden"])
         a = self.out["after"]
         self.assertEqual((a["fetches"], self._rows(a, "tap-offer"), a["chip"]["hidden"]), ([], [], True), "nothing left to offer on the next coming-back")
+
+    def test_an_offer_taken_before_this_pages_chat_pane_is_up_says_booting(self):
+        # review find (2026-09-09, on #1157): the offer's own scenario is a relaunch on the start URL with the chip up
+        # at boot, and the user taking it before the chat pane's socket has reported up. The road goes through land(),
+        # so the #1127 latch applies: boot:true until {romp:'wsState',app:'chat',state:'up'}, and the kernel parks for
+        # this page's pane instead of aiming at a same-wid socket the previous page left behind
+        e = self.early["early"]
+        self.assertEqual(e["fetches"], [["/reveal", {"sid": "S9", "wid": "W-test", "via": "offer", "boot": True}]])
+        self.assertIn(["reveal-post", {"status": 200, "via": "offer", "boot": True}], e["diag"])
+        self.assertIn({"romp": "tapLanded", "id": "N-1"}, e["ctrl"], "taken: the record is retired the same way")
+        self.assertNotIn("/__romp/shown", e["keys"])
+        self.assertTrue(e["chip"]["hidden"])
 
     def test_dismissing_retires_the_record_without_landing(self):
         s = self.out["second"]
