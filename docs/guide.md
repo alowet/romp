@@ -58,6 +58,21 @@ beside it shows, and a link to a sibling document opens in the same viewer. Link
 on other sites open in a new tab, as before — and a ctrl- or ⌘-click still opens the file in
 a tab.
 
+**A file's own HTML.** The Rendered view keeps the HTML a markdown file carries, under rules
+modelled on those GitHub applies to a README, so nothing in a file can move, hide or cover the
+viewer's own controls. A `<style>` block is dropped whole. A form, its controls and a
+`<dialog>` are dropped but their text stays as prose. A task-list checkbox stays but cannot be
+ticked. An inline `style` keeps only its `color` and `background-color`, and only when the
+value is a color name, a hex code, or `rgb()`, `rgba()`, `hsl()` or `hsla()`; a span colored
+with any other function, such as `var()`, loses its color. A `background=` attribute is
+dropped, since it would load a remote image the moment the file opens. An inline `svg`, a
+`canvas` or a `video` shrinks to the column, as a picture does, and a table wider than the
+column scrolls sideways on its own. An element's `id` or `name` is prefixed `user-content-`,
+as on GitHub; the viewer's own heading ids are not, so a link to a heading in the file still
+lands on it. An image map (`<map>`, `usemap`) is dropped. The same rules apply to the HTML in
+a chat message, where a link to an element's own `id` or `<a name>` lands on it under the
+prefix.
+
 **Opening a PDF.** A PDF the session mentions, or one you click in the file browser, opens
 inside the dashboard like an image: the chat's PDF card opens it full-view, a path or a
 file-browser row opens it in the file viewer. Cmd-click it instead (Ctrl on Windows and

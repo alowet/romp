@@ -3,7 +3,12 @@
 // (the .romp-acted / filebrowse precedent). The copies had already drifted once (feed.css lacked the
 // a.fileview-btn anchor rules, so the GitHub link rendered hrefless-underlined there, 2026-08-26).
 // This pins the shared chrome byte-equal so it cannot drift again. Rules that are deliberately
-// pane-specific (the md body, wrap mode, load cue) are not pinned.
+// pane-specific (wrap mode, load cue, the md body's typography where the feed sheet carries a
+// fallback) are not pinned. The md body's own rule IS: its `contain: layout` is what keeps a
+// file's fixed-positioned element inside the note, and it has to hold in both documents, as do
+// the width caps on the media a file draws itself (svg, canvas, video), which under containment
+// would otherwise be clipped and unreachable, and the table rule that gives a wide table a
+// horizontal scroll of its own for the same reason.
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -18,7 +23,10 @@ const RULES = [
   ".fileview-dir {", ".fileview-base {", ".fileview-sess {", ".fileview-sess .host-prefix {", ".fileview-acts {", ".fileview-btn {", ".fileview-btn:hover {",
   "a.fileview-btn {", ".fileview-gh {", ".fileview-gh-why {", ".fileview-gh-dots {",
   ".fileview-gh .fileview-btn:disabled {", ".fileview-gh .fileview-btn:disabled:hover {",
-  ".fileview-gh .fileview-btn:disabled:active {", "a.fileview-gh-note {", ".fileview-body {",
+  ".fileview-gh .fileview-btn:disabled:active {", "a.fileview-gh-note {", ".fileview-body {", ".fileview-md {",
+  ":where(.fileview-md) svg, :where(.fileview-md) canvas, :where(.fileview-md) video {",
+  ':where(.fileview-md :is(svg, canvas)[width]:not([width$="%"])) {',
+  ".fileview-md table {",
   ".fileview-cm {", ".fileview-cm .cm-editor {", ".fileview-editor {", ".fileview > .fileview-err {",
   ".fileview-dir-link {", ".fileview-dir-link:hover {",
   ".fileview-imgbox {", ".fileview-img {", ".fileview-frame {",

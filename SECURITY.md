@@ -63,6 +63,20 @@ UID can read.
 - **Output sanitization:** model output and message content rendered in the
   dashboard/webview pass through DOMPurify; the VS Code webview runs under a
   strict nonce CSP with `localResourceRoots` limited to the extension's assets.
+  The profile is modelled on the rules GitHub applies to a README
+  (`ui/webview/md-sanitize.ts`, shared by the chat and the file viewer): no
+  `<style>`, no form controls, no image map, ids and names prefixed
+  `user-content-`, an inline `style` reduced to its color declarations, no
+  `background` attribute; unlike GitHub it keeps that color-only inline `style`
+  and inline SVG. One renderer writes
+  into that sanitized DOM after DOMPurify has run: KaTeX. The sanitizer keeps
+  only color in an inline `style`, and KaTeX's layout is inline style, so a
+  formula's TeX passes through DOMPurify as the text of an inert placeholder
+  and KaTeX renders it there afterwards, under `trust: false` (KaTeX's own
+  safety model: no TeX command writes a link, an image, or an HTML attribute of
+  the author's choosing). That boundary is checked against the code by
+  `ui/webview/md-sanitize-postpass-browser.test.ts`; the profile, as the browser
+  lays a file out, by `ui/webview/md-sanitize-browser.test.ts`.
 - **No unsafe deserialization:** no `pickle`, `eval`, `exec`, or non-safe YAML on
   untrusted data.
 

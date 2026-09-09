@@ -40,10 +40,15 @@ test("render.ts: every mover of #content is a writeScroll — scrollBy and scrol
   assert.match(RENDER, /scrollContentBy\(content, e\.key === "ArrowDown" \? NAV_SCROLL_STEP : -NAV_SCROLL_STEP, "key-nav"\);/, "the arrow keys");
   assert.match(RENDER, /scrollElInto\(content0, el0, "center", "land-on"\);/, "the sentence land");
   assert.match(RENDER, /const land = \(writer: string\) => \{ const c = document\.getElementById\("content"\); if \(c\) scrollElInto\(c, target, "start", writer\); \};\s*\n\s*const realign = \(\) => land\("land-realign"\);\s*\n\s*land\("land-on"\);/, "the deep-link land and its re-alignments");
-  // the scrollIntoView calls that remain are on OTHER scrollers (the tab strip, picker rows, the slash popup, the awaiting box)
+  // a message's own `#` link (the click delegate): inside the transcript the move is a writeScroll; a target that stands
+  // outside #content (a comment popover's reply, found through userContentTarget's document fallback) scrolls its own
+  // container the browser's way, and the #content arm is taken first
+  assert.match(RENDER, /if \(cont && cont\.contains\(target\)\) scrollElInto\(cont, target, "start", "section-link"\);\s*\n\s*else target\.scrollIntoView\(\{ block: "start" \}\);/, "the section link");
+  // the scrollIntoView calls that remain are on OTHER scrollers (the tab strip, picker rows, the slash popup, the awaiting
+  // box, and the section link's else arm above, which the #content test keeps off the transcript)
   const rest = RENDER.split("\n").filter((l) => /scrollIntoView\(/.test(l));
-  assert.equal(rest.length, 4, "four scrollIntoView calls remain, none on a #content child: " + rest.map((l) => l.trim().slice(0, 60)).join(" | "));
-  for (const l of rest) assert.doesNotMatch(l, /target|el0|realign/, l);
+  assert.equal(rest.length, 5, "five scrollIntoView calls remain, none on a #content child: " + rest.map((l) => l.trim().slice(0, 60)).join(" | "));
+  for (const l of rest) if (!/else target\.scrollIntoView/.test(l)) assert.doesNotMatch(l, /target|el0|realign/, l);
 });
 
 test("render.ts: a spacer re-size of the active view files a spacer row; the cap comes from localStorage", () => {

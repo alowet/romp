@@ -1,41 +1,79 @@
 // Behavior tests for the TeX math extension (math.ts). The delimiter rules are the
 // load-bearing part: in chat text a bare `$` means shell variables and prices far more often
-// than math, so the stay-literal cases matter as much as the rendered ones. marked and katex
-// both run for real here (plain JS, no DOM needed); DOMPurify compatibility is pinned at the
-// source level instead, same as render-sanitize.test.ts (no jsdom harness for the webview).
+// than math, so the stay-literal cases matter as much as the rendered ones. marked runs for
+// real here (plain JS, no DOM needed). The extension emits a PLACEHOLDER per formula, an
+// element carrying the TeX as text, and KaTeX renders into it AFTER the sanitizer
+// (renderMathPlaceholders, a DOM post-pass sanitizeMd runs), so what this file can execute is
+// the placeholder contract: which text becomes a formula, which stays prose, and what the
+// placeholder carries. That KaTeX's layout survives the sanitizer is executed in headless
+// Chromium over the real modules by md-sanitize-postpass-browser.test.ts (a fraction stacks, a
+// superscript is raised, the radical has height, and the rendered root is katex.render's own
+// output byte for byte). The wiring (math.ts, chat-md.ts, render.ts) is source-pinned below.
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Marked } from "marked";
-import { mathBlock, mathInline } from "./math";
+import katex from "katex";
+import { mathBlock, mathInline, mathPlaceholder, MATH_INLINE_CLASS, MATH_DISPLAY_CLASS } from "./math";
 
 const m = new Marked({ gfm: true, extensions: [mathBlock, mathInline] });
 const html = (src: string) => m.parse(src) as string;
-const hasMath = (s: string) => s.includes('class="katex"');
+const PLACEHOLDER = /<(span|div) class="(md-math-inline|md-math-display)">([\s\S]*?)<\/\1>/g;
+const unescape = (s: string) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+/** Every placeholder in marked's output, in order: its tag, its mode and the TeX it carries. */
+const formulas = (out: string) => Array.from(out.matchAll(PLACEHOLDER)).map((x) => ({ tag: x[1], display: x[2] === MATH_DISPLAY_CLASS, tex: unescape(x[3]) }));
+const hasMath = (s: string) => formulas(s).length > 0;
+// the options renderMathPlaceholders hands katex.render (pinned against math.ts below)
+const KATEX = { throwOnError: false, output: "html", trust: false } as const;
 
-// --- renders as math ---
+// --- becomes a formula: marked emits the placeholder, KaTeX does not run here ---
 
-test("inline $..$ renders KaTeX", () => {
+test("inline $..$ becomes an inline placeholder carrying the TeX", () => {
   const out = html("Euler: $e^{i\\pi}+1=0$ holds.");
-  assert.ok(hasMath(out));
-  assert.ok(!out.includes("$e^"), "raw TeX must not leak through");
+  assert.deepEqual(formulas(out), [{ tag: "span", display: false, tex: "e^{i\\pi}+1=0" }]);
+  assert.ok(!out.includes("$e^"), "the delimiters must not leak through");
+  assert.ok(!out.includes('class="katex"'), "KaTeX runs after the sanitizer, never inside marked");
+  assert.equal(MATH_INLINE_CLASS, "md-math-inline");
 });
 
-test("inline \\(..\\) renders KaTeX", () => {
-  assert.ok(hasMath(html("Ratio \\(\\tfrac{a}{b}\\) here.")));
+test("inline \\(..\\) becomes an inline placeholder", () => {
+  assert.deepEqual(formulas(html("Ratio \\(\\tfrac{a}{b}\\) here.")), [{ tag: "span", display: false, tex: "\\tfrac{a}{b}" }]);
 });
 
-test("$$..$$ and \\[..\\] render display math", () => {
-  assert.ok(html("Total: $$\\sum_i x_i$$ done.").includes("katex-display"));
-  assert.ok(html("\\[x^2\\]").includes("katex-display"));
+test("$$..$$ and \\[..\\] become display placeholders: a span inside a paragraph, a div for a paragraph of their own", () => {
+  assert.deepEqual(formulas(html("Total: $$\\sum_i x_i$$ done.")), [{ tag: "span", display: true, tex: "\\sum_i x_i" }]);
+  assert.deepEqual(formulas(html("\\[x^2\\]")), [{ tag: "div", display: true, tex: "x^2" }]);
+  assert.ok(!html("\\[x^2\\]").includes("<p>"), "the block form is not wrapped in a paragraph");
 });
 
 test("a multi-line $$ paragraph beats markdown's block rules", () => {
   // The "- x" line would become a <li> if block tokenization carved the formula up first.
   const out = html("$$\n- x\n$$");
-  assert.ok(out.includes("katex-display"));
+  assert.deepEqual(formulas(out), [{ tag: "div", display: true, tex: "- x" }]);
   assert.ok(!out.includes("<li>"), "list rule must not fire inside display math");
+});
+
+test("the TeX is text: markup inside a formula is escaped, never emitted as HTML", () => {
+  // The placeholder is the one place marked writes a formula, and the sanitizer sees it as an element
+  // with text; a formula can therefore never smuggle an element past it.
+  const out = html("$a<b \\& c>d$ and $<img src=x onerror=1>$");
+  assert.deepEqual(formulas(out).map((f) => f.tex), ["a<b \\& c>d", "<img src=x onerror=1>"]);
+  assert.ok(!out.includes("<img"), "escaped: the placeholder's text is not markup");
+  assert.ok(out.includes("&lt;img src=x onerror=1&gt;"));
+  assert.equal(mathPlaceholder("a<b", false, false), '<span class="md-math-inline">a&lt;b</span>');
+  assert.equal(mathPlaceholder("x", true, true), '<div class="md-math-display">x</div>');
+  assert.equal(mathPlaceholder("x", true, false), '<span class="md-math-display">x</span>', "display math inside a paragraph is a span: the placeholder stays in the flow it came from");
+});
+
+test("marked's output holds no KaTeX markup, no inline style and no svg: nothing for the colour-only style rule to strip", () => {
+  for (const src of ["$\\frac{a}{b}$", "$$\\sum_{i=0}^{n} i^2$$", "$\\sqrt{d}$", "$x^2$", "\\[\\int_0^1 f\\]"]) {
+    const out = html(src);
+    assert.ok(hasMath(out), "placeholder expected for " + src + ": " + out);
+    assert.doesNotMatch(out, /class="katex/, "no KaTeX markup before the sanitizer: " + out);
+    assert.doesNotMatch(out, /style=/, "no inline style before the sanitizer: " + out);
+    assert.doesNotMatch(out, /<svg/, "no svg before the sanitizer: " + out);
+  }
 });
 
 test("closing $ may touch trailing punctuation and emphasis", () => {
@@ -44,10 +82,13 @@ test("closing $ may touch trailing punctuation and emphasis", () => {
   assert.ok(strong.includes("<strong>") && hasMath(strong));
 });
 
-test("invalid TeX degrades to flagged output, never a throw", () => {
-  const out = html("bad: $\\frac{1}{$ end");
-  assert.equal(typeof out, "string");
-  assert.ok(out.includes("katex"), "katex error rendering expected");
+test("invalid TeX renders as flagged output under the options the post-pass uses, never a throw; trust: false mints no URL", () => {
+  // renderMathPlaceholders needs a DOM (katex.render); the same options through renderToString are
+  // KaTeX's same pipeline minus the node building, and the browser leg runs the real call.
+  const out = katex.renderToString("\\frac{1}{", { ...KATEX, displayMode: false });
+  assert.ok(out.includes("katex-error"), "throwOnError: false paints bad TeX as flagged source");
+  const untrusted = katex.renderToString("\\href{javascript:alert(1)}{x}", { ...KATEX, displayMode: false });
+  assert.ok(!untrusted.includes("<a ") && !untrusted.includes("javascript:"), "trust: false: no TeX command mints a URL");
 });
 
 // --- stays literal ---
@@ -95,25 +136,30 @@ test("render.ts wires the math extensions into marked, through the shared chat g
   // chat-md.ts owns the extension list (shared with the breaks:true user-text instance, so a user
   // message with math renders exactly as before); render.ts applies it to the singleton.
   const grammar = UI("chat-md.ts");
-  assert.match(grammar, /import \{ mathBlock, mathInline \} from "\.\/math";/);
+  assert.match(grammar, /import \{ mathBlock, mathInline, renderMathPlaceholders \} from "\.\/math";/);
   assert.match(grammar, /export const chatMdExtensions: MarkedExtension\[\] = \[delDoubleTilde, \{ extensions: \[mathBlock, mathInline\] \}\];/);
   const src = UI("render.ts");
   assert.match(src, /import \{ chatMdExtensions, userMdHtml \} from "\.\/chat-md";/);
   assert.match(src, /marked\.use\(\.\.\.chatMdExtensions\);/);
 });
 
-test("math.ts renders html-only output so md()'s DOMPurify profile passes it", () => {
-  // output: "html" means no MathML twin — but stretchy glyphs (\sqrt radicals, wide accents,
-  // extensible arrows) are still inline <svg> even in html mode, so the sanitizer allows
-  // DOMPurify's svg profile alongside html (the user 2026-08-19: $\sqrt{d}$ rendered as a bare
-  // serif "d" — the radical was sanitized away while its radicand survived).
-  assert.match(UI("math.ts"), /output: "html"/);
-  assert.match(UI("render.ts"), /USE_PROFILES: \{ html: true, svg: true \}/);
+test("math.ts renders KaTeX into the placeholders after the sanitizer, html-only, under trust: false", () => {
+  // output: "html" means no MathML twin. KaTeX's output no longer passes through DOMPurify at all: the
+  // fill writes katex.render's DOM into the sanitized body, so its inline styles and stretchy <svg>
+  // glyphs (\sqrt radicals, wide accents) reach the page whole, and trust: false is what keeps a
+  // formula from minting a link, an image or a style of the author's choosing. The sanitizer's svg
+  // profile stays for an author's own inline SVG.
+  const math = UI("math.ts");
+  assert.match(math, /export function renderMathPlaceholders\(root: ParentNode\): void \{/);
+  assert.match(math, /katex\.render\(tex, el, \{ displayMode: display, throwOnError: false, output: "html", trust: false \}\);/);
+  assert.doesNotMatch(math, /katex\.renderToString\(/, "the string renderer is gone: marked emits placeholders, the fill renders into the DOM");
+  assert.match(UI("md-sanitize.ts"), /USE_PROFILES: \{ html: true, svg: true \}/);
+  assert.doesNotMatch(UI("render.ts"), /USE_PROFILES/, "render.ts spells no profile of its own");
 });
 
-test("executed: \\sqrt really does emit inline svg — the glyph the sanitizer must keep", () => {
-  const out = html("norm grows like $\\sqrt{d}$ here.");
-  assert.ok(hasMath(out));
+test("executed: \\sqrt really does emit inline svg, the glyph the fill writes into the sanitized DOM", () => {
+  const out = katex.renderToString("\\sqrt{d}", { ...KATEX, displayMode: false });
+  assert.ok(out.includes('class="katex"'));
   assert.ok(out.includes("<svg"), "the radical is an inline svg even with output:html");
   assert.ok(out.includes("sqrt"), "KaTeX marks the construct");
 });
