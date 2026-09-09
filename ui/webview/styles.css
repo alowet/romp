@@ -3468,10 +3468,14 @@ mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 
   background: var(--bg, #1e1e1e); border: 1px solid var(--box-border); border-radius: var(--radius-modal);
   box-shadow: var(--shadow-modal); }
 body.fileview-open { overflow: hidden; }
-.fileview-bar { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; min-width: 0;
+.fileview-bar { flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: 0;
   padding: 7px 10px; border-bottom: 1px solid var(--box-border); }
 /* Only the DIRECTORY may be truncated: the filename identifies the file, so it holds its width however
-   deep the path is, and the dimmed directory in front of it gives up room first. */
+   deep the path is, and the dimmed directory in front of it gives up room first. The bar WRAPS: the path
+   keeps at least 12em and the action row drops to a second line, right-aligned, when the two do not fit
+   side by side (the text-size control's three buttons pushed Download, Copy path and the close button off
+   the card below about 600px; .fileview is overflow: hidden, and a phone has no Escape). The wrap is the
+   bar's own: the two .fileview-bar rules after .fileview-acts below. */
 .fileview-name { flex: 1 1 auto; min-width: 0; font-size: 0.86em; color: var(--fg);
   display: flex; align-items: baseline; white-space: nowrap; }
 .fileview-dir { flex: 0 1 auto; min-width: 0; color: var(--dim);
@@ -3494,6 +3498,12 @@ body.fileview-open { overflow: hidden; }
   background: var(--overlay-10, rgba(255, 255, 255, 0.12)); color: var(--fg); user-select: none; }
 .fileview-sess .host-prefix { color: inherit; opacity: 0.75; }
 .fileview-acts { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
+/* The wrap is the TITLE BAR's, not the classes': the file browser's action row (.fb-bar, file-browse.ts)
+   wears .fileview-acts outside any bar and keeps one line at every width (its crumb trail is what gives up
+   room), so the plain flex above holds there. Inside the bar the path keeps 12em and takes the rest of a
+   wide bar, and the action row shrinks and wraps to the right edge. */
+.fileview-bar .fileview-name { flex: 1 1 0; min-width: 12em; }
+.fileview-bar .fileview-acts { flex: 0 1 auto; min-width: 0; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
 .fileview-btn { font: inherit; font-size: 0.82em; cursor: pointer; flex: 0 0 auto;
   padding: 3px 9px; border-radius: 6px; background: transparent; color: var(--fg);   /* T151: the one button rest */
   border: 1px solid var(--card-border);
@@ -3514,11 +3524,21 @@ a.fileview-btn { text-decoration: none; display: inline-flex; align-items: cente
    dimmed button and the loader's dots (.fileview-dot, the pane's own) where the caption will go — a slow
    check must read as a wait, not as the old no-button state nor as a verdict (the loading-state rule) */
 .fileview-gh-dots { display: inline-flex; align-items: center; gap: 4px; }
-/* no link: a real disabled button, greyed, hover inert — never hidden (an absent button read as
-   "broken" when the file was simply not committed yet, 2026-09-05) */
-.fileview-gh .fileview-btn:disabled { opacity: 0.55; cursor: default; }
-.fileview-gh .fileview-btn:disabled:hover { border-color: var(--card-border); color: var(--fg); background: transparent; }
-.fileview-gh .fileview-btn:disabled:active { transform: none; }
+/* a disabled bar button, greyed, hover inert: the GitHub unit's no-link state (a real disabled button, never
+   hidden: an absent button read as "broken" when the file was simply not committed yet, 2026-09-05), the
+   editor's Save while a save is in flight (disabled and reading "Saving…"), and the text-size control's ends
+   (A− at the smallest step, A+ at the largest; aria-disabled, so the button keeps the keyboard focus it holds
+   and the ring stays where the person left it). One treatment for every bar button, so neither an end nor a
+   save in progress reads as live under the pointer. */
+.fileview-btn:disabled, .fileview-btn[aria-disabled="true"] { opacity: 0.55; cursor: default; }
+.fileview-btn:disabled:hover, .fileview-btn[aria-disabled="true"]:hover { border-color: var(--card-border); color: var(--fg); background: transparent; }
+.fileview-btn:disabled:active, .fileview-btn[aria-disabled="true"]:active { transform: none; }
+/* the text-size readout between A− and A+ (file-view.ts textSizeControl): a slot of ONE width whatever it
+   says, and at the default (nothing to reset, nothing to say) an empty slot rather than none, so A− never
+   moves under the pointer when the readout appears after the first press. visibility, not display: the slot
+   stays, the button leaves the tab order. */
+.fileview-size-reset { min-width: 5.5em; box-sizing: border-box; text-align: center; font-variant-numeric: tabular-nums; }
+.fileview-size-reset.fileview-size-default { visibility: hidden; }
 /* a link whose branch is not on origin yet: dashed, the caption carries the note */
 a.fileview-gh-note { border-style: dashed; }
 .fileview-body { flex: 1 1 auto; min-height: 0; overflow: auto; }
@@ -3586,11 +3606,11 @@ body.filebrowse-open { overflow: hidden; }
 .fileview-code { display: flex; align-items: flex-start; min-height: 100%; }
 .fileview-gutter { flex: 0 0 auto; position: sticky; left: 0; z-index: 1;
   padding: 10px 8px 10px 10px; text-align: right; user-select: none;
-  font-family: var(--mono, ui-monospace, monospace); font-size: 12px; line-height: 1.5;
+  font-family: var(--mono, ui-monospace, monospace); font-size: calc(12px * var(--fv-scale, 1)); line-height: 1.5;
   color: var(--dim); opacity: 0.55; background: var(--bg, #1e1e1e);
   border-right: 1px solid var(--box-border); white-space: pre; }
 .fileview-pre { flex: 1 1 auto; margin: 0; padding: 10px 12px;
-  font-family: var(--mono, ui-monospace, monospace); font-size: 12px; line-height: 1.5;
+  font-family: var(--mono, ui-monospace, monospace); font-size: calc(12px * var(--fv-scale, 1)); line-height: 1.5;
   white-space: pre; tab-size: 4; }
 .fileview-pre code { background: none; padding: 0; font: inherit; }
 /* a refusal explains itself in place, in the kernel's own words (too large — with the size and the
@@ -3638,6 +3658,32 @@ body.filebrowse-open { overflow: hidden; }
 }
 .fileview-wrap .fv-ct { flex: 1 1 auto; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 
+/* ── text size and measure (file-view.ts textSizeControl) ── The A− / A+ buttons and Ctrl/Cmd + wheel over the
+   body set `data-fv-text` on the viewer root to one of TEXT_SIZES; this table turns the step into the ONE
+   property the text views read, --fv-scale. Every text size below is a multiple of it, so the prose, its
+   headings (em of the prose), inline and fenced code, and the Raw view's rows and gutter scale together, and
+   the prose measure with them (the same characters per line at every size). Nothing else reads it: the title
+   bar, its buttons and the editor keep the page's size. Absent (a bundle without these rules) every fallback
+   reads as 1, today's sizes exactly. file-view-text-size.test.ts pins the table against TEXT_SIZES in both
+   sheets. The measure sits on the root's children, not the root: a table takes the viewer's width when its
+   columns need it (the root is fluid to the body), and a table wider than that scrolls on its own with
+   whole words kept (`overflow-wrap: normal` against the root's `anywhere`, which would crush every column to
+   fit), so the page never widens. Code blocks keep the measure and wrap their long lines (long lines always
+   soft-wrap): a short snippet has no use for a viewer-wide block beside 860px prose. The measure rule is written
+   at ZERO specificity (:where) so a picture's own cap below always beats it: a bare <img> line in a README is a
+   direct child of the root, and a plain :not() chain would tie `.fileview-md img` on specificity and leave the
+   winner to rule order; :where keeps the picture's cap the winner whatever the order, so a wide banner is never
+   laid out at the measure to scroll a narrow viewer sideways. A picture that is itself a block of the page takes
+   the measure AND the column, like an image paragraph (the `.fileview-md > :is(img, svg, canvas, video)` rule). */
+.fileview[data-fv-text="70"] { --fv-scale: 0.7; }
+.fileview[data-fv-text="80"] { --fv-scale: 0.8; }
+.fileview[data-fv-text="90"] { --fv-scale: 0.9; }
+.fileview[data-fv-text="100"] { --fv-scale: 1; }
+.fileview[data-fv-text="115"] { --fv-scale: 1.15; }
+.fileview[data-fv-text="130"] { --fv-scale: 1.3; }
+.fileview[data-fv-text="150"] { --fv-scale: 1.5; }
+.fileview[data-fv-text="175"] { --fv-scale: 1.75; }
+.fileview[data-fv-text="200"] { --fv-scale: 2; }
 /* Rendered markdown (the Raw ⇄ Rendered toggle; Rendered is the default — the user 2026-08-09).
    Typography mirrors the chat's .md block in styles.css, the reference aesthetic (one treatment, two
    sheets — the .romp-acted precedent); font sizes reuse what this surface already wears (the page base,
@@ -3649,8 +3695,10 @@ body.filebrowse-open { overflow: hidden; }
    body's vertical scroll is untouched. Content wider than .fileview-md becomes ink overflow the body cannot
    scroll to, so the media rules below cap an <svg>, <canvas> or <video> at the column as `.fileview-md img`
    already does, and the table rule below gives a table wider than the column a horizontal scroll of its own.
-   Pinned byte-equal in both sheets (fileview-parity.test.ts). */
-.fileview-md { padding: 14px 18px; max-width: 860px; overflow-wrap: anywhere; font-family: var(--font-prose); contain: layout; }
+   The column is the root's own width, fluid to the viewer: the prose measure sits on the root's children (the
+   text-size block above). Pinned byte-equal in both sheets (fileview-parity.test.ts). */
+.fileview-md { padding: 14px 18px; overflow-wrap: anywhere; font-family: var(--font-prose); font-size: calc(1em * var(--fv-scale, 1)); contain: layout; }
+.fileview-md > :where(:not(table)) { max-width: calc(860px * var(--fv-scale, 1)); }
 .fileview-md > :first-child { margin-top: 0; }
 .fileview-md > :last-child { margin-bottom: 0; }
 .fileview-md p { margin: 0.5em 0; }
@@ -3680,14 +3728,15 @@ body.filebrowse-open { overflow: hidden; }
 }
 .fileview-md pre code {
   background: none; padding: 0; display: block;
-  font-family: var(--mono, ui-monospace, monospace); font-size: 12px; line-height: 1.5;
+  font-family: var(--mono, ui-monospace, monospace); font-size: calc(12px * var(--fv-scale, 1)); line-height: 1.5;
   color: var(--code-fg, #e1c08d); white-space: pre-wrap; overflow-wrap: anywhere;
 }
 /* A table wider than the column (a `nowrap` cell, many columns) scrolls sideways on its own, as on GitHub: a block
    box shrink-wrapped to its content (width: max-content) and capped at the column, with the overflow scrollable.
    Under contain: layout the body cannot scroll to what a table lets run past the column, so the table has to.
-   border-collapse is inherited by the anonymous table box the block wraps, so the cell borders still collapse. */
-.fileview-md table { border-collapse: collapse; margin: 0.6em 0; display: block; width: max-content; max-width: 100%; overflow-x: auto; }
+   border-collapse is inherited by the anonymous table box the block wraps, so the cell borders still collapse.
+   overflow-wrap: normal keeps whole words against the root's `anywhere`, which would crush every column to fit. */
+.fileview-md table { border-collapse: collapse; margin: 0.6em 0; display: block; width: max-content; max-width: 100%; overflow-x: auto; overflow-wrap: normal; }
 .fileview-md th, .fileview-md td { border: 1px solid var(--box-border); padding: 4px 10px; text-align: left; }
 .fileview-md th { background: var(--box-bg); }
 .fileview-md img { max-width: 100%; }
@@ -3699,6 +3748,11 @@ body.filebrowse-open { overflow: hidden; }
    the cap and keeps the author's height. */
 :where(.fileview-md) svg, :where(.fileview-md) canvas, :where(.fileview-md) video { max-width: 100%; }
 :where(.fileview-md :is(svg, canvas)[width]:not([width$="%"])) { height: auto; }
+/* a bare top-level medium (an <img> line in a README, an inline <svg>, <canvas> or <video> block: a direct child of
+   the root) takes the measure AND the column, like an image paragraph. Class-and-type specificity, so it outranks
+   both the general caps above and the :where measure; the measure alone (a class) would beat the element-level
+   media cap for a direct child and hold a wide diagram at 860px on a narrower viewer, clipped under contain: layout. */
+.fileview-md > :is(img, svg, canvas, video) { max-width: min(100%, calc(860px * var(--fv-scale, 1))); }
 
 /* ── the viewer's image + PDF bodies (a .png used to open as line-numbered mojibake). The <img>
    wears the lightbox image's own treatment (.romp-lightbox-img: capped, object-fit contain, the

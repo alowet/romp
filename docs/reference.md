@@ -249,6 +249,18 @@ ghostty --working-directory={dir}   # Linux: Ghostty
 code {dir}                          # VS Code instead
 ```
 
+### The file viewer's per-browser choices
+
+The file viewer keeps two choices in the browser's own storage, not on the
+kernel, so they survive a kernel restart and apply wherever the viewer opens
+(over the chat or the feed, and for a document opened from a link on the
+dashboard's own address): the Rendered or Raw view of a markdown file
+(`romp:fileviewFmt`) and the text size (`romp:fileviewTextSize`, one of 70,
+80, 90, 100, 115, 130, 150, 175 or 200 percent, set by the **A−** / **A+**
+buttons or Ctrl/Cmd + wheel over the text). The size scales the prose, its
+headings, the code and the Raw view together, and the prose measure with
+them; a value outside the table reads as 100.
+
 ### Model and effort, from the statusline or a typed command
 
 Typing `/model X` or `/effort X` into the chat composer, or sending one with

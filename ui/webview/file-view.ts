@@ -118,6 +118,112 @@ function el(tag: string, cls?: string): HTMLElement {
   return e;
 }
 
+// ── text size (A−, A+, Ctrl/Cmd + wheel) ───────────────────────────────────────────────────────────
+// The viewer's text sizes, as percentages of the page's own size: a FIXED table with ends, not a free
+// multiplier, so the buttons, the wheel and the stored value all land on the same few sizes and a size can
+// never run away. 100 is the default and leaves every size exactly as it was. The chosen step rides the
+// viewer root as `data-fv-text`, and the sheets turn it into the ONE property the text views read
+// (`--fv-scale`; the "text size and measure" block in styles.css and feed.css). Persisted like the
+// Rendered ⇄ Raw choice above: per browser, in localStorage, under its own key, and any malformed or
+// foreign value reads as the default (parseFmt's contract). The value stays a percentage, never a
+// multiplier, so the stored text and the readout say the same thing.
+export const TEXT_SIZES: readonly number[] = [70, 80, 90, 100, 115, 130, 150, 175, 200];
+export const TEXT_SIZE_DEFAULT = 100;
+const TEXT_SIZE_KEY = "romp:fileviewTextSize";
+/** A stored value back to a step of the table; anything else (absent, garbage, a size the table does not
+ *  hold, a multiplier) is the default, so a corrupt entry may cost the preference, never the viewer. */
+export function parseTextSize(raw: string | null | undefined): number {
+  const n = Number(raw ?? NaN);
+  return TEXT_SIZES.includes(n) ? n : TEXT_SIZE_DEFAULT;
+}
+/** The step next to `pct` in `dir`, clamped at the table's ends (from 200, +1 answers 200). A `pct` the table
+ *  does not hold (never stored, but the function is pure) steps from the default. */
+export function stepTextSize(pct: number, dir: 1 | -1): number {
+  const from = TEXT_SIZES.includes(pct) ? pct : TEXT_SIZE_DEFAULT;
+  const i = TEXT_SIZES.indexOf(from) + dir;
+  return TEXT_SIZES[Math.min(TEXT_SIZES.length - 1, Math.max(0, i))];
+}
+function loadTextSize(): number {
+  try { return parseTextSize(localStorage.getItem(TEXT_SIZE_KEY)); } catch { return TEXT_SIZE_DEFAULT; }
+}
+function saveTextSize(pct: number): void {
+  try { localStorage.setItem(TEXT_SIZE_KEY, String(pct)); } catch { /* storage full */ }
+}
+// Ctrl/Cmd + wheel over the text is the pointer's way to the same steps. A wheel notch is one event of about
+// 100 pixels (Chrome) or a few LINES (Firefox, deltaMode 1); a trackpad pinch, which browsers report as a
+// ctrlKey wheel, is a burst of events a few pixels each. Stepping once per event would run a pinch through
+// the whole table in a moment, so the deltas are SUMMED: normalized to pixels, added up, and a step is taken
+// each time the sum passes WHEEL_STEP_PX (then cleared); a change of direction clears it too, so a reversal
+// does not first pay off the other way's remainder. Pure over the event's fields, so the summing is testable:
+// `acc` is the running sum the caller keeps, `dir` the step to take now (0 for none). Events without the
+// modifier are not the gesture (the caller lets them scroll) and never reach this.
+export const WHEEL_STEP_PX = 40;
+export function foldWheel(e: { deltaY: number; deltaMode: number }, acc: number): { acc: number; dir: 0 | 1 | -1 } {
+  const px = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1);   // lines and pages as pixels
+  if (px === 0) return { acc, dir: 0 };
+  const sum = acc !== 0 && Math.sign(acc) !== Math.sign(px) ? px : acc + px;         // a reversal starts over
+  if (Math.abs(sum) < WHEEL_STEP_PX) return { acc: sum, dir: 0 };
+  return { acc: 0, dir: sum < 0 ? 1 : -1 };                                           // wheel up is larger
+}
+// The control: A−, the current size as the reset between them, A+. Built once per open by BOTH viewers (a
+// file on disk and a document opened from a link on the dashboard's own address), so the two honour one
+// stored size and a step in either is kept for both. The readout is said only once the size is off the
+// default (at 100% there is nothing to reset and nothing to say), but its SLOT is there from the start: the
+// sheet empties it by visibility, not display, so neither A− nor A+ moves under the pointer when it fills
+// after the first press, and the empty slot leaves the tab order. An end of the table is said with
+// aria-disabled, not `disabled`: a button that disables under keyboard focus drops it (the ring would vanish
+// on the press that reached the end), while an aria-disabled one keeps the focus, wears the sheet's disabled
+// dress, and its press is the no-op set() already makes of a step to the size in force. The three hide until
+// `textShowing` says a text body is up: each viewer's renderBody calls sync() on every paint, the first of them
+// before the fetch, so the loader, a picture, a PDF and the editor never show them. Direct listeners are
+// click-safe here: the buttons are built once and never rebuilt by a paint (the format toggles' idiom), and
+// every press acknowledges in the same tick (the attribute, the readout, the dimmed end; the sheets reflow
+// from the attribute alone).
+function textSizeControl(root: HTMLElement, textShowing: () => boolean): { buttons: HTMLButtonElement[]; sync: () => void; bindWheel: (body: HTMLElement) => void } {
+  let pct = loadTextSize();
+  const down = el("button", "fileview-btn fileview-size") as HTMLButtonElement;
+  down.type = "button"; down.textContent = "A−"; down.title = "Smaller text (Ctrl/Cmd + wheel)";
+  down.setAttribute("aria-label", "Smaller text");
+  const reset = el("button", "fileview-btn fileview-size fileview-size-reset") as HTMLButtonElement;
+  reset.type = "button"; reset.title = "Reset the text size";
+  const up = el("button", "fileview-btn fileview-size") as HTMLButtonElement;
+  up.type = "button"; up.textContent = "A+"; up.title = "Larger text (Ctrl/Cmd + wheel)";
+  up.setAttribute("aria-label", "Larger text");
+  const buttons = [down, reset, up];
+  const atEnd = (b: HTMLButtonElement, end: boolean) => { if (end) b.setAttribute("aria-disabled", "true"); else b.removeAttribute("aria-disabled"); };
+  // the property on the root, and the control's own state, from pct
+  const apply = () => {
+    root.dataset.fvText = String(pct);
+    reset.textContent = pct + "%";
+    reset.setAttribute("aria-label", "Text size " + pct + "%, reset to " + TEXT_SIZE_DEFAULT + "%");
+    reset.classList.toggle("fileview-size-default", pct === TEXT_SIZE_DEFAULT);   // the empty slot
+    atEnd(down, pct === TEXT_SIZES[0]);
+    atEnd(up, pct === TEXT_SIZES[TEXT_SIZES.length - 1]);
+  };
+  apply();                                                    // on the root before the bytes land: the first paint is at size
+  // one step: store it and apply it; a step that changes nothing (an end of the table, a reset at the default) does nothing
+  const set = (n: number) => { if (n === pct) return; pct = n; saveTextSize(n); apply(); };
+  down.addEventListener("click", () => set(stepTextSize(pct, -1)));
+  up.addEventListener("click", () => set(stepTextSize(pct, 1)));
+  reset.addEventListener("click", () => set(TEXT_SIZE_DEFAULT));
+  // Ctrl/Cmd + wheel over the BODY (not the bar): the browser's page zoom is the same gesture, so it is taken
+  // over the viewer's text only, and only with the modifier held over a text body; a plain wheel scrolls as
+  // ever, and the keyboard's Ctrl+plus/minus stays the browser's. Non-passive, so the page zoom can be
+  // prevented; the summing is foldWheel's.
+  let acc = 0;
+  const bindWheel = (body: HTMLElement) => {
+    body.addEventListener("wheel", (e: WheelEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || !textShowing()) return;
+      e.preventDefault();
+      const r = foldWheel(e, acc);
+      acc = r.acc;
+      if (r.dir) set(stepTextSize(pct, r.dir));
+    }, { passive: false });
+  };
+  const sync = () => { const hide = !textShowing(); for (const b of buttons) b.hidden = hide; };
+  return { buttons, sync, bindWheel };
+}
+
 // The romp loader (swirl + wordmark + three pulsing accent dots), per the loading-state rule: the
 // FIRST thing up on any wait, fading the instant real content lands. The viewer's earlier waits
 // build this markup inline; the URL viewer reaches for it here.
@@ -450,6 +556,16 @@ export function openFileView(path: string, sid?: string | null, frag?: string | 
       acts.appendChild(b);
     }
   }
+  // ── text size ── A− and A+ step every text view through TEXT_SIZES, Ctrl/Cmd + wheel over the body
+  // does the same, and the percentage between them (said once the size is off the default) is the reset;
+  // textSizeControl above has the shape. Shown over a TEXT view only: the editor does not hold the body,
+  // and the text the current view shows has landed (viewText: the fetch pipeline's text, or the decoded
+  // XML while the SVG Source view is up; a picture or a PDF frame leaves both null). The text lands with
+  // the kernel's Content-Type verdict, so a picture opened over a slow link never shows the control
+  // beside the loader and then takes it away.
+  const textShowing = (): boolean => !editing && viewText() !== null;
+  const textSize = textSizeControl(box, textShowing);
+  for (const b of textSize.buttons) acts.appendChild(b);
   // ── the SVG Source toggle ── an SVG is served (and shown) as an image, but it IS also XML worth
   // reading; the toggle swaps in the existing highlighted-code view (langFor maps svg → xml) built
   // from the SAME fetched bytes — no second request. Appears only once an image/svg+xml body landed.
@@ -548,6 +664,7 @@ export function openFileView(path: string, sid?: string | null, frag?: string | 
   bar.appendChild(name); if (sess) bar.appendChild(sess); bar.appendChild(acts);
 
   const body = el("div", "fileview-body");
+  textSize.bindWheel(body);                    // Ctrl/Cmd + wheel over the text steps the size (textSizeControl)
   // A rendered document's RELATIVE links (`[notes](./notes.md)`, `[fig](plots/a.png)`) open the
   // sibling file in this same viewer — mdBlock stamps each one `data-act="fv-open"` with the joined
   // path (joinDocPath) instead of a target the page would navigate to. One delegated listener on
@@ -635,6 +752,7 @@ export function openFileView(path: string, sid?: string | null, frag?: string | 
       b.hidden = editing;                       // format choices leave with edit mode; Save/Cancel own the bar
     }
     editBtn.hidden = editing || text === null || !isText || !mtimeNs;
+    textSize.sync();                          // the text-size control follows every paint: shown over a text view only
     saveBtn.hidden = !editing;
     cancelBtn.hidden = !editing;
     if (isImage || isPdf) {
@@ -671,8 +789,16 @@ export function openFileView(path: string, sid?: string | null, frag?: string | 
   // chip lands in the session the file was opened FOR even if the active tab changed while the
   // modal was up (the 2026-08-19 routing rule: the gesture's session, never activeId-at-gesture).
   let seedSeq = 0;                                 // last gesture wins if two fresh reads race
-  box.addEventListener("mouseup", () => {
+  box.addEventListener("mouseup", (ev) => {
     if (editing) return;   // CodeMirror selections are edit gestures, not quotes
+    // A press on a title-bar CONTROL (A−, A+, the readout, Raw, Copy path, the GitHub link) settles no
+    // selection: the mouseup lands on the button while a passage may still stand selected in the body,
+    // and the seed below would re-read the file and re-seed the quote chip on every step of the text
+    // size. The gate is the control under the lift, not the bar: a drag that starts in the body and is
+    // released over the bar's path or its padding (the overshoot when selecting back to a file's first
+    // line) is a selection like any other and settles.
+    const at = ev.target as Element | null;
+    if (at && bar.contains(at) && at.closest("button, a")) return;
     // No chip target reachable → no seed (the no-sink gating): the post would be dead air and the
     // label's fresh read dead work. The target is this document's composer (the chat-hosted viewer)
     // or, from a pane without one — the feed — the shell, which forwards the seed into the chat pane
@@ -969,6 +1095,10 @@ export function openUrlView(href: string): void {
     segBtns.push([mode, b]);
     acts.appendChild(b);
   }
+  // the text-size control the local viewer has (textSizeControl): a document opened from a link honours
+  // the same stored size as a file on disk, and a step here is kept for both
+  const textSize = textSizeControl(box, () => text !== null);
+  for (const b of textSize.buttons) acts.appendChild(b);
   // The way OUT to the URL itself, in a new tab — an anchor wearing the button treatment, the
   // GitHub link's dress: the browser owns the tab. It is also every failure pane's exit below.
   // data-new-tab: this href IS a same-origin .md, exactly what the chat's anchor delegate routes
@@ -996,6 +1126,7 @@ export function openUrlView(href: string): void {
   bar.appendChild(name); bar.appendChild(acts);
 
   const body = el("div", "fileview-body");
+  textSize.bindWheel(body);                            // Ctrl/Cmd + wheel over the text steps the size
   // In-document links land on their heading (mdBlock's fv-anchor stamp): one delegated listener, the
   // local viewer's pattern. No fv-open here — a URL document's sibling links are made absolute and
   // the chat's own anchor delegate routes them.
@@ -1027,6 +1158,7 @@ export function openUrlView(href: string): void {
       b.classList.toggle("on", on);
       b.setAttribute("aria-pressed", String(on));
     }
+    textSize.sync();                                   // shown once the document's text is up
     if (text === null) return;                         // the loader holds the body until the bytes land
     body.replaceChildren(fmt.md === "rendered"
       ? mdBlock(text, { kind: "url", href: loc })      // relative refs resolve against where it LIVES
