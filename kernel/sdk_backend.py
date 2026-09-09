@@ -9827,8 +9827,9 @@ class SdkBackend:
         _ls = reg.get("lastSid")
         _tp = Path(transcript_path(reg.get("cwd") or "", _ls)) if _ls else None
         _has_history = bool(_tp) and _tp.exists() and _tp.stat().st_size > 0
-        fields = {"name": new_name, **({"renameNote": new_name} if _has_history else {})}
-        self._update_reg(sid, **fields)    # locked RMW — see set_effort's race note
+        note = {"renameNote": new_name} if _has_history else {}
+        fields = {"name": new_name, **note}          # the keys this write moves: what the rollback below puts back
+        self._update_reg(sid, name=new_name, **note)   # locked RMW — see set_effort's race note
         # keep the shared names/ identity file in sync (preserve colours). Durable registry FIRST; a
         # names write that RAISES (ENOSPC, EROFS, a permission fault) used to leave the registry holding
         # the new name and the exception escaping with no compensation, so a rename the caller was told
