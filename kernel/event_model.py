@@ -101,7 +101,26 @@ MSG_TAG_RE = re.compile(r"<!--\s*romp-tag:\s*([A-Za-z0-9][A-Za-z0-9-]{0,23})\s*-
 # over the stream as promptSource "sdk", so sdk_human would author them 'human' → _is_opener opens a turn →
 # the planner force-pins a junk goal titled "<task-notification>" (the user 2026-06-30, screenshot). Anchored
 # at the START so a real user message with a reminder APPENDED isn't caught (the kernel splits those off).
-SYSTEM_WRAPPER_RE = re.compile(r"^\s*<(?:task-notification|system-reminder)\b")
+# ...and the CLI's harness PREAMBLE (Claude Code 2.1.263, the user 2026-09-07): the CLI now puts a fixed
+# paragraph AHEAD of the wrapper tag so the MODEL never mistakes an injected turn for its user —
+# "[SYSTEM NOTIFICATION - NOT USER INPUT]" before a background task's <task-notification>. The tag no
+# longer opens the record, so the tag-anchored test above stopped seeing these as harness-injected and
+# every background agent's completion authored 'human' → the blue "you typed this" bubble, wearing the
+# preamble paragraph as its text, and a junk goal per completion. Authorship is FIELD-FIRST now (author_of
+# reads the record's own `origin.kind`); this text shape is the fallback for a record that lacks the field
+# (an older CLI, the live stream's echo, a queued copy). Matched as the record's OPENING line only, like
+# the tags — a prompt that merely quotes the sentinel is still the user's.
+SYSTEM_WRAPPER_RE = re.compile(r"^\s*(?:\[SYSTEM NOTIFICATION - NOT USER INPUT\]|<(?:task-notification|system-reminder)\b)")
+# A scheduled task's FIRED PROMPT (origin.subkind "scheduled-trigger") wears its own preamble. Unlike a
+# notification it IS a prompt — the work that follows is real and must open a turn — so it authors 'sdk'
+# (a programmatic prompt: opens a turn, never the human's blue bubble), not 'system'.
+SCHEDULED_PREAMBLE_RE = re.compile(r"^\s*\[SCHEDULED TASK - AUTOMATED FIRING OF A CONFIGURED PROMPT\]")
+# The preamble PARAGRAPH, wherever it sits in an injected record's text (the sentinel line and the
+# explanatory lines that run to the next blank line) — what strip_harness_preamble lifts out of the shown
+# text into the card's fold. Only ever applied to a record already classified as NOT the human's.
+HARNESS_PREAMBLE_PARA_RE = re.compile(
+    r"\[(?:SYSTEM NOTIFICATION - NOT USER INPUT|SCHEDULED TASK - AUTOMATED FIRING OF A CONFIGURED PROMPT)\][^\n]*"
+    r"(?:\n(?!\s*\n)[^\n]*)*")
 # Claude Code's NATIVE teammate/agent-message channel — one agent messages another, DISTINCT from romp's
 # own postal bus (no romp-msg-id). It's delivered as a promptSource "sdk" user record whose text is a
 # <prompt> wrapper: "Another Claude session sent a message:" + one or more <teammate-message
@@ -110,8 +129,14 @@ SYSTEM_WRAPPER_RE = re.compile(r"^\s*<(?:task-notification|system-reminder)\b")
 # this" bubble (the user 2026-07-05: idle_notification coordination JSON showed as a human message).
 # Anchored at the START (optionally inside a one-level <prompt>/<unit> wrapper) so it matches a real
 # DELIVERY and NOT a conversation SUMMARY that merely quotes one ("<turn>\nUSER ASKED: Another Claude…").
-TEAMMATE_MSG_RE = re.compile(r"^\s*(?:<\w+>\s*)?Another Claude session sent a message:", re.I)
+# Three text shapes, all the CLI's own fixed lead-ins (2.1.263 added the mid-turn forms and the
+# <cross-session-message from="…"> envelope its cross-session SendMessage delivers): matched by that lead-in,
+# never by the body. Field-first still wins — a record stamped origin.kind "peer" authors 'teammate'
+# whatever its text (author_of).
+TEAMMATE_MSG_RE = re.compile(r"^\s*(?:<\w+>\s*)?(?:(?:Another Claude session|A peer session) sent a message"
+                             r"(?: while you were working)?:|<cross-session-message\b)", re.I)
 TEAMMATE_BLOCK_RE = re.compile(r"<teammate-message\b([^>]*)>(.*?)</teammate-message>", re.S)
+CROSS_SESSION_BLOCK_RE = re.compile(r"<cross-session-message\b([^>]*)>(.*?)</cross-session-message>", re.S)
 # Claude Code's slash-command transcript wrappers. The INVOCATION (`<command-name>`) and its OUTPUT
 # (`<local-command-stdout>`) become a tracked COMMAND TURN (the user 2026-06-29) — see atoms(); the rest
 # (`<command-message|args|contents>`, `<local-command-caveat>`) stay skipped as harness noise.
@@ -778,11 +803,20 @@ def postal_pairs(text):
 # message from a human prompt (both are `user` messages). Everything else the old
 # typed/queued/absorbed/decision/postal enum encoded is derived from position
 # (opener vs mid-turn) and content, not stored here.
-def author_of(blocks, prompt_source, postal_index, sdk_human=False):
-    """human | romp | sdk | system | {"peer": <rompUuid|None>, "mid": <id>, "kind": <kind|"">} | None.
+def author_of(blocks, prompt_source, postal_index, sdk_human=False, origin=None):
+    """human | romp | sdk | system | teammate | {"peer": <rompUuid|None>, "mid": <id>, "kind": <kind|"">} | None.
 
     Order matters: the postal marker wins over promptSource (a delivered message can
     arrive with any promptSource). A tool_result-only user atom has no author.
+
+    origin: the record's own `origin` field — the CLI's PROVENANCE stamp on every turn it injects on its
+    own (claude_agent_sdk MessageOrigin: kind task-notification / peer / coordinator / channel /
+    auto-continuation / observer / unclassified…; "human" or absent for the person's own prompt). Read
+    FIRST (the user 2026-09-07): the text shapes below are how each kind happened to be worded by one CLI
+    build, and 2.1.263 reworded the background-task notification (a preamble ahead of the tag), which
+    made every one of them a blue human bubble. The field is the authoritative source; the text tests
+    stay as the fallback for records without it. Any kind that is not "human" is NOT the human, whatever
+    sdk_human says — that flag exists only to read an UNSTAMPED "sdk" prompt as the composer's.
 
     A peer author carries the marker it resolved, not just the sender: one delivery can hold
     several messages, so every later reader (the judge's _seg_peer / _seg_peer_kind) must be
@@ -793,10 +827,24 @@ def author_of(blocks, prompt_source, postal_index, sdk_human=False):
     injections still carry the romp-injected marker and peers the postal marker (both handled
     above), so an UNMARKED "sdk" prompt here is the human → render it as the blue human bubble.
     Off (the default) elsewhere, where "sdk" means a genuine programmatic/autonomous injection."""
+    okind = origin.get("kind") if isinstance(origin, dict) else None
+    osub = origin.get("subkind") if isinstance(origin, dict) else None
+    # A peer STAMP is kind "peer" OR a task-notification whose subkind is "peer-send-message", the SDK's other
+    # task-channel subkind (claude_agent_sdk TaskNotificationOriginSubkind): a message sent from another of the
+    # user's sessions. Another session's words, classified exactly like kind "peer": never a background
+    # task's report, so it neither opens nor folds into a task turn, and the task channel's own preamble on
+    # its text cannot re-read it as one (review find, 2026-09-09, on #1099).
+    peer_stamp = okind == "peer" or (okind == "task-notification" and osub == "peer-send-message")
+    if okind == "task-notification" and not peer_stamp:
+        if osub == "scheduled-trigger":
+            return "sdk"                          # a scheduled task's fired PROMPT: programmatic, but real work follows
+        return "system"                           # a background task's completion → folds in, never a goal
     text = _text_of(blocks)
     if text:
-        if SYSTEM_WRAPPER_RE.match(text):         # a harness <task-notification> / <system-reminder>, not the user
+        if SYSTEM_WRAPPER_RE.match(text) and not peer_stamp:   # a harness <task-notification> / <system-reminder> / its preamble
             return "system"                       # → author 'system' so _is_opener folds it in, never a goal
+        if SCHEDULED_PREAMBLE_RE.match(text) and not peer_stamp:   # a scheduled task's fired prompt, unstamped → programmatic prompt
+            return "sdk"
         if TEAMMATE_MSG_RE.match(text):           # Claude Code's native agent-to-agent delivery, not the user typing
             return "teammate"                     # → its own collapsed chat card; a non-opener (like 'system'), so
             #   high-frequency coordination pings never pin a junk goal. Checked before the postal marker: the
@@ -816,6 +864,12 @@ def author_of(blocks, prompt_source, postal_index, sdk_human=False):
             return {"peer": peer, "mid": mid, "kind": kind}
         if ROMP_INJECT_RE.search(text):           # romp pasted this into the pane (a feed nudge) → system, not human
             return "romp"
+    if okind and okind != "human":
+        # Stamped as injected, and no romp/postal marker claimed it above: a peer session's (or an
+        # in-process background subagent's) message, by kind "peer" or the task channel's "peer-send-message"
+        # subkind → the teammate card; everything else the CLI injects (coordinator, channel,
+        # auto-continuation, observer…) → a programmatic prompt.
+        return "teammate" if peer_stamp else "sdk"
     if prompt_source == "sdk":
         return "human" if sdk_human else "sdk"
     if prompt_source == "system":
@@ -857,7 +911,123 @@ def parse_teammate_message(text):
         out.append({"id": (a.get("teammate_id") or "").strip(),
                     "summary": (a.get("summary") or "").strip(),
                     "body": body.strip()})
+    if not out:
+        # the 2.1.263 cross-session envelope: <cross-session-message from="…" [from-name="…"]>body</…>. The
+        # sender's display name when the CLI gave one, else its address; the CLI's "This came from another
+        # Claude session…" boilerplate around the block falls away like the teammate wrapper's.
+        for attrs, body in CROSS_SESSION_BLOCK_RE.findall(text or ""):
+            a = dict(re.findall(r'([\w-]+)="([^"]*)"', attrs))
+            out.append({"id": (a.get("from-name") or a.get("from") or "").strip(),
+                        "summary": "", "body": body.strip()})
     return out
+
+
+# The `origin` keys the atom carries — the SDK's documented per-kind fields (claude_agent_sdk MessageOrigin).
+# `body` is the peer message with the envelope stripped, "byte-exact with what the model saw" — the SDK
+# says to render it rather than re-parse the text, so it rides (capped like every other body).
+_ORIGIN_KEYS = ("kind", "subkind", "name", "from", "server", "senderTaskId", "body")
+
+
+def _record_origin(rec):
+    """A transcript record's provenance stamp as the atom carries it, or None. Two record shapes: a user
+    record's top-level `origin`, and a queued_command ATTACHMENT's (the mid-turn splice), which either
+    carries `origin` outright or says `commandMode: "task-notification"` — the same fact, older spelling."""
+    o = rec.get("origin")
+    if not isinstance(o, dict):
+        att = rec.get("attachment") if rec.get("type") == "attachment" else None
+        if isinstance(att, dict):
+            o = att.get("origin")
+            if not isinstance(o, dict) and att.get("commandMode") == "task-notification":
+                o = {"kind": "task-notification"}
+    if not isinstance(o, dict) or not isinstance(o.get("kind"), str) or o["kind"] == "human":
+        return None            # a "human" stamp says nothing the author does not; only INJECTED kinds ride
+    out = {k: o[k] for k in _ORIGIN_KEYS if isinstance(o.get(k), str)}
+    if out.get("body") and len(out["body"]) > _RESULT_CAP:
+        out["body"] = out["body"][:_RESULT_CAP]
+    return out
+
+
+def strip_harness_preamble(text):
+    """(text without the CLI's harness preamble paragraph, the paragraph) — for a record ALREADY known
+    not to be the human's. The paragraph is the CLI's fixed note to the model ("[SYSTEM NOTIFICATION -
+    NOT USER INPUT] This is an automated background-task event…"); the chat shows the record under its
+    source label and keeps the paragraph one click away in the card's fold, never as the message."""
+    if not text:
+        return text, ""
+    m = HARNESS_PREAMBLE_PARA_RE.search(text)
+    if not m:
+        return text, ""
+    pre = m.group(0).strip()
+    rest = (text[:m.start()].rstrip() + "\n\n" + text[m.end():].lstrip()).strip()
+    return rest, pre
+
+
+def injected_source(author, origin, reminders=(), preamble=""):
+    """The SOURCE a harness-injected user-role record is shown under (the chat's notice head), or None for
+    the human's own words. `kind`: "subagent" (a background agent came to rest — name = its description,
+    the one the model itself sees in the notification's <summary>), "task" (a background command),
+    "system" (a harness notice: a bare reminder, a scheduled task's firing, an automatic continuation…),
+    "peer" (another session / the coordinating session / an MCP channel — postal has its own card and
+    never reaches here). Pure: the kernel's chat build and its tests read it the same way.
+
+    preamble: the harness paragraph strip_harness_preamble lifted off the record's text, when there was
+    one. It is the fallback that names an UNSTAMPED scheduled firing (an older CLI, the live echo): the
+    stamped path labels it "Scheduled task", and the text path must not hand the same record back as an
+    unlabelled neutral note (review find, 2026-09-09, on #1099).
+
+    The user asked whether the model can tell WHICH subagent a notification came from (2026-09-07): it
+    can — the notification names the task id, the launching tool-use id and the agent's description in
+    its <summary> ("Agent \"<description>\" came to rest"), so the head shows at least that description."""
+    if author == "human" or author == "romp" or isinstance(author, dict):
+        return None
+    okind = (origin or {}).get("kind") if isinstance(origin, dict) else None
+    sub = (origin or {}).get("subkind") if isinstance(origin, dict) else None
+    # kind "peer", or the task channel's "peer-send-message" subkind (a message from another of the user's
+    # sessions): the peer notice, never a finished background task, so the notification-naming loop below
+    # never runs for it either (review find, 2026-09-09, on #1099). Same rule as author_of's peer_stamp.
+    peer_stamp = okind == "peer" or (okind == "task-notification" and sub == "peer-send-message")
+    if peer_stamp:
+        # a "peer-send-message" stamp carries none of kind "peer"'s sender fields, so it reads "another session"
+        return {"kind": "peer", "name": origin.get("name") or origin.get("from") or "another session",
+                "subagent": bool(origin.get("senderTaskId"))}
+    # The notification names its task only when the RECORD is the notification: a system-authored (or
+    # author-less live) record, or one stamped task-notification. An unstamped programmatic prompt that
+    # merely arrived with a notification attached keeps today's neutral note with the card nested under it.
+    for r in (reminders or ()) if (author in ("system", None) or okind == "task-notification") else ():
+        note = _parse_task_notification("<task-notification>%s</task-notification>" % r)
+        if not note or not (note.get("summary") or "<task-id>" in r):
+            continue                     # a plain reminder, not a task's notification (the parser defaults a status)
+        summ = note.get("summary") or ""
+        m = re.search(r'Agent\s+"([^"]+)"', summ)
+        if m:
+            return {"kind": "subagent", "name": m.group(1), "status": note["status"]}
+        m = re.search(r'Background command\s+"([^"]+)"', summ)
+        if m:
+            return {"kind": "task", "name": m.group(1), "status": note["status"]}
+        return {"kind": "task", "name": re.sub(r"\s+(?:came to rest|completed).*$", "", summ).strip() or "task",
+                "status": note["status"]}
+    if okind == "task-notification":
+        if sub == "scheduled-trigger":
+            return {"kind": "system", "label": "Scheduled task"}
+        return {"kind": "task", "name": "background task", "status": ""}
+    if okind == "coordinator":
+        return {"kind": "peer", "name": "the coordinating session", "subagent": False}
+    if okind == "channel":
+        return {"kind": "peer", "name": origin.get("server") or "a channel", "subagent": False}
+    if okind == "auto-continuation":
+        return {"kind": "system", "label": "Automatic continuation"}
+    if okind in ("observer", "observer-activity"):
+        return {"kind": "system", "label": "Observer report"}
+    if okind and okind != "human":
+        return {"kind": "system", "label": okind.replace("-", " ")}
+    if author == "system":
+        return {"kind": "system", "label": "System reminder"}   # a bare <system-reminder> record, unstamped
+    if preamble and SCHEDULED_PREAMBLE_RE.match(preamble):
+        # unstamped, but the lifted preamble itself says what fired the prompt: the same label the stamped
+        # path gives it, with the preamble kept on the event for the card's fold: nothing the text path
+        # labelled before becomes an unlabelled note (review find, 2026-09-09, on #1099)
+        return {"kind": "system", "label": "Scheduled task"}
+    return None   # an unstamped 'sdk' prompt keeps today's neutral note; a teammate has its own card
 
 
 # ═════════════════════════ FILE ADAPTER: graph recovery, quarantined ═════════════════════════
@@ -1572,12 +1742,14 @@ class FileAdapter:
         reply, so markdown folded the reply INTO the blockquote; and the kernel's optimistic echo could
         never text-prune against the collapsed copy, so the message rendered TWICE)."""
         blocks = [{"type": "text", "text": full}]
+        arec = self.by_uuid.get(auid) or {}
+        origin = _record_origin(arec)   # a queued_command attachment carries its own origin / commandMode
         atom = {
             "type": "user", "uuid": auid, "session_id": rompuuid,
             "t": t, "sentAt": t, "fsid": self.fsid_of.get(auid),
-            "parentUuid": (self.by_uuid.get(auid) or {}).get("parentUuid"),
+            "parentUuid": arec.get("parentUuid"),
             "message": {"role": "user", "content": blocks},
-            "author": author_of(blocks, None, postal_index, getattr(self, "sdk_human", False)),
+            "author": author_of(blocks, None, postal_index, getattr(self, "sdk_human", False), origin),
             "absorbed": True,   # a mid-turn splice, placed where the model read it (T252d): the
             #                     atoms that FOLLOW it are the model's work after reading it — its
             #                     reply, as for any ask. (Until T252d the atom sat at its SEND time and
@@ -1586,6 +1758,8 @@ class FileAdapter:
             #                     flag still tells the chat and the judges how the message arrived.
             "_seq": seq,
         }
+        if origin:
+            atom["origin"] = origin
         landed_t = self._landing_t(seq)
         if landed_t is not None:
             if landed_t < t:
@@ -1924,7 +2098,10 @@ class FileAdapter:
                     atom["toolUseResult"] = r["toolUseResult"]
                 if ps:
                     atom["promptSource"] = ps
-                author = author_of(blocks, ps, postal_index, getattr(self, "sdk_human", False))
+                origin = _record_origin(r)
+                if origin:
+                    atom["origin"] = origin      # the CLI's provenance stamp rides the atom (the chat's source head)
+                author = author_of(blocks, ps, postal_index, getattr(self, "sdk_human", False), origin)
                 if author is not None:
                     atom["author"] = author
                     if not _author_final(author, btext):

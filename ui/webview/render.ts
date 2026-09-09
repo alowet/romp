@@ -44,7 +44,8 @@ import { reloadHoldReason } from "./reload-hold";
 import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional, focusResolvesProvisional } from "./provisional";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
-import { parseAgentNotif, type AgentNotif } from "./agent-notif";
+import { parseAgentNotif, notifHead, type AgentNotif } from "./agent-notif";
+import { injectedHead, type InjectedSource } from "./injected-source";
 import { subTabId, isSubId, subParts, subLabel, gistLines, stepLines, stepsNote, agentFoldLabel, subHeadParts, openIconSvg, pinIconSvg, type SubMeta, type AgentGist, type AgentGistRow, type GistLine } from "./subagent-view";
 import { previewKind, previewFull, canPreview, fileUrl, retryFailedPreviews, refreshSettledPreviews, installMdImgHeal, setLightboxNav, type LightboxNavEntry } from "./preview";
 import { openFileClick } from "./file-view";                  // a clicked file WITH its gesture (pdf-new-tab.test.ts)
@@ -106,7 +107,10 @@ type TaskOutputs = Record<string, { command: string; output: string }>;
 type ChatEvent = (
   // mid/mids: postal message ids the kernel could NOT resolve into cards, carried on the raw turn so a
   // timeline arc into it still lands (see _hydrate_postal's unresolved path)
-  | { kind: "user"; md: string; uuid?: string; ts?: string; reminders?: string[]; taskOutputs?: TaskOutputs; human?: boolean; romp?: boolean; rompAuto?: boolean; rompSystem?: boolean; followUp?: boolean; goal?: string; fuCtx?: string; canned?: string; tag?: string; mid?: string; mids?: string[]; images?: { src: string; path?: string }[]; undelivered?: boolean; echoT?: number; absorbed?: boolean; sentAt?: number; hiddenByPending?: boolean; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }
+  // source/preamble: a harness-INJECTED record (kernel injected_source — a background agent's completion, a
+  // system notice, a peer's message) and the CLI's note-to-the-model paragraph lifted out of its text; the
+  // event renders as a labelled notice (renderInjected), never the user's bubble (the user 2026-09-07)
+  | { kind: "user"; md: string; uuid?: string; ts?: string; reminders?: string[]; taskOutputs?: TaskOutputs; human?: boolean; romp?: boolean; rompAuto?: boolean; rompSystem?: boolean; followUp?: boolean; goal?: string; fuCtx?: string; canned?: string; tag?: string; mid?: string; mids?: string[]; images?: { src: string; path?: string }[]; undelivered?: boolean; echoT?: number; absorbed?: boolean; sentAt?: number; hiddenByPending?: boolean; source?: InjectedSource; preamble?: string; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }
   | { kind: "assistant"; md: string; uuid?: string; ts?: string; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }   // spacePaths: backticked filenames WITH spaces the kernel verified exist (build_session _space_paths) → whole-span links. pathLinks: path-shaped tokens the kernel verified against the filesystem, token → real open target (build_session _path_links) — the linkifier's gate
   | { kind: "thinking"; text: string; encrypted: boolean; uuid?: string; ts?: string }
   | {
@@ -170,7 +174,7 @@ type ChatEvent = (
   // Claude Code's NATIVE teammate/agent-message channel (one agent messaged this session) — distinct from
   // romp's postal service, so it gets its OWN neutral collapsed card, NOT the per-peer-colored postal card
   // and NOT a blue "you typed this" bubble. blocks = one per sending agent {id, summary?, body}.
-  | { kind: "teammate"; blocks: { id: string; summary?: string; body: string }[]; ts?: string; uuid?: string }
+  | { kind: "teammate"; blocks: { id: string; summary?: string; body: string }[]; ts?: string; uuid?: string; source?: InjectedSource }
   // Claude Code's Task to-do list, folded into one live checklist.
   | { kind: "todo"; tasks: TodoTask[]; error?: string; ts?: string; uuid?: string }
   // A CLIENT-side optimistic echo of a just-sent message is one of these (uuid OPT_PREFIX), injected at the
@@ -1453,7 +1457,7 @@ function foldable(label: string, content: HTMLElement, key?: string): HTMLElemen
 // detached from the timeline. Nested → return the bare card; it sits in the parent turn's rail column under
 // its single dot (connected, like any in-turn card). A standalone notice (romp system) IS its own top-level
 // turn, so it keeps the .turn wrapper + dot.
-function noticeCard(o: { variant: "agent" | "romp" | "reminder" | "compact" | "clear"; chip: string; logo?: boolean;
+function noticeCard(o: { variant: "agent" | "romp" | "reminder" | "compact" | "clear" | "peer"; chip: string; logo?: boolean;
                         head: string; body: HTMLElement; collapsible?: boolean; key?: string;
                         nested?: boolean }): HTMLElement {
   const card = el("div", "notice-card notice-card-" + o.variant + (o.nested ? " notice-nested" : ""));
@@ -1502,9 +1506,10 @@ function noticeCard(o: { variant: "agent" | "romp" | "reminder" | "compact" | "c
 //     tool-use-id (ev.taskOutputs — the client can't read the output file itself).
 // When there is genuinely nothing more than the gist, the card renders FLAT (no caret, no repeated body) —
 // honest, and no dead-end. The pure parse lives in agent-notif.ts (testable); this owns the DOM.
-function renderAgentNotif(a: AgentNotif, outputs?: TaskOutputs, key?: string): HTMLElement {
+function renderAgentNotif(a: AgentNotif, outputs?: TaskOutputs, key?: string,
+                          opts: { nested?: boolean; preamble?: string } = {}): HTMLElement {
   const chip = a.kind === "agent" ? "agent" : "task";       // a Bash command is a task, not an "agent"
-  const head = a.detail ? `${a.label} · ${a.detail}` : a.label;
+  const head = notifHead(a);                                // "Background agent finished · <description>" (the user 2026-09-07)
   const body = el("div", "notice-md md");
   const extra = a.toolUseId && outputs ? outputs[a.toolUseId] : undefined;
   let hasBody = false;
@@ -1515,8 +1520,47 @@ function renderAgentNotif(a: AgentNotif, outputs?: TaskOutputs, key?: string): H
     if (extra.output) { const lbl = el("div", "notice-sub"); lbl.textContent = "output"; body.appendChild(lbl); body.appendChild(preEl(extra.output)); }
     hasBody = true;
   }
+  if (opts.preamble) { appendHarnessNote(body, opts.preamble); hasBody = true; }
+  // nested (the default) inside a carrying HUMAN turn — a prompt that arrived with a notification attached;
+  // on its OWN rail (nested: false) when the record was nothing but the notification (renderInjected)
   return noticeCard({ variant: "agent", chip, head, body, key,
-                      collapsible: hasBody, nested: true });   // flat when the gist is all there is; rendered inside the carrying user turn
+                      collapsible: hasBody, nested: opts.nested !== false });   // flat when the gist is all there is
+}
+
+// The CLI's note-to-the-model paragraph ("[SYSTEM NOTIFICATION - NOT USER INPUT] …"), kept one click away
+// inside a notice body under a dim "harness note" label — never shown as the message (the user 2026-09-07).
+function appendHarnessNote(body: HTMLElement, preamble: string): void {
+  const lbl = el("div", "notice-sub"); lbl.textContent = "harness note";
+  body.appendChild(lbl);
+  body.appendChild(preEl(preamble));
+}
+
+// A harness-INJECTED user-role record — a background agent's completion, a system notice, a scheduled task's
+// firing, a peer's message — rendered as a labelled notice on the left rail, never the user's bubble (the
+// user 2026-09-07: subagent reports and system notices were showing as their own typed words). The kernel
+// classifies by the record's OWN fields (origin.kind, then the notification's <summary>) and ships
+// `source`; this owns the DOM. Head = the source in the user's terms (injected-source.ts); body = the
+// report / message, folded by default (progressive disclosure); the CLI's preamble sits under "harness
+// note" inside the fold. Compact transcript treats it like every other notice card (its own collapse).
+function renderInjected(ev: Extract<ChatEvent, { kind: "user" }>): HTMLElement {
+  const src = ev.source as InjectedSource;
+  const notifs: { a: AgentNotif; i: number }[] = [];
+  const plain: string[] = [];
+  (ev.reminders || []).forEach((r, i) => { const a = parseAgentNotif(r); if (a) notifs.push({ a, i }); else plain.push(r); });
+  const text = (ev.md || "").replace(/<!--[\s\S]*?-->/g, "").trim();
+  const key = ev.uuid ? "inj:" + ev.uuid : undefined;
+  if (notifs.length === 1 && !text && !plain.length) {
+    // the common record: one background task came to rest and that is all it says → the task's own card,
+    // on its own rail; its body is the agent's report (or the command's shell + output tail)
+    return renderAgentNotif(notifs[0].a, ev.taskOutputs, key, { nested: false, preamble: ev.preamble });
+  }
+  const h = injectedHead(src);
+  const body = el("div", "notice-md md");
+  if (text) { const t = el("div", "md"); t.innerHTML = md(text); highlight(t); body.appendChild(t); }
+  for (const { a, i } of notifs) body.appendChild(renderAgentNotif(a, ev.taskOutputs, ev.uuid ? "agn:" + ev.uuid + ":" + i : undefined));
+  for (const r of plain) body.appendChild(preEl(r));
+  if (ev.preamble) appendHarnessNote(body, ev.preamble);
+  return noticeCard({ variant: h.variant, chip: h.chip, head: h.head, body, key, collapsible: body.childNodes.length > 0 });
 }
 
 // ---- path-source pasted images ----
@@ -2801,6 +2845,11 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
                           collapsible: more,
                           key: ev.uuid ? "rsys:" + ev.uuid : undefined });
     }
+    // A harness-INJECTED record the kernel could NAME (ev.source: a background agent's completion, a system
+    // notice, a peer's message) → its labelled notice card, never a bubble of any color (the user 2026-09-07).
+    // Never for a genuine prompt (human), even one that arrived with a notification attached — that stays the
+    // blue bubble with the nested agent card below it.
+    if (ev.source && !ev.human) return renderInjected(ev);
     // Three flavors of a "user-role" turn: a GENUINE typed prompt → the blue right-aligned bubble; a
     // message romp INJECTED (a feed nudge / follow-up — ev.romp) → a GRAY right-aligned bubble with a
     // "romp" tag, so it's clear romp (not you) sent it (the user 2026-06-19); everything else harness-
@@ -4750,11 +4799,16 @@ function renderTeammate(ev: Extract<ChatEvent, { kind: "teammate" }>): HTMLEleme
 
   const head = el("div", "teammate-head");
   const tag = el("span", "teammate-tag");
-  tag.textContent = "teammate";
-  tag.title = "a message from another Claude agent — not from you, not the romp postal service";
+  // the kernel's source (origin-stamped deliveries, CLI 2.1.263): one of THIS session's background agents
+  // messaging its parent is labelled so, not as a "teammate" from elsewhere (the user 2026-09-07)
+  const fromSub = !!(ev.source && ev.source.subagent);
+  tag.textContent = fromSub ? "background agent" : "teammate";
+  tag.title = fromSub ? "a message from one of this session's background agents — not from you"
+    : "a message from another Claude agent — not from you, not the romp postal service";
   head.appendChild(tag);
   // the sending agent name(s) as PLAIN text — no colored session chip (that's the postal card's language)
   const ids = (ev.blocks || []).map((b) => b.id).filter(Boolean);
+  if (!ids.length && ev.source && ev.source.name) ids.push(ev.source.name);
   if (ids.length) {
     const names = el("span", "teammate-names");
     names.textContent = ids.length <= 3 ? ids.join(", ") : ids.slice(0, 2).join(", ") + ", +" + (ids.length - 2);
@@ -9569,8 +9623,12 @@ function scrollToAnchor(uuid: string): boolean {
   // node's prompt IS the incoming message) — never an assistant turn. A peer opener
   // used to be refused here (.turn-postal-service isn't .turn-user) and fall through to the
   // time fallback; accepting postal lets it resolve BY ID instead (the user 2026-06-20).
+  // A harness-injected record's notice card (.turn-notice, renderInjected) is a user-role message too: a
+  // turn opened by a STAMPED prompt (a scheduled task's firing) renders as a sourced notice, not .turn-user,
+  // so a prompt-intent link into it was refused as the wrong kind (review find, 2026-09-09, on #1099).
   if (pendingAnchorIntent === "user"
-      && !target.classList.contains("turn-user") && !target.classList.contains("turn-postal-service")) {
+      && !target.classList.contains("turn-user") && !target.classList.contains("turn-postal-service")
+      && !target.classList.contains("turn-notice")) {
     pendingAnchor = null; pendingAnchorIntent = null; landTrail.push("pointer-wrong-kind"); return false;
   }
   pendingAnchor = null; pendingAnchorIntent = null;
