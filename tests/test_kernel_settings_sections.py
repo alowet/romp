@@ -62,7 +62,8 @@ class SettingsSectionsTest(unittest.TestCase):
         self.assertLess(h.index(">Updates & debug<"), h.index("id=rs-judges-index"))
         self.assertLess(h.index(">Updates & debug<"), h.index("id=rs-judges-triage"))
         self.assertLess(h.index("id=rs-judges-triage"), h.index("id=ra-open"))
-        self.assertLess(h.index("id=ra-open"), h.index("id=rsver"), "version is the very bottom")
+        self.assertLess(h.index("id=ra-open"), h.index("id=rs-log-open"), "Open log is the section's last row (T290)")
+        self.assertLess(h.index("id=rs-log-open"), h.index("id=rsver"), "version is the very bottom")
         self.assertNotIn("id=rs-debug", h)   # the single Debug toggle is gone
         # the judge toggles read as a DEBUG *show* control, not an on/off for the judges (the user 2026-06-30):
         # labels lead with "Show", and the sub spells out that it doesn't enable/disable them

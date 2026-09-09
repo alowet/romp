@@ -270,13 +270,13 @@ class ErrorCenterExecutes(unittest.TestCase):
 class ErrorCenterWiring(unittest.TestCase):
     def test_the_shell_mounts_bell_popover_and_script(self):
         html = km._landing()
-        for pin in ("id=rail-errs", "id=rerr-back", "id=rerr-list", "id=rerr-clear", "id=merr"):
+        for pin in ("id=rerr-back", "id=rerr-list", "id=rerr-clear", "id=merr"):   # the desktop bar's opener left (T290)
             self.assertIn(pin, html)
         self.assertNotIn("rerr-badge", html)   # the CORNER badge clipped and is gone (the user 2026-07-27);
         # the count lives INSIDE the glyph (the user 2026-07-28): an svg <text> the JS drives,
         # reddening with the outline via fill=currentColor
         self.assertIn("<text class='rerr-n'", html)
-        self.assertEqual(html.count("class='rerr-n'"), 2, "rail + mobile, both from the ONE _ERRS_SVG")
+        self.assertEqual(html.count("class='rerr-n'"), 1, "the mobile bar's only, from the ONE _ERRS_SVG (the desktop bar's opener left, T290)")
         self.assertIn("n>9?'+':String(n)", html)
         # the errors glyph is a warning TRIANGLE since 2026-07-28 — the BELL shape now belongs to the
         # session/card notification toggles, so the error center must not wear it; when nothing is

@@ -179,7 +179,8 @@ var GEAR_HTML =
   '</span></label>' +
   '</div>' +
   "<div class=rs-sep style='padding-top:8px'>" +
-  '<button id=ra-open class=ra-openbtn>Token usage analytics</button></div>' +
+  '<button id=ra-open class=ra-openbtn>Token usage analytics</button>' +
+  '<button id=rs-log-open class=ra-openbtn hidden>Open log</button></div>' +   // T290: the Log moved here from the bottom bar (web shell only)
   "<div class='rs-h rs-sep'>romp · version</div>" +
   '<div id=rsver>…</div></div></div>' +
   '<div id=rs-login-modal hidden>' +
@@ -1201,6 +1202,11 @@ function initGear(post) {
     if (vrow) vrow.hidden = web;
     var kb2 = document.getElementById('rs-keys-btn');
     if (kb2) kb2.onclick = function () { closeSettings(); try { window.parent.postMessage({ romp: 'openKeys' }, '*'); } catch (e) { /* no shell to ask */ } };
+    // "Open log" (T290, the user 2026-09-09): the Log left the bottom bar; this button, the last row of Updates &
+    // debug, opens the shell's Log panel (a centered modal over the dimmed dashboard, the panels rule). The modal
+    // closes first so the two never stack. Web shell only: VS Code's cross-origin parent has no Log panel.
+    var lg = document.getElementById('rs-log-open');
+    if (lg) { lg.hidden = !web; lg.onclick = function () { closeSettings(); try { window.parent.postMessage({ romp: 'openLog' }, '*'); } catch (e) { /* no shell to ask */ } }; }
   })();
   p.addEventListener('click', function (e) { if (e.target === p) closeSettings(); });   // click the dimmed backdrop (not the card) → close
   document.addEventListener('click', function (e) { if (!p.hidden && e.target !== g && !p.contains(e.target)) closeSettings(); });
