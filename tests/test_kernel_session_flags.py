@@ -854,6 +854,7 @@ class WsFlagsMustBeBooleans(unittest.TestCase):
             ("setFileEditing", "enabled", {}, km._file_editing_on, warn),
             ("setThinkingSummaries", "enabled", {}, km._thinking_summaries_on, warn),
             ("setConserve", "enabled", {}, km._conserve_on, warn),
+            ("setTmuxBackend", "enabled", {}, lambda: km.jd._state_str("tmux-backend", "off") == "on", warn),   # T288
             ("setGlobalRetryPaused", "value", {}, km._retry_paused_on, warn),
             ("setSessionFlag", "value", {"id": self.SID, "flag": "hideFromFeed"},
              lambda: km._session_flag(self.SID, "hideFromFeed"), lane),
@@ -940,6 +941,7 @@ class WsFlagsMustBeBooleans(unittest.TestCase):
         for field in ('msg.get("value")', 'msg.get("enabled")', 'msg.get("mkdir")', 'e.get("delete")',
                       'b.get("delete")', 'b.get("on")', 'b.get("mkdir")', 'body.get("on")', 'msg["enabled"]'):
             self.assertNotIn("bool(%s)" % field, src, "%s is checked by _as_bool, never coerced" % field)
+        self.assertNotIn('if msg.get("enabled") else', src, "a truthiness ternary is a coercion too (the T288 review's find)")
 
     def test_create_session_refuses_a_string_mkdir_before_touching_the_disk(self):
         calls = []

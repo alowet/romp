@@ -309,7 +309,7 @@ class CreateSessionTags(_Wire):
     def test_a_tmux_create_with_tags_refuses_instead_of_dropping_them(self):
         r = self.send({"type": "createSession", "name": "term1", "dir": self.tmp, "backend": "tmux", "tags": ["pool"]})
         self.assertEqual(r["type"], "warn")
-        self.assertIn("SDK or Codex", r["text"])
+        self.assertIn("Claude Code or Codex", r["text"])   # the backends' names since T288
         self.assertEqual(self.spawned, [], "no tmux spawn with the tags silently gone")
 
     def test_a_codex_create_takes_tags_and_a_parent_like_an_sdk_one(self):

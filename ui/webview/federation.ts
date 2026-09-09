@@ -78,7 +78,8 @@ const KERNEL_SETTING = new Set(["setAutoNudge", "setJudgeModel", "setIndexModel"
                                 "setJudgeConcurrency",   // T277: the judges' pool width, one value across machines
                                 "setDistillModel", "setDistillEffort", "setFileEditing",
                                 "setCompactSuggest",
-                                "setCommentModel", "setCommentEffort", "setCommentFast"]);
+                                "setCommentModel", "setCommentEffort", "setCommentFast",
+                                "setTmuxBackend"]);   // T288: the tmux backend's offer, one value across machines
 
 /** Return a COPY of an inbound message with every session-id field prefixed by `host`. The local host
  *  ("") is the identity transform, so local messages are untouched. Unknown fields pass through. */

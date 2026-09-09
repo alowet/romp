@@ -1036,6 +1036,7 @@ def _version_info():
             "commentModel": jd._state_str("comment-model", "session"),
             "commentEffort": jd._state_str("comment-effort", "session"),
             "commentFast": jd._state_str("comment-fast", "session"),
+            "tmuxBackend": jd._state_str("tmux-backend", "off"),   # T288: "on" offers Claude Code (tmux) in the picker and the gear
             # One dict with every kernel-side setting, lifted by a PEER kernel's /version poll onto its
             # /tunnels row so its gear can mark controls where machines disagree (the user 2026-08-14).
             # The top-level fields above stay: this tab's own gear and older kernels read those.
@@ -1054,7 +1055,8 @@ def _version_info():
                          "distillEffort": jd._state_str("distill-effort", "triage"),
                          "commentModel": jd._state_str("comment-model", "session"),
                          "commentEffort": jd._state_str("comment-effort", "session"),
-                         "commentFast": jd._state_str("comment-fast", "session")},
+                         "commentFast": jd._state_str("comment-fast", "session"),
+                         "tmuxBackend": jd._state_str("tmux-backend", "off")},
             # every gt-gated store's last-applied gesture stamp (epoch-ms ints, nothing path-shaped):
             # the gear stamps its next gesture above these instead of trusting the device clock.
             # Top-level, not lifted into /tunnels rows — a remote's newer stamp reaches the dashboard
@@ -12517,7 +12519,7 @@ def _fork_session_inner(parent_sid, cut_msg_uuid, new_name, now=None, client=Non
         return "session names use letters, digits, . _ - only."
     be = Sessions.backend_for(parent_sid)
     if not (hasattr(be, "fork") and _sdk_ready()):
-        return "fork needs the SDK backend — this session runs on tmux, so there is nothing to fork from."
+        return "fork needs a Claude Code session — this one runs in a terminal (Claude Code (tmux)), so there is nothing to fork from."
     now = now or time.time()
     sess = next((s for s in _sessions(now) if s["sid"] == parent_sid), None)
     if not sess:
@@ -13529,7 +13531,7 @@ def _comment_create(parent_sid, anchor_uuid, exact, text, name="", model="", eff
     exact/name as usual; nothing kernel-side consumes meta beyond storing it."""
     be = Sessions.backend_for(parent_sid)
     if not (hasattr(be, "fork") and _sdk_ready()):
-        return "threads need the SDK backend; this session runs on tmux, so there is nothing to fork.", None
+        return "threads need a Claude Code session; this one runs in a terminal (Claude Code (tmux)), so there is nothing to fork.", None
     if not str(exact or "").strip() or not str(text or "").strip():
         return "nothing to send: highlight a passage and write a comment.", None
     now = now or time.time()
@@ -13627,7 +13629,7 @@ def _comment_reply(parent_sid, tid, text):
     relay carries only the new tail. Returns an error string or None."""
     be = Sessions.backend_for(parent_sid)
     if not hasattr(be, "fork"):
-        return "threads need the SDK backend."
+        return "threads need a Claude Code session."
     prior, th = _comment_update_if(parent_sid, tid, ("open", "merged"),
                                    status="open", lastSeenT=int(time.time()))
     if th is None:
@@ -13840,7 +13842,7 @@ def _comment_promote_inner(parent_sid, tid, new_name, now=None, client=None):
         return "session names use letters, digits, . _ - only."
     be = Sessions.backend_for(parent_sid)
     if not (hasattr(be, "promote_thread") and _sdk_ready()):
-        return "threads need the SDK backend."
+        return "threads need a Claude Code session."
     # LATCH first (status='promoting', a CAS under the lock): the seeding below takes real time on a
     # big parent transcript, and a resolve/delete landing inside that window used to read 'open',
     # win its status write, and kill the just-promoted board session. With the latch they refuse.
@@ -13998,8 +14000,8 @@ _SDK_PROMPT = Path(os.path.expanduser("~/.claude/romp-session-prompt.md"))
 # What a session-creation refusal says when the Agent SDK isn't provisioned. ONE string for the browser
 # toast and the `romp new` JSON, because they are the same sentence to the same person: nothing was
 # created, and here is the single command that fixes it. Names the remedy, not the missing module.
-SDK_SETUP_HINT = ("Session not created: romp's Agent SDK backend isn't installed. "
-                  "Run bin/romp-sdk-setup, then try again. (tmux sessions still work.)")
+SDK_SETUP_HINT = ("Session not created: the Claude Code backend's Agent SDK isn't installed. "
+                  "Run bin/romp-sdk-setup, then try again. (Claude Code (tmux) sessions still work.)")
 
 _sdk_backend = None   # None = not built yet, False = unavailable, else the SdkBackend
 _sdk_lock = threading.Lock()   # single-flight construction: the eager boot thread races handler
@@ -26216,7 +26218,7 @@ def _rewind_send(sid, user_uuid, text, now=None):
     injection is exactly the fragility the backend seam exists to avoid."""
     be = Sessions.backend_for(sid)
     if not hasattr(be, "rewind"):
-        return "editing past messages needs the SDK backend — this session runs in tmux (use Esc Esc in its terminal)"
+        return "editing past messages needs a Claude Code session — this one runs in a terminal (use Esc Esc there)"
     if _ops_gate(sid):
         return "the session is busy — wait for the current turn to finish, then edit"
     now = now or time.time()
@@ -26261,7 +26263,7 @@ def _rewind_rollback(sid, user_uuid, now=None):
     error string for the warn toast, or None."""
     be = Sessions.backend_for(sid)
     if not hasattr(be, "rollback"):
-        return "deleting past messages needs the SDK backend — this session runs in tmux (use Esc Esc in its terminal)"
+        return "deleting past messages needs a Claude Code session — this one runs in a terminal (use Esc Esc there)"
     # NO busy gate here (delete-while-busy, the user 2026-08-29): the backend decides — a bare
     # delete on an in-flight turn interrupts it and arms the rewind at the turn's actual end;
     # compacting and queued-strangers keep their honest refusals inside _arm_rewind.
@@ -37738,6 +37740,12 @@ def _set_distill_effort(v, gt=None): return _set_judge_state("distill-effort", v
 def _set_comment_model(v, gt=None):  return _set_judge_state("comment-model", v, _judge_model_values() | {"session", "default"}, gt=gt)
 def _set_comment_effort(v, gt=None): return _set_judge_state("comment-effort", v, _EFFORT_VALUES | {"session"}, gt=gt)
 def _set_comment_fast(v, gt=None):   return _set_judge_state("comment-fast", v, {"session", "on"}, gt=gt)
+# The tmux backend's OFFER (T288, the user 2026-09-09): "Claude Code (tmux)" appears in the + picker and the
+# gear's Default backend list only while this is "on"; off by default. It gates what the picker offers and
+# nothing else: an existing tmux session keeps working and keeps its label, `romp new -t` still works, the
+# ids and the protocol are unchanged. Rides the judge-knob machinery (validated, stamped, propagated to
+# every linked kernel: the 2026-08-14 gear rule, one value across machines).
+def _set_tmux_backend(v, gt=None):   return _set_judge_state("tmux-backend", v, {"on", "off"}, gt=gt)
 
 
 # The four judge-tier settings PROPAGATE: a pick made here follows to every linked kernel (the user
@@ -37761,7 +37769,8 @@ _JUDGE_SETTING_FIELDS = (("judgeModel", _set_judge_model), ("indexModel", _set_i
                          # settings follow to every machine (the 2026-08-14 gear rule), and
                          # /judge-settings is the tunnel-side propagation that already does it
                          ("commentModel", _set_comment_model), ("commentEffort", _set_comment_effort),
-                         ("commentFast", _set_comment_fast))
+                         ("commentFast", _set_comment_fast),
+                         ("tmuxBackend", _set_tmux_backend))   # T288: the tmux backend's offer, "on" | "off"
 
 # The per-field PICK STAMPS this leg carried from 2026-08-30 (each field's STATE-file mtime in a
 # body "stamps" dict, preserved by utime at the receiver — the distill-pick stomp fix) are
@@ -37812,7 +37821,8 @@ def _apply_judge_settings(body):
             "distillEffort": jd._state_str("distill-effort", "triage"),
             "commentModel": jd._state_str("comment-model", "session"),
             "commentEffort": jd._state_str("comment-effort", "session"),
-            "commentFast": jd._state_str("comment-fast", "session")}
+            "commentFast": jd._state_str("comment-fast", "session"),
+            "tmuxBackend": jd._state_str("tmux-backend", "off")}
 
 
 def _propagate_judge_settings(body):
@@ -38022,7 +38032,8 @@ def _adopt_peer_settings(host, rver):
 # frame and the gear's STALE_LABELS already share, so /version's settingsGt speaks the same one.
 _GT_STORES = ("auto-nudge", "compact-suggest", "file-editing", "update-mode", "thinking-summaries",
               "judge-model", "index-model", "judge-effort", "index-effort", "judge-concurrency",
-              "distill-model", "distill-effort", "comment-model", "comment-effort", "comment-fast")
+              "distill-model", "distill-effort", "comment-model", "comment-effort", "comment-fast",
+              "tmux-backend")
 
 
 def _setting_stored_gt(name):
@@ -47491,7 +47502,7 @@ class Handler(BaseHTTPRequestHandler):
                             _envbe = None
                         if not hasattr(_envbe, "set_env"):
                             return self._send(200, json.dumps({"ok": False, "error":
-                                'per-session env needs an SDK session — "%s" runs on tmux, whose CLI '
+                                'per-session env needs a Claude Code session — "%s" runs in a terminal, whose CLI '
                                 "reads the tmux server's environment" % nm}), "application/json")
                     extra = _apply_new_session_prefs(live[nm], b)
                     # the idempotent open never INHERITS (no creation event — the ruling), but an
@@ -47536,7 +47547,7 @@ class Handler(BaseHTTPRequestHandler):
                         # Codex thread runs on the shared app-server and has no per-session
                         # environment to take it — refuse, like the tmux arm, never a silent drop
                         return self._send(200, json.dumps({"ok": False, "error":
-                            "per-session env needs the SDK backend — a Codex session runs on the "
+                            "per-session env needs a Claude Code session — a Codex session runs on the "
                             "shared app-server and takes no per-session environment"}), "application/json")
                     # parent/tags ride the create like the SDK arm's (the tag store is backend-
                     # agnostic), so the echo below carries the same `tags` the CLI checks
@@ -47573,13 +47584,13 @@ class Handler(BaseHTTPRequestHandler):
                                       "application/json")
                 if env_req is not None:
                     return self._send(200, json.dumps({"ok": False, "error":
-                        "per-session env needs the SDK backend — a tmux session's CLI reads the "
+                        "per-session env needs a Claude Code session — a terminal session's CLI reads the "
                         "tmux server's environment"}), "application/json")
                 if psid or tags_req:
                     # a tmux spawn is threaded and its sid is unknown at ack time, so nothing here could
                     # tag it — refuse loudly rather than spawn it outside the group it was asked into
                     return self._send(200, json.dumps({"ok": False, "error":
-                        "tags and parent need an SDK or Codex session — a terminal session's id is not "
+                        "tags and parent need a Claude Code or Codex session — a terminal session's id is not "
                         "known until it starts"}), "application/json")
                 # the claim is taken on THIS thread (kind create), so a taken or in-flight name refuses
                 # the request that asked as a 409 — the launch itself runs threaded, as before
@@ -49033,7 +49044,7 @@ class Handler(BaseHTTPRequestHandler):
                     # a tmux spawn's sid is unknown at ack time — nothing could tag it (the /new
                     # contract) — refuse loudly, never a spawn outside its group
                     client["send"](json.dumps({"type": "warn", "text":
-                        "tags and parent need an SDK or Codex session — a terminal session's id is not known until it starts"}))
+                        "tags and parent need a Claude Code or Codex session — a terminal session's id is not known until it starts"}))
                 else:
                     refusal = _spawn_session_start(nm, cwd)   # claimed on THIS thread: the refusal reaches the asker
                     if refusal:
@@ -49063,6 +49074,9 @@ class Handler(BaseHTTPRequestHandler):
                                        # billing choices THIS host can offer a new session, with the
                                        # reason for any it cannot — the picker's Billing row (see _auth_avail)
                                        "authAvail": _auth_avail(),
+                                       # whether the + picker OFFERS Claude Code (tmux) (T288): the kernel
+                                       # setting, off by default; the Backend row follows this reply
+                                       "tmuxBackend": jd._state_str("tmux-backend", "off") == "on",
                                        # this machine's name (the identity peers see) — the picker's
                                        # Host row labels its this-machine option with it, so every
                                        # option is a machine by name (the user 2026-08-12)
@@ -49373,6 +49387,21 @@ class Handler(BaseHTTPRequestHandler):
             if _jgt is not None:
                 threading.Thread(target=_propagate_judge_settings,
                                  args=({"commentFast": str(msg["fast"]), "gt": _jgt},), daemon=True).start()
+            else:
+                _tell_stale_gesture(client, msg)
+        elif msg and msg.get("type") == "setTmuxBackend" and msg.get("enabled") is not None:
+            # gear "Enable Claude Code tmux backend" (T288): a checkbox, stored as on/off. The boolean is
+            # checked like every sibling's (_as_bool; the review's find: a truthy string would have read as
+            # on and fanned out to every kernel), and a malformed frame is refused with a warn, unwritten.
+            _tbe, ferr = _as_bool(msg.get("enabled"), "enabled")
+            if ferr:
+                _refuse_ws_flag(client, msg["type"], ferr, "enabled", msg.get("enabled"))
+                return
+            _tbv = "on" if _tbe else "off"
+            _jgt = _set_tmux_backend(_tbv, gt=_gesture_ms(msg))
+            if _jgt is not None:
+                threading.Thread(target=_propagate_judge_settings,
+                                 args=({"tmuxBackend": _tbv, "gt": _jgt},), daemon=True).start()
             else:
                 _tell_stale_gesture(client, msg)
         else:

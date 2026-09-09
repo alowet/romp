@@ -25,6 +25,7 @@ import { markerLabel, dayContext } from "./time-marker";
 import { compactDisplay, toolCounts, type DisplayItem } from "./compact";
 import { senderKind, SenderKind } from "./sender-identity";
 import { loadSettings, onExternalSettingsChange, installSettingsSync, type RompSettings } from "./settings";
+import { backendLabel, effectiveDefaultBackend } from "./backend-names";
 import { delegate } from "./actions";
 import { awaitWord, awaitBreakdown, groupRows, GROUP_TITLE, workingFor, type AwaitRow } from "./spin-caption";
 import { isClearCmd, openTopTitles, clearConfirmDetail, endConfirmDetail } from "./clear-confirm";
@@ -5131,7 +5132,7 @@ function showTabTip(tab: HTMLElement, s: Session): void {
   if (s.status.effort) rows.push(["Effort", s.status.effort]);
   // Backend is a plain labelled FIELD now, under the others (the user 2026-07-08 — no longer a coloured
   // "SDK backend" badge at the top of the tooltip; it reads as one of the session's config fields).
-  if (be === "sdk" || be === "tmux" || be === "codex") rows.push(["Backend", be === "sdk" ? "SDK" : be === "codex" ? "Codex" : "tmux"]);
+  if (be === "sdk" || be === "tmux" || be === "codex") rows.push(["Backend", backendLabel(be)]);   // the shared names (T288); a tmux session keeps its label whatever the offer setting says
   // Billing: whether this tab bills the API key or the Claude login — and WHICH login account (the
   // user 2026-08-09: shown whenever the backend reports it, one-auth machines included; only a tmux
   // session, whose CLI env romp does not control, reports nothing). No key material, ever.
@@ -7047,6 +7048,15 @@ function dirPrefill(host: string): string {
 // The capability rides in on the local sessionList; assume yes until a kernel says otherwise, so an older
 // kernel that doesn't send it keeps the button it always had.
 let kernelNativeDialogs = true;
+// Whether the + picker OFFERS "Claude Code (tmux)" (T288, the user 2026-09-09): a kernel setting, off by default,
+// carried on the local sessionList reply. It gates the offer alone: an existing tmux session keeps working and
+// keeps its tooltip label whatever it says. Assumed off until a kernel says on (an older kernel sends none).
+let kernelTmuxBackend = false;
+// whether the user clicked a Backend toggle during THIS open of the picker: the sessionList reply, which lands after
+// the open reset the row, re-applies the effective default only while no explicit pick stands (the review's find:
+// a saved tmux default with the setting on landed on Claude Code on the first open, since the reset ran before
+// the reply said the toggle was on offer), and never undoes a pick the user made
+let pickerBackendPicked = false;
 
 // The two cases are shown differently, because one of them can change and the other cannot. A REMOTE host
 // is one click back to local, so the button stays in place, disabled, saying so. A kernel with no desktop
@@ -7090,7 +7100,27 @@ let pickerAuthAvail: AuthAvail | null = null;
 // same chip grammar, and a selected tag chip must never read as a backend)
 function pickerBackendChoice(): string {
   const beSel = document.querySelector("#picker .picker-backend:not(.picker-host):not(.picker-auth):not(.picker-tags) .picker-be-opt.sel") as HTMLElement | null;
-  return beSel?.dataset.be || loadSettings().backend;
+  return beSel?.dataset.be || effectiveDefaultBackend(loadSettings().backend, kernelTmuxBackend);
+}
+
+// The Backend row offers "Claude Code (tmux)" only while the kernel setting is on (T288): the toggle hides
+// otherwise, and a hidden toggle that was selected hands the selection to the effective default, so the create
+// can never send a backend the picker does not show. Re-run on every open and on the local sessionList reply.
+function syncPickerBackends(): void {
+  const wrap = document.querySelector("#picker .picker-backend:not(.picker-host):not(.picker-auth):not(.picker-tags)") as HTMLElement | null;
+  if (!wrap) return;
+  const tmuxBtn = wrap.querySelector('.picker-be-opt[data-be="tmux"]') as HTMLElement | null;
+  if (tmuxBtn) tmuxBtn.style.display = kernelTmuxBackend ? "" : "none";
+  // the effective default is re-applied while the user has not picked this open (so a saved tmux default lands
+  // once the reply says the toggle is on offer), and always when the selected toggle went off offer
+  const def = effectiveDefaultBackend(loadSettings().backend, kernelTmuxBackend);
+  const cur = wrap.querySelector(".picker-be-opt.sel") as HTMLElement | null;
+  if (!pickerBackendPicked || (!kernelTmuxBackend && cur?.dataset.be === "tmux")) {
+    if (cur?.dataset.be !== def) {
+      wrap.querySelectorAll(".picker-be-opt").forEach((x) => x.classList.toggle("sel", (x as HTMLElement).dataset.be === def));
+      syncPickerAuth(); syncPickerTags();
+    }
+  }
 }
 
 // the backends whose create takes `tags`: the kernel applies parent/tags on an SDK or a Codex create
@@ -7404,12 +7434,14 @@ function openPicker(pick = false, prompt?: string, allowNew = false) {
     const mkBe = (val: string, txt: string, tip: string) => {
       const b = el("button", "picker-be-opt") as HTMLButtonElement;
       b.type = "button"; b.textContent = txt; b.title = tip; b.dataset.be = val;
-      b.addEventListener("click", () => beWrap.querySelectorAll(".picker-be-opt").forEach((x) => x.classList.toggle("sel", x === b)));
+      b.addEventListener("click", () => { pickerBackendPicked = true; beWrap.querySelectorAll(".picker-be-opt").forEach((x) => x.classList.toggle("sel", x === b)); });
       return b;
     };
-    beWrap.append(beLabel, mkBe("sdk", "SDK", "Runs via the Claude Agent SDK."),   // not "headless" — same full chat UI (the user 2026-07-12)
-                  mkBe("tmux", "tmux", "Drives a real terminal pane (tmux)."),   // SDK first — the de-facto default (the user 2026-07-02)
-                  mkBe("codex", "Codex", "Runs an OpenAI Codex agent (the host needs romp-codex-setup + codex login)."));
+    // the labels come from backend-names.ts (T288): "Claude Code" (the default, no qualifier), "Claude Code (tmux)"
+    // (offered only while the kernel setting is on — syncPickerBackends), "Codex"; the ids are unchanged
+    beWrap.append(beLabel, mkBe("sdk", backendLabel("sdk"), "The default: romp runs the Claude Code session itself, with the same full chat."),   // first — the de-facto default (the user 2026-07-02)
+                  mkBe("tmux", backendLabel("tmux"), "Drives a Claude Code session in a real terminal pane (tmux); offered while the tmux backend is enabled in the gear."),
+                  mkBe("codex", backendLabel("codex"), "Runs an OpenAI Codex agent (the host needs romp-codex-setup + codex login)."));
     // the billing row exists only for SDK sessions, the Tags row only for backends whose create takes
     // tags (backendTakesTags) — re-decide both on every backend toggle
     beWrap.addEventListener("click", () => { syncPickerAuth(); syncPickerTags(); });
@@ -7443,7 +7475,7 @@ function openPicker(pick = false, prompt?: string, allowNew = false) {
     const tgLabel = el("span", "picker-backend-label"); tgLabel.textContent = "Tags";
     tgWrap.appendChild(tgLabel);
     const tgNote = el("span", "picker-auth-fixed picker-tags-note");   // the Billing row's written-out text style
-    tgNote.textContent = "Tags apply to SDK and Codex sessions";
+    tgNote.textContent = `Tags apply to ${backendLabel("sdk")} and ${backendLabel("codex")} sessions`;   // the shared names (T288)
     tgNote.style.display = "none";
     tgWrap.appendChild(tgNote);
     // per-session HOST picker (federation, the user 2026-07-02): local | each attached SSH host — the new
@@ -7487,7 +7519,7 @@ function openPicker(pick = false, prompt?: string, allowNew = false) {
       // create as names; the owning kernel resolves them by name, minting a missing one like POST /tag.
       // SDK and Codex creates (backendTakesTags) — a tmux create carries none (the row is disabled for
       // it, and the kernel refuses tags on a terminal create)
-      const backend = beSel?.dataset.be || loadSettings().backend;
+      const backend = beSel?.dataset.be || effectiveDefaultBackend(loadSettings().backend, kernelTmuxBackend);
       const tags = backendTakesTags(backend)
         ? Array.from(tgWrap.querySelectorAll<HTMLElement>(".picker-be-opt.sel")).map((x) => x.dataset.tag || "").filter(Boolean)
         : [];
@@ -7546,8 +7578,10 @@ function openPicker(pick = false, prompt?: string, allowNew = false) {
   const beWrapEl = overlay.querySelector(".picker-backend:not(.picker-host):not(.picker-auth)") as HTMLElement | null;
   if (beWrapEl) {   // reset the backend toggle to the gear default each open (overridable for this session)
     beWrapEl.style.display = pick ? "none" : "";
-    const def = loadSettings().backend || "tmux";
+    pickerBackendPicked = false;   // a fresh open: the row follows the effective default until the user picks
+    const def = effectiveDefaultBackend(loadSettings().backend, kernelTmuxBackend);   // a saved tmux default while it is off → Claude Code
     beWrapEl.querySelectorAll(".picker-be-opt").forEach((x) => x.classList.toggle("sel", (x as HTMLElement).dataset.be === def));
+    syncPickerBackends();
   }
   const auWrapEl = overlay.querySelector(".picker-auth") as HTMLElement | null;
   if (auWrapEl) {   // fresh open: forget last time's pick + availability; the local sessionList reply re-arms it
@@ -14838,6 +14872,9 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       kernelNativeDialogs = m.nativeDialogs;
       applyBrowseState(pickerHost());
     }
+    // the tmux backend's offer (T288): the LOCAL kernel's setting; the Backend row follows it while the picker
+    // is on screen (the reply lands after the open), and an older kernel that sends none leaves the row as it was
+    if (typeof m.tmuxBackend === "boolean" && !from) { kernelTmuxBackend = m.tmuxBackend; syncPickerBackends(); }
     // the selected host's billing choices ride its own list reply — this is what arms (or hides) the
     // picker's Billing row (the user 2026-08-08); an older kernel sends none and the row stays away
     pickerAuthAvail = (m.authAvail && typeof m.authAvail === "object") ? m.authAvail : null;
