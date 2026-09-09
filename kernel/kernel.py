@@ -398,7 +398,8 @@ class _PerfStats:
         memos = {}
         for key, read in (("pass", _goals_memo_report), ("shared", jd.shared_store_stats),
                           ("chain", jd.chain_memo_stats), ("courierSkip", jd.courier_skip_stats),
-                          ("backref", jd.backref_memo_stats)):
+                          ("backref", jd.backref_memo_stats), ("captions", jd.captions_memo_stats),
+                          ("goalArchive", jd.goal_archive_memo_stats)):
             try:
                 memos[key] = read()
             except Exception:
