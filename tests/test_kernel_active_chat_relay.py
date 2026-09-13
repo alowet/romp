@@ -138,6 +138,33 @@ class ActiveChatRelay(unittest.TestCase):
         _dispatch({"type": "activeTab", "id": API, "focused": False}, tile)   # None recorded: an unfocused report seeds again
         self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB, API, WEB, None, API])
 
+    def test_03c_a_focused_close_clears_the_record_and_a_focused_navigation_from_any_column_displaces(self):
+        """The client's rule, inverted after review (2026-09-13): `focused` is true for every NAVIGATION that changes the
+        active tab — a click, a focus message, the trail, next/prev, and the fallback when the active tab closes (the new
+        tab, or None when the pane goes unfocused) — and false only on the automatic paths (a boot restore, the grid's
+        fill, the stale fallback, an adoption, a re-render). So at the relay: the user's column closing its tab CLEARS the
+        record with a focused None and the feed's section empties; its fallback landing on another tab follows at once; a
+        focus message answered in ANOTHER column (a feed card, a deep link) displaces the followed session; and an
+        automatic report from any column still never does."""
+        chat = self._client("chat", "W1")
+        tile = self._client("chat", "W1")
+        feed = self._client("feed", "W1")
+        _dispatch({"type": "activeTab", "id": WEB, "focused": True}, chat)     # a click in the first column
+        _dispatch({"type": "activeTab", "id": API, "focused": False}, tile)    # the grid's fill landed API in a tile: automatic, skipped
+        self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB])
+        _dispatch({"type": "activeTab", "id": None, "focused": True}, chat)    # the user closed WEB; nothing to fall back to: the pane goes unfocused
+        self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB, None], "a focused None clears the record: the section empties with the pane")
+        self.assertEqual(km._ACTIVE_CHAT_BY_WID, {"W1": None})
+        _dispatch({"type": "activeTab", "id": API, "focused": False}, tile)    # the tile's next re-render seeds the empty record
+        self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB, None, API])
+        _dispatch({"type": "activeTab", "id": WEB, "focused": True}, chat)     # a feed card's focus answered in the first column: a navigation, displaces
+        self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB, None, API, WEB])
+        _dispatch({"type": "activeTab", "id": API, "focused": True}, chat)     # the user closed WEB and the fallback landed on API in the same column
+        self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB, None, API, WEB, API], "the fallback's new tab follows at once")
+        _dispatch({"type": "activeTab", "id": WEB, "focused": False}, tile)    # a tile's boot restore: automatic, never displaces
+        self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB, None, API, WEB, API])
+        self.assertEqual(km._ACTIVE_CHAT_BY_WID, {"W1": API})
+
     def test_04_a_feed_that_says_ready_learns_the_current_focus_once(self):
         chat = self._client("chat", "W1")
         _dispatch({"type": "activeTab", "id": WEB}, chat)           # recorded with no feed connected yet

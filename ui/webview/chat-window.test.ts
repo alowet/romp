@@ -161,7 +161,7 @@ test("render.ts wires the three rules, tracks the pending needFull reason, hides
   // (T357: the unfocused state's clear sits between the two lines; the re-evaluation still follows the activation.) The
   // pin is the ORDER: the activation, the clear line, then updateLivePaused with no statement between (a character
   // distance was consumed by every comment edit: 198 of 200 at one point)
-  assert.match(active, /activeId = id;\n  vanishedId = null;[^\n]*\n  updateLivePaused\(\);/, "a tab switch re-evaluates the strip for the entering tab, right after the activation and its clear");
+  assert.match(active, /activeId = id;\n  activeChanged\(\);[^\n]*\n  vanishedId = null;[^\n]*\n  updateLivePaused\(\);/, "a tab switch re-evaluates the strip for the entering tab, right after the activation and its clear");
   assert.ok(RENDER.includes('turn.dataset.orphanOf = String((ev as { orphanOf?: string }).orphanOf)'), "an orphan note's turn carries its record uuid");
   assert.equal((RENDER.match(/\.turn\[data-orphan-of="\$\{cssEscape\(uuid\)\}"\]/g) || []).length, 2, "…and both anchor lookups read it");
   assert.ok(RENDER.includes("(e as { orphanOf?: string }).orphanOf === uuid"), "…as does the events-list search behind them");

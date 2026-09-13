@@ -119,6 +119,7 @@ function lift(): (hooks: Hooks) => Api {
     const stripShows = (id, only) => tabInView(id) && (!only || matchesOnly(sessions.get(id)?.name ?? tabMeta.get(id)?.name ?? "", only));
     const stripLists = (id) => !closingTabs.has(id) && (order.includes(id) || tabMeta.has(id));   // the strip's one membership rule (T357 fix)
     const setActive = (id) => { H.activated.push(id); }; const setTimeout = (f) => { H.timers.push(f); return 0; };   // the deferred checks, held for the test to fire
+    const withAuto = (fn) => fn();   // the automatic-path latch the restores wrap their pick in (the feed's follow, tiles 2026-09-13): transparent here
     const unfocusHiddenByView = () => {};
     // the section-at-a-glance view's readers on the strip, inert: the plan the view reads (lastStripItems), the
     // section the pane shows (snapView, null: no view open, so stripAftermath's follow does nothing), and the

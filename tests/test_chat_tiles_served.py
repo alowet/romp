@@ -20,8 +20,15 @@ at 1440×900, and ONE driver run walks the story, each step landing in its own a
   4. 2×3 → 2×2 folds the surplus two tiles' sessions back into the first tile;
   5. a reload restores the grid: four frames, the class, the headers;
   6. `focused`: every activeTab a tile posts at its boot says focused:false; a click into a tile's composer posts one
-     with focused:true (the kernel lets the feed follow that tile, tests/test_kernel_active_chat_relay.py);
+     with focused:true and the feed's activeChat follows it (the kernel lets the feed follow that tile,
+     tests/test_kernel_active_chat_relay.py); then a focus from the shell — what a feed card, a deep link or the switcher
+     deliver — to a session on the first tile's strip: that column reports it focused:true and the feed's activeChat
+     moves to it (review 2026-09-13: the first cut sent every focus message unfocused, and the feed went stale);
   7. Back to tabs: one frame, the row, {v:2, cols:[]} byte for byte, no header, every session on the one strip.
+Beside steps 2 and 3, the first tile's + opens the picker: the lifted first frame is the whole viewport (dark and light),
+the grid stays a grid around it (review 2026-09-13: the first-cell rule outranked the lift and the picker stayed the size
+of its cell). The first frame's document carries a nonce set before the first transition and still there after each: a
+moved or re-made iframe loads a new document without it.
 Screenshots of the 2×2 and 2×3 states, dark and light, land in $ROMP_TILES_SHOTS (else the lab dir) for the PR — safe by
 construction: synthetic sessions, invented notes-api prompt text, placeholder ids, no real session data.
 Skips LOUDLY when the extension deps or a playwright browser are absent (CI installs none)."""
@@ -100,13 +107,14 @@ try { browser = await chromium.launch(); }
 catch (e) { console.error("browser-launch-failed: " + e); process.exit(3); }
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 const out = { t0: Date.now() };
-// every chat column's activeTab reports at the wire, with the column and the `focused` flag (step 6)
-const activeTabs = [];
+// every chat column's activeTab reports at the wire, with the column and the `focused` flag (step 6), and every
+// activeChat the kernel relays to the feed's socket (the feed's focused-session section is a view of it)
+const activeTabs = [], activeChats = [];
 await page.routeWebSocket(() => true, (ws) => {   // every pane socket: the chat columns' carry ?col=N (the first none)
-  const col = (new URL(ws.url()).searchParams.get("col")) || "";
+  const url = new URL(ws.url()), col = url.searchParams.get("col") || "", app = url.searchParams.get("app") || "";
   const server = ws.connectToServer();
   ws.onMessage((m) => { try { const f = JSON.parse(m); if (f && f.type === "activeTab") activeTabs.push({ col, id: f.id, focused: f.focused }); } catch (e) { /* a non-JSON frame */ } server.send(m); });
-  server.onMessage((m) => ws.send(m));
+  server.onMessage((m) => { if (app === "feed") { try { const f = JSON.parse(m); if (f && f.type === "activeChat") activeChats.push({ id: f.id }); } catch (e) { /* a non-JSON frame */ } } ws.send(m); });
   server.onClose(() => ws.close()); ws.onClose(() => server.close());
 });
 // the pages' errors, for a death's record (a thrown render is the likeliest way a wait never resolves)
@@ -155,6 +163,30 @@ const shell = () => page.evaluate(() => {
            crossShown: Array.from(document.querySelectorAll("#chat-pane .col-x")).map((x) => getComputedStyle(x).display) };
 });
 const shot = (name) => page.screenshot({ path: cfg.shots + "/" + name + ".png" });
+// the first tile's + opens the picker: the shell lifts the first frame (body.picker-open, #f-chat.lifted); its box, its
+// position, the grid's display and every tile's cell while lifted; then the picker closes (Escape, else the backdrop)
+const liftFirst = async () => {
+  { const fr = await (await page.$("#f-chat")).contentFrame(); await fr.locator("#tabs .tab-add").click(); }
+  await waitFn(() => document.body.classList.contains("picker-open") && document.getElementById("f-chat").classList.contains("lifted")
+    && (() => { const d = document.getElementById("f-chat").contentDocument, o = d && d.getElementById("picker"); return !!o && o.style.display !== "none"; })(), null, "the first tile's picker never lifted");
+  const r = await page.evaluate(() => {
+    const f = document.getElementById("f-chat"), b = f.getBoundingClientRect(), cs = getComputedStyle(f), cp = document.getElementById("chat-pane");
+    const d = f.contentDocument, o = d && d.getElementById("picker"), ob = o ? o.getBoundingClientRect() : null;
+    return { left: b.left, top: b.top, width: b.width, height: b.height, position: cs.position, zIndex: cs.zIndex, vw: window.innerWidth, vh: window.innerHeight,
+             appH: getComputedStyle(document.documentElement).getPropertyValue("--app-h").trim(), gridDisplay: getComputedStyle(cp).display, paneLifted: cp.classList.contains("lifted"),
+             picker: ob ? { width: ob.width, height: ob.height } : null, paneKids: Array.from(cp.children).map((e) => ({ id: e.id, area: e.style.gridArea || "" })) }; });
+  await page.keyboard.press("Escape");
+  const byKey = await page.waitForFunction(() => !document.body.classList.contains("picker-open"), null, { timeout: 3000 }).then(() => true).catch(() => false);
+  if (!byKey) { const fr = await (await page.$("#f-chat")).contentFrame(); await fr.locator("#picker").click({ position: { x: 4, y: 4 } }); }
+  await waitFn(() => !document.body.classList.contains("picker-open") && !document.getElementById("f-chat").classList.contains("lifted"), null, "the first tile's picker never closed");
+  r.after = await page.evaluate(() => { const f = document.getElementById("f-chat"), b = f.getBoundingClientRect(); return { width: b.width, height: b.height, position: getComputedStyle(f).position }; });
+  return r;
+};
+// a NONCE on the first frame's DOCUMENT (its window): a moved or re-made iframe loads a new document without it; a kept one
+// still carries it after each transition. Marked before the first transition, and again after the reload (a new document)
+let nonce = null;
+const markDoc = async () => { nonce = await page.evaluate(() => { const f = document.getElementById("f-chat"), n = "tiles-" + Math.random().toString(36).slice(2); f.__tilesMark = 1; f.contentWindow.__tilesDocNonce = n; return n; }); return nonce; };
+const docNonce = () => page.evaluate((n) => document.getElementById("f-chat").contentWindow.__tilesDocNonce === n, nonce);
 const setTheme = async (theme) => {
   await page.evaluate((theme) => { localStorage.setItem("romp:settings", JSON.stringify({ theme })); window.dispatchEvent(new Event("romp:settings")); }, theme);
   await waitFn((light) => document.body.classList.contains("theme-light") === light, theme === "yatharth-light", "the shell never switched theme to " + theme);
@@ -172,7 +204,7 @@ const act = cfg.sids[0], order = await tabsIn("f-chat"), rest = order.filter((s)
 const fill22 = rest.slice(0, 3), fill23 = rest.slice(0, 5), keep22 = [act].concat(rest.slice(3)), keep23 = [act].concat(rest.slice(5));
 out.order = order; out.fill22 = fill22; out.fill23 = fill23; out.keep22 = keep22; out.keep23 = keep23;
 out.before = await shell();
-out.before.firstNode = await page.evaluate(() => { const f = document.getElementById("f-chat"); f.__tilesMark = 1; return true; });   // a mark on the first frame's node: a moved iframe is a new document, a kept one keeps the mark's document below
+out.before.nonce = await markDoc();   // a mark on the first frame's node, and the nonce on its document
 
 // ---- 1. Tiles 2×2 ----
 out.s1 = { r: await page.evaluate(() => window.__rompChatTiles("2x2")) };
@@ -183,7 +215,7 @@ await waitTabs("f-chat", keep22);
 out.s1.shell = await shell();
 out.s1.tiles = {}; for (const fid of out.s1.shell.frameIds) out.s1.tiles[fid] = await tileOf(fid);
 out.s1.firstKept = await page.evaluate(() => document.getElementById("f-chat").__tilesMark === 1);
-out.s1.firstDocKept = await page.evaluate(() => { const d = document.getElementById("f-chat").contentDocument; return !!d && !!d.getElementById("tabs") && Array.from(d.querySelectorAll("#tabs .tab[data-id]")).length > 0; });
+out.s1.firstDocKept = await docNonce();
 await shot("tiles-2x2-dark");
 
 // ---- 2. Tiles 2×3 ----
@@ -193,13 +225,16 @@ for (const fid of ["f-chat-2", "f-chat-3", "f-chat-4", "f-chat-5", "f-chat-6"]) 
 await waitTabs("f-chat", keep23);
 out.s2.shell = await shell();
 out.s2.tiles = {}; for (const fid of out.s2.shell.frameIds) out.s2.tiles[fid] = await tileOf(fid);
+out.s2.firstDocKept = await docNonce();
 await shot("tiles-2x3-dark");
+out.s2.lift = await liftFirst();
 
 // ---- 3. the light theme: every tile follows ----
 await setTheme("yatharth-light");
 out.s3 = { shell: await shell() };
 out.s3.tiles = {}; for (const fid of out.s3.shell.frameIds) out.s3.tiles[fid] = await tileOf(fid);
 await shot("tiles-2x3-light");
+out.s3.lift = await liftFirst();
 
 // ---- 4. 2×3 → 2×2 folds the surplus home ----
 out.s4 = { r: await page.evaluate(() => window.__rompChatTiles("2x2")) };
@@ -208,6 +243,7 @@ await waitTabs("f-chat", keep22);
 out.s4.shell = await shell();
 out.s4.col1Tabs = await tabsIn("f-chat");
 out.s4.tiles = {}; for (const fid of out.s4.shell.frameIds) out.s4.tiles[fid] = await tileOf(fid);
+out.s4.firstDocKept = await docNonce();
 await shot("tiles-2x2-light");
 await setTheme("classic");
 
@@ -221,14 +257,25 @@ for (const fid of ["f-chat-2", "f-chat-3", "f-chat-4"]) { await waitTileHead(fid
 await waitBootGone();
 out.s5 = { shell: await shell() };
 out.s5.tiles = {}; for (const fid of out.s5.shell.frameIds) out.s5.tiles[fid] = await tileOf(fid);
+out.s5.nonce = await markDoc();   // a reload is a new document: marked afresh for the transitions after it
 
 // ---- 6. focused: the boot's reports say false; a click into a tile's composer says true ----
 const until = async (pred, ms) => { const t0 = Date.now(); while (!pred() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 50)); return pred(); };   // a node-side condition (the wire's record), bounded
 out.s6 = { boot: activeTabs.slice() };
-activeTabs.length = 0;
+activeTabs.length = 0; activeChats.length = 0;
 { const fr = await (await page.$("#f-chat-3")).contentFrame(); await fr.locator("#composer-input").click(); }
 out.s6.sawFocused = await until(() => activeTabs.some((a) => a.col === "3" && a.focused === true), 5000);
-out.s6.afterClick = activeTabs.slice();
+out.s6.feedFollowedClick = await until(() => activeChats.some((c) => c.id === fill22[1]), 5000);
+out.s6.afterClick = activeTabs.slice(); out.s6.feedAfterClick = activeChats.slice();
+// ---- 6b. a focus from the shell to a session on the first tile's strip (the frame a feed card, a deep link, the switcher
+//          and the kernel's reveal deliver): the first column reports it focused:true and the feed's activeChat follows ----
+const jump = keep22[1];
+activeTabs.length = 0; activeChats.length = 0;
+await page.evaluate((sid) => document.getElementById("f-chat").contentWindow.postMessage({ type: "focus", id: sid }, "*"), jump);
+await waitActive("f-chat", jump);
+out.s6.jump = { sid: jump, sawReport: await until(() => activeTabs.some((a) => a.col === "" && a.id === jump && a.focused === true), 5000),
+                sawFeed: await until(() => activeChats.some((c) => c.id === jump), 5000) };
+out.s6.jump.reports = activeTabs.slice(); out.s6.jump.feed = activeChats.slice(); out.s6.jump.active = await activeIn("f-chat");
 
 // ---- 7. Back to tabs ----
 out.s7 = { r: await page.evaluate(() => window.__rompChatTilesOff()) };
@@ -237,6 +284,7 @@ await waitClass(false);
 await waitTabs("f-chat", cfg.sids);
 out.s7.shell = await shell();
 out.s7.first = await tileOf("f-chat");
+out.s7.firstDocKept = await docNonce();
 out.ms = Date.now() - out.t0;
 fs.writeSync(1, "RESULT:" + JSON.stringify(out) + "\n");
 await browser.close();
@@ -437,7 +485,7 @@ class ServedChatTiles(unittest.TestCase):
             self._assert_tile_shows_one(t, fid, sid)
             self.assertEqual(t[fid]["pane"], "chat-pane-" + fid[-1], "%s's frame sits in its tile pane" % fid)
         # the first frame never moved: a moved iframe reloads its document, and the fill reads that document's strip
-        self.assertTrue(s["firstKept"], "the first iframe is the same node"); self.assertTrue(s["firstDocKept"], "…with its document intact")
+        self.assertTrue(s["firstKept"], "the first iframe is the same node"); self.assertTrue(s["firstDocKept"], "…and its DOCUMENT is the one marked before the transition (the nonce set on its window is still there)")
         self.assertEqual(t["f-chat"]["pane"], "chat-pane", "the first frame is #chat-pane's own item (the grid), not a moved child")
 
     def test_2_tiles_2x3_makes_six_tiles_five_with_a_header_and_the_first_tile_the_overflow_each_a_third_wide_and_the_desktop_chat(self):
@@ -459,6 +507,32 @@ class ServedChatTiles(unittest.TestCase):
         for fid in sh["frameIds"]:
             self.assertEqual(t[fid]["mhdr"], "none", "%s: the phone header never shows on a mouse desktop, however narrow the tile" % fid)
             self.assertTrue(t[fid]["composer"], "%s keeps its composer" % fid)
+        self.assertTrue(s["firstDocKept"], "the widening re-made no first frame: its document still carries the nonce")
+
+    def _assert_lifted_to_the_viewport(self, lift, theme):
+        """The picker opened from the first tile lifts its frame to the WHOLE viewport, as in the row (review 2026-09-13: the
+        first-cell rule `#chat-pane.chat-grid>#f-chat` at (1,1,0) outranked `body.picker-open iframe.lifted` at (0,2,2), so the
+        lifted first frame stayed static, 100% of its cell, and the picker opened ~428×304 inside the tile); the grid stays a
+        grid around it, every other tile on its cell; closing puts the frame back in its cell."""
+        self.assertEqual(lift["position"], "fixed", "%s: the lifted first frame is fixed to the viewport: %r" % (theme, lift))
+        for k, want in (("left", 0), ("top", 0), ("width", lift["vw"]), ("height", lift["vh"])):
+            self.assertLessEqual(abs(lift[k] - want), 1, "%s: the lifted frame's %s is the viewport's (%r vs %r): %r" % (theme, k, lift[k], want, lift))
+        self.assertEqual((lift["vw"], lift["vh"]), (1440, 900), "the lab's viewport")
+        self.assertEqual(lift["zIndex"], "200", "over every pane")
+        self.assertIsNotNone(lift["picker"], "the picker is up inside it")
+        self.assertGreater(lift["picker"]["width"], 1000, "%s: the picker's overlay spans the lifted frame, not a 428 px cell: %r" % (theme, lift["picker"]))
+        self.assertGreater(lift["picker"]["height"], 700, "%s: …and its height: %r" % (theme, lift["picker"]))
+        self.assertEqual(lift["gridDisplay"], "grid", "the grid stays a grid while its first frame is lifted (the .lifted pane rule)"); self.assertTrue(lift["paneLifted"])
+        areas = [p["area"] for p in lift["paneKids"] if p["id"].startswith("chat-pane-") and p["id"] != "chat-pane-1"]
+        self.assertEqual(areas, ["1 / 2", "1 / 3", "2 / 1", "2 / 2", "2 / 3"], "every other tile keeps its explicit cell under the lift")
+        a = lift["after"]
+        self.assertEqual(a["position"], "static", "closed: the first frame is a grid item again")
+        self.assertLess(a["width"], 500, "…the size of its cell: %r" % a); self.assertLess(a["height"], 460)
+
+    def test_2b_the_first_tile_s_picker_lifts_its_frame_to_the_whole_viewport_in_a_2x3_grid_dark_and_light(self):
+        r = self._r()
+        self._assert_lifted_to_the_viewport(r["s2"]["lift"], "dark")
+        self._assert_lifted_to_the_viewport(r["s3"]["lift"], "light")
 
     def test_3_the_light_theme_reaches_every_tile_and_the_seam(self):
         s = self._r()["s3"]
@@ -478,6 +552,7 @@ class ServedChatTiles(unittest.TestCase):
         self.assertEqual(sorted(s["col1Tabs"]), sorted(keep22), "the two folded sessions are back on the first tile's strip: %r" % s["col1Tabs"])
         for fid, sid in zip(("f-chat-2", "f-chat-3", "f-chat-4"), fill22):
             self._assert_tile_shows_one(s["tiles"], fid, sid)
+        self.assertTrue(s["firstDocKept"], "the fold re-made no first frame")
 
     def test_5_a_reload_restores_the_grid_with_its_headers(self):
         s = self._r()["s5"]
@@ -500,6 +575,25 @@ class ServedChatTiles(unittest.TestCase):
         self.assertEqual(clicked[-1]["focused"], True, "…saying the user's gesture made it: %r" % clicked)
         self.assertEqual(clicked[-1]["id"], self._order()[0][1], "…for the tile's own session (the second of the fill)")
         self.assertTrue(all(a["focused"] is not True for a in s["afterClick"] if a["col"] != "3"), "no other tile claimed a gesture: %r" % s["afterClick"])
+        self.assertTrue(s["feedFollowedClick"], "the kernel relayed the click's session to the feed's socket as activeChat: %r" % s["feedAfterClick"])
+        self.assertEqual(s["feedAfterClick"][-1]["id"], self._order()[0][1])
+
+    def test_6b_a_focus_from_the_shell_is_reported_focused_true_and_the_feed_s_active_chat_follows_it(self):
+        """Review 2026-09-13: the first cut marked only the page's own gestures focused, so a focus MESSAGE (a feed card, a deep
+        link, the switcher, the kernel's reveal after a create) changed the active tab unfocused, the kernel refused it once it
+        followed a session, and the feed's section went stale — in the row too. Now every navigation that changes the active
+        tab reports focused:true; here the frame the shell delivers."""
+        s = self._r()["s6"]
+        j = s["jump"]
+        fill22, _, keep22, _ = self._order()
+        self.assertEqual(j["sid"], keep22[1], "a session on the first tile's strip, not the active one")
+        self.assertEqual(j["active"], j["sid"], "the first column switched to it")
+        self.assertTrue(j["sawReport"], "the first column (col '') reported the focus with focused:true: %r" % j["reports"])
+        first = [a for a in j["reports"] if a["col"] == ""]
+        self.assertEqual(first[-1], {"col": "", "id": j["sid"], "focused": True}, "…the last report from that column names it, focused: %r" % first)
+        self.assertTrue(j["sawFeed"], "the feed's socket received activeChat for it (the record moved off tile 3's session): %r" % j["feed"])
+        self.assertEqual(j["feed"][-1]["id"], j["sid"])
+        self.assertTrue(all(a["focused"] is not True for a in j["reports"] if a["col"] != ""), "no tile claimed the navigation: %r" % j["reports"])
 
     def test_7_back_to_tabs_leaves_one_frame_the_row_and_the_v2_store(self):
         s = self._r()["s7"]
@@ -513,6 +607,7 @@ class ServedChatTiles(unittest.TestCase):
         f = s["first"]
         self.assertFalse(f["headOn"], "no header: the one chat wears its strip"); self.assertNotEqual(f["tabbar"], "none")
         self.assertEqual(sorted(f["tabs"]), sorted(SIDS), "every session on the one strip")
+        self.assertTrue(s["firstDocKept"], "Back to tabs re-made no first frame: its document still carries the nonce")
 
     def test_8_the_screenshots_exist(self):
         self._r()

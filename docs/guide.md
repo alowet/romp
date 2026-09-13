@@ -276,7 +276,9 @@ its session back and leaves the tile empty, and **Back to tabs** (there and in t
 folds every tile back into the one chat. The first tile keeps its tab strip for whatever is not
 placed in a tile, so every session stays a click away. Drag a tab onto a tile to move a session
 there. Switching 2×3 to 2×2 folds the surplus tiles' sessions back into the first tile; the
-grid, like the columns, is remembered per browser.
+grid, like the columns, is remembered per browser. A column or tile with a session still being
+created keeps what you typed: Tiles, a smaller grid and Back to tabs wait for that create to
+land (a line says so), rather than rebuilding the column under it.
 
 ### The feed
 

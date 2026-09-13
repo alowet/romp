@@ -281,12 +281,14 @@ class SplitSourcePins(unittest.TestCase):
         self.assertIn("__rompTakeSessionState", split)
         # the page's two answers the shell asks for before it moves a tab or closes a column (review finds 2026-09-11), and
         # the one refusal line each; the movable check at the top of the one mutation, the busy check where a column's
-        # last listed member would leave and where a column is closed by hand (a reconcile of another tab's write is not)
+        # last listed member would leave and where a column is closed by hand (a reconcile of another tab's write skips it,
+        # having preflighted the whole transition and deferred on a busy column — TilesExecute); close() answers false on
+        # a refusal so a caller folding several stops there (review 2026-09-13)
         for needle in ["function movable(f,sid){", "function busy(f){", "function loaded(f){",
                        "var why=refusal(src,sid);if(why==='locked')return notify(LOCKED);if(why||!movable(src,sid))return notify('Only an open session can be moved between columns.');",
                        "var BUSY='A session is still being created in this column.';",
                        "var se2=entry(from);if(se2&&se2.ids.length===1&&busy(src))return notify(BUSY);",
-                       "if(!keep&&busy(f)){notify(BUSY);return;}"]:
+                       "if(!keep&&busy(f)){notify(BUSY);return false;}"]:
             self.assertIn(needle, split, needle)
         mt = split[split.index("function moveTab(sid,to){"):split.index("function close(n,keep){")]
         self.assertLess(mt.index("var why=refusal(src,sid);"), mt.index("if(to==='new'){"), "refused before anything is taken or grown (the reason read first, T395)")
@@ -589,6 +591,10 @@ boot({ 'romp-chat-cols': JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB] }] }) 
 BUSY['f-chat-2'] = true; STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [] }); CALLS.notify = [];
 window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
 out.busy.reconciled = { ids: ids(), notify: CALLS.notify.slice() };
+msg({ romp: 'colBusy', busy: true }, 'f-chat-2');   // a flip TO busy applies nothing
+out.busy.reconciled.stillHeld = ids();
+BUSY['f-chat-2'] = false; msg({ romp: 'colBusy', busy: false }, 'f-chat-2');   // the page's word that its create landed: the deferred write applies
+out.busy.reconciled.thenClear = { ids: ids(), notify: CALLS.notify.slice(), saves: saves() };
 // M) a colEmpty that closes a column tells the first column which of its gone ids the page's own cross removed (crossed),
 //    ahead of the store write; a prune that leaves members says nothing; a gone id nobody crossed is not held (it is the
 //    first column's the moment its strip repaints); a crossed id the entry did not hold is ignored
@@ -893,7 +899,8 @@ class SplitExecutes(unittest.TestCase):
     def test_a_column_with_a_create_in_flight_keeps_its_last_member_and_stays_open(self):
         # its queued text and draft would die with the document (review find 2026-09-11): the move that would empty it,
         # its cross and the palette's close are refused with the line; a column with two members lets one go; the create
-        # resolving frees it; another dashboard tab's write is the truth and is not refused
+        # resolving frees it; another dashboard tab's write is the truth and is not refused — it WAITS for the create
+        # (review 2026-09-13; the grid's transitions in TilesExecute)
         b = self.out["busy"]
         self.assertIsNone(b["home"], "the move that would empty the column is refused")
         self.assertEqual(b["notify"], [["warn", "A session is still being created in this column."]])
@@ -910,7 +917,11 @@ class SplitExecutes(unittest.TestCase):
         f = b["thenFree"]
         self.assertEqual(f["home"], "f-chat", "the create resolved: the last member leaves and the column closes")
         self.assertEqual(f["ids"], ["f-chat"]); self.assertEqual(f["stored"], {"v": 2, "cols": []}); self.assertEqual(f["notify"], [])
-        self.assertEqual(b["reconciled"], {"ids": ["f-chat"], "notify": []}, "another dashboard tab's write closes a busy column all the same, and says nothing")
+        r = b["reconciled"]
+        self.assertEqual(r["ids"], ["f-chat", "f-chat-2"], "another dashboard tab's write that drops the busy column WAITS (review 2026-09-13): its truth is not refused, and the document holding the create's text is not killed under it")
+        self.assertEqual(r["notify"], [], "…and says nothing: nobody in this window asked for it")
+        self.assertEqual(r["stillHeld"], ["f-chat", "f-chat-2"], "a flip TO busy applies nothing")
+        self.assertEqual(r["thenClear"], {"ids": ["f-chat"], "notify": [], "saves": 0}, "the page's word that its create landed applies the write — from a fresh read, nothing written back")
 
     def test_a_column_closed_for_emptiness_tells_the_first_column_which_ids_are_on_their_way_home(self):
         # the kernel may still list a member closed from its own cross for a push or two, and the first column would draw
@@ -1311,6 +1322,69 @@ boot({ 'romp-chat-cols': STORED }, false);
 msg({ romp: 'tabDrag', on: true, sid: S(2), name: 'two', stripH: 30 }, 'f-chat');
 out.dragGrid = { zones: Object.fromEntries(BYID['chat-pane'].children.filter((c) => c.className.indexOf('pane') === 0).map((p) => [p.id, p.children.filter((z) => z.className.indexOf('col-drop') === 0).map((z) => z.className)])), edge: BYID['chat-pane'].children.some((p) => p.children.some((z) => z.className.indexOf('col-drop-edge') >= 0)) };
 msg({ romp: 'tabDrag', on: false });
+// M) THE BUSY PREFLIGHT of a layout transition (review 2026-09-13). A column with a create in flight (a provisional tab
+//    holding typed and queued text, or a failed one still holding its text) would die with its document when a layout
+//    switch re-makes it or a fold closes it. Tiles from a split whose second column is busy: refused WHOLE, before
+//    anything moves — the column's frame is the same node (its document lives), nothing taken from any page, no store
+//    write, no pane toggle, the row stands, the line says why
+boot({}, false);
+BYID['f-chat']._tabs = six.slice(); BYID['f-chat']._active = S(1);
+const bf2 = window.__rompMoveTab(S(2), 'new'); window.__rompMoveTab(S(3), 'new');
+BUSY['f-chat-2'] = true; TAKE['f-chat-2'] = { [S(2)]: { draft: 'typed while the session is created', citations: [], files: [], staged: ['queued: run the tests'] } };
+CALLS.notify = []; CALLS.sets = []; CALLS.taken = []; CALLS.unregister = []; CALLS.colGone = []; CALLS.toggle = []; CALLS.posted = [];
+const busyEnter = window.__rompChatTiles('2x2');
+out.busyEnter = { r: busyEnter, notify: CALLS.notify.slice(), layout: shellLayout(), ids: ids(), sameDoc: BYID['f-chat-2'] === bf2, held: TAKE['f-chat-2'][S(2)].draft, taken: CALLS.taken.slice(), saves: saves(),
+                  unregister: CALLS.unregister.slice(), colGone: CALLS.colGone.slice(), toggle: CALLS.toggle.slice(), grid: gridStyle(), order: order(), layoutPosts: posted('layout').length, stored: cols() };
+// …a busy FIRST column refuses nothing: its frame is never re-made, and the fill skips its create (unmovable)
+BUSY['f-chat-2'] = false; BUSY['f-chat'] = true; CALLS.notify = [];
+out.busyEnter.firstBusy = { r: window.__rompChatTiles('2x2'), notify: CALLS.notify.slice(), layout: shellLayout(), ids: ids() };
+BUSY['f-chat'] = false;
+// …Back to tabs with a busy tile: refused whole — the grid stands with every tile, none folded (not even the ones after it), nothing written
+BYID['f-chat']._tabs = [S(1), S(5), S(6)];
+BUSY['f-chat-3'] = true; TAKE['f-chat-3'] = { [S(3)]: { draft: 'a create in tile three', citations: [], files: [], staged: [] } };
+CALLS.notify = []; CALLS.sets = []; CALLS.taken = []; CALLS.unregister = []; CALLS.colGone = []; CALLS.posted = [];
+const tf3 = BYID['f-chat-3'];
+const busyLeave = window.__rompChatTilesOff();
+out.busyLeave = { r: busyLeave, notify: CALLS.notify.slice(), layout: shellLayout(), ids: ids(), sameDoc: BYID['f-chat-3'] === tf3, held: TAKE['f-chat-3'][S(3)].draft, taken: CALLS.taken.slice(), saves: saves(),
+                  unregister: CALLS.unregister.slice(), colGone: CALLS.colGone.slice(), grid: gridStyle(), panes: panes(), stored: cols(), adopts: CALLS.posted.filter((p) => p.m && p.m.romp === 'adopt').length };
+// …a widening re-makes and folds nothing, so it goes ahead past the busy tile; a fold that would close the busy tile is
+// refused; a fold that leaves it standing goes ahead; the create landing frees Back to tabs
+CALLS.notify = [];
+const widen = window.__rompChatTiles('2x3');
+out.busyLeave.widen = { r: widen, notify: CALLS.notify.slice(), layout: shellLayout(), ids: ids(), sets: window.__rompChatSets() };
+BUSY['f-chat-6'] = true; CALLS.notify = []; CALLS.sets = []; CALLS.colGone = [];
+const shrinkRefused = window.__rompChatTiles('2x2');
+out.busyLeave.shrinkRefused = { r: shrinkRefused, notify: CALLS.notify.slice(), layout: shellLayout(), ids: ids(), saves: saves(), colGone: CALLS.colGone.slice() };
+BUSY['f-chat-6'] = false; CALLS.notify = [];
+const shrink = window.__rompChatTiles('2x2');
+out.busyLeave.shrink = { r: shrink, notify: CALLS.notify.slice(), layout: shellLayout(), ids: ids(), sets: window.__rompChatSets() };
+BUSY['f-chat-3'] = false; CALLS.notify = [];
+out.busyLeave.thenFree = { r: window.__rompChatTilesOff(), layout: shellLayout(), ids: ids(), notify: CALLS.notify.slice() };
+// N) another dashboard's write is DEFERRED, not refused, while a column it would destroy is busy here: applied on the
+//    page's own word that its create landed ({romp:'colBusy',busy:false} from that column), from a FRESH read of the
+//    store, so the two windows converge on the latest write. A flip to busy, another column's clear while the busy one
+//    stands, a message from no chat column, and a clear with nothing deferred apply nothing.
+boot({}, false);
+BYID['f-chat']._tabs = six.slice(); BYID['f-chat']._active = S(1);
+window.__rompChatTiles('2x3');   // tiles 2..6 on S(2)..S(6)
+BUSY['f-chat-6'] = true; CALLS.notify = []; CALLS.sets = []; CALLS.colGone = [];
+const df6 = BYID['f-chat-6'];
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, layout: 'grid', grid: [2, 2], cols: [{ n: 2, ids: [S(2)] }, { n: 3, ids: [S(3)] }, { n: 4, ids: [S(4)] }] });   // the other window folded to 2×2: tile 6 would close
+window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
+out.deferred = { layout: shellLayout(), ids: ids(), sets: window.__rompChatSets(), notify: CALLS.notify.slice(), sameDoc: BYID['f-chat-6'] === df6, colGone: CALLS.colGone.slice() };
+msg({ romp: 'colBusy', busy: true }, 'f-chat-6');
+out.deferred.onBusy = { ids: ids(), layout: shellLayout() };
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [{ n: 2, ids: [S(2)] }] });   // …then back to tabs but for one column: every later column here would be re-made, so this waits too
+window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
+out.deferred.second = { ids: ids(), layout: shellLayout() };
+msg({ romp: 'colBusy', busy: false }, 'f-chat-3');
+out.deferred.otherClear = { ids: ids(), layout: shellLayout() };
+msg({ romp: 'colBusy', busy: false });
+out.deferred.stranger = { ids: ids(), layout: shellLayout() };
+BUSY['f-chat-6'] = false; msg({ romp: 'colBusy', busy: false }, 'f-chat-6');
+out.deferred.applied = { layout: shellLayout(), ids: ids(), sets: window.__rompChatSets(), saves: saves(), notify: CALLS.notify.slice(), grid: gridStyle(), order: order(), colGone: CALLS.colGone.slice() };
+msg({ romp: 'colBusy', busy: false }, 'f-chat-2');
+out.deferred.idle = { ids: ids(), layout: shellLayout() };
 console.log(JSON.stringify(out));
 """
 
@@ -1320,7 +1394,9 @@ class TilesExecute(unittest.TestCase):
     composer, instead of tabs): the real _LANDING_SPLIT_JS runs against the DOM stub and the grid is driven end to end —
     entering a grid fills it from the first column's strip with the active tab kept there, a grid keeps its shape (an
     emptied tile stands, a fourth column is refused, 'new' lands in an empty tile), widening and folding, the swap,
-    persistence and the restore, back to tabs, entering from a split, the phone, another tab's write. Synthetic only."""
+    persistence and the restore, back to tabs, entering from a split, the phone, another tab's write — and the busy
+    preflight of every transition (review 2026-09-13): a user's transition over a column with a create in flight refuses
+    whole, another dashboard's write over one waits for the create and applies the latest store. Synthetic only."""
     maxDiff = None
 
     @classmethod
@@ -1491,6 +1567,60 @@ class TilesExecute(unittest.TestCase):
         self.assertEqual(r["layout"], {"layout": "row", "rows": 1, "cols": 2}); self.assertEqual(r["ids"], ["f-chat", "f-chat-2"], "the other tab left the grid and kept one column: this window follows")
         self.assertEqual(r["sets"], {"2": [S(1)]}); self.assertEqual(r["saves"], 0); self.assertEqual(r["grid"]["cls"], "")
         self.assertEqual(r["order"], ["chat-pane", "gv-chat-2", "chat-pane-2", "gv-a", "fleet-pane", "gv-b", "feed-pane"], "the column is back in the row behind its gutter")
+
+    def test_a_layout_transition_refuses_whole_while_a_column_it_would_destroy_has_a_create_in_flight(self):
+        S = self.S
+        line = [["warn", "A session is still being created in this column."]]
+        e = self.out["busyEnter"]
+        self.assertIsNone(e["r"]); self.assertEqual(e["notify"], line, "Tiles over a busy column: the line, once")
+        self.assertEqual(e["layout"], {"layout": "row", "rows": 1, "cols": 3}); self.assertEqual(e["ids"], ["f-chat", "f-chat-2", "f-chat-3"], "the row stands with both columns")
+        self.assertTrue(e["sameDoc"], "the busy column's frame is the very node: no re-make, so its document — the provisional tab, its typed and queued text — lives")
+        self.assertEqual(e["held"], "typed while the session is created", "…and still holds what it held")
+        self.assertEqual(e["taken"], [], "nothing taken from any page: refused before the hand-off")
+        self.assertEqual(e["saves"], 0); self.assertEqual(e["unregister"], []); self.assertEqual(e["colGone"], []); self.assertEqual(e["toggle"], [], "refused before the pane toggle")
+        self.assertEqual(e["grid"], {"cls": "", "rows": None, "cols": None}); self.assertEqual(e["layoutPosts"], 0, "no page heard a layout change")
+        self.assertEqual(e["stored"], {"v": 2, "cols": [{"n": 2, "ids": [S(2)]}, {"n": 3, "ids": [S(3)]}]}, "the store is as it was")
+        fb = e["firstBusy"]
+        self.assertTrue(fb["r"], "a busy FIRST column refuses nothing: its frame is never re-made, and the fill skips its create"); self.assertEqual(fb["notify"], [])
+        self.assertEqual(fb["layout"], {"layout": "grid", "rows": 2, "cols": 2}); self.assertEqual(fb["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4"])
+        l = self.out["busyLeave"]
+        self.assertFalse(l["r"]); self.assertEqual(l["notify"], line, "Back to tabs over a busy tile: the line")
+        self.assertEqual(l["layout"], {"layout": "grid", "rows": 2, "cols": 2}); self.assertEqual(l["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4"], "the grid stands, every tile in it")
+        self.assertTrue(l["sameDoc"]); self.assertEqual(l["held"], "a create in tile three"); self.assertEqual(l["taken"], [])
+        self.assertEqual(l["adopts"], 0, "no tile folded home — not the ones after the busy one either: the refusal is whole, never a row applied over a half-folded grid")
+        self.assertEqual(l["saves"], 0); self.assertEqual(l["colGone"], []); self.assertEqual(l["unregister"], []); self.assertEqual(l["grid"], {"cls": "chat-grid", "rows": "2", "cols": "2"})
+        self.assertEqual([p["id"] for p in l["panes"]], ["f-chat", "chat-pane-1", "chat-pane-2", "chat-pane-3", "chat-pane-4"])
+        self.assertEqual(l["stored"]["cols"], [{"n": 2, "ids": [S(2)]}, {"n": 3, "ids": [S(3)]}, {"n": 4, "ids": [S(4)]}])
+        w = l["widen"]
+        self.assertTrue(w["r"]); self.assertEqual(w["notify"], []); self.assertEqual(w["layout"], {"layout": "grid", "rows": 2, "cols": 3}, "a widening re-makes and folds nothing: the busy tile is not in its way")
+        self.assertEqual(w["sets"], {"2": [S(2)], "3": [S(3)], "4": [S(4)], "5": [S(5)], "6": [S(6)]})
+        sr = l["shrinkRefused"]
+        self.assertIsNone(sr["r"]); self.assertEqual(sr["notify"], line, "a fold that would close the busy tile: refused")
+        self.assertEqual(sr["layout"], {"layout": "grid", "rows": 2, "cols": 3}); self.assertEqual(len(sr["ids"]), 6); self.assertEqual(sr["saves"], 0); self.assertEqual(sr["colGone"], [])
+        s = l["shrink"]
+        self.assertTrue(s["r"]); self.assertEqual(s["notify"], []); self.assertEqual(s["layout"], {"layout": "grid", "rows": 2, "cols": 2}, "a fold that leaves the busy tile standing goes ahead")
+        self.assertEqual(s["sets"], {"2": [S(2)], "3": [S(3)], "4": [S(4)]})
+        t = l["thenFree"]
+        self.assertTrue(t["r"]); self.assertEqual(t["layout"], {"layout": "row", "rows": 1, "cols": 1}); self.assertEqual(t["ids"], ["f-chat"]); self.assertEqual(t["notify"], [], "the create landed: Back to tabs folds every tile")
+
+    def test_another_dashboard_s_write_over_a_busy_column_waits_for_its_create_and_applies_the_latest_store(self):
+        S = self.S
+        d = self.out["deferred"]
+        held = {"ids": d["ids"], "layout": d["layout"]}
+        self.assertEqual(d["layout"], {"layout": "grid", "rows": 2, "cols": 3}); self.assertEqual(len(d["ids"]), 6, "the other window's fold to 2×2 would close tile 6 over its create: nothing applied")
+        self.assertEqual(d["sets"], {"2": [S(2)], "3": [S(3)], "4": [S(4)], "5": [S(5)], "6": [S(6)]})
+        self.assertEqual(d["notify"], [], "…and nothing said: the write is another window's, not a refusal of anything the user did here")
+        self.assertTrue(d["sameDoc"], "tile 6's document lives"); self.assertEqual(d["colGone"], [])
+        self.assertEqual(d["onBusy"], held, "a flip TO busy applies nothing")
+        self.assertEqual(d["second"], held, "a later write (back to tabs but for one column) would re-make every later column: it waits too")
+        self.assertEqual(d["otherClear"], held, "another column's clear asks again and finds tile 6 still busy")
+        self.assertEqual(d["stranger"], held, "a message from no chat column is nobody's word")
+        a = d["applied"]
+        self.assertEqual(a["layout"], {"layout": "row", "rows": 1, "cols": 2}, "tile 6's create landed: the deferred write applies — the LATEST store, not the one first heard")
+        self.assertEqual(a["ids"], ["f-chat", "f-chat-2"]); self.assertEqual(a["sets"], {"2": [S(2)]}); self.assertEqual(a["saves"], 0, "nothing written back"); self.assertEqual(a["notify"], [])
+        self.assertEqual(a["grid"], {"cls": "", "rows": None, "cols": None}); self.assertEqual(a["order"], ["chat-pane", "gv-chat-2", "chat-pane-2", "gv-a", "fleet-pane", "gv-b", "feed-pane"])
+        self.assertEqual(a["colGone"], ["3", "4", "5", "6", "2"], "the dropped tiles close, then the kept column is re-made in the row")
+        self.assertEqual(d["idle"], {"ids": a["ids"], "layout": a["layout"]}, "a clear with nothing deferred re-reads nothing")
 
     def test_a_drag_in_a_grid_mounts_a_zone_on_every_other_tile_and_no_edge_zone(self):
         d = self.out["dragGrid"]

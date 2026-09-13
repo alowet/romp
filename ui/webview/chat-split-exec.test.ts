@@ -80,6 +80,7 @@ function world(o: { col?: string; sets?: ColSets | null; tabOrderSeen?: boolean;
     const peekId = null; const chatVisible = () => true;
     const setTimeout = (f) => { HOOKS.timers.push(f); return HOOKS.timers.length; };
     const setActive = (id) => { HOOKS.activated.push(id); activeId = id; };
+    const withAuto = (fn) => fn();   // the automatic-path latch the fallback wraps its pick in (the feed's follow, tiles 2026-09-13): transparent here
     const drafts = new Map(), composerCitations = new Map(), composerFiles = new Map(); const stagedMsgs = new StagedStack();
     const persistDrafts = () => { HOOKS.persisted++; }; const loadComposerFor = (sid) => { HOOKS.loaded.push(sid); };
   `;

@@ -159,7 +159,7 @@ test("the silent-failure backstop is long, because it is no longer what you wait
 });
 
 test("closing a provisional tab aborts the pending spawn; a FAILED one is a plain local discard", () => {
-  assert.match(RENDER, /if \(id === provisionalId\) cancelProvisional\(\);\s*\n\s*else \{ failedProvisionals\.delete\(id\); dismissSession\(id, "close"\); \}/);
+  assert.match(RENDER, /if \(id === provisionalId\) cancelProvisional\(\);\s*\n\s*else \{ failedProvisionals\.delete\(id\); syncColumnBusy\(\); dismissSession\(id, "close"\); \}/, "…and the shell hears the column is no longer busy: a deferred layout switch may go ahead (review 2026-09-13)");
   assert.match(RENDER, /vscodeApi\.postMessage\(\{ type: "cancelCreate", name \}\)/);
   // the kernel never knew a provisional id — the dead-tab ✕ must not post closeTab for one
   assert.match(RENDER, /if \(!isProvisionalId\(id\)\) vscodeApi\.postMessage\(\{ type: "closeTab", id \}\);/);

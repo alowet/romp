@@ -49647,13 +49647,17 @@ def _relay_active_chat(client, sid, focused=None):
     live feed clients the frame (T347: the feed's focused-session section is a view of the chat pane's active tab,
     never a move of a card; one window's panes share a wid, and a pane outside a dashboard files under ""). The
     chat columns of a split window all report here. `focused` (tiles, the user 2026-09-13) says whether the report
-    came from a USER gesture in that column — a tab click, the keyboard, the composer taking focus, the shell's
-    pane focus — or from a boot, a restore or a re-render (False): with four to six tiles each re-rendering on its
-    own pushes, the feed would otherwise follow whichever tile repainted last. An unfocused report may SEED an
-    empty focus (no record for the window yet, or None: a reload's first paint, as before) but never DISPLACE a
-    session the feed follows; a focused one always stands; a report without the field (an older client) relays as
-    it always did. The client list is copied under _clients_lock; the sends run outside it, as every other
-    fan-out does."""
+    follows a NAVIGATION in that column — a tab click, the keyboard, a focus message (the feed's card, a deep link,
+    the shell's switcher), the trail, next/prev, the fallback when the active tab closes (the new tab, or None), the
+    composer taking focus, the shell's pane focus — or an AUTOMATIC path (False): a boot restore, the grid's fill,
+    the stale-active fallback, an arriving tab's adoption, a re-render that changed nothing (render.ts notifyActive
+    draws the line; the review of 2026-09-13 inverted it from gestures-only, which left the feed stale on every
+    focus message). With four to six tiles each re-rendering on its own pushes, the feed would otherwise follow
+    whichever tile repainted last. An unfocused report may SEED an empty focus (no record for the window yet, or
+    None: a reload's first paint, as before) but never DISPLACE a session the feed follows; a focused one always
+    stands — a focused None clears the record, so the feed's section empties with the pane; a report without the
+    field (an older client) relays as it always did. The client list is copied under _clients_lock; the sends run
+    outside it, as every other fan-out does."""
     wid = _active_chat_wid(client)
     if focused is False and _ACTIVE_CHAT_BY_WID.get(wid):
         return
@@ -55652,6 +55656,16 @@ function movable(f,sid){try{var m=f&&f.contentWindow&&f.contentWindow.__rompMova
 // the page's REASON behind movable (T395 round one): 'locked' means the tab lock, and the toast names the padlock; '' is movable
 function refusal(f,sid){try{var w=f&&f.contentWindow&&f.contentWindow.__rompMoveRefusal;return typeof w==='function'?String(w(sid)||''):'';}catch(e){return '';}}
 function busy(f){try{var b=f&&f.contentWindow&&f.contentWindow.__rompColumnBusy;return typeof b==='function'&&!!b();}catch(e){return false;}}
+// THE PREFLIGHT OF A LAYOUT TRANSITION (review find 2026-09-13): row↔grid re-makes every later column — a reload of its
+// document — and a grid→grid fold closes the surplus tiles, so a create in flight in any of those columns (a provisional
+// tab with typed and queued text, or a failed one still holding its text) would die with the document, exactly what
+// close() and vacate() refuse for one column. doomed(nl,ng) names the columns a transition to that layout would destroy:
+// every later column when the layout changes, the surplus past the new cap when only the shape does; anyBusy asks each
+// one's page. A user-initiated transition (enterGrid, leaveGrid) refuses WHOLE when any is busy — the layout, the store
+// and every frame stay as they were, and the line says why; the storage-driven reconcile DEFERS instead (see there).
+function capOf(nl,ng){return (nl==='grid'?ng[0]*ng[1]:ROW_MAX)-1;}   // the later columns a layout holds
+function doomed(nl,ng){return (nl!==layout?cols:cols.slice(capOf(nl,ng))).map(function(c){return c.n;});}
+function anyBusy(ns){for(var i=0;i<ns.length;i++){if(busy(frameOfCol(ns[i])))return true;}return false;}
 function loaded(f){try{return !!(f&&f.contentWindow&&typeof f.contentWindow.__rompTakeSessionState==='function');}catch(e){return false;}}   // the page's bundle has evaluated, so a posted message is heard
 var BUSY='A session is still being created in this column.';
 var LOCKED='The tabs are locked: unlock them in the tab strip\\u2019s gear menu (Lock the tabs in place) to move this session.';
@@ -55723,16 +55737,18 @@ try{tf.contentWindow.focus();}catch(e){}return tf;}
 // CLOSE a column: its sessions return to the first column — the entry goes whole, so the first column derives them —
 // drafts and all (what the closing page holds for each is handed to the first column's page); the pane, its gutter
 // and its grow go; the Log drops its connection state; the ring moves to the column on its left. `keep` skips the
-// store write (a reconcile of another dashboard tab's write, which is already the truth).
-function close(n,keep){var i=idx(n);if(i<0)return;
+// store write (a reconcile of another dashboard tab's write, which is already the truth — and one that preflighted
+// the busy question for the whole transition, see reconcile). True when the column closed, false when it refused (a
+// caller folding several must stop at a refusal, never fall through to a layout switch that re-makes the survivor).
+function close(n,keep){var i=idx(n);if(i<0)return false;
 var f=document.getElementById(frameId(n)),home=document.getElementById('f-chat');
-if(!keep&&busy(f)){notify(BUSY);return;}   // a create in flight would die with the document (its queued text with it)
+if(!keep&&busy(f)){notify(BUSY);return false;}   // a create in flight would die with the document (its queued text with it)
 if(f&&home)cols[i].ids.forEach(function(sid){adopt(home,sid,take(f,sid));});
 var left=i>0?paneId(cols[i-1].n):'chat-pane';   // the column on its left: takes the ring below, and the width first
 cols.splice(i,1);if(!keep)save();
 unmount(n,left);
 var pf=document.getElementById(i>0?frameId(cols[i-1].n):'f-chat');   // the ring moves to the column before it
-try{pf&&pf.contentWindow.focus();}catch(e){}}
+try{pf&&pf.contentWindow.focus();}catch(e){}return true;}
 // the pane, its gutter and its grow go (the entry is the caller's): a close, or a layout switch that re-makes the column
 function unmount(n,left){var p=document.getElementById(paneId(n)),g=document.getElementById('gv-chat-'+n);
 if(layout!=='grid'){if(window.__rompSplitShrink)window.__rompSplitShrink(left||'chat-pane',paneId(n));   // its pixels go to the column on its left (the halving's twin), while the pane is still in the row
@@ -55753,10 +55769,12 @@ function closeFocused(){var f=focused(),c=f?colOf(f.contentWindow):'';if(!c&&col
 // THE GRID'S FILL: the first column's strip, its active tab skipped (the eye is there), each session into a tile of its own
 // in strip order — left to right, top to bottom — first the tiles standing empty, then new ones up to the grid's size;
 // spare tiles stand empty. Only a session the page lets move (movable: no create in flight, no viewer, no tab lock).
-// Drafts travel as on any move; no focus moves (the user is where they were).
+// Drafts travel as on any move; no focus moves (the user is where they were), and the focus posted to an open tile says
+// so (`auto`): the page reports the tab it shows unfocused, so the feed keeps following the session the user is on
+// rather than the last tile the fill landed (render.ts notifyActive).
 function place(sid,to){var from=ownerOf(sid),src=frameOfCol(from),st=take(src,sid);unlist(sid);
 if(to==='new'){var n=nextNumber();cols.push({n:n,ids:[sid]});make(n,sid,st);return;}
-entry(to).ids.push(sid);var tf=frameOfCol(to);adopt(tf,sid,st);try{tf&&tf.contentWindow.postMessage({type:'focus',id:sid},'*');}catch(e){}}
+entry(to).ids.push(sid);var tf=frameOfCol(to);adopt(tf,sid,st);try{tf&&tf.contentWindow.postMessage({type:'focus',id:sid,auto:true},'*');}catch(e){}}
 function fill(){var home=document.getElementById('f-chat'),active=activeIn(home);
 var pool=stripOf(home).filter(function(id){return id!==active&&ownerOf(id)===1&&movable(home,id);});
 var empties=cols.filter(function(c){return !c.ids.length;}),room=maxCols()-1-cols.length;
@@ -55766,7 +55784,8 @@ save();}
 // A LAYOUT SWITCH: row↔grid re-makes every later column in the new dress (a frame reload — its blob keeps its tab, its
 // drafts and its scroll); grid↔grid only re-sizes the grid. Then every column page hears {romp:'layout'} and re-renders
 // its chrome (render.ts: a tile holding one session wears a header in the strip's place). Nothing is written here: the
-// callers save, a reconcile does not.
+// callers save, a reconcile does not. And nothing is asked here: every caller has preflighted the columns this
+// re-make destroys (doomed/anyBusy) and refused or deferred before reaching it.
 function applyLayout(nl,ng){var was=layout;if(nl===was&&gridKey(ng)===gridKey(grid))return;
 var carry={};if(nl!==was)cols.forEach(function(c){var f=frameOfCol(c.n),a=seedFor(c);carry[c.n]=a?take(f,a):null;unmount(c.n,null);});   // the panes go, the entries stay; each page's live draft for its tab rides to the re-made frame
 if(was==='grid'&&nl!=='grid')unmountGrid();
@@ -55776,14 +55795,20 @@ if(nl!==was)cols.forEach(function(c){make(c.n,seedFor(c),carry[c.n]||null);});
 placeTiles();broadcast();}
 function broadcast(){frames().forEach(function(f){try{f.contentWindow.postMessage({romp:'layout'},'*');}catch(e){}});}
 // ENTER a grid (or switch grids): the layout, then the shape — surplus tiles fold home from the end (their sessions return
-// to the first column; a tile with a create in flight stays), the rest fill. LEAVE: every tile folds home and the row is back.
+// to the first column), the rest fill. LEAVE: every tile folds home and the row is back. Both refuse WHOLE, before
+// anything moves, when a column the transition would re-make or fold has a create in flight (the preflight above): the
+// first cut re-made every column without asking, so a session being created in a column was lost the moment the user
+// picked Tiles, and Back to tabs applied the row after a tile's close had refused, re-making that tile in the row.
 function enterGrid(g){if(mobile())return notify('The phone shows one pane at a time — no tiles here.');g=gridOf(g);if(!g)return null;
+if(anyBusy(doomed('grid',g)))return notify(BUSY);
 try{if(!document.body.classList.contains('po-chat')&&window.__rompPaneToggle)window.__rompPaneToggle('chat',true);}catch(e){}   // a hidden chat group comes forward first
 applyLayout('grid',g);
 for(var i=cols.length-1;i>=0&&cols.length+1>maxCols();i--)close(cols[i].n);
 fill();try{document.getElementById('f-chat').contentWindow.focus();}catch(e){}return true;}
 function leaveGrid(){if(layout!=='grid')return false;
-cols.slice().reverse().forEach(function(c){close(c.n);});
+if(anyBusy(doomed('row',null))){notify(BUSY);return false;}
+var ns=cols.map(function(c){return c.n;}).reverse();
+for(var i=0;i<ns.length;i++){if(!close(ns[i]))return false;}   // a refusal stops here: the grid stands, the row is never applied over it
 applyLayout('row',null);save();return true;}
 // the palette's Move this session to a new column: the focused column's active tab (the one DOM read kept, for this)
 window.__rompSplitChat=function(sid){var id=typeof sid==='string'&&sid?sid:activeIn(focused());if(!id)return notify('No session is open in this column to move.');return moveTab(id,'new');};
@@ -55887,14 +55912,25 @@ return {cols:out,grid:g,migrated:migrated};}
 // a grid restored with fewer tiles than its shape (a store another shell wrote, a sanitised entry): spare tiles stand empty
 function topUp(){if(layout!=='grid')return;while(cols.length+1<maxCols()){var n=nextNumber();cols.push({n:n,ids:[]});make(n,'',null);}}
 // another dashboard tab's write (this window never hears its own): its arrangement is the truth — its layout, close
-// what it dropped, make what it added (seeded like a restore), take its sets — and nothing is written back
-function reconcile(r){var next=r.cols;
+// what it dropped, make what it added (seeded like a restore), take its sets — and nothing is written back. DEFERRED,
+// not refused, while a column it would destroy (one it drops, or every later one when the layout changes) has a
+// create in flight here: nothing here can refuse another window's truth, and nothing may kill the document holding
+// the user's text, so the write waits and is applied the moment that page says its create is done — {romp:'colBusy',
+// busy:false}, the event that clears the busy state (render.ts syncColumnBusy), never a timer — from a FRESH read of
+// the store, so a later write in between is what lands and the two dashboards converge. A storage event arriving
+// meanwhile simply asks again.
+var deferred=false;   // a store write this window has heard and not yet applied
+function reconcile(r){var next=r.cols,change=(r.grid?'grid':'row')!==layout;
+var gone=cols.filter(function(c){return change||!next.some(function(d){return d.n===c.n;});}).map(function(c){return c.n;});
+if(anyBusy(gone)){deferred=true;return;}
+deferred=false;
 cols.filter(function(c){return !next.some(function(d){return d.n===c.n;});}).forEach(function(c){close(c.n,true);});
 cols=next.map(function(c){return {n:c.n,ids:c.ids.slice()};});
 applyLayout(r.grid?'grid':'row',r.grid);
 cols.forEach(function(c){if(!document.getElementById(frameId(c.n)))make(c.n,seedFor(c),null);});
 topUp();placeTiles();}
 window.addEventListener('storage',function(e){if(!e||e.key!==CK||mobile())return;var r=read();if(!r.migrated)reconcile(r);});
+window.addEventListener('message',function(e){var m=e&&e.data;if(!m||m.romp!=='colBusy'||m.busy||!deferred||mobile()||!frameOfWin(e.source))return;var r=read();if(!r.migrated)reconcile(r);});   // a column's create landed or was dropped: the deferred write applies now, from the store as it is
 // the columns this browser had open come back, each on a member of its own, in the layout it had (the phone restores
 // nothing: the arrangement stays in the store for the desktop); a v1 store is written back in the new shape, once
 try{if(!mobile()){var r0=read();cols=r0.cols;if(r0.grid){layout='grid';grid=r0.grid;mountGrid();}cols.forEach(function(c){make(c.n,seedFor(c),null);});topUp();placeTiles();if(r0.migrated)save();}}catch(e){}
@@ -56835,9 +56871,13 @@ def _landing():
             # ring and a drop zone land on it, the pointer goes through it to the frame. Later tiles take explicit cells
             # (_LANDING_SPLIT_JS placeTiles), so a first frame the picker lifts out shifts nothing; the lifted grid stays a grid.
             # A tile's cross is gone: a tile is emptied from its header's menu, never closed (the grid keeps its shape).
+            # The first-cell rule stands down for a LIFTED first frame (review find 2026-09-13): at (2,1,0) it outranked
+            # `body.picker-open iframe.lifted` (0,2,2), so the picker opened from the first tile's + or Swap stayed the size
+            # of its cell; with `:not(.lifted)` the lift rule above sizes it to the viewport as in the row, and the grid
+            # (display:grid kept by the .lifted rule below, every other tile on an explicit cell) does not re-flow around it.
             "#chat-pane.chat-grid{display:grid;grid-template-columns:repeat(var(--tile-cols,2),1fr);grid-template-rows:repeat(var(--tile-rows,2),1fr);"
             "grid-auto-rows:1fr;gap:1px;background:#333}"
-            "#chat-pane.chat-grid>#f-chat{position:static;width:100%;height:100%;min-width:0;min-height:0;grid-area:1 / 1}"
+            "#chat-pane.chat-grid>#f-chat:not(.lifted){position:static;width:100%;height:100%;min-width:0;min-height:0;grid-area:1 / 1}"
             "#chat-pane.chat-grid>.chat-col{min-width:0;min-height:0}"
             "#chat-pane.chat-grid>.tile-ring{position:absolute;inset:0;grid-area:1 / 1 / 2 / 2;pointer-events:none}"   # both ends named: an absolutely positioned grid item's auto end line is the container's padding edge, so 1 / 1 alone spanned the whole grid
             "#chat-pane.chat-grid>.tile-ring>.col-drop{pointer-events:auto}"

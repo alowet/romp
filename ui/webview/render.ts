@@ -6654,7 +6654,7 @@ function renderTabs() {
   // the re-point below — and the persisted tab then names a member, so a reload lands here on one of its own.
   if (activeId && ids.includes(activeId) && !heldHere(activeId) && visibleIds.length) {
     const moved = activeId, first = visibleIds[0];
-    setTimeout(() => { if (activeId === moved && !heldHere(moved) && stripLists(first) && stripShows(first)) setActive(first); }, 0);
+    setTimeout(() => { if (activeId === moved && !heldHere(moved) && stripLists(first) && stripShows(first)) withAuto(() => setActive(first)); }, 0);   // automatic (the feed keeps following the moved tab, in its new column)
   }
   else if (activeId && ids.includes(activeId) && !visibleIds.includes(activeId)) {
     const hid = activeId;
@@ -6666,7 +6666,7 @@ function renderTabs() {
     // the paint's own rule: order and the placeholders, less a closing tab), not only the predicate: a torn-down tab has
     // left the strip while its reason may still read "hidden", and stripShows knows the view and the filter, not the
     // strip (the review's low, and the next review's: the schedule and the fire read ONE membership rule)
-    setTimeout(() => { if (!activeId && vanishedId === back && vanishedWhy === "hidden" && stripLists(back) && stripShows(back)) setActive(back); }, 0);
+    setTimeout(() => { if (!activeId && vanishedId === back && vanishedWhy === "hidden" && stripLists(back) && stripShows(back)) withAuto(() => setActive(back)); }, 0);   // a restore, automatic (the feed's follow)
   }
   staleActiveFallback(ids, visibleIds);   // no active tab and none on its way (the chat split): the first visible member, deferred like the re-point
   // TAB SECTIONS (the user 2026-09-04): groups are tags. With sectioning on (per browser — the
@@ -7784,7 +7784,7 @@ function startTabRename(id: string, copy?: string) {   // `copy`: which copy of 
 
 // Keyboard nav on a focused tab: ←/→ step prev/next; ↑/↓ jump to the nearest tab
 // in the row above/below (tabs wrap via flex-wrap).
-function onTabKey(e: KeyboardEvent) { withGesture(() => tabKey(e)); }   // a keyboard pick is the user's own act in this column: the feed follows it (tiles, 2026-09-13)
+function onTabKey(e: KeyboardEvent) { tabKey(e); }
 function tabKey(e: KeyboardEvent) {
   if (!order.length) return;
   if (!activeId) {   // from the unfocused pane an arrow lands on the first visible tab (T357)
@@ -7880,11 +7880,11 @@ window.addEventListener("keydown", (e) => {
       // so the step starts from the header's place on the strip (onTabKey's and cycleTab's rule). A
       // view-hidden active id is not on the strip at all: nothing to step from, as before.
       const nb = collapsedTabIds.has(activeId) ? neighborOfFolded(lastStripItems, activeId, dir) : null;
-      if (nb) { e.preventDefault(); withGesture(() => setActive(nb)); }
+      if (nb) { e.preventDefault(); setActive(nb); }
       return;
     }
     e.preventDefault();
-    withGesture(() => setActive(ord[(i + dir + ord.length) % ord.length]));   // the user's own step: the feed follows this column (tiles)
+    setActive(ord[(i + dir + ord.length) % ord.length]);
   } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
     const content = document.getElementById("content");
     if (!content) return;
@@ -8102,6 +8102,18 @@ const PROVISIONAL_WAIT_MS = 90_000;
 // "only an open session" for the rest, instead of one line for both
 (window as any).__rompMoveRefusal = (sid: unknown): string => typeof sid !== "string" || !sid || isProvisionalId(sid) || isSubId(sid) ? "not-open" : settings.tabsLocked ? "locked" : "";
 (window as any).__rompColumnBusy = (): boolean => !!provisionalId || failedProvisionals.size > 0;
+// …and the shell hears the answer CHANGE (review find 2026-09-13): a layout switch another dashboard wrote (tiles ↔ tabs,
+// a dropped column) is deferred by the shell while this column is busy — it would re-make this document and lose the
+// create's text — and applied the moment the create lands or is dropped. That moment is this message, posted from every
+// write of the two facts the answer reads (openProvisional, dropProvisional, failProvisional, a failed tab's discard),
+// only when the answer flipped; no timer anywhere.
+let columnBusyTold = false;
+function syncColumnBusy(): void {
+  const busy = (window as any).__rompColumnBusy() as boolean;
+  if (busy === columnBusyTold) return;
+  columnBusyTold = busy;
+  try { if (window.parent && window.parent !== window) window.parent.postMessage({ romp: "colBusy", busy }, "*"); } catch (e) { /* no shell */ }
+}
 
 function openProvisional(req: CreateReq): void {
   dropProvisional();                       // never two at once: a second create supersedes the first
@@ -8109,6 +8121,7 @@ function openProvisional(req: CreateReq): void {
   pendingNewSession = display;
   const id = mintProvisionalId(Date.now().toString(36) + Math.random().toString(36).slice(2));
   provisionalId = id;
+  syncColumnBusy();                        // this column is busy now: the shell defers a layout switch that would re-make it
   provisionalTags = req.tags?.slice() ?? [];   // the strip sections it under each of these from the first paint
   // state "opening", NOT "working": updateStatusline renders the working chip with an elapsed timer off
   // sinceEpoch, and a provisional tab has no honest work clock — the seed showed "Working" + a giant
@@ -8135,6 +8148,7 @@ function openProvisional(req: CreateReq): void {
 function dropProvisional(): { queued: string[]; draft: string } {
   const id = provisionalId;
   provisionalId = null;
+  syncColumnBusy();                        // the shell may hold a deferred layout switch for this create
   provisionalTags = [];
   pendingNewSession = null;
   if (provisionalTimer) { clearTimeout(provisionalTimer); provisionalTimer = undefined; }
@@ -8207,6 +8221,7 @@ function failProvisional(why: string): void {
   const held = [...queued, draft].filter(Boolean).join("\n\n");
   pendingSent.delete(id);            // the dashed "received" bubbles fold into the held text instead
   failedProvisionals.add(id);
+  syncColumnBusy();                  // still busy (the held text lives in this document): the shell keeps deferring
   const s = sessions.get(id);
   // "closed" gives the tab the dead treatment (struck label, plain ✕) — but the composer stays LIVE
   // for a failed provisional (the read-only exemption below), since the held text must stay editable
@@ -8347,7 +8362,7 @@ function staleActiveFallback(ids: readonly string[], visibleIds: readonly string
   if (wantActive && heldHere(wantActive)) return;   // awaited by this column, listed or not: T357's restore takes it when it comes
   // a wanted tab another column holds is nobody's to await here (dragged away before the reload): retired, the first visible member takes the box
   const first = visibleIds[0];
-  setTimeout(() => { if (!activeId && !provisionalId && tabInView(first)) { wantActive = null; setActive(first); } }, 0);
+  setTimeout(() => { if (!activeId && !provisionalId && tabInView(first)) { wantActive = null; withAuto(() => setActive(first)); } }, 0);   // automatic: the feed's follow is not moved by it
 }
 
 // Full-screen bridge (the user 2026-07-05): the picker is rendered inside the /chat iframe, so its
@@ -12449,15 +12464,26 @@ function turnWorkedSecs(events: ChatEvent[], i: number, working: boolean): numbe
 // the cached DOM is just revealed.
 // Tell the extension which tab is active, so it can publish it to the romp
 // timeline (which outlines the open lane). activeId may be null (no session).
-// …with `focused` (tiles, the user 2026-09-13): true when the report follows the user's own act in THIS column — a tab
-// click, the keyboard, the composer taking focus, the shell's pane focus — false on a boot, a restore or a re-render, so
-// the kernel lets the feed follow the tile the user is IN rather than whichever of four to six tiles repainted last
-// (_relay_active_chat: an unfocused report seeds an empty focus and never displaces one). Set for the synchronous
-// length of the gesture's own path (withGesture), never left on.
-let gestureActive = false;
-function withGesture(fn: () => void): void { const was = gestureActive; gestureActive = true; try { fn(); } finally { gestureActive = was; } }
-function notifyActive() {
-  if (vscodeApi) vscodeApi.postMessage({ type: "activeTab", id: activeId, focused: gestureActive });
+// …with `focused` (tiles, the user 2026-09-13; the model inverted after review the same day): the kernel lets the feed
+// follow the tile the user is IN rather than whichever of four to six tiles repainted last (_relay_active_chat: an
+// unfocused report seeds an empty focus and never displaces one). So `focused` is TRUE for every NAVIGATION that changes
+// the active tab — a tab click, the keyboard, a focus message (the feed's card, a deep link, the shell's switcher, a
+// forwarded pick, a moved tab landing), the trail, next/prev, and the fallback when the active tab closes or hides (the
+// record follows the new tab, or clears) — and for the two re-announcements that say the user is in THIS column (the
+// composer taking focus, the shell's pane focus). FALSE only on the AUTOMATIC paths (withAuto): a boot restore, the
+// shell's grid fill (`auto` on its focus), the stale-active fallback, an arriving tab's adoption, and a re-render that
+// changed nothing. The first cut defaulted to false and marked gestures true, which starved the feed: a focus message,
+// the trail and next/prev changed the tab unfocused, the kernel refused them once it had a named focus, and the feed's
+// section went stale — in the row too. The intent is recorded WITH the change (activeChanged, at every write of
+// activeId) and read by the report that follows, so it survives whatever renders in between and is never left on.
+let autoPath = false;                        // latched for the synchronous length of an automatic activation
+let pendingFocus: boolean | null = null;     // the intent of the change since the last report; null: nothing changed
+function withAuto(fn: () => void): void { const was = autoPath; autoPath = true; try { fn(); } finally { autoPath = was; } }
+function activeChanged(): void { pendingFocus = !autoPath; }
+function notifyActive(reannounce = false) {
+  const focused = reannounce || pendingFocus === true;
+  pendingFocus = null;
+  if (vscodeApi) vscodeApi.postMessage({ type: "activeTab", id: activeId, focused });
 }
 
 // Move id to the front of the recency stack (most-recently-active).
@@ -12818,7 +12844,7 @@ function stripLists(id: string): boolean {
  *  back (1 frame of 70 per push). */
 function restoreIfShown(id: string): boolean {
   if (!stripLists(id)) return false;
-  if (stripShows(id)) { setActive(id); return true; }
+  if (stripShows(id)) { withAuto(() => setActive(id)); return true; }   // a restore is automatic: the feed's follow is not moved by it (notifyActive)
   if (!activeId) { vanishedId = id; vanishedWhy = "hidden"; vanishedName = sessions.get(id)?.name || tabMeta.get(id)?.name || vanishedName || wantActiveName || ""; }
   return false;
 }
@@ -12838,6 +12864,7 @@ function unfocusHiddenByView(id: string): void {
   if (activeId !== id) return;
   stashActiveDraft(id);
   activeId = null; vanishedId = id; vanishedWhy = "hidden"; vanishedName = sessions.get(id)?.name || tabMeta.get(id)?.name || ""; vanishedByDecline = false;   // the user's own tab: no arrival may adopt over it
+  activeChanged();   // the feed's record clears with the pane (a view of the active tab, and there is none)
   loadComposerFor(null);
   renderTabs();
   showActive();
@@ -17025,6 +17052,7 @@ function setActive(id: string, anchor?: string, anchorT?: number, anchorKind?: s
     clearSeek();
   }
   activeId = id;
+  activeChanged();   // the report showActive posts below says whether this was a navigation or an automatic restore (the feed's follow)
   vanishedId = null; vanishedWhy = null; vanishedName = ""; wantActive = null; wantActiveGone = null; vanishedByDecline = false;   // any activation ends the unfocused state (T357)
   updateLivePaused();   // the entering tab's own detached state shows or hides the strip (round 2, item 7)
   syncLoadingPill();    // the pill is the ACTIVE tab's reader wait (T402 round two, medium 1)
@@ -17200,7 +17228,7 @@ function upsert(msg: any) {
   if (vanishedId === msg.id && heldHere(msg.id)) restoreIfShown(msg.id);   // …if the strip shows it: hidden by the view or the filter, the pane stays unfocused (applyTabOrder's rule); and only when this column holds it (the chat split)
   const wouldAdopt = !activeId && (!vanishedId || vanishedByDecline) && !wantActive && !wantActiveGone && heldHere(msg.id);   // …nor while the persisted tab is awaited after a reload, nor while the body says it is gone: a pick, not an arrival, moves on (T357); and only a session this column holds (the chat split, 2026-09-11): another column's session neither adopts here nor leaves a declined record; membership is the append above
   const adopted = wouldAdopt && stripShows(msg.id);   // …and never a session the view or the #only= filter hides (the review's low: the adopt wrote activeId past the rule's visibility half; membership is the append above)
-  if (adopted) { activeId = msg.id; assertPeekFor(msg.id); loadComposerFor(msg.id, true); persistActive(msg.id); vanishedId = null; vanishedWhy = null; vanishedName = ""; wantActive = null; wantActiveGone = null; vanishedByDecline = false; }   // persisted like a pick: a restart lands here again; the peek asserted like a pick's, so a view-hidden first arrival has a tab (the review's lows)   // adopted as the only tab → its draft too (T236: the once-per-page restore below never covers a session that LEFT and came back) An adoption ends the unfocused state exactly as setActive does (the review's high: a declined record left standing beside the adopted tab would hand its session to applyTabOrder's restore the moment the filter lifted, and the pane jumped to a session the user never had).
+  if (adopted) { activeId = msg.id; withAuto(activeChanged); assertPeekFor(msg.id); loadComposerFor(msg.id, true); persistActive(msg.id); vanishedId = null; vanishedWhy = null; vanishedName = ""; wantActive = null; wantActiveGone = null; vanishedByDecline = false; }   // persisted like a pick: a restart lands here again; the peek asserted like a pick's, so a view-hidden first arrival has a tab (the review's lows)   // adopted as the only tab → its draft too (T236: the once-per-page restore below never covers a session that LEFT and came back) An adoption ends the unfocused state exactly as setActive does (the review's high: a declined record left standing beside the adopted tab would hand its session to applyTabOrder's restore the moment the filter lifted, and the pane jumped to a session the user never had).
   else if (wouldAdopt && !vanishedId) { vanishedId = msg.id; vanishedWhy = "hidden"; vanishedName = sessions.get(msg.id)?.name || tabMeta.get(msg.id)?.name || ""; vanishedByDecline = true; }   // a DECLINED adoption records the session as restoreIfShown does, so renderTabs's schedule restores it when the filter shows it (the review's low: under a filter matching no live session the body showed the generic line and lifting the filter restored nothing); the record yields to a later VISIBLE first arrival (vanishedByDecline), since nothing was chosen, and is taken on FIRST sight only: a later hidden arrival never overwrites it, so which session the lift restores does not change between builds (the review's low)
   if (wantActive && msg.id === wantActive && stripLists(msg.id) && heldHere(msg.id)) { wantActive = null; restoreIfShown(msg.id); }   // restore persisted tab on arrival, if the strip shows it (else unfocused as hidden, restored when shown) — while this column holds it (a want for a tab moved away is retired by staleActiveFallback)
   renderTabs();                                   // a new id appended to `order` above → strip repaints in kernel order
@@ -17912,7 +17940,7 @@ function closeTabLocally(id: string): void {
   // (and the kernel never knew the id): its ✕ is a plain local discard — tab, draft, and all.
   if (isProvisionalId(id)) {
     if (id === provisionalId) cancelProvisional();
-    else { failedProvisionals.delete(id); dismissSession(id, "close"); }
+    else { failedProvisionals.delete(id); syncColumnBusy(); dismissSession(id, "close"); }   // the held text is discarded with the tab: the shell's deferred layout switch may go ahead
     return;
   }
   dismissSession(id, "close");
@@ -18079,6 +18107,7 @@ function dismissSession(id: string, why: DismissWhy, doomed?: ReadonlySet<string
     const goingToo = (x: string) => (doomed?.has(x) ?? false) || (why === "hostDrop" && !!home && hostOf(x) === home) || !heldHere(x);   // …nor a tab another column holds (the chat split): it is nobody's fallback here
     const next = focusAfterDismiss(why, mru, order, goingToo);
     activeId = next.activeId;
+    activeChanged();   // the feed follows: the record moves to the fallback's tab, or clears with an unfocused pane (never left on the closed one)
     if (next.unfocused) { vanishedId = id; vanishedWhy = why; vanishedName = name; vanishedByDecline = false; }   // the user's own tab went: no arrival may adopt over it (the review's high)
     loadComposerFor(activeId);   // the strip was showing the CLOSED session's chip/thumbnails/draft — swap in the new active tab's (usually none)
     // The box just changed hands under the user. Their own ✕ is the one case they already know; for every
@@ -18168,7 +18197,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
   // the shell's palette / shell-focus chords: the chat owns the nav trail, the shell just asks
   if (m.romp === "chatNav") { navHist.go(m.dir === 1 ? 1 : -1); return; }
   // the shell's Alt+Arrow landed the keyboard here: the user is in THIS column now, and the feed follows it (tiles, 2026-09-13)
-  if (m.romp === "paneFocus") { withGesture(notifyActive); return; }
+  if (m.romp === "paneFocus") { notifyActive(true); return; }
   // the shell changed the chat area's layout (tiles ↔ tabs, or the grid's shape): the chrome re-renders from the shell's answer, no reload
   if (m.romp === "layout") { renderTabs(); return; }
   // a moved tab's drafts (the chat split): the shell took them from the source page (__rompTakeSessionState) and
@@ -18264,6 +18293,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     // showActive scrolls there; and cover the ALREADY-ACTIVE case, where setActive early-returns (activeId ===
     // id, no anchor) and would otherwise leave a scrolled-up chat parked in history, not at the prompt.
     if (m.live) { const v = views.get(m.id); if (v) v.stick = true; }
+    const wasOn = activeId === m.id;   // already showing it: setActive posts nothing below, so the arrival is re-announced after
     if (m.live && activeId === m.id) {
       // one frame LATER, not now: when this focus is what un-hid the pane (the shell's reveal lands a
       // task after revealSelfPane's postMessage), the pane is still display:none here and scrollHeight
@@ -18275,9 +18305,17 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       });
     } else {
       pendingAnchorQuote = typeof (m as { anchorQuote?: string }).anchorQuote === "string" ? (m as { anchorQuote?: string }).anchorQuote! : null;   // the supporting span (T218) — consumed by the landing
-      setActive(m.id, m.anchor, typeof m.anchorT === "number" ? m.anchorT : undefined, typeof m.anchorKind === "string" ? m.anchorKind : undefined,
-                typeof m.anchorEventT === "number" ? m.anchorEventT : undefined);   // the anchor turn's own moment, when the kernel resolved it (T336)
+      const arrive = () => setActive(m.id, m.anchor, typeof m.anchorT === "number" ? m.anchorT : undefined, typeof m.anchorKind === "string" ? m.anchorKind : undefined,
+                                   typeof m.anchorEventT === "number" ? m.anchorEventT : undefined);   // the anchor turn's own moment, when the kernel resolved it (T336)
+      // a focus is a navigation the feed follows (notifyActive), unless the sender said it is AUTOMATIC (`auto`: the
+      // shell's grid fill landing a session in a tile) — the intent rides the message, so a focus forwarded to the owner
+      // or answered after its frame arrives is still the user's
+      if (m.auto === true) withAuto(arrive); else arrive();
     }
+    // …and a focus landing on the tab this column ALREADY shows is the same navigation (a feed card for the session in
+    // tile five while the feed follows tile two): setActive's fast path posts nothing, so the arrival is re-announced
+    // as the user's, like the composer taking focus — never for an `auto` one, which moves the feed nowhere
+    if (wasOn && m.auto !== true) notifyActive(true);
     // A feed card click that resolved to a live goal → seed the composer citation chip (the user 2026-07-01).
     if (m.cite && typeof m.cite.itemId === "string" && typeof m.cite.title === "string") setCitation(m.id, { itemId: m.cite.itemId, title: m.cite.title });
   }
@@ -19335,7 +19373,7 @@ function setupComposer() {
   // is the user's own act (a click, Tab, Enter over a selection, Quote, a citation seed, a slash pick, an edit
   // recall). Retiring on pointerdown alone left the note over a box they were typing in by any other route.
   ta.addEventListener("focus", () => { if (composerNoteSid) clearComposerNote(); });
-  ta.addEventListener("focus", () => withGesture(notifyActive));   // the box taking focus is the user's act in THIS column: the feed follows it (tiles, 2026-09-13)
+  ta.addEventListener("focus", () => notifyActive(true));   // the box taking focus is the user's act in THIS column: the feed follows it (tiles, 2026-09-13)
   ta.addEventListener("blur", () => window.setTimeout(closeSlash, 120));   // close when leaving (a row's mousedown keeps focus, so it fires only on a real leave)
   window.addEventListener("resize", positionSlash);
 
@@ -20268,7 +20306,7 @@ setupSettings();
     // Clicking a tab leaves focus ON the tab (renderTabs rebuilds the tab during setActive, which dropped
     // focus to the body — so Enter afterward did nothing). Now focus the (rebuilt) active tab, so the model
     // is consistent: tab focused → Enter drops into the message box; Escape there returns to the tabs.
-    select: (el) => { const id = el.dataset.id; if (id) withGesture(() => { setActive(id); focusActiveTab(); }); },   // the user's own pick: the feed follows this column (tiles)
+    select: (el) => { const id = el.dataset.id; if (id) { setActive(id); focusActiveTab(); } },
     // a section header (tab groups): fold or open that group — the new state is the opposite of the
     // one the header RENDERED (data-folded), never a toggle of the stored bit (a header can render a
     // state the store does not hold). The write notifies (TABGROUPS_EVENT) and the listener re-renders:

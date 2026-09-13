@@ -53,13 +53,13 @@ test("emptyStateParts: the body names the session that vanished and why; reconne
 test("the wiring: the dismiss branch, the unfocused body, the composer, the restore on return, no adoption meanwhile", () => {
   assert.match(RENDER, /^let vanishedId: string \| null = null;\s*\nlet vanishedWhy: VanishWhy \| null = null;\s*\nlet vanishedName = "";/m);
   const dismiss = fn("dismissSession");
-  assert.match(dismiss, /const next = focusAfterDismiss\(why, mru, order, goingToo\);\s*\n\s*activeId = next\.activeId;\s*\n\s*if \(next\.unfocused\) \{ vanishedId = id; vanishedWhy = why; vanishedName = name; vanishedByDecline = false; \}/);
+  assert.match(dismiss, /const next = focusAfterDismiss\(why, mru, order, goingToo\);\s*\n\s*activeId = next\.activeId;\s*\n\s*activeChanged\(\);[^\n]*\n\s*if \(next\.unfocused\) \{ vanishedId = id; vanishedWhy = why; vanishedName = name; vanishedByDecline = false; \}/);
   assert.match(dismiss, /if \(why !== "close"\) \{[\s\S]*?ta\.blur\(\);[\s\S]*?renderComposerNote\(id, why, name\);/, "the T236 note above the box still says whose box went away");
   // the pick (and the restore) end the unfocused state
-  assert.match(fn("setActive"), /activeId = id;\s*\n\s*vanishedId = null; vanishedWhy = null; vanishedName = ""; wantActive = null; wantActiveGone = null;/, "a pick ends the unfocused state AND the awaited tab");
+  assert.match(fn("setActive"), /activeId = id;\s*\n\s*activeChanged\(\);[^\n]*\n\s*vanishedId = null; vanishedWhy = null; vanishedName = ""; wantActive = null; wantActiveGone = null;/, "a pick ends the unfocused state AND the awaited tab (its intent recorded between, for the feed\'s follow)");
   assert.match(fn("setActive"), /persistActive\(id\);/, "the pick persists id and name");
   assert.match(fn("persistActive"), /activeId: id, activeName: liveSession\(id\)\?\.name \|\| tabMeta\.get\(id\)\?\.name \|\| ""/, "the name persists beside the id for the reload's body");
-  assert.match(RENDER, /if \(adopted\) \{ activeId = msg\.id; assertPeekFor\(msg\.id\); loadComposerFor\(msg\.id, true\); persistActive\(msg\.id\); vanishedId = null; vanishedWhy = null; vanishedName = ""; wantActive = null; wantActiveGone = null; vanishedByDecline = false; \}/, "an adopted tab asserts its peek and is persisted like a pick (the review's lows)");
+  assert.match(RENDER, /if \(adopted\) \{ activeId = msg\.id; withAuto\(activeChanged\); assertPeekFor\(msg\.id\); loadComposerFor\(msg\.id, true\); persistActive\(msg\.id\); vanishedId = null; vanishedWhy = null; vanishedName = ""; wantActive = null; wantActiveGone = null; vanishedByDecline = false; \}/, "an adopted tab asserts its peek and is persisted like a pick (the review's lows)");
   // the empty body: pane-focus's words, the name dressed as the strip dresses it, the composer disabled and nameless
   const show = fn("showActive");
   assert.match(show, /paintEmptyState\(empty\);\s*\n\s*empty\.style\.display = "";\s*\n[\s\S]{0,200}?ta\.disabled = true; ta\.placeholder = order\.length \? "Pick a tab to start" : "Click \+ to add a session"; syncComposerPh\(\);/);
@@ -86,7 +86,7 @@ test("the wiring: the dismiss branch, the unfocused body, the composer, the rest
   // every restore reads ONE rule (the review's leak: applyTabOrder's had no visibility predicate, so a routine push
   // re-focused a filtered-out session for one frame): listed AND shown takes focus back; listed but hidden leaves the
   // pane unfocused as "hidden", for renderTabs's schedule to restore when the filter shows it
-  assert.match(fn("restoreIfShown"), /if \(!stripLists\(id\)\) return false;\s*\n\s*if \(stripShows\(id\)\) \{ setActive\(id\); return true; \}\s*\n\s*if \(!activeId\) \{ vanishedId = id; vanishedWhy = "hidden";/);
+  assert.match(fn("restoreIfShown"), /if \(!stripLists\(id\)\) return false;\s*\n\s*if \(stripShows\(id\)\) \{ withAuto\(\(\) => setActive\(id\)\); return true; \}[^\n]*\n\s*if \(!activeId\) \{ vanishedId = id; vanishedWhy = "hidden";/);
   assert.match(fn("stripLists"), /return !closingTabs\.has\(id\) && \(order\.includes\(id\) \|\| tabMeta\.has\(id\)\);/, "the paint's membership rule, shared with every restore");
   assert.match(RENDER, /if \(wantActive && msg\.id === wantActive && stripLists\(msg\.id\) && heldHere\(msg\.id\)\) \{ wantActive = null; restoreIfShown\(msg\.id\); \}/, "the persisted tab's arrival restores only if shown, and only while this column holds it (the chat split)");
   assert.equal((RENDER.match(/\bsetActive\(back\)/g) || []).length, 1, "the one direct setActive(back) left is renderTabs's own fire-time restore, behind stripLists and stripShows");
@@ -109,7 +109,7 @@ test("the wiring: the dismiss branch, the unfocused body, the composer, the rest
   // applied on top of tabInView and is no peek input, so an only-filtered active tab goes UNFOCUSED here, never
   // re-pointed; the fire-time check reads the same predicate visibleIds is built from (stripShows)
   assert.match(fn("renderTabs"), /if \(activeId && ids\.includes\(activeId\) && !visibleIds\.includes\(activeId\)\) \{\s*\n\s*const hid = activeId;\s*\n\s*setTimeout\(\(\) => \{ if \(activeId === hid && !stripShows\(hid\)\) unfocusHiddenByView\(hid\); \}, 0\);/);
-  assert.match(fn("renderTabs"), /if \(!activeId && vanishedId && vanishedWhy === "hidden" && visibleIds\.includes\(vanishedId\)\)[\s\S]{0,900}?if \(!activeId && vanishedId === back && vanishedWhy === "hidden" && stripLists\(back\) && stripShows\(back\)\) setActive\(back\);/, "…and comes back when the filter shows it again, the reason AND the strip's membership (stripLists, the paint's rule) re-read at fire time");
+  assert.match(fn("renderTabs"), /if \(!activeId && vanishedId && vanishedWhy === "hidden" && visibleIds\.includes\(vanishedId\)\)[\s\S]{0,900}?if \(!activeId && vanishedId === back && vanishedWhy === "hidden" && stripLists\(back\) && stripShows\(back\)\) withAuto\(\(\) => setActive\(back\)\); \}, 0\);/, "…and comes back when the filter shows it again, the reason AND the strip's membership (stripLists, the paint's rule) re-read at fire time");
   assert.doesNotMatch(fn("renderTabs"), /const nameOf = /, "no second name ladder in renderTabs: stripShows carries the one (the review's low)");
   assert.match(fn("stripShows"), /function stripShows\(id: string, only: string \| null = onlyTag\(\)\): boolean \{\s*\n\s*if \(!tabInView\(id\)\) return false;\s*\n\s*return !only \|\| matchesOnly\(sessions\.get\(id\)\?\.name \?\? tabMeta\.get\(id\)\?\.name \?\? "", only\);/, "the one predicate");
   assert.match(fn("renderTabs"), /const visibleIds = ids\.filter\(\(id\) => stripShows\(id, only\)\);/, "visibleIds is built from it: no second copy");
@@ -119,7 +119,7 @@ test("the wiring: the dismiss branch, the unfocused body, the composer, the rest
   assert.doesNotMatch(RENDER, /visibleIds\.includes\(activeId\) && visibleIds\.length/, "no first-visible-tab RE-POINT");
   assert.match(fn("unfocusHiddenByView"), /activeId = null; vanishedId = id; vanishedWhy = "hidden";/);
   assert.match(fn("assertPeekFor"), /const next = chatVisible\(id\) \? null : id;/, "the peek rule, over the views blob alone");
-  assert.match(RENDER, /if \(adopted\) \{ activeId = msg\.id; assertPeekFor\(msg\.id\); loadComposerFor\(msg\.id, true\); persistActive\(msg\.id\); vanishedId = null;/, "an adoption asserts the peek like a pick");
+  assert.match(RENDER, /if \(adopted\) \{ activeId = msg\.id; withAuto\(activeChanged\); assertPeekFor\(msg\.id\); loadComposerFor\(msg\.id, true\); persistActive\(msg\.id\); vanishedId = null;/, "an adoption asserts the peek like a pick");
   assert.match(fn("paintEmptyState"), /name: nameOf\(vanishedId, vanishedName\), why: vanishedWhy/, "no raw sid on the dismissal branch either");
   assert.match(fn("dismissSession"), /const name = sessions\.get\(id\)\?\.name \|\| tabMeta\.get\(id\)\?\.name \|\| "a session";/);
   assert.match(fn("cycleTab"), /if \(pickFirstVisibleTab\(\)\) return;/);
@@ -128,7 +128,8 @@ test("the wiring: the dismiss branch, the unfocused body, the composer, the rest
   assert.doesNotMatch(RENDER, /setActive\(next\); \}, 0\);/, "the old re-point is gone");
   // the feed relay: showActive announces the active tab (null included) on every branch it takes
   assert.match(show, /^\s*notifyActive\(\);/m);
-  assert.match(fn("notifyActive"), /vscodeApi\.postMessage\(\{ type: "activeTab", id: activeId, focused: gestureActive \}\)/, "null rides as null (beside the gesture flag the feed's follow reads, tiles 2026-09-13)");
+  assert.match(fn("notifyActive"), /vscodeApi\.postMessage\(\{ type: "activeTab", id: activeId, focused \}\)/, "null rides as null (beside the navigation flag the feed's follow reads, tiles 2026-09-13)");
+  assert.match(fn("dismissSession"), /activeId = next\.activeId;\n\s*activeChanged\(\);/, "the fallback after a close is a navigation the feed follows: the record moves to the new tab, or clears");
   assert.match(CSS, /\.empty-state\.unfocused \{/); assert.match(CSS, /\.empty-state-name \{ font-weight: 600; \}/);
   // the statusline says nothing with no active session: not the vanished session's chips (the served lab's screenshot found it)
   assert.match(fn("updateStatusline"), /if \(!s\) \{ sl\.replaceChildren\(\); return; \}/);

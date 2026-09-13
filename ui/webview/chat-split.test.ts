@@ -15,7 +15,9 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createRequire } from "node:module";
 
+const requireCjs = createRequire(__filename);
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
 const MAIN = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "palette-main.ts"), "utf8");
 const COMMANDS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "commands.ts"), "utf8");
@@ -221,20 +223,99 @@ test("the tile header keys on a grid layout AND exactly one session shown here, 
   assert.ok(!RENDER.includes('postMessage({ type: "pickResult", id: it.id, name: it.name })'), "the row's pick goes through settlePick");
 });
 
-test("activeTab carries `focused`: true on the user's own gesture in this column, false on a boot, a restore or a re-render", () => {
-  assert.match(RENDER, /function notifyActive\(\) \{\n\s*if \(vscodeApi\) vscodeApi\.postMessage\(\{ type: "activeTab", id: activeId, focused: gestureActive \}\);/);
-  assert.match(RENDER, /let gestureActive = false;\nfunction withGesture\(fn: \(\) => void\): void \{ const was = gestureActive; gestureActive = true; try \{ fn\(\); \} finally \{ gestureActive = was; \} \}/, "set for the synchronous gesture path only, never left on");
-  // the gestures: the tab click (the #tabs delegate), the keyboard (a focused tab's keys, the window's arrows), the composer taking focus, the shell's pane focus
-  assert.match(RENDER, /select: \(el\) => \{ const id = el\.dataset\.id; if \(id\) withGesture\(\(\) => \{ setActive\(id\); focusActiveTab\(\); \}\); \},/);
-  assert.match(RENDER, /function onTabKey\(e: KeyboardEvent\) \{ withGesture\(\(\) => tabKey\(e\)\); \}/);
-  assert.match(RENDER, /if \(nb\) \{ e\.preventDefault\(\); withGesture\(\(\) => setActive\(nb\)\); \}/);
-  assert.match(RENDER, /withGesture\(\(\) => setActive\(ord\[\(i \+ dir \+ ord\.length\) % ord\.length\]\)\);/);
-  assert.match(RENDER, /ta\.addEventListener\("focus", \(\) => withGesture\(notifyActive\)\);/);
-  assert.match(RENDER, /if \(m\.romp === "paneFocus"\) \{ withGesture\(notifyActive\); return; \}/);
-  // …and the kernel reads it: an unfocused report never displaces a followed session (tests/test_kernel_active_chat_relay.py runs it)
+// The intent trio, EXECUTED: activeChanged records whether the change was a navigation or automatic, notifyActive reports it once.
+function focusModel(): { posted: { id: string | null; focused: boolean }[]; set: (id: string | null) => void; activeChanged: () => void; withAuto: (fn: () => void) => void; notifyActive: (re?: boolean) => void } {
+  const at = RENDER.indexOf("let autoPath = false;");
+  const end = RENDER.indexOf("\n}\n", RENDER.indexOf("function notifyActive(", at)) + 3;
+  assert.ok(at > 0 && end > at, "the intent trio moved: re-anchor");
+  const js = requireCjs("esbuild").transformSync(RENDER.slice(at, end), { loader: "ts" }).code;
+  const posted: { id: string | null; focused: boolean }[] = [];
+  const api = new Function("posted", `let activeId = null; const vscodeApi = { postMessage: (m) => posted.push({ id: m.id, focused: m.focused }) };\n${js}\n`
+    + "return { set: (id) => { activeId = id; }, activeChanged, withAuto, notifyActive };")(posted);
+  return { posted, ...api };
+}
+
+test("activeTab's `focused` is TRUE for every navigation that changes the active tab and FALSE only on the automatic paths (the model, executed)", () => {
+  const m = focusModel();
+  m.set("web"); m.activeChanged(); m.notifyActive();                         // a navigation: a tab click, a focus message, the trail, next/prev
+  m.notifyActive();                                                          // a re-render of the same tab: nothing changed
+  m.withAuto(() => { m.set("api"); m.activeChanged(); }); m.notifyActive();  // an automatic change: a boot restore, the grid's fill, the stale fallback, an adoption
+  m.notifyActive(true);                                                      // a re-announcement of where the user IS: the composer taking focus, the shell's pane focus
+  m.set(null); m.activeChanged(); m.notifyActive();                          // the active tab closed or hid: the fallback's null is a navigation too — the feed's record clears
+  m.withAuto(() => m.withAuto(() => { m.set("tests"); m.activeChanged(); })); m.notifyActive();   // nested automatic scopes stay automatic
+  m.set("docs"); m.activeChanged(); m.notifyActive();                        // …and the latch is released after them: the next navigation is a navigation
+  assert.deepEqual(m.posted, [
+    { id: "web", focused: true }, { id: "web", focused: false }, { id: "api", focused: false }, { id: "api", focused: true },
+    { id: null, focused: true }, { id: "tests", focused: false }, { id: "docs", focused: true },
+  ]);
+  // the intent is consumed by the report that follows the change, never left on for a later re-render
+  m.set("lint"); m.activeChanged(); m.notifyActive(); m.notifyActive();
+  assert.deepEqual(m.posted.slice(-2), [{ id: "lint", focused: true }, { id: "lint", focused: false }]);
+});
+
+test("the paths: every write of activeId records the intent, the automatic paths are enumerated, the shell's fill says `auto`, and the kernel reads the flag", () => {
+  assert.match(RENDER, /function notifyActive\(reannounce = false\) \{\n\s*const focused = reannounce \|\| pendingFocus === true;\n\s*pendingFocus = null;\n\s*if \(vscodeApi\) vscodeApi\.postMessage\(\{ type: "activeTab", id: activeId, focused \}\);/);
+  assert.match(RENDER, /let autoPath = false;/); assert.match(RENDER, /function activeChanged\(\): void \{ pendingFocus = !autoPath; \}/);
+  // every write of activeId records the intent with the change (setActive, the dismissal's fallback, the view's hide, the adoption)
+  assert.match(RENDER, /  activeId = id;\n  activeChanged\(\);/, "setActive");
+  assert.match(RENDER, /activeId = next\.activeId;\n\s*activeChanged\(\);/, "the fallback after a close: the record follows the new tab, or clears");
+  assert.match(RENDER, /activeId = null; vanishedId = id; vanishedWhy = "hidden";[^\n]*\n\s*activeChanged\(\);/, "the view hid the active tab: the record clears");
+  assert.match(RENDER, /if \(adopted\) \{ activeId = msg\.id; withAuto\(activeChanged\);/, "an arriving tab's adoption is automatic");
+  assert.equal((RENDER.match(/activeId = (?!null;|next\.activeId;|id;|msg\.id;)/g) || []).length, 0, "no other write of activeId: every one is one of the four above");
+  // the automatic paths, and ONLY these: a restore (boot, a re-listed tab, the filter lifting), the stale-active fallback, the moved-away re-point, the adoption, an `auto` focus
+  assert.match(RENDER, /if \(stripShows\(id\)\) \{ withAuto\(\(\) => setActive\(id\)\); return true; \}/, "restoreIfShown");
+  assert.match(RENDER, /wantActive = null; withAuto\(\(\) => setActive\(first\)\); \} \}, 0\);/, "staleActiveFallback");
+  assert.match(RENDER, /stripShows\(first\)\) withAuto\(\(\) => setActive\(first\)\); \}, 0\);/, "the active tab moved to another column");
+  assert.match(RENDER, /stripShows\(back\)\) withAuto\(\(\) => setActive\(back\)\); \}, 0\);/, "the filter shows the hidden tab again");
+  assert.match(RENDER, /if \(m\.auto === true\) withAuto\(arrive\); else arrive\(\);/, "a focus message is a navigation unless its sender said `auto`");
+  assert.equal((RENDER.match(/withAuto\(/g) || []).length, 7, "the definition and six automatic sites: restoreIfShown, staleActiveFallback, the two renderTabs re-points, the adoption, the auto focus — a seventh needs a reason here");
+  // the navigations wear NO wrapper: the tab click, the keyboard, the window's arrows, next/prev, the trail, the shell's switcher
+  assert.match(RENDER, /select: \(el\) => \{ const id = el\.dataset\.id; if \(id\) \{ setActive\(id\); focusActiveTab\(\); \} \}/);
+  assert.match(RENDER, /function onTabKey\(e: KeyboardEvent\) \{ tabKey\(e\); \}/);
+  assert.match(RENDER, /if \(nb\) \{ e\.preventDefault\(\); setActive\(nb\); \}/);
+  assert.match(RENDER, /^    setActive\(spot\.sid\);$/m, "the trail's apply");
+  assert.match(RENDER, /if \(order\.includes\(m\.id\)\) \{ revealSelfPane\(\); closingTabs\.delete\(m\.id\); setActive\(m\.id\); \}/, "the shell's switcher");
+  assert.match(RENDER, /else if \(m\.type === "nextTab"\) cycleTab\(1\);/);
+  assert.doesNotMatch(RENDER, /withGesture|gestureActive/, "the gestures-only model is gone");
+  // the three re-announcements of where the user is: the composer taking focus, the shell's pane focus, and a focus message
+  // landing on the tab this column already shows (setActive's fast path posts nothing, and the feed may follow another tile)
+  assert.match(RENDER, /ta\.addEventListener\("focus", \(\) => notifyActive\(true\)\);/);
+  assert.match(RENDER, /if \(m\.romp === "paneFocus"\) \{ notifyActive\(true\); return; \}/);
+  assert.match(RENDER, /const wasOn = activeId === m\.id;/); assert.match(RENDER, /if \(wasOn && m\.auto !== true\) notifyActive\(true\);/, "an already-shown session's focus is still the user's arrival here; an `auto` one moves the feed nowhere");
+  assert.equal((RENDER.match(/notifyActive\(true\)/g) || []).length, 3, "the re-announcements are these three — a fourth needs a reason here");
+  // the shell: the grid's fill lands a session with an automatic focus; a move the user made, without
+  assert.ok(KERNEL.includes("tf&&tf.contentWindow.postMessage({type:'focus',id:sid,auto:true},'*');"), "place()");
+  assert.ok(KERNEL.includes("adopt(tf,sid,st);try{tf.contentWindow.postMessage({type:'focus',id:sid},'*');}catch(e){}"), "moveTab()");
+  // …and the kernel reads it: an unfocused report never displaces a followed session, a focused one always stands (tests/test_kernel_active_chat_relay.py runs it)
   assert.match(KERNEL, /def _relay_active_chat\(client, sid, focused=None\):/);
   assert.match(KERNEL, /if focused is False and _ACTIVE_CHAT_BY_WID\.get\(wid\):\n\s*return/);
   assert.match(KERNEL, /_relay_active_chat\(client, msg\.get\("id"\), msg\.get\("focused"\)\)/);
+});
+
+test("a column tells the shell when its busy answer flips, and the shell preflights every layout transition on it (review 2026-09-13)", () => {
+  // the page: one helper, posted only on a flip, from every write of the two facts __rompColumnBusy reads
+  assert.match(RENDER, /function syncColumnBusy\(\): void \{\n\s*const busy = \(window as any\)\.__rompColumnBusy\(\) as boolean;\n\s*if \(busy === columnBusyTold\) return;\n\s*columnBusyTold = busy;\n\s*try \{ if \(window\.parent && window\.parent !== window\) window\.parent\.postMessage\(\{ romp: "colBusy", busy \}, "\*"\); \}/);
+  assert.match(RENDER, /provisionalId = id;\n\s*syncColumnBusy\(\);/, "openProvisional");
+  assert.match(RENDER, /provisionalId = null;\n\s*syncColumnBusy\(\);/, "dropProvisional");
+  assert.match(RENDER, /failedProvisionals\.add\(id\);\n\s*syncColumnBusy\(\);/, "failProvisional");
+  assert.match(RENDER, /failedProvisionals\.delete\(id\); syncColumnBusy\(\); dismissSession\(id, "close"\);/, "a failed tab's discard");
+  // the shell: the columns a transition destroys, asked before anything moves; a user's transition refuses whole, a peer window's write defers
+  assert.ok(KERNEL.includes("function doomed(nl,ng){return (nl!==layout?cols:cols.slice(capOf(nl,ng))).map(function(c){return c.n;});}"));
+  assert.ok(KERNEL.includes("function anyBusy(ns){for(var i=0;i<ns.length;i++){if(busy(frameOfCol(ns[i])))return true;}return false;}"));
+  assert.ok(KERNEL.includes("if(anyBusy(doomed('grid',g)))return notify(BUSY);"), "enterGrid, before the pane toggle and applyLayout");
+  assert.ok(KERNEL.includes("if(anyBusy(doomed('row',null))){notify(BUSY);return false;}"), "leaveGrid");
+  assert.ok(KERNEL.includes("for(var i=0;i<ns.length;i++){if(!close(ns[i]))return false;}"), "a refused close never falls through to applyLayout");
+  assert.ok(KERNEL.includes("if(anyBusy(gone)){deferred=true;return;}"), "reconcile defers");
+  assert.ok(KERNEL.includes("if(!m||m.romp!=='colBusy'||m.busy||!deferred||mobile()||!frameOfWin(e.source))return;var r=read();if(!r.migrated)reconcile(r);"), "…and applies on the page's flip, from a fresh read");
+  const split = KERNEL.slice(KERNEL.indexOf("_LANDING_SPLIT_JS = \"\"\""), KERNEL.indexOf("\"\"\"", KERNEL.indexOf("_LANDING_SPLIT_JS = \"\"\"") + 30));
+  assert.doesNotMatch(split, /setTimeout|setInterval/, "no timer: the deferral is keyed on the page's event");
+});
+
+test("the first tile's picker lifts out of its cell: the first-cell rule stands down for a lifted frame (review 2026-09-13)", () => {
+  assert.ok(KERNEL.includes('"#chat-pane.chat-grid>#f-chat:not(.lifted){position:static;width:100%;height:100%;min-width:0;min-height:0;grid-area:1 / 1}"'));
+  assert.doesNotMatch(KERNEL, /"#chat-pane\.chat-grid>#f-chat\{/, "no unconditioned first-cell rule that would outrank the lift");
+  assert.ok(KERNEL.includes('"body.picker-open iframe.lifted{display:block;position:fixed;left:0;right:0;top:0;height:var(--app-h,100dvh);z-index:200;background:transparent}"'), "the lift rule the exclusion hands the frame to");
+  assert.ok(KERNEL.includes('"body.picker-open #chat-pane.chat-grid.lifted{display:grid!important}"'), "the grid stays a grid around it");
 });
 
 test("the palette offers every grid the shell does, and Back to tabs while one is up; the shell's offer is one line per grid", () => {
