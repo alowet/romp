@@ -417,6 +417,29 @@ body.chat-theme-yatharth #tabs .tab-row-line { display: none; }
 }
 #tabbar-resize:hover::after, #tabbar-resize.dragging::after { background: var(--accent); width: 52px; }
 body.tabbar-resizing { cursor: ns-resize; user-select: none; }
+/* THE TILE HEADER (tiles, the user 2026-09-13): in a grid, a column showing ONE session wears this one line in the tab
+   strip's place — the strip's own dot (tab-dot, the same classes), the name at the session names' weight in the identity
+   colour with a remote session's quiet "host:" prefix, and the ⋯ at the right — in the strip's chrome sizes (the tab's
+   0.92em and its 6px 7px padding, no new font size) on the strip's own plane and hairline. body.tile-head hides the strip
+   and its grip; render.ts syncTileHead decides per render by chat-columns.ts tileHeaderShown. The dashed ring an
+   awaiting / blocked / retrying tab wears is the header's too, in the tab's own state colours. */
+#tile-head { display: none; flex: 0 0 auto; align-items: center; gap: 6px; padding: 6px 8px 6px 10px; font-size: 0.92em; color: var(--fg);
+  border-bottom: 1px solid var(--box-border); background: var(--vscode-editor-background, var(--bg)); --state: transparent; }
+body.tile-head #tile-head { display: flex; }
+body.tile-head #tabbar, body.tile-head #tabbar-resize { display: none; }
+#tile-head .tile-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+#tile-head .tile-name.host-off { opacity: 0.6; }
+#tile-head .tile-more { flex: 0 0 auto; background: none; border: 1px solid transparent; border-radius: 5px; color: var(--dim); cursor: pointer;
+  font: inherit; line-height: 1; padding: 1px 6px; }
+#tile-head .tile-more:hover, #tile-head .tile-more:focus-visible { color: var(--fg); background: var(--tab-active-bg); outline: none; }
+#tile-head.tab-awaiting { --state: var(--st-awaiting-bg); }
+#tile-head.tab-blocked { --state: var(--st-blocked-bg); }
+#tile-head.tab-retrying { --state: var(--st-retrying-bg); }
+#tile-head.tab-awaiting, #tile-head.tab-blocked, #tile-head.tab-retrying { outline: 2px dashed var(--state); outline-offset: -2px; }
+/* the empty tile's pick (render.ts syncTilePick): the placeholder's copy above it, the button in the chat's button dress */
+.tx-empty-pick { display: block; margin: 0 auto 28px; background: var(--btn-bg); color: var(--fg); border: 1px solid var(--hairline); border-radius: 6px;
+  padding: 4px 12px; font: inherit; font-size: 0.92em; cursor: pointer; }
+.tx-empty-pick:hover, .tx-empty-pick:focus-visible { border-color: var(--accent); outline: none; }
 /* TAB SECTIONS — groups are tags (the user 2026-09-04): one header per home tag in the strip, the
    untagged trail behind a plain separator. A header reads as a LABEL, not a session (the user
    2026-09-06): a disclosure chevron that flips with the fold, the tag as THE CHIP it wears everywhere

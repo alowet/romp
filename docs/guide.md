@@ -265,6 +265,19 @@ no session is ever shown twice. The arrangement, each column's sessions and widt
 remembered per browser across reloads. Four columns at most; the phone shows one pane at a time
 and never splits.
 
+**Tiles.** Instead of columns behind gutters, the chat can lay its sessions out as a grid of
+tiles, each one session with its own composer: **Tiles 2×2** and **Tiles 2×3** in the command
+palette. The session you are on stays in the first tile, and the tiles after it fill from the
+first tile's tab strip in order, left to right, top to bottom; a tile with no session to show
+stands empty and offers to pick one. A tile showing one session wears a one-line header in the
+tab strip's place, its name, its state dot and a **⋯** menu: **Swap session…** brings a picked
+session into that tile and sends the one it showed back to the first tile, **Close tile** sends
+its session back and leaves the tile empty, and **Back to tabs** (there and in the palette)
+folds every tile back into the one chat. The first tile keeps its tab strip for whatever is not
+placed in a tile, so every session stays a click away. Drag a tab onto a tile to move a session
+there. Switching 2×3 to 2×2 folds the surplus tiles' sessions back into the first tile; the
+grid, like the columns, is remembered per browser.
+
 ### The feed
 
 The feed is Romp's task-management layer: a card for each task. Romp's

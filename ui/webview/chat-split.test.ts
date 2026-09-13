@@ -20,6 +20,7 @@ const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview"
 const MAIN = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "palette-main.ts"), "utf8");
 const COMMANDS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "commands.ts"), "utf8");
 const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
+const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
 
 test("the pane asks the shell which column holds a session, acts only when it is its own, and hands a consumed reveal to the owner once", () => {
   // the arbitration: the shell's __rompChatTarget names the frame; no shell (standalone, VS Code) → always ours
@@ -102,7 +103,8 @@ test("a pick of a session another column holds is shown where it lives: the setA
   assert.match(RENDER, /function noteOrphanState\(\): void \{\n\s*if \(!colSets \|\| !tabOrderSeen\) return;[\s\S]*?window\.parent\.postMessage\(\{ romp: "orphanState", sids \}, "\*"\);/);
   assert.ok(KERNEL.includes("if(m.romp==='orphanState'&&Array.isArray(m.sids)){"));
   // the no-sessions copy's third case: sessions listed, none this column's
-  assert.match(RENDER, /const txt = totalCount > 0 && heldCount === 0\n\s*\? "Every session is in another column\. Drag a tab here, or start one with the \+ above\."/);
+  assert.match(RENDER, /const txt = tile\n\s*\? "An empty tile\. Drag a tab here, or pick a session to show:"\n\s*: totalCount > 0 && heldCount === 0\n\s*\? "Every session is in another column\. Drag a tab here, or start one with the \+ above\."/,
+    "…and its fourth, ahead of it: an empty TILE in a grid (tiles, 2026-09-13), which also offers the pick (syncTilePick)");
 });
 
 test("drafts travel with a moved tab: the source hands over what it holds, synchronously, and the target adopts it", () => {
@@ -135,7 +137,10 @@ test("the tab menu offers no column item and the page never asks the shell to op
 });
 
 test("a lifted column measures ITS OWN pane, never the first column's", () => {
-  assert.match(RENDER, /function liftPaneRect\(\): DOMRect \| null \{[\s\S]*?const own = window\.frameElement \? \(window\.frameElement as HTMLElement\)\.parentElement : null;\n\s*const p = own \|\| window\.parent\?\.document\?\.getElementById\("chat-pane"\);/);
+  assert.match(RENDER, /function liftPaneRect\(\): DOMRect \| null \{[\s\S]*?const own = tile \|\| \(window\.frameElement \? \(window\.frameElement as HTMLElement\)\.parentElement : null\);\n\s*const p = own \|\| window\.parent\?\.document\?\.getElementById\("chat-pane"\);/);
+  // …and in a grid the first frame is an item of the whole grid, so the TILE the shell names for this frame (its overlay) is
+  // measured ahead of the parent (tiles, 2026-09-13)
+  assert.match(RENDER, /const named = fid \? \(window\.parent as any\)\?\.__rompChatPaneOf\?\.\(fid\) : null;/);
   // …and the shell lifts by class, marking the asking frame (the pinned CSS moved off #f-chat)
   assert.ok(KERNEL.includes('"body.picker-open iframe.lifted{display:block;position:fixed;left:0;right:0;top:0;height:var(--app-h,100dvh);z-index:200;background:transparent}"'));
   assert.ok(!KERNEL.includes('"body.picker-open #f-chat{'));
@@ -174,4 +179,72 @@ test("the column commands exist under their new meanings, the move to a new colu
   assert.ok(KERNEL.includes("window.dispatchEvent(new CustomEvent('romp-chat-cols',{detail:{frame:f,col:n,open:true}}))"));
   // no bottom-bar button for it (the user 2026-09-08): the tab menu and the palette are the doors
   assert.ok(!KERNEL.includes("rail-split"));
+});
+
+// ── TILES (the user 2026-09-13): the chat area as a grid, one session per tile ─────────────────────────────────────────────
+test("the tile header keys on a grid layout AND exactly one session shown here, hides the strip only then, and is repainted every render", () => {
+  // the rule is chat-columns.ts's (executed in chat-columns.test.ts); render.ts reads the shell's layout beside the sets, once per render
+  assert.match(RENDER, /import \{ colFromSearch, columnHolds, parseChatLayout, tileHeaderShown, type ColSets, type ChatLayout \} from "\.\/chat-columns";/);
+  assert.match(RENDER, /function readChatLayout\(\): ChatLayout \| null \{[\s\S]*?const f = \(window\.parent as any\)\.__rompChatLayout;\n\s*return typeof f === "function" \? parseChatLayout\(f\(\)\) : null;/);
+  const rt = RENDER.slice(RENDER.indexOf("function renderTabs() {"), RENDER.indexOf("function stripAftermath("));
+  assert.ok(rt.indexOf("colSets = readColSets();") > 0 && rt.indexOf("chatLayout = readChatLayout();") > rt.indexOf("colSets = readColSets();"), "the layout is read right after the sets");
+  // the header's branch: on = grid && one visible session; body.tile-head hides #tabbar and its grip (styles.css), and nothing else does
+  assert.match(RENDER, /function syncTileHead\(visibleIds: readonly string\[\]\): void \{\n\s*const on = tileHeaderShown\(chatLayout, visibleIds\.length\);\n\s*document\.body\.classList\.toggle\("tile-head", on\);/);
+  assert.match(CSS, /body\.tile-head #tabbar, body\.tile-head #tabbar-resize \{ display: none; \}/);
+  assert.equal((CSS.match(/#tabbar[^{]*\{[^}]*display: none/g) || []).length, 1, "the strip hides under the tile header alone (the phone hides #tabs, not #tabbar)");
+  // repainted from stripAftermath, after the placeholder (the skip path reaches it: a state or name change needs no strip rebuild)
+  assert.match(RENDER, /syncNoSessionsPlaceholder\(visibleIds\.length, ids\.length, ids\.filter\(heldHere\)\.length\);[^\n]*\n\s*syncTileHead\(visibleIds\);/);
+  // the dot is the strip's own rule (tabDotClass / tabDotTitle) and the header wears the tab's state class; the name draws the host prefix as the tab does
+  assert.match(RENDER, /dot\.className = tabDotClass\(st\?\.state\) \|\| "tab-dot none"; dot\.title = tabDotTitle\(st\?\.state\) \|\| "";/);
+  assert.match(RENDER, /head\.className = "tile-head" \+ \(st \? " " \+ tabStateClass\(st\) : ""\);/);
+  assert.match(RENDER, /name\.replaceChildren\(\.\.\.hostNameNodes\(tabName\(id\) \|\| "", id\)\);/);
+  // a skeleton's status comes from the kernel's status frames, never a stale session (the strip's own read)
+  assert.match(RENDER, /function tileStatusOf\(id: string\)[\s\S]*?if \(renderKind\(skeletonTabs, id, !!s\) === "skeleton"\) return skeletonTabs\.status\.get\(id\)/);
+  // click-safe: the ⋯ acts through a delegate on the header, keyed by data-act, installed once with the header
+  assert.match(RENDER, /more\.dataset\.act = "tile-menu";/);
+  assert.match(RENDER, /delegate\(head, \{ "tile-menu": \(btn\) => openTileMenu\(btn\) \}\);/);
+  // the menu is the house rows menu: Swap session… (the local pick → the shell's swap), Back to tabs, Close tile off the first tile only
+  const menu = RENDER.slice(RENDER.indexOf("function openTileMenu("), RENDER.indexOf("\n}\n", RENDER.indexOf("function openTileMenu(")));
+  assert.match(menu, /openRowsMenu\(anchor, \(\) => \[/);
+  assert.match(menu, /label: "Swap session\\u2026"[\s\S]*?pickSessionLocally\("Swap in a session", swapIntoThisTile\)/);
+  assert.match(menu, /label: "Back to tabs"[\s\S]*?w\.__rompChatTilesOff\(\)/);
+  assert.match(menu, /\.\.\.\(COL \? \[\{ label: "Close tile"[\s\S]*?w\.__rompCloseSplit\(Number\(COL\)\)/, "Close tile only off the first tile");
+  assert.match(RENDER, /function swapIntoThisTile\(sid: string \| null\): void \{[\s\S]*?w\.__rompSwapTile\(sid, COL \|\| "1"\)/);
+  // the shell's layout change reaches the page as a message and re-renders the chrome, no reload
+  assert.match(RENDER, /if \(m\.romp === "layout"\) \{ renderTabs\(\); return; \}/);
+  // the empty tile's pick: a sibling button kept while the tile stands empty (click-safe), gone with a shown session
+  assert.match(RENDER, /function syncTilePick\(content: HTMLElement, on: boolean\): void \{\n\s*const have = document\.getElementById\("tile-pick"\);\n\s*if \(!on\) \{ have\?\.remove\(\); return; \}\n\s*if \(have\) return;/);
+  assert.match(RENDER, /b\.addEventListener\("click", \(\) => pickSessionLocally\("Show a session in this tile", swapIntoThisTile\)\);/);
+  // the local pick settles into its handler, else the kernel's pickResult exactly as before
+  assert.match(RENDER, /function settlePick\(id: string \| null, name\?: string\): void \{\n\s*const h = pickHandler; pickHandler = null;\n\s*if \(h\) \{ h\(id\); return; \}\n\s*if \(vscodeApi\) vscodeApi\.postMessage\(id \? \{ type: "pickResult", id, name \} : \{ type: "pickResult", id: null \}\);/);
+  assert.equal((RENDER.match(/settlePick\(/g) || []).length, 3, "defined once, the dismiss and the row's pick");
+  assert.ok(!RENDER.includes('postMessage({ type: "pickResult", id: it.id, name: it.name })'), "the row's pick goes through settlePick");
+});
+
+test("activeTab carries `focused`: true on the user's own gesture in this column, false on a boot, a restore or a re-render", () => {
+  assert.match(RENDER, /function notifyActive\(\) \{\n\s*if \(vscodeApi\) vscodeApi\.postMessage\(\{ type: "activeTab", id: activeId, focused: gestureActive \}\);/);
+  assert.match(RENDER, /let gestureActive = false;\nfunction withGesture\(fn: \(\) => void\): void \{ const was = gestureActive; gestureActive = true; try \{ fn\(\); \} finally \{ gestureActive = was; \} \}/, "set for the synchronous gesture path only, never left on");
+  // the gestures: the tab click (the #tabs delegate), the keyboard (a focused tab's keys, the window's arrows), the composer taking focus, the shell's pane focus
+  assert.match(RENDER, /select: \(el\) => \{ const id = el\.dataset\.id; if \(id\) withGesture\(\(\) => \{ setActive\(id\); focusActiveTab\(\); \}\); \},/);
+  assert.match(RENDER, /function onTabKey\(e: KeyboardEvent\) \{ withGesture\(\(\) => tabKey\(e\)\); \}/);
+  assert.match(RENDER, /if \(nb\) \{ e\.preventDefault\(\); withGesture\(\(\) => setActive\(nb\)\); \}/);
+  assert.match(RENDER, /withGesture\(\(\) => setActive\(ord\[\(i \+ dir \+ ord\.length\) % ord\.length\]\)\);/);
+  assert.match(RENDER, /ta\.addEventListener\("focus", \(\) => withGesture\(notifyActive\)\);/);
+  assert.match(RENDER, /if \(m\.romp === "paneFocus"\) \{ withGesture\(notifyActive\); return; \}/);
+  // …and the kernel reads it: an unfocused report never displaces a followed session (tests/test_kernel_active_chat_relay.py runs it)
+  assert.match(KERNEL, /def _relay_active_chat\(client, sid, focused=None\):/);
+  assert.match(KERNEL, /if focused is False and _ACTIVE_CHAT_BY_WID\.get\(wid\):\n\s*return/);
+  assert.match(KERNEL, /_relay_active_chat\(client, msg\.get\("id"\), msg\.get\("focused"\)\)/);
+});
+
+test("the palette offers every grid the shell does, and Back to tabs while one is up; the shell's offer is one line per grid", () => {
+  assert.match(MAIN, /const grids = \(\(w\.__rompChatGrids \? w\.__rompChatGrids\(\) : null\) \|\| \["2x2", "2x3"\]\) as string\[\];/);
+  assert.match(MAIN, /for \(const g of grids\) registerCommand\(\{ id: "chat\.tiles\." \+ g, title: "Tiles " \+ g\.replace\("x", "\\u00d7"\), run: \(\) => \{ if \(w\.__rompChatTiles\) w\.__rompChatTiles\(g\); \} \}\);/);
+  assert.match(MAIN, /registerCommand\(\{ id: "chat\.tilesOff", title: "Back to tabs", run: \(\) => \{ if \(w\.__rompChatTilesOff\) w\.__rompChatTilesOff\(\); \}, when: inGrid \}\);/);
+  assert.match(MAIN, /const inGrid = \(\): boolean => \{ try \{ const l = w\.__rompChatLayout && w\.__rompChatLayout\(\); return !!l && l\.layout === "grid"; \}/);
+  assert.ok(KERNEL.includes("var GRIDS={'2x2':[2,2],'2x3':[2,3]};"), "the offer, data-driven: one line adds a grid");
+  assert.ok(KERNEL.includes("window.__rompChatGrids=function(){return Object.keys(GRIDS);};"));
+  assert.ok(KERNEL.includes("window.__rompChatTiles=function(g){return enterGrid(g);};window.__rompChatTilesOff=leaveGrid;"));
+  assert.ok(KERNEL.includes("window.__rompChatLayout=function(){"));
+  for (const id of ["chat.tiles.2x2", "chat.tiles.2x3", "chat.tilesOff"]) assert.ok(!COMMANDS.includes('"' + id + '":'), id + " stays unbound by default — the palette owns it");
 });

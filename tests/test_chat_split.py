@@ -17,7 +17,8 @@ halves are checked here:
     message, another dashboard tab's write reconciled, the cross returning sessions home with their drafts,
     drafts travelling on a move, a created session claimed once and never stolen, the restore's seeding, the
     cap, and nothing on the phone — and THE DRAG (DragZonesExecute): a tab drag's zones mounted and unmounted, the
-    rectangle's geometry and cue, the drops calling the one mutation, the refused edge at the cap.
+    rectangle's geometry and cue, the drops calling the one mutation, the refused edge at the cap — and TILES
+    (TilesExecute, 2026-09-13): the grid layout entered, filled, widened, folded, swapped, restored and left.
 
 Synthetic only — invented sids, no network, no real DOM.
 """
@@ -157,7 +158,8 @@ class SplitSourcePins(unittest.TestCase):
         for needle in ["function edgeWidth(w){return Math.max(72,Math.min(180,0.2*w));}",
                        "function ghostRect(pane,rowRect){return {top:rowRect.top,height:rowRect.height,left:pane.left+pane.width/2,width:pane.width/2};}",
                        "function mountZones(){", "function unmountZones(){", "ghost=document.getElementById('col-ghost')",
-                       "ghost.textContent=refused?'Four columns at most':drag.name;"]:
+                       "ghost.textContent=refused?capShort():drag.name;",
+                       "function capShort(){return layout==='grid'?'The grid is full':'Four columns at most';}"]:
             self.assertIn(needle, split, needle)
         self.assertNotIn("setTimeout", split, "nothing is timed")
         # the rectangle's element beside the divider drag's landing line: a child of .col, never a flex item of the row
@@ -219,7 +221,8 @@ class SplitSourcePins(unittest.TestCase):
         focus = km._LANDING_FOCUS_JS
         self.assertIn("window.__rompFocusedChatId=function(){return document.getElementById(lastChat)?lastChat:'f-chat';};", focus)
         self.assertIn("window.__rompWireFocus=function(f){f.addEventListener('load',function(){wire(f);});wire(f);};", focus)
-        self.assertIn("function paneOf(id){return PANE[id]||(window.__rompChatPaneOf?window.__rompChatPaneOf(id):null);}", focus)
+        self.assertIn("function paneOf(id){var c=window.__rompChatPaneOf?window.__rompChatPaneOf(id):null;return c||PANE[id]||null;}", focus,
+                      "the split names a chat frame's pane first: in a grid the first frame's tile is an overlay, not #chat-pane (tiles, 2026-09-13)")
         self.assertIn("window.__rompWireEsc=function(f){", km._LANDING_ESC_JS)
         # the gutters: later columns register, gv-a/gv-b's left neighbour is the rightmost chat column
         gut = km._LANDING_JS
@@ -240,7 +243,8 @@ class SplitSourcePins(unittest.TestCase):
         self.assertIn("if(window.__rompSplitGrow)window.__rompSplitGrow(lastPane(),'chat'+n);", split)
         self.assertIn("if(window.__rompGrowFairIfNew)window.__rompGrowFairIfNew('chat'+n);", split)
         # a refused move says why (the acknowledgement rule), and the tab menu can ask first
-        self.assertIn("function canSplit(){return !mobile()&&cols.length+1<MAX;}", split)
+        self.assertIn("function canSplit(){return !mobile()&&cols.length+1<maxCols();}", split, "the cap is the layout's: four in the row, rows×cols in a grid (tiles, 2026-09-13)")
+        self.assertIn("function maxCols(){return layout==='grid'?grid[0]*grid[1]:ROW_MAX;}", split)
         self.assertIn("window.__rompCanSplit=canSplit;", split)
         self.assertIn("Four chat columns at most", split)
         self.assertIn("The phone shows one pane at a time", split)
@@ -253,7 +257,8 @@ class SplitSourcePins(unittest.TestCase):
     def test_the_partition_s_functions_exist_and_the_owner_lookup_reads_no_pane_s_dom(self):
         split = km._LANDING_SPLIT_JS
         # the store's shape and its one-shot migration
-        self.assertIn("JSON.stringify({v:2,cols:cols.map(function(c){return {n:c.n,ids:c.ids.slice()};})})", split)
+        self.assertIn("var o={v:2,cols:cols.map(function(c){return {n:c.n,ids:c.ids.slice()};})};if(layout==='grid'){o.layout='grid';o.grid=grid.slice();}localStorage.setItem(CK,JSON.stringify(o));", split,
+                      "the v2 shape byte for byte in the row; a grid adds its layout and shape (tiles, 2026-09-13)")
         self.assertIn("if(Array.isArray(raw)){migrated=true;", split, "a v1 array of numbers is read once more…")
         self.assertIn("if(r0.migrated)save();", split, "…and written back in the new shape")
         # the three pure readers, the sets the pages read, the one mutation, the claim
@@ -267,8 +272,9 @@ class SplitSourcePins(unittest.TestCase):
         target = re.search(r"function target\(sid\)\{.*?\}\n", split).group(0)
         self.assertNotIn("activeIn(", target)
         self.assertIn("frameOfCol(ownerOf(sid))", target)
-        self.assertEqual(split.count("activeIn("), 2, "defined once, called once (the palette's move of the focused column's tab)")
+        self.assertEqual(split.count("activeIn("), 3, "defined once, called twice: the palette's move of the focused column's tab, and the grid's fill, which skips the first column's active tab (tiles, 2026-09-13)")
         self.assertIn("activeIn(focused())", split)
+        self.assertIn("var home=document.getElementById('f-chat'),active=activeIn(home);", split)
         # the emptiness message, the drafts hand-off and the other dashboard tab's write
         self.assertIn("m.romp==='colEmpty'&&Array.isArray(m.gone)", split)
         self.assertIn("f.contentWindow.postMessage({romp:'adopt',sid:sid,state:state},'*');", split)
@@ -297,10 +303,11 @@ class SplitSourcePins(unittest.TestCase):
         self.assertIn("if(t&&t!==sf&&loaded(t))adopt(t,sid,take(sf,sid));", split)
         # a closing column's width goes to the column on its left before its key is dropped (the halving's twin)
         cl = split[split.index("function close(n,keep){"):split.index("function closeFocused(){")]
-        self.assertIn("if(window.__rompSplitShrink)window.__rompSplitShrink(left,paneId(n));", cl)
-        self.assertLess(cl.index("__rompSplitShrink(left,paneId(n))"), cl.index("__rompUnregisterPane(paneId(n))"))
+        self.assertIn("if(window.__rompSplitShrink)window.__rompSplitShrink(left||'chat-pane',paneId(n));", cl, "in unmount(), the pane's teardown close() and a layout switch share (tiles, 2026-09-13); a tile hands back nothing (never registered)")
+        self.assertIn("if(layout!=='grid'){if(window.__rompSplitShrink)", cl)
+        self.assertLess(cl.index("__rompSplitShrink(left||'chat-pane',paneId(n))"), cl.index("__rompUnregisterPane(paneId(n))"))
         self.assertLess(cl.index("var left=i>0?paneId(cols[i-1].n):'chat-pane';"), cl.index("cols.splice(i,1);"))
-        self.assertIn("window.addEventListener('storage',function(e){if(!e||e.key!==CK||mobile())return;var r=read();if(!r.migrated)reconcile(r.cols);});", split)
+        self.assertIn("window.addEventListener('storage',function(e){if(!e||e.key!==CK||mobile())return;var r=read();if(!r.migrated)reconcile(r);});", split, "the whole read: its layout too (tiles, 2026-09-13)")
         # the cross's title reads as what it does now
         self.assertIn("x.title='Close this column';", split)
 
@@ -331,6 +338,7 @@ let MOBILE = false;       // whether #mtabs is displayed (the phone layout)
 let BYID = {};
 let WL = {};
 let TAKE = {};            // frame id → sid → what that page holds for the session (its __rompTakeSessionState answer)
+function detach(c) { const p = c.parentElement; if (p) { const i = p.children.indexOf(c); if (i >= 0) p.children.splice(i, 1); } c.parentElement = null; }
 function mkEl(tag) {
   const el = {
     tagName: tag, className: '', title: '', textContent: '', src: '', parentElement: null, _id: '',
@@ -340,8 +348,8 @@ function mkEl(tag) {
     contains(n) { return n === this || this.children.some((c) => c.contains && c.contains(n)); },
     setAttribute(k, v) { this._attrs[k] = String(v); },
     getAttribute(k) { return k in this._attrs ? this._attrs[k] : null; },
-    appendChild(c) { c.parentElement = this; this.children.push(c); return c; },
-    insertBefore(c, ref) { c.parentElement = this; const i = this.children.indexOf(ref); if (i < 0) this.children.push(c); else this.children.splice(i, 0, c); return c; },
+    appendChild(c) { detach(c); c.parentElement = this; this.children.push(c); return c; },   // a node moved leaves its old parent (the DOM's rule)
+    insertBefore(c, ref) { detach(c); c.parentElement = this; const i = this.children.indexOf(ref); if (i < 0) this.children.push(c); else this.children.splice(i, 0, c); return c; },
     remove() { const p = this.parentElement; if (p) { const i = p.children.indexOf(this); if (i >= 0) p.children.splice(i, 1); }
       const drop = (n) => { if (n._id) delete BYID[n._id]; n.children.forEach(drop); }; drop(this); this.parentElement = null; },
     addEventListener(k, f, opts) { (this._ls[k] = this._ls[k] || []).push({ f, once: !!(opts && opts.once) }); },
@@ -363,7 +371,9 @@ function mkEl(tag) {
       __rompMoveRefusal(sid) { return LOCKED_SIDS.has(sid) ? 'locked' : UNMOVABLE.has(sid) ? 'not-open' : ''; },
       __rompColumnBusy() { return !!BUSY[el.id]; },
     };
-    el.contentDocument = { querySelector(sel) { return (sel === '#tabs .tab.active[data-id]' && el._active) ? { getAttribute: () => el._active } : null; } };
+    el._tabs = [];   // the page's strip, in order (the grid's fill reads it: stripOf)
+    el.contentDocument = { querySelector(sel) { return (sel === '#tabs .tab.active[data-id]' && el._active) ? { getAttribute: () => el._active } : null; },
+                           querySelectorAll(sel) { return sel === '#tabs .tab[data-id]' ? el._tabs.map((id) => ({ getAttribute: () => id })) : []; } };
   }
   return el;
 }
@@ -1182,6 +1192,311 @@ class DragZonesExecute(unittest.TestCase):
     def test_the_phone_and_a_message_from_no_chat_column_mount_nothing(self):
         self.assertEqual(self.out["phone"], {"zones": [], "body": ["po-chat", "po-feed", "po-timeline"]}, "no zone, and no body class for the gesture (nothing read one; review find 2026-09-11)")
         self.assertEqual(self.out["unknown"], {"zones": [], "noSid": []})
+
+
+# ── TILES, RUN: the grid layout of the split (the user 2026-09-13) ──────────────────────────────────────────────────
+TILES_DRIVER = r"""
+const out = {};
+const S = (k) => '11111111-2222-3333-4444-5555555555' + String(k).padStart(2, '0');   // six synthetic sessions, S(1)…S(6)
+const six = [1, 2, 3, 4, 5, 6].map(S);
+function tilesOf() { return window.__rompChatFrameIds().map((fid) => { const f = BYID[fid]; return { fid, col: f.getAttribute('data-col'), src: f.src, pane: f.parentElement && f.parentElement.id }; }); }
+function panes() { return BYID['chat-pane'].children.map((c) => ({ id: c.id, cls: c.className, area: c.style.gridArea || '' })); }
+function shellLayout() { return window.__rompChatLayout(); }
+function posted(kind) { return CALLS.posted.filter((p) => p.m && p.m.romp === kind).map((p) => p.id); }
+function gridStyle() { const cp = BYID['chat-pane']; return { cls: cp.className, rows: cp.style._props['--tile-rows'] || null, cols: cp.style._props['--tile-cols'] || null }; }
+// A) six sessions, S(2) active in the first column; Tiles 2×2 → three tiles made, the active stays in the first, S(1) S(3) S(4) fill in strip order
+boot({}, false);
+BYID['f-chat']._tabs = six.slice(); BYID['f-chat']._active = S(2);
+out.grids = window.__rompChatGrids();
+out.before = { layout: shellLayout(), canSplit: window.__rompCanSplit() };
+CALLS.posted = []; CALLS.focus = []; CALLS.register = []; CALLS.growFair = []; CALLS.splitGrow = []; CALLS.gutter = []; CALLS.taken = [];
+const r22 = window.__rompChatTiles('2x2');
+out.enter22 = { r: r22, layout: shellLayout(), ids: ids(), tiles: tilesOf(), stored: cols(), sets: window.__rompChatSets(), panes: panes(), grid: gridStyle(),
+                order: order(), canSplit: window.__rompCanSplit(), register: CALLS.register.slice(), growFair: CALLS.growFair.slice(), splitGrow: CALLS.splitGrow.slice(), gutter: CALLS.gutter.length,
+                layoutPosts: posted('layout'), focusPosts: CALLS.posted.filter((p) => p.m && p.m.type === 'focus').map((p) => [p.id, p.m.id]), taken: CALLS.taken.slice(),
+                blobs: [2, 3, 4].map(blob), paneOfFirst: window.__rompChatPaneOf('f-chat'), lastPane: window.__rompLastChatPane(), targetS1: tgt(S(1)), targetS2: tgt(S(2)), targetS5: tgt(S(5)) };
+// a fourth tile is refused in a grid: the shape is the cap (the line says so); 'new' lands in an empty tile when one stands
+CALLS.notify = [];
+out.enter22.fourth = { r: window.__rompMoveTab(S(5), 'new'), notify: CALLS.notify.slice(), ids: ids() };
+// B) 2×2 → 2×3 widens: two more tiles, filled from the first column's remaining strip (S(5), S(6)); the first column keeps S(2)
+BYID['f-chat']._tabs = [S(2), S(5), S(6)];
+CALLS.posted = []; CALLS.unregister = [];
+window.__rompChatTiles('2x3');
+out.widen23 = { layout: shellLayout(), ids: ids(), stored: cols(), sets: window.__rompChatSets(), panes: panes(), grid: gridStyle(), unregister: CALLS.unregister.slice(), layoutPosts: posted('layout').length };
+// C) 2×3 → 2×2 folds: the last two tiles' sessions return home, drafts and all, and the grid is four cells again
+TAKE['f-chat-6'] = { [S(6)]: { draft: 'typed in the sixth tile', citations: [], files: [], staged: [] } };
+CALLS.posted = []; CALLS.taken = []; CALLS.unregister = []; CALLS.splitShrink = [];
+window.__rompChatTiles('2x2');
+out.fold22 = { layout: shellLayout(), ids: ids(), stored: cols(), sets: window.__rompChatSets(), panes: panes(), adopts: CALLS.posted.filter((p) => p.m && p.m.romp === 'adopt').map((p) => [p.id, p.m.sid, p.m.state.draft]),
+               taken: CALLS.taken.filter((t) => t[2]), unregister: CALLS.unregister.slice(), shrink: CALLS.splitShrink.slice(), colGone: CALLS.colGone.slice() };
+// D) a tile emptied by a move home STANDS (the grid keeps its shape): the entry stays with no ids, its page shows the empty state; 'new' then fills it
+CALLS.posted = []; CALLS.unregister = [];
+const home = window.__rompMoveTab(S(3), 1);
+out.emptied = { target: home && home.id, ids: ids(), stored: cols(), sets: window.__rompChatSets(), unregister: CALLS.unregister.slice(), panes: panes() };
+CALLS.notify = [];
+const refill = window.__rompMoveTab(S(5), 'new');
+out.emptied.refill = { target: refill && refill.id, stored: cols(), notify: CALLS.notify.slice() };
+// the emptiness message in a grid: the gone ids leave the entry and the tile stands; a crossed id is still held back in the first column
+CALLS.posted = []; CALLS.unregister = [];
+msg({ romp: 'colEmpty', gone: [S(5)], crossed: [S(5)] }, 'f-chat-3');
+out.emptied.colEmpty = { ids: ids(), stored: cols(), closing: CALLS.posted.filter((p) => p.m && p.m.romp === 'closing').map((p) => [p.id, p.m.ids]), unregister: CALLS.unregister.slice() };
+// the cross and the palette's close of a tile EMPTY it (their sessions go home) rather than close it
+CALLS.posted = []; CALLS.unregister = [];
+crossOf('f-chat-2').fire('click', { stopPropagation() {} });
+out.emptied.cross = { ids: ids(), stored: cols(), unregister: CALLS.unregister.slice(), focused: CALLS.focus.slice(-1) };
+window.__rompCloseSplit(4);
+out.emptied.palette = { ids: ids(), stored: cols() };
+// E) THE SWAP (a tile's header menu): the pick comes into the tile, the tile's session goes home; on the first tile the pick simply comes home
+window.__rompMoveTab(S(1), 2); window.__rompMoveTab(S(3), 3);
+CALLS.posted = [];
+const sw = window.__rompSwapTile(S(3), 2);
+out.swap = { target: sw && sw.id, stored: cols(), sets: window.__rompChatSets(), focusPosts: CALLS.posted.filter((p) => p.m && p.m.type === 'focus').map((p) => [p.id, p.m.id]) };
+const swHome = window.__rompSwapTile(S(3), 1);
+out.swap.home = { target: swHome && swHome.id, stored: cols() };
+out.swap.junk = { noSid: window.__rompSwapTile('', 2), noSuch: window.__rompSwapTile(S(1), 9) };
+// F) persistence: the store carries the layout; a fresh shell restores the grid with every tile, empty ones included, and tops up a short one
+const STORED = STORE['romp-chat-cols'];
+boot({ 'romp-chat-cols': STORED }, false);
+out.restored = { layout: shellLayout(), ids: ids(), stored: cols(), sets: window.__rompChatSets(), panes: panes(), grid: gridStyle(), saves: saves(), srcs: window.__rompChatFrameIds().slice(1).map((f) => BYID[f].src), paneOfFirst: window.__rompChatPaneOf('f-chat'), storedWas: STORED };
+boot({ 'romp-chat-cols': JSON.stringify({ v: 2, layout: 'grid', grid: [2, 3], cols: [{ n: 2, ids: [S(1)] }] }) }, false);
+out.toppedUp = { ids: ids(), stored: cols(), sets: window.__rompChatSets(), layout: shellLayout() };
+// a grid the offer does not know reads as the row, and the row's cap applies; an unknown layout word too
+boot({ 'romp-chat-cols': JSON.stringify({ v: 2, layout: 'grid', grid: [3, 3], cols: [{ n: 2, ids: [S(1)] }, { n: 3, ids: [] }, { n: 4, ids: [S(2)] }, { n: 5, ids: [S(3)] }, { n: 6, ids: [S(4)] }] }) }, false);
+out.unknownGrid = { layout: shellLayout(), ids: ids(), stored: STORE['romp-chat-cols'] === JSON.stringify({ v: 2, layout: 'grid', grid: [3, 3], cols: [{ n: 2, ids: [S(1)] }, { n: 3, ids: [] }, { n: 4, ids: [S(2)] }, { n: 5, ids: [S(3)] }, { n: 6, ids: [S(4)] }] }), grid: gridStyle() };
+// G) BACK TO TABS: every tile folds home, the row is back, the store is the v2 shape byte for byte; the pages hear the layout
+boot({ 'romp-chat-cols': STORED }, false);
+BYID['f-chat']._tabs = [S(2)]; BYID['f-chat']._active = S(2);
+CALLS.posted = [];
+const off = window.__rompChatTilesOff();
+out.backToTabs = { r: off, layout: shellLayout(), ids: ids(), stored: cols(), storedRaw: STORE['romp-chat-cols'], sets: window.__rompChatSets(), panes: panes(), grid: gridStyle(), order: order(),
+                   layoutPosts: posted('layout').length, canSplit: window.__rompCanSplit(), paneOfFirst: window.__rompChatPaneOf('f-chat'), again: window.__rompChatTilesOff() };
+// H) entering a grid from a SPLIT (two row columns open) keeps their sessions in place: the columns become tiles (re-made in the grid, their live drafts carried), the rest fill
+boot({}, false);
+BYID['f-chat']._tabs = six.slice(); BYID['f-chat']._active = S(1);
+window.__rompMoveTab(S(2), 'new'); window.__rompMoveTab(S(3), 'new');
+BYID['f-chat']._tabs = [S(1), S(4), S(5), S(6)];
+TAKE['f-chat-2'] = { [S(2)]: { draft: 'half typed in column two', citations: [], files: [], staged: [] } };
+CALLS.posted = []; CALLS.unregister = []; CALLS.register = []; CALLS.taken = [];
+window.__rompChatTiles('2x3');
+const f2 = BYID['f-chat-2']; f2.fire('load');
+out.fromSplit = { layout: shellLayout(), ids: ids(), stored: cols(), sets: window.__rompChatSets(), panes: panes(), unregister: CALLS.unregister.slice(), register: CALLS.register.slice(),
+                  adopts: CALLS.posted.filter((p) => p.m && p.m.romp === 'adopt').map((p) => [p.id, p.m.sid, p.m.state.draft]), order: order() };
+// I) fewer sessions than tiles: 2×3 with three sessions → five tiles, two filled, three empty, none closed; the empty tiles' blobs name no tab
+boot({ 'romp-vscode-state-chat:4': JSON.stringify({ activeId: S(9), scroll: 2 }) }, false);
+BYID['f-chat']._tabs = [S(1), S(2), S(3)]; BYID['f-chat']._active = S(1);
+window.__rompChatTiles('2x3');
+out.sparse = { ids: ids(), stored: cols(), sets: window.__rompChatSets(), blob4: blob(4), panes: panes() };
+// a session the page will not let move (a create in flight) is skipped by the fill
+boot({}, false);
+BYID['f-chat']._tabs = [S(1), 'new-abc123', S(2)]; BYID['f-chat']._active = S(1); UNMOVABLE.add('new-abc123');
+window.__rompChatTiles('2x2');
+out.sparse.unmovable = { stored: cols() };
+// J) the phone: no grid, a line; a grid nobody offers: nothing
+boot({}, true);
+CALLS.notify = [];
+out.phone = { r: window.__rompChatTiles('2x2'), notify: CALLS.notify.slice(), layout: shellLayout(), ids: ids() };
+boot({}, false);
+out.unknownAsk = { r: window.__rompChatTiles('4x4'), layout: shellLayout(), ids: ids() };
+// K) another dashboard tab's write carries a grid: this window enters it (nothing written back), and its later write of the row leaves it
+boot({}, false);
+CALLS.sets = [];
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, layout: 'grid', grid: [2, 2], cols: [{ n: 2, ids: [S(1)] }, { n: 3, ids: [] }, { n: 4, ids: [S(2)] }] });
+window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
+out.reconciledGrid = { layout: shellLayout(), ids: ids(), sets: window.__rompChatSets(), saves: saves(), grid: gridStyle(), panes: panes() };
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [{ n: 2, ids: [S(1)] }] });
+window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
+out.reconciledRow = { layout: shellLayout(), ids: ids(), sets: window.__rompChatSets(), saves: saves(), grid: gridStyle(), order: order() };
+// L) the drag in a grid: a column zone on every tile but the source (the first tile's on its overlay), no edge zone anywhere
+boot({ 'romp-chat-cols': STORED }, false);
+msg({ romp: 'tabDrag', on: true, sid: S(2), name: 'two', stripH: 30 }, 'f-chat');
+out.dragGrid = { zones: Object.fromEntries(BYID['chat-pane'].children.filter((c) => c.className.indexOf('pane') === 0).map((p) => [p.id, p.children.filter((z) => z.className.indexOf('col-drop') === 0).map((z) => z.className)])), edge: BYID['chat-pane'].children.some((p) => p.children.some((z) => z.className.indexOf('col-drop-edge') >= 0)) };
+msg({ romp: 'tabDrag', on: false });
+console.log(JSON.stringify(out));
+"""
+
+
+class TilesExecute(unittest.TestCase):
+    """Tiles (the user 2026-09-13, who wanted the chat as a 2×2 or 2×3 grid of sessions side by side, each with its own
+    composer, instead of tabs): the real _LANDING_SPLIT_JS runs against the DOM stub and the grid is driven end to end —
+    entering a grid fills it from the first column's strip with the active tab kept there, a grid keeps its shape (an
+    emptied tile stands, a fourth column is refused, 'new' lands in an empty tile), widening and folding, the swap,
+    persistence and the restore, back to tabs, entering from a split, the phone, another tab's write. Synthetic only."""
+    maxDiff = None
+
+    @classmethod
+    def setUpClass(cls):
+        script = HARNESS.replace("__SPLIT_JS__", json.dumps(km._LANDING_SPLIT_JS)) + TILES_DRIVER
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            r = subprocess.run(["node", path], capture_output=True, text=True, timeout=30)
+        finally:
+            os.unlink(path)
+        assert r.returncode == 0, "the tiles' JS threw: " + r.stderr[:1500]
+        cls.out = json.loads(r.stdout.strip().splitlines()[-1])
+
+    @staticmethod
+    def S(k):
+        return "11111111-2222-3333-4444-5555555555%02d" % k
+
+    def test_the_offer_is_two_grids_and_the_row_is_the_layout_until_one_is_entered(self):
+        self.assertEqual(self.out["grids"], ["2x2", "2x3"], "the offer, data-driven: one line adds a grid")
+        self.assertEqual(self.out["before"], {"layout": {"layout": "row", "rows": 1, "cols": 1}, "canSplit": True})
+
+    def test_entering_2x2_with_six_sessions_makes_three_tiles_keeps_the_active_in_the_first_and_fills_in_strip_order(self):
+        S = self.S
+        o = self.out["enter22"]
+        self.assertTrue(o["r"])
+        self.assertEqual(o["layout"], {"layout": "grid", "rows": 2, "cols": 2}, "what every column page reads beside the sets")
+        self.assertEqual(o["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4"], "three tiles made: 2×2 less the first")
+        self.assertEqual(o["stored"], {"v": 2, "cols": [{"n": 2, "ids": [S(1)]}, {"n": 3, "ids": [S(3)]}, {"n": 4, "ids": [S(4)]}], "layout": "grid", "grid": [2, 2]},
+                         "the store carries the layout and the shape; the active tab S(2) stays in the first column (the eye is there), the rest fill in strip order")
+        self.assertEqual(o["sets"], {"2": [S(1)], "3": [S(3)], "4": [S(4)]})
+        self.assertEqual(o["targetS2"], "f-chat", "the active stayed home"); self.assertEqual(o["targetS1"], "f-chat-2"); self.assertEqual(o["targetS5"], "f-chat", "the overflow is the first column's")
+        # the grid: #chat-pane wears the class and the shape; the first frame stays put (a moved iframe reloads); the first tile is an overlay on cell 1; later tiles take explicit cells row-major
+        self.assertEqual(o["grid"], {"cls": "chat-grid", "rows": "2", "cols": "2"})
+        self.assertEqual(o["panes"], [{"id": "f-chat", "cls": "", "area": ""}, {"id": "chat-pane-1", "cls": "pane chat-col tile-ring", "area": ""},
+                                      {"id": "chat-pane-2", "cls": "pane chat-col", "area": "1 / 2"}, {"id": "chat-pane-3", "cls": "pane chat-col", "area": "2 / 1"}, {"id": "chat-pane-4", "cls": "pane chat-col", "area": "2 / 2"}])
+        self.assertEqual([t["pane"] for t in o["tiles"]], ["chat-pane", "chat-pane-2", "chat-pane-3", "chat-pane-4"], "every tile's frame sits in its pane inside the grid")
+        self.assertEqual([t["src"] for t in o["tiles"]][1:], ["/chat?col=2&skeleton=1", "/chat?col=3&skeleton=1", "/chat?col=4&skeleton=1"], "a tile is a column: /chat?col=N, a skeleton client of its session")
+        self.assertEqual(o["order"], ["chat-pane", "gv-a", "fleet-pane", "gv-b", "feed-pane"], "the row is untouched: no gutters, the other panes where they were")
+        self.assertEqual(o["paneOfFirst"], "chat-pane-1", "the first frame's tile, for the focus ring and the drop zone"); self.assertEqual(o["lastPane"], "chat-pane", "gv-a's left neighbour is the grid itself")
+        # the grow math is bypassed: no registration, no fair grow, no halving, no gutter
+        self.assertEqual(o["register"], []); self.assertEqual(o["growFair"], []); self.assertEqual(o["splitGrow"], []); self.assertEqual(o["gutter"], 0)
+        self.assertEqual(o["blobs"], [{"activeId": S(1)}, {"activeId": S(3)}, {"activeId": S(4)}], "each tile's blob names its session before its frame exists (the shim's hint)")
+        self.assertEqual(o["taken"], [["f-chat", S(1), False], ["f-chat", S(3), False], ["f-chat", S(4), False]], "drafts travel as on any move: the source page is asked for each")
+        self.assertEqual(o["focusPosts"], [], "no focus moves: the user is where they were")
+        self.assertEqual(o["layoutPosts"], ["f-chat"], "the page hears the layout change (the tiles made after it read the layout at their first render)")
+        self.assertFalse(o["canSplit"], "the grid's shape is the cap")
+        f = o["fourth"]
+        self.assertIsNone(f["r"]); self.assertEqual(f["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4"])
+        self.assertEqual(f["notify"], [["warn", "Every tile is taken: 4 in this grid. Swap a session into a tile, or go back to tabs."]], "a refused move says why, in the grid's words")
+
+    def test_2x2_to_2x3_widens_and_fills_and_2x3_to_2x2_folds_the_surplus_home_with_their_drafts(self):
+        S = self.S
+        w = self.out["widen23"]
+        self.assertEqual(w["layout"], {"layout": "grid", "rows": 2, "cols": 3})
+        self.assertEqual(w["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4", "f-chat-5", "f-chat-6"], "two more tiles")
+        self.assertEqual(w["sets"], {"2": [S(1)], "3": [S(3)], "4": [S(4)], "5": [S(5)], "6": [S(6)]}, "filled from the first column's remaining strip, its active S(2) kept there")
+        self.assertEqual(w["stored"]["grid"], [2, 3]); self.assertEqual(w["grid"], {"cls": "chat-grid", "rows": "2", "cols": "3"})
+        self.assertEqual([p["area"] for p in w["panes"]][2:], ["1 / 2", "1 / 3", "2 / 1", "2 / 2", "2 / 3"], "the cells re-laid row-major for the wider grid")
+        self.assertEqual(w["unregister"], [], "grid to grid: nothing re-made")
+        self.assertEqual(w["layoutPosts"], 4, "every open page hears it")
+        f = self.out["fold22"]
+        self.assertEqual(f["layout"], {"layout": "grid", "rows": 2, "cols": 2})
+        self.assertEqual(f["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4"], "the last two tiles fold")
+        self.assertEqual(f["sets"], {"2": [S(1)], "3": [S(3)], "4": [S(4)]}, "S(5) and S(6) are the first column's again")
+        self.assertEqual(f["adopts"], [["f-chat", S(6), "typed in the sixth tile"]], "a folded tile's draft lands in the first column's page")
+        self.assertEqual(f["taken"], [["f-chat-6", S(6), True]])
+        self.assertEqual(f["shrink"], [], "no grow hand-back in a grid"); self.assertEqual(f["unregister"], [], "…and no key to drop: tiles were never registered with the gutters")
+        self.assertEqual(f["colGone"], ["6", "5"], "the Log drops each folded tile's connection state")
+        self.assertEqual([p["id"] for p in f["panes"]], ["f-chat", "chat-pane-1", "chat-pane-2", "chat-pane-3", "chat-pane-4"])
+
+    def test_a_tile_emptied_by_a_move_stands_and_the_grid_keeps_its_shape(self):
+        S = self.S
+        e = self.out["emptied"]
+        self.assertEqual(e["target"], "f-chat", "S(3) went home")
+        self.assertEqual(e["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4"], "the emptied tile STANDS: no column closed")
+        self.assertEqual(e["sets"], {"2": [S(1)], "3": [], "4": [S(4)]}, "its entry stays with no session: its page shows the empty state")
+        self.assertEqual(e["unregister"], [])
+        self.assertEqual([p["area"] for p in e["panes"]][2:], ["1 / 2", "2 / 1", "2 / 2"], "every tile keeps its cell")
+        r = e["refill"]
+        self.assertEqual(r["target"], "f-chat-3", "'new' in a grid lands in the first empty tile")
+        self.assertEqual(r["stored"]["cols"], [{"n": 2, "ids": [S(1)]}, {"n": 3, "ids": [S(5)]}, {"n": 4, "ids": [S(4)]}]); self.assertEqual(r["notify"], [])
+        c = e["colEmpty"]
+        self.assertEqual(c["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4"], "a tile whose members the kernel no longer lists stands too")
+        self.assertEqual(c["stored"]["cols"], [{"n": 2, "ids": [S(1)]}, {"n": 3, "ids": []}, {"n": 4, "ids": [S(4)]}], "the gone id left its entry")
+        self.assertEqual(c["closing"], [["f-chat", [S(5)]]], "a crossed id is still held back in the first column until the kernel's strip omits it")
+        self.assertEqual(c["unregister"], [])
+        x = e["cross"]
+        self.assertEqual(x["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4"], "the cross EMPTIES a tile (hidden in a grid, but its click is the same door)")
+        self.assertEqual(x["stored"]["cols"][0], {"n": 2, "ids": []}, "S(1) went home"); self.assertEqual(x["unregister"], [])
+        self.assertEqual(x["focused"], ["f-chat"], "the ring lands on the first tile, where the session went")
+        self.assertEqual(e["palette"]["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4"], "…and so does the palette's Close this column")
+        self.assertEqual(e["palette"]["stored"]["cols"], [{"n": 2, "ids": []}, {"n": 3, "ids": []}, {"n": 4, "ids": []}])
+
+    def test_the_swap_brings_the_pick_into_the_tile_and_sends_its_session_home(self):
+        S = self.S
+        s = self.out["swap"]
+        self.assertEqual(s["target"], "f-chat-2", "the pick's new tile")
+        self.assertEqual(s["sets"], {"2": [S(3)], "3": [], "4": []}, "S(3) came from tile 3 into tile 2; S(1), tile 2's session, went home; tile 3 stands empty")
+        self.assertEqual(s["focusPosts"], [["f-chat", S(1)], ["f-chat-2", S(3)]], "the session going home is shown there, then the pick where it landed")
+        h = s["home"]
+        self.assertEqual(h["target"], "f-chat", "on the first tile the pick simply comes home")
+        self.assertEqual(h["stored"]["cols"], [{"n": 2, "ids": []}, {"n": 3, "ids": []}, {"n": 4, "ids": []}])
+        self.assertEqual(s["junk"], {"noSid": None, "noSuch": None})
+
+    def test_the_store_carries_the_layout_and_a_fresh_shell_restores_the_grid_tiles_empty_ones_included(self):
+        S = self.S
+        r = self.out["restored"]
+        self.assertEqual(json.loads(r["storedWas"]), {"v": 2, "cols": [{"n": 2, "ids": []}, {"n": 3, "ids": []}, {"n": 4, "ids": []}], "layout": "grid", "grid": [2, 2]})
+        self.assertEqual(r["layout"], {"layout": "grid", "rows": 2, "cols": 2}); self.assertEqual(r["grid"], {"cls": "chat-grid", "rows": "2", "cols": "2"})
+        self.assertEqual(r["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4"], "every tile comes back, the empty ones too: the grid keeps its shape")
+        self.assertEqual(r["sets"], {"2": [], "3": [], "4": []}); self.assertEqual(r["saves"], 0, "a v2 store is not rewritten at boot")
+        self.assertEqual(r["srcs"], ["/chat?col=2&skeleton=1", "/chat?col=3&skeleton=1", "/chat?col=4&skeleton=1"])
+        self.assertEqual(r["paneOfFirst"], "chat-pane-1"); self.assertEqual([p["area"] for p in r["panes"]][2:], ["1 / 2", "2 / 1", "2 / 2"])
+        t = self.out["toppedUp"]
+        self.assertEqual(t["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4", "f-chat-5", "f-chat-6"], "a grid stored short of its shape is topped up with empty tiles")
+        self.assertEqual(t["sets"], {"2": [S(1)], "3": [], "4": [], "5": [], "6": []}); self.assertEqual(t["layout"], {"layout": "grid", "rows": 2, "cols": 3})
+        u = self.out["unknownGrid"]
+        self.assertEqual(u["layout"], {"layout": "row", "rows": 1, "cols": 4}, "a grid the offer does not know reads as the row…")
+        self.assertEqual(u["ids"], ["f-chat", "f-chat-2", "f-chat-4", "f-chat-5"], "…with the row's cap and no empty entry kept")
+        self.assertTrue(u["stored"], "…and nothing written back"); self.assertEqual(u["grid"], {"cls": "", "rows": None, "cols": None})
+
+    def test_back_to_tabs_folds_every_tile_home_and_the_store_is_the_v2_shape_again(self):
+        b = self.out["backToTabs"]
+        self.assertTrue(b["r"]); self.assertEqual(b["layout"], {"layout": "row", "rows": 1, "cols": 1})
+        self.assertEqual(b["ids"], ["f-chat"]); self.assertEqual(b["sets"], {})
+        self.assertEqual(b["stored"], {"v": 2, "cols": []}); self.assertEqual(b["storedRaw"], '{"v":2,"cols":[]}', "byte for byte the shape the row always wrote: no layout key")
+        self.assertEqual(b["panes"], [{"id": "f-chat", "cls": "", "area": ""}], "the overlay is gone; the first frame never moved")
+        self.assertEqual(b["grid"], {"cls": "", "rows": None, "cols": None}); self.assertEqual(b["order"], ["chat-pane", "gv-a", "fleet-pane", "gv-b", "feed-pane"])
+        self.assertEqual(b["layoutPosts"], 1, "the one page left hears it"); self.assertTrue(b["canSplit"]); self.assertEqual(b["paneOfFirst"], "chat-pane")
+        self.assertFalse(b["again"], "already in the row: nothing to do")
+
+    def test_entering_a_grid_from_a_split_keeps_the_columns_sessions_as_tiles_and_carries_their_drafts(self):
+        S = self.S
+        f = self.out["fromSplit"]
+        self.assertEqual(f["layout"], {"layout": "grid", "rows": 2, "cols": 3})
+        self.assertEqual(f["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4", "f-chat-5", "f-chat-6"])
+        self.assertEqual(f["sets"], {"2": [S(2)], "3": [S(3)], "4": [S(4)], "5": [S(5)], "6": [S(6)]}, "the two columns keep their sessions; the rest fill from the first column's strip, S(1) kept there")
+        self.assertEqual(f["unregister"], ["chat-pane-2", "chat-pane-3"], "the row columns leave the gutters' registry…")
+        self.assertEqual(f["register"], [], "…and tiles never join it")
+        self.assertEqual(f["adopts"], [["f-chat-2", S(2), "half typed in column two"]], "a re-made column's live draft rides to its new frame")
+        self.assertEqual(f["order"], ["chat-pane", "gv-a", "fleet-pane", "gv-b", "feed-pane"], "the row's gutters are gone with the columns")
+        self.assertEqual([p["id"] for p in f["panes"]], ["f-chat", "chat-pane-1", "chat-pane-2", "chat-pane-3", "chat-pane-4", "chat-pane-5", "chat-pane-6"])
+
+    def test_fewer_sessions_than_tiles_leaves_the_spare_tiles_empty_and_none_closed(self):
+        S = self.S
+        s = self.out["sparse"]
+        self.assertEqual(s["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4", "f-chat-5", "f-chat-6"], "five tiles for 2×3")
+        self.assertEqual(s["sets"], {"2": [S(2)], "3": [S(3)], "4": [], "5": [], "6": []}, "two filled, three empty, none auto-closed")
+        self.assertEqual(s["blob4"], {"scroll": 2}, "an empty tile's blob names no tab: a reused number's stale hint is cleared, the rest kept")
+        self.assertEqual(len(s["panes"]), 7)
+        self.assertEqual(s["unmovable"]["stored"]["cols"], [{"n": 2, "ids": [S(2)]}, {"n": 3, "ids": []}, {"n": 4, "ids": []}], "a create in flight is the page's own: the fill skips it")
+
+    def test_the_phone_gets_no_grid_and_an_unoffered_grid_is_nothing(self):
+        p = self.out["phone"]
+        self.assertIsNone(p["r"]); self.assertEqual(p["notify"], [["warn", "The phone shows one pane at a time — no tiles here."]])
+        self.assertEqual(p["layout"], {"layout": "row", "rows": 1, "cols": 1}); self.assertEqual(p["ids"], ["f-chat"])
+        u = self.out["unknownAsk"]
+        self.assertIsNone(u["r"]); self.assertEqual(u["layout"], {"layout": "row", "rows": 1, "cols": 1}); self.assertEqual(u["ids"], ["f-chat"])
+
+    def test_another_dashboard_tab_s_write_carries_the_layout_both_ways_and_nothing_is_written_back(self):
+        S = self.S
+        g = self.out["reconciledGrid"]
+        self.assertEqual(g["layout"], {"layout": "grid", "rows": 2, "cols": 2}); self.assertEqual(g["ids"], ["f-chat", "f-chat-2", "f-chat-3", "f-chat-4"])
+        self.assertEqual(g["sets"], {"2": [S(1)], "3": [], "4": [S(2)]}); self.assertEqual(g["saves"], 0); self.assertEqual(g["grid"]["cls"], "chat-grid")
+        r = self.out["reconciledRow"]
+        self.assertEqual(r["layout"], {"layout": "row", "rows": 1, "cols": 2}); self.assertEqual(r["ids"], ["f-chat", "f-chat-2"], "the other tab left the grid and kept one column: this window follows")
+        self.assertEqual(r["sets"], {"2": [S(1)]}); self.assertEqual(r["saves"], 0); self.assertEqual(r["grid"]["cls"], "")
+        self.assertEqual(r["order"], ["chat-pane", "gv-chat-2", "chat-pane-2", "gv-a", "fleet-pane", "gv-b", "feed-pane"], "the column is back in the row behind its gutter")
+
+    def test_a_drag_in_a_grid_mounts_a_zone_on_every_other_tile_and_no_edge_zone(self):
+        d = self.out["dragGrid"]
+        self.assertEqual(d["zones"], {"chat-pane-1": [], "chat-pane-2": ["col-drop"], "chat-pane-3": ["col-drop"], "chat-pane-4": ["col-drop"]},
+                         "from the first tile: a whole-tile zone on every other tile, none on the source's overlay")
+        self.assertFalse(d["edge"], "no edge zone: the grid's shape is the cap, and a drop on a tile moves the session there")
 
 
 if __name__ == "__main__":

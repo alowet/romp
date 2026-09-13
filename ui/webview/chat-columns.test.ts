@@ -3,7 +3,7 @@
 // one caller; tab-strip-skip.test.ts pins that call at the source. Synthetic ids only.
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
-import { colFromSearch, columnHolds, ownerOf, type ColSets } from "./chat-columns";
+import { colFromSearch, columnHolds, ownerOf, parseChatLayout, tileHeaderShown, type ColSets } from "./chat-columns";
 
 const WEB = "11111111-2222-3333-4444-555555555501";
 const API = "11111111-2222-3333-4444-555555555502";
@@ -57,4 +57,29 @@ test("a doubly listed id belongs to ONE column, the first key holding it, never 
 test("ownerOf: the empty string for an id no entry lists, and a junk entry is skipped, never a throw", () => {
   assert.equal(ownerOf({ "2": [API] }, WEB), "");
   assert.equal(ownerOf({ "2": null as unknown as string[], "3": [WEB] }, WEB), "3", "a corrupt entry is passed over");
+});
+
+// ── the layout and the tile header rule (tiles, the user 2026-09-13) ──────────────────────────────────────────────
+test("parseChatLayout: a grid needs integer rows and cols of at least 1; anything else reads as the row; a non-object is no layout", () => {
+  assert.deepEqual(parseChatLayout({ layout: "grid", rows: 2, cols: 3 }), { layout: "grid", rows: 2, cols: 3 });
+  assert.deepEqual(parseChatLayout({ layout: "grid", rows: "2", cols: "2" }), { layout: "grid", rows: 2, cols: 2 }, "numeric strings are numbers");
+  assert.deepEqual(parseChatLayout({ layout: "row", rows: 1, cols: 3 }), { layout: "row", rows: 1, cols: 3 });
+  assert.deepEqual(parseChatLayout({ layout: "grid", rows: 0, cols: 2 }), { layout: "row", rows: 1, cols: 2 }, "a grid with no rows is the row");
+  assert.deepEqual(parseChatLayout({ layout: "grid", rows: 2.5, cols: 2 }), { layout: "row", rows: 1, cols: 2 }, "…and so is a fractional one");
+  assert.deepEqual(parseChatLayout({ layout: "grid" }), { layout: "row", rows: 1, cols: 1 }, "no shape: the row, one column");
+  assert.deepEqual(parseChatLayout({}), { layout: "row", rows: 1, cols: 1 });
+  assert.equal(parseChatLayout(null), null, "no shell answer");
+  assert.equal(parseChatLayout(undefined), null);
+  assert.equal(parseChatLayout("grid"), null, "a bare string is not an answer");
+});
+
+test("tileHeaderShown: a grid AND exactly one session shown here; the row never; an empty tile and an overflow tile keep the strip", () => {
+  const grid = { layout: "grid" as const, rows: 2, cols: 3 };
+  const row = { layout: "row" as const, rows: 1, cols: 2 };
+  assert.equal(tileHeaderShown(grid, 1), true, "one session in a tile: the header");
+  assert.equal(tileHeaderShown(grid, 0), false, "an empty tile: the strip (its + and the pick)");
+  assert.equal(tileHeaderShown(grid, 2), false, "two or more: the strip — the first tile is the overflow, never a dead end");
+  assert.equal(tileHeaderShown(grid, 5), false);
+  assert.equal(tileHeaderShown(row, 1), false, "the row wears the strip whatever it holds");
+  assert.equal(tileHeaderShown(null, 1), false, "no shell (standalone, VS Code): the strip, as ever");
 });

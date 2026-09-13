@@ -173,6 +173,15 @@ installMenuEcho();
   // that column (the last one when the first column has the focus), its sessions returning to the first column.
   registerCommand({ id: "chat.split", title: "Move this session to a new column", run: () => { if (w.__rompSplitChat) w.__rompSplitChat(); } });
   registerCommand({ id: "chat.closeSplit", title: "Close this column", run: () => { if (w.__rompCloseSplit) w.__rompCloseSplit(); } });
+  // TILES (the user 2026-09-13): the chat area as a grid of tiles, one session per tile, each with its own composer, instead
+  // of tabs. The shell owns the offer (__rompChatGrids: "2x2", "2x3" — one line there adds a grid, and one entry here
+  // follows) and the switch (__rompChatTiles / __rompChatTilesOff); the offer is read at boot (the split script runs ahead of
+  // this bundle), with the two grids as the fallback for a shell without it. Back to tabs is listed only while a grid is
+  // up: a `when` predicate over the shell's live layout, re-read at every open like the pane entries above.
+  const grids = ((w.__rompChatGrids ? w.__rompChatGrids() : null) || ["2x2", "2x3"]) as string[];
+  for (const g of grids) registerCommand({ id: "chat.tiles." + g, title: "Tiles " + g.replace("x", "\u00d7"), run: () => { if (w.__rompChatTiles) w.__rompChatTiles(g); } });
+  const inGrid = (): boolean => { try { const l = w.__rompChatLayout && w.__rompChatLayout(); return !!l && l.layout === "grid"; } catch (e) { return false; } };
+  registerCommand({ id: "chat.tilesOff", title: "Back to tabs", run: () => { if (w.__rompChatTilesOff) w.__rompChatTilesOff(); }, when: inGrid });
   // The keyboard path across columns, palette-only and unbound (Alt+Arrow is pane focus and Ctrl+Alt+Arrow an OS
   // binding on some desktops; the palette's rebinding covers anyone who wants a chord): the focused column's
   // active session to the column on its right (past the last: a new one, the shell checks the cap) or on its

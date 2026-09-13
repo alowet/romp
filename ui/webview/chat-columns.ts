@@ -36,3 +36,28 @@ export function columnHolds(sets: ColSets | null, col: string, id: string): bool
   if (sets === null) return true;
   return ownerOf(sets, id) === col;
 }
+
+/** THE LAYOUT of the chat area (tiles, the user 2026-09-13): the shell's `__rompChatLayout()`. `row` is the split as
+ *  it was, the columns side by side behind gutters; `grid` lays every column out as a TILE of a rows×cols grid, each
+ *  tile one column of the same partition, each with its own composer. null: no shell (a standalone page, the VS Code
+ *  webview) or an older shell — the row, as ever. */
+export type ChatLayout = { layout: "row" | "grid"; rows: number; cols: number };
+
+/** The shell's answer, sanitised: a grid needs integer rows and cols of at least 1, else it reads as the row (never a
+ *  throw); anything that is not an object is no layout at all. */
+export function parseChatLayout(raw: unknown): ChatLayout | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as { layout?: unknown; rows?: unknown; cols?: unknown };
+  const rows = Number(r.rows), cols = Number(r.cols);
+  const ok = (n: number): boolean => Number.isInteger(n) && n >= 1;
+  if (r.layout === "grid" && ok(rows) && ok(cols)) return { layout: "grid", rows, cols };
+  return { layout: "row", rows: 1, cols: ok(cols) ? cols : 1 };
+}
+
+/** THE TILE HEADER RULE: a column wears a one-line header (its one session's dot, name and ⋯) in the tab strip's
+ *  place exactly when the layout is a grid AND the column shows exactly one session. With none (an empty tile) or
+ *  two or more (the first tile is the overflow: a session placed in no tile stays reachable there, never a dead end)
+ *  the strip shows as ever. */
+export function tileHeaderShown(layout: ChatLayout | null, visibleHeld: number): boolean {
+  return !!layout && layout.layout === "grid" && visibleHeld === 1;
+}

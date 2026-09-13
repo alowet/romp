@@ -49642,13 +49642,21 @@ def _forget_active_chat_if_last(client):
         _ACTIVE_CHAT_BY_WID.pop(wid, None)
 
 
-def _relay_active_chat(client, sid):
+def _relay_active_chat(client, sid, focused=None):
     """A chat client's activeTab: record the session under its window's wid (None for no tab) and send the window's
     live feed clients the frame (T347: the feed's focused-session section is a view of the chat pane's active tab,
     never a move of a card; one window's panes share a wid, and a pane outside a dashboard files under ""). The
-    two chat columns of a split window both report here and the later report stands. The client list is copied
-    under _clients_lock; the sends run outside it, as every other fan-out does."""
+    chat columns of a split window all report here. `focused` (tiles, the user 2026-09-13) says whether the report
+    came from a USER gesture in that column — a tab click, the keyboard, the composer taking focus, the shell's
+    pane focus — or from a boot, a restore or a re-render (False): with four to six tiles each re-rendering on its
+    own pushes, the feed would otherwise follow whichever tile repainted last. An unfocused report may SEED an
+    empty focus (no record for the window yet, or None: a reload's first paint, as before) but never DISPLACE a
+    session the feed follows; a focused one always stands; a report without the field (an older client) relays as
+    it always did. The client list is copied under _clients_lock; the sends run outside it, as every other
+    fan-out does."""
     wid = _active_chat_wid(client)
+    if focused is False and _ACTIVE_CHAT_BY_WID.get(wid):
+        return
     _ACTIVE_CHAT_BY_WID[wid] = str(sid) if sid else None
     with _clients_lock:
         feeds = [c for c in _clients if c.get("alive") and c.get("app") == "feed" and _active_chat_wid(c) == wid]
@@ -52442,7 +52450,7 @@ var curFocus='f-chat', lastCol='f-chat';   // for Shift-Up out of the timeline: 
 // The active pane gets a focus RING (.pane-focused). Same-origin iframes, so the shell sets it directly on
 // pointerdown / focusin / window-focus — event-based, no polling. Exactly one pane is ringed at a time.
 var lastChat='f-chat';   // the chat column the user last worked in (split screen 2026-09-08): where shell relays land
-function paneOf(id){return PANE[id]||(window.__rompChatPaneOf?window.__rompChatPaneOf(id):null);}   // split columns are made after this map
+function paneOf(id){var c=window.__rompChatPaneOf?window.__rompChatPaneOf(id):null;return c||PANE[id]||null;}   // the split names a chat frame's pane first: split columns are made after this map, and in a grid the first frame's tile is an overlay, not #chat-pane (tiles, 2026-09-13)
 function allCols(){var c=window.__rompChatFrameIds?window.__rompChatFrameIds():['f-chat'];return c.concat(COLS.slice(1));}   // every chat column, then Outline, Feed
 function setFocus(id){var pid=paneOf(id);if(!pid)return;curFocus=id;if(allCols().indexOf(id)>=0)lastCol=id;if(pid.indexOf('chat-pane')===0)lastChat=id;
 Array.prototype.forEach.call(document.querySelectorAll('.pane'),function(el){el.classList.toggle('pane-focused',el.id===pid);});}
@@ -55572,20 +55580,32 @@ _LANDING_COLLAPSE_JS = """
 # the others stand down — render.ts focusIsOurs.
 _LANDING_SPLIT_JS = """
 (function(){
-var CK='romp-chat-cols',MAX=4,cols=[];   // cols: the later columns in ROW order, each {n: the column number, ids: the sessions it holds}; MAX counts the first column too
+var CK='romp-chat-cols',cols=[];   // cols: the later columns in ROW order, each {n: the column number, ids: the sessions it holds}
+// THE LAYOUT (tiles, the user 2026-09-13, who wanted sessions side by side in a grid, each with its own composer, instead
+// of behind tabs): 'row' is the split as it was — the columns side by side in the row, each behind a gutter, four at
+// most; 'grid' lays the first column and the later ones out as TILES, rows×cols of them in the chat pane's slot, no
+// gutters, every tile a column of the same partition. A grid KEEPS ITS SHAPE: a tile left with no session stands empty
+// (the page shows its empty state) instead of closing, and the cap is the grid's size. GRIDS is the offer, one line per
+// grid; MAX counts the first column too and is the layout's: ROW_MAX in the row, rows×cols in a grid.
+var GRIDS={'2x2':[2,2],'2x3':[2,3]};
+var ROW_MAX=4,layout='row',grid=null;   // grid: [rows, cols] while layout==='grid'
 var BK='romp-vscode-state-chat:';   // a column's state blob (the shim's SK for /chat?col=N): its activeId is the shim's ?active= connect hint and render.ts's wantActive
-var row=document.querySelector('.row'),gva=document.getElementById('gv-a');
-if(!row||!gva)return;
+var row=document.querySelector('.row'),gva=document.getElementById('gv-a'),cp=document.getElementById('chat-pane');
+if(!row||!gva||!cp)return;
 function mobile(){var b=document.getElementById('mtabs');try{return !!b&&getComputedStyle(b).display!=='none';}catch(e){return false;}}
-function save(){try{localStorage.setItem(CK,JSON.stringify({v:2,cols:cols.map(function(c){return {n:c.n,ids:c.ids.slice()};})}));}catch(e){}}
+function maxCols(){return layout==='grid'?grid[0]*grid[1]:ROW_MAX;}
+function gridKey(g){return g?g[0]+'x'+g[1]:'';}
+function gridOf(v){var k=typeof v==='string'?v:Array.isArray(v)?gridKey(v):'';return GRIDS[k]?GRIDS[k].slice():null;}   // a grid the offer knows, else null
+function save(){try{var o={v:2,cols:cols.map(function(c){return {n:c.n,ids:c.ids.slice()};})};if(layout==='grid'){o.layout='grid';o.grid=grid.slice();}localStorage.setItem(CK,JSON.stringify(o));}catch(e){}placeTiles();}
 function paneId(n){return 'chat-pane-'+n;}function frameId(n){return 'f-chat-'+n;}
+function firstPane(){return layout==='grid'?paneId(1):'chat-pane';}   // the first column's pane: in a grid, its tile (a child of #chat-pane, which is the grid)
 function idx(n){for(var i=0;i<cols.length;i++){if(cols[i].n===n)return i;}return -1;}
 function entry(n){var i=idx(n);return i<0?null:cols[i];}
 function frames(){var out=[document.getElementById('f-chat')];cols.forEach(function(c){out.push(document.getElementById(frameId(c.n)));});return out.filter(Boolean);}
 function frameOfWin(win){if(!win)return null;var fs=frames();for(var i=0;i<fs.length;i++){try{if(fs[i].contentWindow===win)return fs[i];}catch(e){}}return null;}
 function colOf(win){var f=frameOfWin(win);return f?String(f.getAttribute('data-col')||''):'';}
 function frameOfCol(n){return document.getElementById(n===1?'f-chat':frameId(n));}
-function lastPane(){return cols.length?paneId(cols[cols.length-1].n):'chat-pane';}
+function lastPane(){return layout==='grid'?'chat-pane':cols.length?paneId(cols[cols.length-1].n):'chat-pane';}   // gv-a's left neighbour: the grid itself when tiles are up
 // THE PARTITION, three pure readers of cols: the column holding a session (1, the first, when no entry lists it);
 // the sets every column page filters by (an id listed twice — a store another dashboard wrote — belongs to the
 // first entry in row order, so no two columns show it); the lowest free number (a reused number's blob and grow
@@ -55593,7 +55613,10 @@ function lastPane(){return cols.length?paneId(cols[cols.length-1].n):'chat-pane'
 function ownerOf(sid){for(var i=0;i<cols.length;i++){if(cols[i].ids.indexOf(sid)>=0)return cols[i].n;}return 1;}
 function sets(){var out={},seen={};cols.forEach(function(c){out[String(c.n)]=c.ids.filter(function(id){if(seen[id])return false;seen[id]=true;return true;});});return out;}
 function nextNumber(){var n=2;while(entry(n))n++;return n;}
-function activeIn(f){try{var t=f.contentDocument&&f.contentDocument.querySelector('#tabs .tab.active[data-id]');return t?String(t.getAttribute('data-id')||''):'';}catch(e){return '';}}   // the palette's "move this session": the focused column's own tab
+function activeIn(f){try{var t=f.contentDocument&&f.contentDocument.querySelector('#tabs .tab.active[data-id]');return t?String(t.getAttribute('data-id')||''):'';}catch(e){return '';}}   // the palette's "move this session" and the grid's fill: the column's own active tab
+// the column's strip in its order, each id once (a session under several tags has a copy per group): what the grid's
+// fill hands out, in the order the eye reads the strip
+function stripOf(f){var out=[],seen={};try{var d=f&&f.contentDocument;if(!d)return out;Array.prototype.forEach.call(d.querySelectorAll('#tabs .tab[data-id]'),function(t){var id=String(t.getAttribute('data-id')||'');if(id&&!seen[id]){seen[id]=true;out.push(id);}});}catch(e){}return out;}
 function focused(){var id=(window.__rompFocusedChatId&&window.__rompFocusedChatId())||'f-chat';return document.getElementById(id)||document.getElementById('f-chat');}
 // Which column a session-focus belongs to: the column that HOLDS the session (one lookup, never a read of the
 // panes' DOM), the first when no entry lists it; with no session named, the column the user last worked in,
@@ -55604,9 +55627,12 @@ function target(sid){if(sid)return frameOfCol(ownerOf(sid))||document.getElement
 // the column's state blob names the session BEFORE the frame exists. The shim's connect reads activeId from that
 // blob and dials ?active=<sid>&skeleton=1, so the kernel serves ONE full frame (the session) and skeletons the rest
 // (Handler._ws), and render.ts's wantActive activates it when its frame lands — the first frame on the socket, by
-// construction; no focus is handed over. Merged, never replaced: a reused number's drafts survive.
-function seed(n,sid){if(!sid)return;var st=null;try{st=JSON.parse(localStorage.getItem(BK+n)||'null');}catch(e){}
-if(!st||typeof st!=='object'||Array.isArray(st))st={};st.activeId=sid;try{localStorage.setItem(BK+n,JSON.stringify(st));}catch(e){}}
+// construction; no focus is handed over. Merged, never replaced: a reused number's drafts survive. An EMPTY tile
+// (no session) clears the hint a reused number's blob may still carry, so its page awaits nothing.
+function seed(n,sid){var st=null;try{st=JSON.parse(localStorage.getItem(BK+n)||'null');}catch(e){}
+if(!st||typeof st!=='object'||Array.isArray(st))st={};
+if(!sid){if(!('activeId' in st))return;delete st.activeId;try{localStorage.setItem(BK+n,JSON.stringify(st));}catch(e){}return;}
+st.activeId=sid;try{localStorage.setItem(BK+n,JSON.stringify(st));}catch(e){}}
 // At a restore a column comes back on the tab its own blob names when that session is still a member, else on its
 // first member (the blob's tab was moved away while this browser was closed)
 function seedFor(c){var st=null;try{st=JSON.parse(localStorage.getItem(BK+c.n)||'null');}catch(e){}var a=st&&typeof st.activeId==='string'?st.activeId:'';return c.ids.indexOf(a)>=0?a:c.ids[0];}
@@ -55629,37 +55655,56 @@ function busy(f){try{var b=f&&f.contentWindow&&f.contentWindow.__rompColumnBusy;
 function loaded(f){try{return !!(f&&f.contentWindow&&typeof f.contentWindow.__rompTakeSessionState==='function');}catch(e){return false;}}   // the page's bundle has evaluated, so a posted message is heard
 var BUSY='A session is still being created in this column.';
 var LOCKED='The tabs are locked: unlock them in the tab strip\\u2019s gear menu (Lock the tabs in place) to move this session.';
+// THE GRID'S MOUNT: #chat-pane, the row's chat slot (its flex and grow var untouched, so the gutters and the rail see one
+// chat pane as before), becomes the grid; its own iframe stays where it is and takes the first cell as a grid item (no
+// move: moving an iframe reloads its document), and #chat-pane-1, an absolutely positioned overlay placed on that same
+// cell, stands for the first column's tile — the focus ring and the drop zone land on it (pointer-through except its
+// zones). Every later column's pane is a sibling tile with an explicit cell, so a lifted first frame (the picker) shifts
+// nothing. The rows and columns ride two vars the landing sheet's grid-template reads. Leaving the grid takes it all off.
+function mountGrid(){cp.classList.add('chat-grid');cp.style.setProperty('--tile-rows',String(grid[0]));cp.style.setProperty('--tile-cols',String(grid[1]));
+if(document.getElementById(paneId(1)))return;var t=document.createElement('div');t.className='pane chat-col tile-ring';t.id=paneId(1);t.setAttribute('data-col','1');cp.appendChild(t);}
+function unmountGrid(){cp.classList.remove('chat-grid');cp.style.removeProperty('--tile-rows');cp.style.removeProperty('--tile-cols');var t=document.getElementById(paneId(1));if(t)t.remove();}
+// every tile's cell, row-major after the first column's (cell 1): a tile that stands empty keeps its place, a folded one
+// frees the last; set inline on each pane so the grid never re-flows around a frame the picker lifted out of it
+function placeTiles(){if(layout!=='grid')return;cols.forEach(function(c,i){var p=document.getElementById(paneId(c.n));if(!p)return;var k=i+1;p.style.gridArea=(Math.floor(k/grid[1])+1)+' / '+(k%grid[1]+1);});}
 function make(n,sid,state){var have=document.getElementById(frameId(n));if(have)return have;
-var g=document.createElement('div');g.className='gv gv-chat';g.id='gv-chat-'+n;
+var tiles=layout==='grid';
 var p=document.createElement('div');p.className='pane chat-col';p.id=paneId(n);p.setAttribute('data-col',String(n));
-p.style.flex='var(--g-chat'+n+',60) 1 0';
 var f=document.createElement('iframe');f.id=frameId(n);f.className='chat-col';f.setAttribute('data-col',String(n));
 seed(n,sid);f.src='/chat?col='+n+'&skeleton=1';   // the blob first, then the src: the shim reads the hint at its connect. skeleton=1: a later column is a VIEW of its one session (the kernel serves that tab whole and the rest as skeleton tabs that load on a click)
 if(state)f.addEventListener('load',function(){adopt(f,sid,state);state=null;});   // the moved tab's drafts, once the page can hear them; once — a later reload of the frame has them in its own blob
 var x=document.createElement('div');x.className='col-x';x.title='Close this column';x.setAttribute('role','button');x.textContent='×';
-x.addEventListener('click',function(ev){ev.stopPropagation();close(n);});
+x.addEventListener('click',function(ev){ev.stopPropagation();closeDoor(n);});
 p.appendChild(f);p.appendChild(x);
+if(tiles){cp.appendChild(p);}   // a tile: a cell of the grid, no gutter, no grow of its own (the grid's slot is the one width the gutters move)
+else{p.style.flex='var(--g-chat'+n+',60) 1 0';
+var g=document.createElement('div');g.className='gv gv-chat';g.id='gv-chat-'+n;
 row.insertBefore(g,gva);row.insertBefore(p,gva);
 if(window.__rompRegisterPane)window.__rompRegisterPane(p.id,'chat'+n);
 if(window.__rompGrowFairIfNew)window.__rompGrowFairIfNew('chat'+n);else if(window.__rompGrowFair)window.__rompGrowFair('chat'+n);   // the half __rompSplitGrow wrote, or a fair width at a restore — never a sliver — and a dragged width survives a reload
-if(window.__rompGutter)window.__rompGutter(g.id,function(){var i=idx(n);return i>0?paneId(cols[i-1].n):'chat-pane';},p.id);
+if(window.__rompGutter)window.__rompGutter(g.id,function(){var i=idx(n);return i>0?paneId(cols[i-1].n):'chat-pane';},p.id);}
 if(window.__rompWireFocus)window.__rompWireFocus(f);if(window.__rompWireEsc)window.__rompWireEsc(f);
 try{window.dispatchEvent(new CustomEvent('romp-chat-cols',{detail:{frame:f,col:n,open:true}}));}catch(e){}   // palette-main wires its keys
 return f;}
-function canSplit(){return !mobile()&&cols.length+1<MAX;}
+function canSplit(){return !mobile()&&cols.length+1<maxCols();}
 // a refused move says why (the click-acknowledgement rule): the cap, the phone's one-pane layout, or nothing to do
 function notify(why){try{if(window.__rompNotify)window.__rompNotify('warn',why);}catch(e){}return null;}
-function refuse(){return notify(mobile()?'The phone shows one pane at a time — no split here.':'Four chat columns at most — close one to open another.');}
+function capLine(){return layout==='grid'?'Every tile is taken: '+maxCols()+' in this grid. Swap a session into a tile, or go back to tabs.':'Four chat columns at most — close one to open another.';}
+function capShort(){return layout==='grid'?'The grid is full':'Four columns at most';}   // the drag's rectangle at the cap
+function refuse(){return notify(mobile()?'The phone shows one pane at a time — no split here.':capLine());}
 function unlist(sid){for(var i=0;i<cols.length;i++){var c=cols[i],j=c.ids.indexOf(sid);if(j>=0){c.ids.splice(j,1);return c.ids.length?0:c.n;}}return 0;}   // the number of an entry the removal emptied, else 0
+function firstEmpty(){for(var i=0;i<cols.length;i++){if(!cols[i].ids.length)return cols[i];}return null;}   // a tile standing empty, in row order
 // THE ONE MUTATION of the sets. `to` is a column number (1 = the first, which derives and takes no entry) or "new":
-// a column of its own to the right of the rightmost, half that column's width. Steps: the source page hands over
-// the session's drafts; the store changes (the id leaves its entry, an entry left empty is removed and its column
-// closed); the target adopts the drafts and shows the session; the ring moves there. Returns the target's iframe,
+// a column of its own to the right of the rightmost, half that column's width — in a grid, the first EMPTY tile (the
+// grid makes no new column: its shape is the cap). Steps: the source page hands over the session's drafts; the store
+// changes (the id leaves its entry, an entry left empty is removed and its column closed — in a grid the tile stays,
+// empty); the target adopts the drafts and shows the session; the ring moves there. Returns the target's iframe,
 // null when refused. A session already alone in a later column has nowhere new to go: a new column would be a twin
 // of the origin and the origin would close, so that is refused with a line rather than done for nothing.
 function moveTab(sid,to){if(typeof sid!=='string'||!sid)return null;
 var from=ownerOf(sid),src=frameOfCol(from);
 var why=refusal(src,sid);if(why==='locked')return notify(LOCKED);if(why||!movable(src,sid))return notify('Only an open session can be moved between columns.');
+if(to==='new'&&layout==='grid'){var fe=firstEmpty();if(!fe)return refuse();to=fe.n;}
 if(to==='new'){var se=entry(from);if(se&&se.ids.length===1)return notify('This session is already alone in its column.');
 if(!canSplit())return refuse();
 try{if(!document.body.classList.contains('po-chat')&&window.__rompPaneToggle)window.__rompPaneToggle('chat',true);}catch(e){}   // a hidden chat group comes forward first
@@ -55673,7 +55718,7 @@ if(tn===from)return tf;   // already there: nothing moves
 var se2=entry(from);if(se2&&se2.ids.length===1&&busy(src))return notify(BUSY);   // its last listed member leaving would close it over a create in flight
 var st=take(src,sid),emptied=unlist(sid);if(tn!==1)entry(tn).ids.push(sid);save();
 adopt(tf,sid,st);try{tf.contentWindow.postMessage({type:'focus',id:sid},'*');}catch(e){}   // a plain focus: the target is the owner now, so its own gate takes it
-if(emptied)close(emptied);   // the origin's last member left: it closes (the ring lands on the target below, not on the origin's neighbour)
+if(emptied&&layout!=='grid')close(emptied);   // the origin's last member left: it closes (the ring lands on the target below, not on the origin's neighbour); a tile stands empty instead
 try{tf.contentWindow.focus();}catch(e){}return tf;}
 // CLOSE a column: its sessions return to the first column — the entry goes whole, so the first column derives them —
 // drafts and all (what the closing page holds for each is handed to the first column's page); the pane, its gutter
@@ -55685,25 +55730,81 @@ if(!keep&&busy(f)){notify(BUSY);return;}   // a create in flight would die with 
 if(f&&home)cols[i].ids.forEach(function(sid){adopt(home,sid,take(f,sid));});
 var left=i>0?paneId(cols[i-1].n):'chat-pane';   // the column on its left: takes the ring below, and the width first
 cols.splice(i,1);if(!keep)save();
-var p=document.getElementById(paneId(n)),g=document.getElementById('gv-chat-'+n);
-if(window.__rompSplitShrink)window.__rompSplitShrink(left,paneId(n));   // its pixels go to the column on its left (the halving's twin), while the pane is still in the row
-if(window.__rompUnregisterPane)window.__rompUnregisterPane(paneId(n));
-if(p)p.remove();if(g)g.remove();
-if(window.__rompColGone)window.__rompColGone(String(n));
-try{window.dispatchEvent(new CustomEvent('romp-chat-cols',{detail:{col:n,open:false}}));}catch(e){}
+unmount(n,left);
 var pf=document.getElementById(i>0?frameId(cols[i-1].n):'f-chat');   // the ring moves to the column before it
 try{pf&&pf.contentWindow.focus();}catch(e){}}
-function closeFocused(){var f=focused(),c=f?colOf(f.contentWindow):'';if(!c&&cols.length)c=String(cols[cols.length-1].n);if(c)close(Number(c));}
+// the pane, its gutter and its grow go (the entry is the caller's): a close, or a layout switch that re-makes the column
+function unmount(n,left){var p=document.getElementById(paneId(n)),g=document.getElementById('gv-chat-'+n);
+if(layout!=='grid'){if(window.__rompSplitShrink)window.__rompSplitShrink(left||'chat-pane',paneId(n));   // its pixels go to the column on its left (the halving's twin), while the pane is still in the row
+if(window.__rompUnregisterPane)window.__rompUnregisterPane(paneId(n));}
+if(p)p.remove();if(g)g.remove();
+if(window.__rompColGone)window.__rompColGone(String(n));
+try{window.dispatchEvent(new CustomEvent('romp-chat-cols',{detail:{col:n,open:false}}));}catch(e){}}
+// EMPTY A TILE (the grid's close, the user 2026-09-13): its sessions return to the first column, drafts and all, and the
+// tile stays — the grid keeps its shape, and the page shows its empty state (drag a tab here, or pick a session). A tile
+// with a create in flight refuses like a closing column would.
+function vacate(n){var i=idx(n);if(i<0)return;var f=document.getElementById(frameId(n)),home=document.getElementById('f-chat');
+if(busy(f)){notify(BUSY);return;}
+if(f&&home)cols[i].ids.forEach(function(sid){adopt(home,sid,take(f,sid));});
+cols[i].ids=[];save();
+try{home&&home.contentWindow.focus();}catch(e){}}
+function closeDoor(n){if(layout==='grid')vacate(n);else close(n);}   // the user's close of a column (the cross, the palette, a tile's menu): in a grid it empties the tile
+function closeFocused(){var f=focused(),c=f?colOf(f.contentWindow):'';if(!c&&cols.length)c=String(cols[cols.length-1].n);if(c)closeDoor(Number(c));}
+// THE GRID'S FILL: the first column's strip, its active tab skipped (the eye is there), each session into a tile of its own
+// in strip order — left to right, top to bottom — first the tiles standing empty, then new ones up to the grid's size;
+// spare tiles stand empty. Only a session the page lets move (movable: no create in flight, no viewer, no tab lock).
+// Drafts travel as on any move; no focus moves (the user is where they were).
+function place(sid,to){var from=ownerOf(sid),src=frameOfCol(from),st=take(src,sid);unlist(sid);
+if(to==='new'){var n=nextNumber();cols.push({n:n,ids:[sid]});make(n,sid,st);return;}
+entry(to).ids.push(sid);var tf=frameOfCol(to);adopt(tf,sid,st);try{tf&&tf.contentWindow.postMessage({type:'focus',id:sid},'*');}catch(e){}}
+function fill(){var home=document.getElementById('f-chat'),active=activeIn(home);
+var pool=stripOf(home).filter(function(id){return id!==active&&ownerOf(id)===1&&movable(home,id);});
+var empties=cols.filter(function(c){return !c.ids.length;}),room=maxCols()-1-cols.length;
+pool.forEach(function(sid){var t=empties.shift();if(t)place(sid,t.n);else if(room>0){room--;place(sid,'new');}});
+while(room-->0){var n=nextNumber();cols.push({n:n,ids:[]});make(n,'',null);}
+save();}
+// A LAYOUT SWITCH: row↔grid re-makes every later column in the new dress (a frame reload — its blob keeps its tab, its
+// drafts and its scroll); grid↔grid only re-sizes the grid. Then every column page hears {romp:'layout'} and re-renders
+// its chrome (render.ts: a tile holding one session wears a header in the strip's place). Nothing is written here: the
+// callers save, a reconcile does not.
+function applyLayout(nl,ng){var was=layout;if(nl===was&&gridKey(ng)===gridKey(grid))return;
+var carry={};if(nl!==was)cols.forEach(function(c){var f=frameOfCol(c.n),a=seedFor(c);carry[c.n]=a?take(f,a):null;unmount(c.n,null);});   // the panes go, the entries stay; each page's live draft for its tab rides to the re-made frame
+if(was==='grid'&&nl!=='grid')unmountGrid();
+layout=nl;grid=ng?ng.slice():null;
+if(nl==='grid')mountGrid();
+if(nl!==was)cols.forEach(function(c){make(c.n,seedFor(c),carry[c.n]||null);});
+placeTiles();broadcast();}
+function broadcast(){frames().forEach(function(f){try{f.contentWindow.postMessage({romp:'layout'},'*');}catch(e){}});}
+// ENTER a grid (or switch grids): the layout, then the shape — surplus tiles fold home from the end (their sessions return
+// to the first column; a tile with a create in flight stays), the rest fill. LEAVE: every tile folds home and the row is back.
+function enterGrid(g){if(mobile())return notify('The phone shows one pane at a time — no tiles here.');g=gridOf(g);if(!g)return null;
+try{if(!document.body.classList.contains('po-chat')&&window.__rompPaneToggle)window.__rompPaneToggle('chat',true);}catch(e){}   // a hidden chat group comes forward first
+applyLayout('grid',g);
+for(var i=cols.length-1;i>=0&&cols.length+1>maxCols();i--)close(cols[i].n);
+fill();try{document.getElementById('f-chat').contentWindow.focus();}catch(e){}return true;}
+function leaveGrid(){if(layout!=='grid')return false;
+cols.slice().reverse().forEach(function(c){close(c.n);});
+applyLayout('row',null);save();return true;}
 // the palette's Move this session to a new column: the focused column's active tab (the one DOM read kept, for this)
 window.__rompSplitChat=function(sid){var id=typeof sid==='string'&&sid?sid:activeIn(focused());if(!id)return notify('No session is open in this column to move.');return moveTab(id,'new');};
 window.__rompCanSplit=canSplit;window.__rompMoveTab=moveTab;
-window.__rompCloseSplit=function(n){if(n===undefined)closeFocused();else close(Number(n));};
+window.__rompCloseSplit=function(n){if(n===undefined)closeFocused();else closeDoor(Number(n));};
 window.__rompChatSets=function(){return mobile()?null:sets();};   // null on the phone: the one chat shows everything
+// THE LAYOUT, read by every column page beside the sets: {layout, rows, cols} — the row's rows is 1 and its cols the
+// columns open; the phone is one column
+window.__rompChatLayout=function(){if(mobile())return {layout:'row',rows:1,cols:1};return layout==='grid'?{layout:'grid',rows:grid[0],cols:grid[1]}:{layout:'row',rows:1,cols:cols.length+1};};
+window.__rompChatGrids=function(){return Object.keys(GRIDS);};   // the offer, for the palette's entries
+window.__rompChatTiles=function(g){return enterGrid(g);};window.__rompChatTilesOff=leaveGrid;
+// A TILE'S SWAP (its header's menu): the picked session comes into tile `col`, and the tile's current session goes back to the
+// first column — both through the one mutation. On the first column the pick simply comes home.
+window.__rompSwapTile=function(sid,col){var n=Number(col)||1;if(typeof sid!=='string'||!sid)return null;
+if(n!==1){var e=entry(n);if(!e)return null;e.ids.slice().forEach(function(id){if(id!==sid)moveTab(id,1);});}
+return moveTab(sid,n);};
 // a session CREATED from a later column's plus button belongs to that column: the page claims the real id when its
 // provisional resolves; a session an entry already lists is never stolen
 window.__rompClaimSession=function(sid,col){var n=Number(col),e=entry(n);if(typeof sid!=='string'||!sid||!e||ownerOf(sid)!==1)return false;e.ids.push(sid);save();return true;};
 window.__rompChatFrames=frames;window.__rompChatFrameIds=function(){return frames().map(function(f){return f.id;});};
-window.__rompChatPaneOf=function(fid){return fid==='f-chat'?'chat-pane':(String(fid).indexOf('f-chat-')===0?paneId(String(fid).slice(7)):null);};
+window.__rompChatPaneOf=function(fid){return fid==='f-chat'?firstPane():(String(fid).indexOf('f-chat-')===0?paneId(String(fid).slice(7)):null);};
 window.__rompLastChatPane=lastPane;window.__rompColOf=colOf;window.__rompFrameOfWin=frameOfWin;window.__rompChatTarget=target;
 // THE DRAG (the user 2026-09-11, who asked for a tab dragged to the right edge to make a column and onto another column
 // to move it). The page posts {romp:'tabDrag',on:true,sid,name,stripH} at its dragstart and {on:false} at dragend
@@ -55715,20 +55816,20 @@ window.__rompLastChatPane=lastPane;window.__rompColOf=colOf;window.__rompFrameOf
 // the source, so its strip stays reorder territory) whose drop opens a new column holding the session at the right
 // half of that pane — the geometry #col-ghost, the provisional rectangle, shows on entering the zone (honest to the
 // new gutter's 7 px). No edge zone when the source is a later column holding only the dragged session (a new column
-// would twin the origin and the origin would close). At the cap the edge zone is mounted refused: the rectangle wears
-// a thin ring and says so, and a drop there notifies and changes nothing. The source pane gets no zone (over its
-// strip the drag is the live reorder, over its transcript the drop cancels as today), nor do the other panes (a drop
-// there cancels). Nothing is read from dataTransfer: the sid rides the message, so a served test can drive the zones
-// with synthetic events. Every transition is a pointer crossing (dragenter, dragleave, drop, dragend); nothing is
-// timed. The page's own dragend, after the drop, takes its cancel path and re-renders from the new sets, so the moved
-// tab is simply gone there.
+// would twin the origin and the origin would close), and none in a grid (its shape is the cap: a drop on a tile moves
+// the session there). At the cap the edge zone is mounted refused: the rectangle wears a thin ring and says so, and a
+// drop there notifies and changes nothing. The source pane gets no zone (over its strip the drag is the live reorder,
+// over its transcript the drop cancels as today), nor do the other panes (a drop there cancels). Nothing is read from
+// dataTransfer: the sid rides the message, so a served test can drive the zones with synthetic events. Every transition
+// is a pointer crossing (dragenter, dragleave, drop, dragend); nothing is timed. The page's own dragend, after the drop,
+// takes its cancel path and re-renders from the new sets, so the moved tab is simply gone there.
 var drag=null,zones=[],ghost=document.getElementById('col-ghost');   // drag: {sid,name,from,stripH} while a tab drags, else null
 function edgeWidth(w){return Math.max(72,Math.min(180,0.2*w));}   // the edge zone's width for a pane w px wide
 function ghostRect(pane,rowRect){return {top:rowRect.top,height:rowRect.height,left:pane.left+pane.width/2,width:pane.width/2};}   // the right half of the rightmost pane, the row's height: what the drop produces
 function showGhost(z){if(!ghost)return;if(!z||!drag){ghost.classList.remove('on','refused');ghost.textContent='';return;}
 var r=ghostRect(z.parentElement.getBoundingClientRect(),row.getBoundingClientRect()),refused=!!z.getAttribute('data-refused');
 ghost.style.top=r.top+'px';ghost.style.height=r.height+'px';ghost.style.left=r.left+'px';ghost.style.width=r.width+'px';
-ghost.textContent=refused?'Four columns at most':drag.name;ghost.classList.toggle('refused',refused);ghost.classList.add('on');}
+ghost.textContent=refused?capShort():drag.name;ghost.classList.toggle('refused',refused);ghost.classList.add('on');}
 function cue(z,on){if(z.classList.contains('col-drop-edge'))showGhost(on?z:null);else z.classList.toggle('over',on);}   // the zone under the pointer: the rectangle for the edge, .over on a column zone itself
 function unmountZones(){zones.forEach(function(z){z.remove();});zones=[];showGhost(null);}   // idempotent: every drop and the page's dragend call it
 function zone(p,cls,col,onDrop){var z=document.createElement('div');z.className='col-drop'+(cls?' '+cls:'');if(col!==null)z.setAttribute('data-col',col===1?'':String(col));
@@ -55739,7 +55840,7 @@ z.addEventListener('drop',function(ev){ev.preventDefault();var d=drag;unmountZon
 p.appendChild(z);zones.push(z);return z;}
 function mountZones(){unmountZones();if(!drag||mobile())return;
 var from=drag.from,last=lastPane(),se=from===1?null:entry(from),alone=!!(se&&se.ids.length===1&&se.ids[0]===drag.sid);
-[{n:1,pid:'chat-pane'}].concat(cols.map(function(c){return {n:c.n,pid:paneId(c.n)};})).forEach(function(c){var p=document.getElementById(c.pid);if(!p)return;
+[{n:1,pid:firstPane()}].concat(cols.map(function(c){return {n:c.n,pid:paneId(c.n)};})).forEach(function(c){var p=document.getElementById(c.pid);if(!p)return;
 if(c.n!==from)zone(p,'',c.n,function(sid){moveTab(sid,c.n);});   // the column zone: a drop anywhere in the pane moves the session here
 if(c.pid===last&&!alone){var e=zone(p,'col-drop-edge',null,function(sid){if(e.getAttribute('data-refused'))refuse();else moveTab(sid,'new');});   // the edge zone: a new column at the right
 e.style.width=edgeWidth(p.getBoundingClientRect().width)+'px';e.style.top=(c.n===from?drag.stripH:0)+'px';if(!canSplit())e.setAttribute('data-refused','1');}});}
@@ -55748,7 +55849,8 @@ if(m.romp==='tabDrag'){if(!m.on){drag=null;unmountZones();return;}   // the page
 if(!frameOfWin(e.source)||mobile()||typeof m.sid!=='string'||!m.sid)return;   // a chat column's dragstart, on the desktop
 drag={sid:m.sid,name:typeof m.name==='string'?m.name:'',from:Number(colOf(e.source))||1,stripH:Math.max(0,Number(m.stripH)||0)};mountZones();return;}
 // a column whose members the kernel's strip no longer lists (ended, or closed from a tab's cross) says so: the gone
-// ids leave its entry, and an entry left empty closes its column — a member added meanwhile keeps it open
+// ids leave its entry, and an entry left empty closes its column — a member added meanwhile keeps it open; a TILE
+// stands empty instead (the grid keeps its shape)
 if(m.romp==='colEmpty'&&Array.isArray(m.gone)){var c=Number(colOf(e.source)),en=c>=2?entry(c):null;if(!en)return;
 var gone=en.ids.filter(function(id){return m.gone.indexOf(id)>=0;});en.ids=en.ids.filter(function(id){return m.gone.indexOf(id)<0;});
 if(en.ids.length){save();return;}
@@ -55760,6 +55862,7 @@ if(en.ids.length){save();return;}
 // and toasted a close nobody asked for (the vanishing tab, the user 2026-09-12)
 var crossed=Array.isArray(m.crossed)?gone.filter(function(id){return m.crossed.indexOf(id)>=0;}):[];
 var home=document.getElementById('f-chat');try{if(home&&crossed.length)home.contentWindow.postMessage({romp:'closing',ids:crossed},'*');}catch(e){}
+if(layout==='grid'){save();return;}
 close(en.n);return;}
 // ORPHANED STATE (review find 2026-09-11): a page holds a draft, citations, attachments or staged messages for a session
 // it does not show — a column blob written before the partition (a v1 column was a whole chat page, so its blob may name
@@ -55769,24 +55872,32 @@ close(en.n);return;}
 if(m.romp==='orphanState'&&Array.isArray(m.sids)){var sf=frameOfWin(e.source);if(!sf)return;var sc=Number(colOf(e.source))||1;
 m.sids.forEach(function(sid){if(typeof sid!=='string'||!sid)return;var o=ownerOf(sid);if(o===sc)return;var t=frameOfCol(o);if(t&&t!==sf&&loaded(t))adopt(t,sid,take(sf,sid));});}});
 // THE STORE, read: the v2 object, or a v1 array of numbers migrated once (each number to the session its blob names;
-// a number with no session is dropped). Sanitised on the way in: integer numbers from 2, each once; string ids, each
-// in one entry; no empty entry; at most MAX-1 entries.
+// a number with no session is dropped). Sanitised on the way in: the layout a grid the offer knows, else the row;
+// integer numbers from 2, each once; string ids, each in one entry; no empty entry (a grid keeps its empty tiles); at
+// most MAX-1 entries, MAX the layout's.
 function read(){var raw=null;try{raw=JSON.parse(localStorage.getItem(CK)||'null');}catch(e){}
-var out=[],seen={},migrated=false;
-function add(n,ids){n=Number(n);if(!(n>=2&&n<100&&n===Math.floor(n))||out.length>=MAX-1)return;for(var i=0;i<out.length;i++){if(out[i].n===n)return;}
-var keep=[];(ids||[]).forEach(function(id){if(typeof id==='string'&&id&&!seen[id]){seen[id]=true;keep.push(id);}});if(keep.length)out.push({n:n,ids:keep});}
+var out=[],seen={},migrated=false,g=null;
+if(raw&&typeof raw==='object'&&!Array.isArray(raw)&&raw.layout==='grid')g=gridOf(raw.grid);
+var cap=(g?g[0]*g[1]:ROW_MAX)-1;
+function add(n,ids){n=Number(n);if(!(n>=2&&n<100&&n===Math.floor(n))||out.length>=cap)return;for(var i=0;i<out.length;i++){if(out[i].n===n)return;}
+var keep=[];(ids||[]).forEach(function(id){if(typeof id==='string'&&id&&!seen[id]){seen[id]=true;keep.push(id);}});if(keep.length||g)out.push({n:n,ids:keep});}
 if(Array.isArray(raw)){migrated=true;raw.forEach(function(n){var st=null;try{st=JSON.parse(localStorage.getItem(BK+Number(n))||'null');}catch(e){}add(n,[st&&typeof st.activeId==='string'?st.activeId:'']);});}
 else if(raw&&typeof raw==='object'&&raw.v===2&&Array.isArray(raw.cols))raw.cols.forEach(function(c){if(c&&typeof c==='object')add(c.n,Array.isArray(c.ids)?c.ids:[]);});
-return {cols:out,migrated:migrated};}
-// another dashboard tab's write (this window never hears its own): its arrangement is the truth — close what it
-// dropped, make what it added (seeded like a restore), take its sets — and nothing is written back
-function reconcile(next){cols.filter(function(c){return !next.some(function(d){return d.n===c.n;});}).forEach(function(c){close(c.n,true);});
+return {cols:out,grid:g,migrated:migrated};}
+// a grid restored with fewer tiles than its shape (a store another shell wrote, a sanitised entry): spare tiles stand empty
+function topUp(){if(layout!=='grid')return;while(cols.length+1<maxCols()){var n=nextNumber();cols.push({n:n,ids:[]});make(n,'',null);}}
+// another dashboard tab's write (this window never hears its own): its arrangement is the truth — its layout, close
+// what it dropped, make what it added (seeded like a restore), take its sets — and nothing is written back
+function reconcile(r){var next=r.cols;
+cols.filter(function(c){return !next.some(function(d){return d.n===c.n;});}).forEach(function(c){close(c.n,true);});
 cols=next.map(function(c){return {n:c.n,ids:c.ids.slice()};});
-cols.forEach(function(c){if(!document.getElementById(frameId(c.n)))make(c.n,seedFor(c),null);});}
-window.addEventListener('storage',function(e){if(!e||e.key!==CK||mobile())return;var r=read();if(!r.migrated)reconcile(r.cols);});
-// the columns this browser had open come back, each on a member of its own (the phone restores nothing: the
-// arrangement stays in the store for the desktop); a v1 store is written back in the new shape, once
-try{if(!mobile()){var r0=read();cols=r0.cols;cols.forEach(function(c){make(c.n,seedFor(c),null);});if(r0.migrated)save();}}catch(e){}
+applyLayout(r.grid?'grid':'row',r.grid);
+cols.forEach(function(c){if(!document.getElementById(frameId(c.n)))make(c.n,seedFor(c),null);});
+topUp();placeTiles();}
+window.addEventListener('storage',function(e){if(!e||e.key!==CK||mobile())return;var r=read();if(!r.migrated)reconcile(r);});
+// the columns this browser had open come back, each on a member of its own, in the layout it had (the phone restores
+// nothing: the arrangement stays in the store for the desktop); a v1 store is written back in the new shape, once
+try{if(!mobile()){var r0=read();cols=r0.cols;if(r0.grid){layout='grid';grid=r0.grid;mountGrid();}cols.forEach(function(c){make(c.n,seedFor(c),null);});topUp();placeTiles();if(r0.migrated)save();}}catch(e){}
 })();
 """
 
@@ -56717,6 +56828,21 @@ def _landing():
             "text-align:center;cursor:pointer;user-select:none;opacity:0;transition:opacity .12s,color .1s,background .1s}"
             ".chat-col:hover>.col-x,.chat-col.pane-focused>.col-x{opacity:1}"
             ".chat-col>.col-x:hover{color:#fff;background:rgba(255,255,255,0.12)}"
+            # TILES (the user 2026-09-13): #chat-pane wears .chat-grid and lays the first frame and every later column's pane out as
+            # a rows×cols grid in its own slot (the row's flex and --g-chat untouched: the gutters see one chat pane), a 1 px seam
+            # in the gutters' line colour between cells and no gutter. The first frame is a grid item (never moved: a moved iframe
+            # reloads) at cell 1; #chat-pane-1 is an overlay placed on that same cell, standing for the first tile — the focus
+            # ring and a drop zone land on it, the pointer goes through it to the frame. Later tiles take explicit cells
+            # (_LANDING_SPLIT_JS placeTiles), so a first frame the picker lifts out shifts nothing; the lifted grid stays a grid.
+            # A tile's cross is gone: a tile is emptied from its header's menu, never closed (the grid keeps its shape).
+            "#chat-pane.chat-grid{display:grid;grid-template-columns:repeat(var(--tile-cols,2),1fr);grid-template-rows:repeat(var(--tile-rows,2),1fr);"
+            "grid-auto-rows:1fr;gap:1px;background:#333}"
+            "#chat-pane.chat-grid>#f-chat{position:static;width:100%;height:100%;min-width:0;min-height:0;grid-area:1 / 1}"
+            "#chat-pane.chat-grid>.chat-col{min-width:0;min-height:0}"
+            "#chat-pane.chat-grid>.tile-ring{position:absolute;inset:0;grid-area:1 / 1 / 2 / 2;pointer-events:none}"   # both ends named: an absolutely positioned grid item's auto end line is the container's padding edge, so 1 / 1 alone spanned the whole grid
+            "#chat-pane.chat-grid>.tile-ring>.col-drop{pointer-events:auto}"
+            "#chat-pane.chat-grid .col-x{display:none}"
+            "body.picker-open #chat-pane.chat-grid.lifted{display:grid!important}"
             ".row>.gv{flex:0 0 7px}"
             # gv-a sits chat|outline (only when both shown); gv-b sits (outline|chat)|feed, so it is the chat|feed gutter when
             # the outline is off; gv-c sits (feed|outline|chat)|files, hidden when files is off or no column is shown to its left.
@@ -56806,6 +56932,7 @@ def _landing():
             # access the outline view in the mobile UI — it was desktop-only before)
             "#chat-pane,#fleet-pane,#feed-pane,#files-pane,#tl-pane{display:contents!important}"
             ".chat-col,.gv-chat{display:none!important}"   # one pane at a time here: split columns never show (nor are made, see _LANDING_SPLIT_JS)
+            "#chat-pane.chat-grid{display:contents!important;gap:0}"   # a grid up when the window narrows: the one chat fills the screen as ever (its tiles hide with .chat-col)
             # reset the desktop iframe absolute-fill (the bare `iframe` reset below re-flows them as tab panes)
             ".pane>iframe{position:static;inset:auto;width:100%;height:100%}"
             "iframe{position:static;display:none;width:100%;height:100%;border:0}"
@@ -56958,6 +57085,7 @@ def _landing():
             "body.theme-light .rail-act.on{color:var(--accent)}"
             "body.theme-light .chat-col>.col-x{background:rgba(255,255,255,0.85);color:#5D574E}"
             "body.theme-light .chat-col>.col-x:hover{color:#1F1E1D;background:rgba(0,0,0,0.06)}"
+            "body.theme-light #chat-pane.chat-grid{background:rgba(0,0,0,0.14)}"   # the tiles' seam in the light gutters' line colour (.gv's twin below)
             # the tab drag's wash in the light accent (styles.css's light --accent-wash); the ring follows --accent by itself. The
             # refused rectangle restated at the winning specificity: body.theme-light #col-ghost (1,1,1) would outrank
             # #col-ghost.refused (1,1,0) and wash it
@@ -59961,7 +60089,7 @@ class Handler(BaseHTTPRequestHandler):
             _pusher_wake.set()                 # …and that push starts when the in-flight cycle ends, not
             #                                     after the 0.5 s backstop (the tab switch IS the event)
             if client.get("app") == "chat":
-                _relay_active_chat(client, msg.get("id"))   # …and the window's feed learns which session is focused (T347)
+                _relay_active_chat(client, msg.get("id"), msg.get("focused"))   # …and the window's feed learns which session is focused (T347); `focused` says whether a gesture said so (tiles, 2026-09-13)
             return
         if msg and msg.get("type") == "needSlot" and msg.get("slot") in _DELTA_SLOTS:
             # The shim could not apply a view delta (its base revision did not match what it holds — a

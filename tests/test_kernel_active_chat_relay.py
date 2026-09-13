@@ -112,6 +112,32 @@ class ActiveChatRelay(unittest.TestCase):
         _dispatch({"type": "activeTab", "id": ""}, chat)            # an empty id is no tab, and no new value
         self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB, None, API, None])
 
+    def test_03b_an_unfocused_report_seeds_an_empty_focus_and_never_displaces_a_named_one(self):
+        """Tiles (the user 2026-09-13): four to six chat columns each re-render on their own pushes and each reports
+        activeTab; the LAST report used to stand, so the feed followed whichever tile repainted last. The client now says
+        whether a gesture made the report (`focused`): an unfocused one — a boot, a restore, a re-render — may fill an
+        empty focus (a reload's first paint, as before) but never displaces a session the feed follows; a focused one
+        always stands; a report without the field (an older client) relays as it always did."""
+        chat = self._client("chat", "W1")
+        tile = self._client("chat", "W1")
+        feed = self._client("feed", "W1")
+        _dispatch({"type": "activeTab", "id": WEB, "focused": False}, chat)   # a boot: nothing recorded yet → seeds
+        self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB], "an unfocused report seeds an empty focus")
+        _dispatch({"type": "activeTab", "id": API, "focused": False}, tile)   # another tile's restore → skipped
+        self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB], "…and never displaces a session the feed follows")
+        self.assertEqual(km._ACTIVE_CHAT_BY_WID, {"W1": WEB})
+        self.assertEqual(tile["active"], API, "the arm's own work is untouched: the tile's build priority is recorded")
+        _dispatch({"type": "activeTab", "id": API, "focused": True}, tile)    # the user clicked into that tile → stands
+        self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB, API], "a focused report always stands")
+        _dispatch({"type": "activeTab", "id": WEB}, chat)                     # an older client, no field → relays as today
+        self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB, API, WEB])
+        _dispatch({"type": "activeTab", "id": None, "focused": False}, tile)  # a re-render with no tab never blanks a followed session
+        self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB, API, WEB])
+        _dispatch({"type": "activeTab", "id": None, "focused": True}, chat)   # …but the user's own column losing its tab does
+        self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB, API, WEB, None])
+        _dispatch({"type": "activeTab", "id": API, "focused": False}, tile)   # None recorded: an unfocused report seeds again
+        self.assertEqual([f["id"] for f in self._relayed(feed)], [WEB, API, WEB, None, API])
+
     def test_04_a_feed_that_says_ready_learns_the_current_focus_once(self):
         chat = self._client("chat", "W1")
         _dispatch({"type": "activeTab", "id": WEB}, chat)           # recorded with no feed connected yet
@@ -212,7 +238,7 @@ class Wiring(unittest.TestCase):
         src = inspect.getsource(km.Handler._dispatch_ws)
         i = src.index('msg.get("type") == "activeTab"')
         body = src[i:src.index('msg.get("type") == "needSlot"', i)]
-        self.assertIn('_relay_active_chat(client, msg.get("id"))', body)
+        self.assertIn('_relay_active_chat(client, msg.get("id"), msg.get("focused"))', body, "the gesture flag rides along (tiles, 2026-09-13)")
         self.assertLess(body.index("_pusher_wake.set()"), body.index("_relay_active_chat("),
                         "release, wake, THEN relay: the older pins on the arm's first 400 chars hold")
 

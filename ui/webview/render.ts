@@ -49,7 +49,7 @@ import { planStrip, readTabGroups, writeTabGroups, setSectionCollapsed, sectionR
          followAdoption, reorderTagOrder, homeSectionOf, neighborOfFolded, TABGROUPS_KEY, TABGROUPS_EVENT, type TabSection, type StripItem } from "./tab-groups";
 import { snapshotModel, snapshotHeading, rowWords, type SnapModel, type SnapRow } from "./tab-snapshot";
 import { rowStillOpen, installSnapshotEscape, reconcileRows } from "./tab-snapshot-view";
-import { tabStateClass, sectionPip, sectionPipMembers, sectionPipTitle } from "./tab-state";
+import { tabStateClass, tabDotClass, tabDotTitle, sectionPip, sectionPipMembers, sectionPipTitle } from "./tab-state";
 import { composeTabWidgets, tabHotkey } from "./tab-widgets";   // the tab-title widgets (T379): the dot, the context bar and the hot-key keycap compose onto every tab from the registry
 import { titleWithKey, chordOf, effectiveChord, loadOverrides } from "./keybindings";
 import { DEFAULT_CHORDS } from "./commands";
@@ -61,7 +61,7 @@ import { rescindedComposerState } from "./queued-rescind";   // a queued message
 import { reloadHoldReason } from "./reload-hold";
 import { liveNotices, keepReloadNotices, takeReloadNotices } from "./reload-notices";
 import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional, focusResolvesProvisional } from "./provisional";
-import { colFromSearch, columnHolds, type ColSets } from "./chat-columns";   // the chat split's partition (2026-09-11): which column this page is, which sessions it holds
+import { colFromSearch, columnHolds, parseChatLayout, tileHeaderShown, type ColSets, type ChatLayout } from "./chat-columns";   // the chat split's partition (2026-09-11): which column this page is, which sessions it holds; the layout and the tile header rule (tiles, 2026-09-13)
 import { onlyTag, matchesOnly, onlyWindow } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
 import { parseAgentNotif, notifHead, type AgentNotif } from "./agent-notif";
@@ -1008,6 +1008,17 @@ function readColSets(): ColSets | null {
   } catch { return null; }   // cross-origin parent (VS Code): no shell
 }
 function heldHere(id: string): boolean { return isSubId(id) || isProvisionalId(id) || columnHolds(colSets, COL, id); }
+// THE LAYOUT (tiles, the user 2026-09-13): the shell's __rompChatLayout() beside the sets, read ONCE per renderTabs into
+// chatLayout — {layout: "row" | "grid", rows, cols}; the shell posts {romp: "layout"} into every column when it changes and
+// the page re-renders its chrome from the answer (no reload). null: no shell, or an older one — the row, as ever.
+let chatLayout: ChatLayout | null = null;
+function readChatLayout(): ChatLayout | null {
+  try {
+    if (!window.parent || window.parent === window) return null;
+    const f = (window.parent as any).__rompChatLayout;
+    return typeof f === "function" ? parseChatLayout(f()) : null;
+  } catch { return null; }   // cross-origin parent (VS Code): no shell
+}
 function tabInView(id: string): boolean { return (id === peekId || chatVisible(id)) && heldHere(id); }
 // TAB SECTIONS (tab-groups.ts): the ids the last render folded away under a collapsed section
 // header. Keyboard cycling walks the VISIBLE order, and a folded tab is not visible. The active tab's
@@ -6439,9 +6450,14 @@ function syncNoSessionsPlaceholder(visibleCount: number, totalCount = 0, heldCou
     existing?.remove();               // a session arrived → the real view takes over
     return;
   }
-  // sessions exist but every one is in another column (the chat split: this column holds none of them), or the
-  // active view hides them all — say THAT, not "no sessions yet"
-  const txt = totalCount > 0 && heldCount === 0
+  // sessions exist but every one is in another column (the chat split: this column holds none of them) — in a grid,
+  // an EMPTY TILE (tiles, 2026-09-13), which also offers the pick below — or the active view hides them all — say THAT,
+  // not "no sessions yet"
+  const tile = tileEmpty(totalCount, heldCount);
+  syncTilePick(content, tile);
+  const txt = tile
+    ? "An empty tile. Drag a tab here, or pick a session to show:"
+    : totalCount > 0 && heldCount === 0
     ? "Every session is in another column. Drag a tab here, or start one with the + above."
     : totalCount > 0
       ? "Every session is hidden from this view. Reveal one from the + picker, or switch views on the timeline's Show menu."
@@ -6451,6 +6467,87 @@ function syncNoSessionsPlaceholder(visibleCount: number, totalCount = 0, heldCou
   ph.id = "no-sessions";
   ph.textContent = txt;
   content.appendChild(ph);
+}
+/** An empty TILE: a grid is up, sessions are listed, and this column holds none of them. */
+function tileEmpty(totalCount: number, heldCount: number): boolean {
+  return !!chatLayout && chatLayout.layout === "grid" && totalCount > 0 && heldCount === 0;
+}
+// THE EMPTY TILE'S PICK (tiles, the user 2026-09-13): the + above opens the create/open flow, which hides the sessions
+// already open as tabs — every session another tile shows — so an empty tile carries its own "Pick a session…", the
+// picker in pick mode whose pick comes into THIS tile (the shell's swap: __rompSwapTile). A sibling of the placeholder,
+// built once and kept while the tile stands empty (the click is on a node no render rebuilds), gone the moment a
+// session is shown here.
+function syncTilePick(content: HTMLElement, on: boolean): void {
+  const have = document.getElementById("tile-pick");
+  if (!on) { have?.remove(); return; }
+  if (have) return;
+  const b = el("button", "tx-empty-pick") as HTMLButtonElement;
+  b.id = "tile-pick"; b.type = "button"; b.textContent = "Pick a session…";
+  b.addEventListener("click", () => pickSessionLocally("Show a session in this tile", swapIntoThisTile));
+  content.appendChild(b);
+}
+/** The tile's swap through the shell's one mutation: the picked session comes into this tile (its column number, 1 for
+ *  the first), and whatever this tile showed goes back to the first tile (__rompSwapTile, kernel.py _LANDING_SPLIT_JS). */
+function swapIntoThisTile(sid: string | null): void {
+  if (!sid) return;
+  try { const w = window.parent && window.parent !== window ? (window.parent as any) : null; if (w?.__rompSwapTile) w.__rompSwapTile(sid, COL || "1"); } catch (e) { /* no shell */ }
+}
+// THE TILE HEADER (tiles, the user 2026-09-13): in a grid, a column showing exactly ONE session wears a one-line header in
+// the tab strip's place — the session's state dot by the strip's own rule (tabDotClass, and the tab's state class for the
+// dashed ring an awaiting or blocked tab wears), its name with a remote session's "host:" prefix as quiet metadata (as
+// the tab draws it), in its identity colour, and a ⋯ opening a menu in the house vocabulary: Swap session… (the picker;
+// the pick comes into THIS tile and the tile's session goes back to the first), Back to tabs, and, off the first tile,
+// Close tile (the session returns to the first tile and this tile stands empty — the grid keeps its shape). With no
+// session or two or more the strip shows as ever: the first tile is the overflow, so nothing is a dead end. The rule is
+// chat-columns.ts tileHeaderShown; the header is built once and repainted every render (stripAftermath), and the ⋯
+// acts through a delegate on the header itself (click-safe across repaints).
+function tileStatusOf(id: string): Partial<Status> | undefined {
+  const s = sessions.get(id);
+  if (renderKind(skeletonTabs, id, !!s) === "skeleton") return skeletonTabs.status.get(id) as Status | undefined;   // a skeleton draws from the kernel's status frames, never a stale session
+  return s?.status ?? (skeletonTabs.status.get(id) as Status | undefined);
+}
+function syncTileHead(visibleIds: readonly string[]): void {
+  const on = tileHeaderShown(chatLayout, visibleIds.length);
+  document.body.classList.toggle("tile-head", on);   // the strip and its grip hide under it (styles.css)
+  let head = document.getElementById("tile-head");
+  if (!on) { if (head) head.style.display = "none"; return; }
+  if (!head) {
+    head = el("div", "tile-head"); head.id = "tile-head";
+    const dot = el("span", "tab-dot none"); dot.id = "tile-dot";
+    const name = el("span", "tile-name"); name.id = "tile-name";
+    const more = el("button", "tile-more") as HTMLButtonElement;
+    more.type = "button"; more.textContent = "\u22EF"; more.dataset.act = "tile-menu";
+    more.title = "This tile: swap the session, back to tabs"; more.setAttribute("aria-label", "Tile menu"); more.setAttribute("aria-haspopup", "menu");
+    head.appendChild(dot); head.appendChild(name); head.appendChild(more);
+    const bar = document.getElementById("tabbar");
+    if (bar && bar.parentElement) bar.parentElement.insertBefore(head, bar); else document.body.prepend(head);
+    delegate(head, { "tile-menu": (btn) => openTileMenu(btn) });
+  }
+  head.style.display = "";
+  const id = visibleIds[0];
+  head.dataset.id = id;
+  const st = tileStatusOf(id);
+  const dot = document.getElementById("tile-dot");
+  if (dot) { dot.className = tabDotClass(st?.state) || "tab-dot none"; dot.title = tabDotTitle(st?.state) || ""; }
+  head.className = "tile-head" + (st ? " " + tabStateClass(st) : "");   // the tab's own state class: the dashed ring of an awaiting or blocked tab
+  const name = document.getElementById("tile-name");
+  if (name) {
+    name.replaceChildren(...hostNameNodes(tabName(id) || "", id));
+    const color = sessions.get(id)?.color?.bg ?? tabMeta.get(id)?.color?.bg;
+    name.style.color = color || "";
+    const off = hostIsDown(id);
+    name.classList.toggle("host-off", off);
+    name.title = off ? hostDownNote(id) : "";
+  }
+}
+function openTileMenu(anchor: HTMLElement): void {
+  const shell = (): any => { try { return window.parent && window.parent !== window ? (window.parent as any) : null; } catch { return null; } };
+  openRowsMenu(anchor, () => [
+    { label: "Swap session\u2026", title: "Pick a session to show in this tile; the one here goes back to the first tile",
+      press: () => { pickSessionLocally("Swap in a session", swapIntoThisTile); } },
+    { label: "Back to tabs", title: "One chat, every session behind its tab", press: () => { const w = shell(); if (w?.__rompChatTilesOff) w.__rompChatTilesOff(); } },
+    ...(COL ? [{ label: "Close tile", title: "Its session goes back to the first tile; this tile stands empty", press: () => { const w = shell(); if (w?.__rompCloseSplit) w.__rompCloseSplit(Number(COL)); } }] : []),
+  ]);
 }
 
 // A hairline under EVERY row of tabs (T134, the user 2026-08-27, overturning the survey's
@@ -6518,6 +6615,7 @@ function renderTabs() {
   const bar = document.getElementById("tabs");
   if (!bar) return;
   colSets = readColSets();   // the partition (the chat split): which sessions each column holds, read ONCE per render — tabInView, the plan and the signature all read this snapshot
+  chatLayout = readChatLayout();   // …and the layout (tiles): whether this column wears a tile header in the strip's place (stripAftermath → syncTileHead)
   // TABS-FIRST (the user 2026-06-26): render the WHOLE strip up front, in `order` — the kernel's order
   // verbatim (applyTabOrder), plus any just-arrived tab not yet pushed. An id whose session hasn't landed yet
   // draws as a placeholder (name+color, non-interactive) that fills in when build_session arrives — so tabs
@@ -6882,6 +6980,7 @@ function renderTabs() {
  *  whose strips are equal. */
 function stripAftermath(visibleIds: readonly string[], ids: readonly string[]): void {
   syncNoSessionsPlaceholder(visibleIds.length, ids.length, ids.filter(heldHere).length);   // …and how many this column holds (the chat split's copy)
+  syncTileHead(visibleIds);   // a tile showing one session wears its header in the strip's place (tiles, 2026-09-13); repainted every render, so a state or name change reaches it without a strip rebuild
   // the section view follows the push (renderTabs runs on every one): a no-op when nothing a row shows has
   // changed (snapshotModel's same-object return). The section GONE from the plan (its tag deleted or
   // renamed, its last member hidden or moved out, sectioning turned off) is the event that ends the view:
@@ -7685,7 +7784,8 @@ function startTabRename(id: string, copy?: string) {   // `copy`: which copy of 
 
 // Keyboard nav on a focused tab: ←/→ step prev/next; ↑/↓ jump to the nearest tab
 // in the row above/below (tabs wrap via flex-wrap).
-function onTabKey(e: KeyboardEvent) {
+function onTabKey(e: KeyboardEvent) { withGesture(() => tabKey(e)); }   // a keyboard pick is the user's own act in this column: the feed follows it (tiles, 2026-09-13)
+function tabKey(e: KeyboardEvent) {
   if (!order.length) return;
   if (!activeId) {   // from the unfocused pane an arrow lands on the first visible tab (T357)
     if ((e.key === "ArrowRight" || e.key === "ArrowLeft" || e.key === "ArrowUp" || e.key === "ArrowDown") && pickFirstVisibleTab()) { e.preventDefault(); focusActiveTab(); }
@@ -7780,11 +7880,11 @@ window.addEventListener("keydown", (e) => {
       // so the step starts from the header's place on the strip (onTabKey's and cycleTab's rule). A
       // view-hidden active id is not on the strip at all: nothing to step from, as before.
       const nb = collapsedTabIds.has(activeId) ? neighborOfFolded(lastStripItems, activeId, dir) : null;
-      if (nb) { e.preventDefault(); setActive(nb); }
+      if (nb) { e.preventDefault(); withGesture(() => setActive(nb)); }
       return;
     }
     e.preventDefault();
-    setActive(ord[(i + dir + ord.length) % ord.length]);
+    withGesture(() => setActive(ord[(i + dir + ord.length) % ord.length]));   // the user's own step: the feed follows this column (tiles)
   } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
     const content = document.getElementById("content");
     if (!content) return;
@@ -7945,6 +8045,16 @@ function tabInAdjacentRow(id: string, dir: number): string | null {
 // pickSession) instead of opening a tab. pickAllowNew adds a "New session…" row.
 let pickMode = false;
 let pickAllowNew = false;
+// A PICK FOR THIS PAGE (tiles, 2026-09-13): the picker in pick mode whose result lands in a callback here instead of the
+// kernel's pickResult — the tile header's Swap session… and the empty tile's Pick a session…. null: dismissed. The kernel's
+// own picks (pickSession) are untouched: with no handler armed the result rides pickResult as it always did.
+let pickHandler: ((id: string | null) => void) | null = null;
+function pickSessionLocally(prompt: string, cb: (id: string | null) => void): void { pickHandler = cb; openPicker(true, prompt); }
+function settlePick(id: string | null, name?: string): void {
+  const h = pickHandler; pickHandler = null;
+  if (h) { h(id); return; }
+  if (vscodeApi) vscodeApi.postMessage(id ? { type: "pickResult", id, name } : { type: "pickResult", id: null });
+}
 
 // The session you just created gets its TAB AND COMPOSER IMMEDIATELY, and starts behind them (the user
 // 2026-07-30). This replaced an "Opening session…" modal that covered the pane while the kernel resolved
@@ -8257,7 +8367,10 @@ function liftPaneRect(): DOMRect | null {
     // THIS column's pane (split screen, the user 2026-09-08): a later column that measured #chat-pane pinned its
     // transcript at the FIRST column's rect — the 2026-08-08/09 black-hole family in a new form. frameElement is
     // the iframe the shell wrapped in a .pane; the id lookup stays as the fallback it always was.
-    const own = window.frameElement ? (window.frameElement as HTMLElement).parentElement : null;
+    const fid = window.frameElement ? (window.frameElement as HTMLElement).id : "";
+    const named = fid ? (window.parent as any)?.__rompChatPaneOf?.(fid) : null;   // the shell's name for this frame's pane: in a grid the first frame is an item of the whole grid, and its TILE is the overlay the shell names (tiles, 2026-09-13)
+    const tile = typeof named === "string" ? window.parent?.document?.getElementById(named) : null;
+    const own = tile || (window.frameElement ? (window.frameElement as HTMLElement).parentElement : null);
     const p = own || window.parent?.document?.getElementById("chat-pane");
     return p ? p.getBoundingClientRect() : null;
   } catch (e) { return null; }   // cross-origin parent (VS Code) — no shell pane to measure
@@ -10880,7 +10993,7 @@ function closePicker() {
   signalPickerOverlay(false);   // release the full-window lift — the chat iframe returns to its pane
   syncComposerPh();             // …and the box re-reads its ring against the page it is back on (T345)
   if (pickMode) {
-    if (vscodeApi) vscodeApi.postMessage({ type: "pickResult", id: null });
+    settlePick(null);
     pickMode = false;
   }
 }
@@ -11021,7 +11134,7 @@ function renderPicker(items: any[]) {
     }
     row.addEventListener("click", () => {
       if (pickMode) {
-        if (vscodeApi) vscodeApi.postMessage({ type: "pickResult", id: it.id, name: it.name });
+        settlePick(it.id, it.name);
         pickMode = false; // so closePicker doesn't also post a cancel
       } else if (it.hiddenTab) {
         revealSession(it.id);   // its tab already exists — switch to a view that shows it (revealIn, post-retirement)
@@ -12336,8 +12449,15 @@ function turnWorkedSecs(events: ChatEvent[], i: number, working: boolean): numbe
 // the cached DOM is just revealed.
 // Tell the extension which tab is active, so it can publish it to the romp
 // timeline (which outlines the open lane). activeId may be null (no session).
+// …with `focused` (tiles, the user 2026-09-13): true when the report follows the user's own act in THIS column — a tab
+// click, the keyboard, the composer taking focus, the shell's pane focus — false on a boot, a restore or a re-render, so
+// the kernel lets the feed follow the tile the user is IN rather than whichever of four to six tiles repainted last
+// (_relay_active_chat: an unfocused report seeds an empty focus and never displaces one). Set for the synchronous
+// length of the gesture's own path (withGesture), never left on.
+let gestureActive = false;
+function withGesture(fn: () => void): void { const was = gestureActive; gestureActive = true; try { fn(); } finally { gestureActive = was; } }
 function notifyActive() {
-  if (vscodeApi) vscodeApi.postMessage({ type: "activeTab", id: activeId });
+  if (vscodeApi) vscodeApi.postMessage({ type: "activeTab", id: activeId, focused: gestureActive });
 }
 
 // Move id to the front of the recency stack (most-recently-active).
@@ -18047,6 +18167,10 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
   }
   // the shell's palette / shell-focus chords: the chat owns the nav trail, the shell just asks
   if (m.romp === "chatNav") { navHist.go(m.dir === 1 ? 1 : -1); return; }
+  // the shell's Alt+Arrow landed the keyboard here: the user is in THIS column now, and the feed follows it (tiles, 2026-09-13)
+  if (m.romp === "paneFocus") { withGesture(notifyActive); return; }
+  // the shell changed the chat area's layout (tiles ↔ tabs, or the grid's shape): the chrome re-renders from the shell's answer, no reload
+  if (m.romp === "layout") { renderTabs(); return; }
   // a moved tab's drafts (the chat split): the shell took them from the source page (__rompTakeSessionState) and
   // hands them to this page, the session's column now — into the maps, persisted, and into the box when it is active
   if (m.romp === "adopt") { adoptSessionState(m.sid, m.state); return; }
@@ -19211,6 +19335,7 @@ function setupComposer() {
   // is the user's own act (a click, Tab, Enter over a selection, Quote, a citation seed, a slash pick, an edit
   // recall). Retiring on pointerdown alone left the note over a box they were typing in by any other route.
   ta.addEventListener("focus", () => { if (composerNoteSid) clearComposerNote(); });
+  ta.addEventListener("focus", () => withGesture(notifyActive));   // the box taking focus is the user's act in THIS column: the feed follows it (tiles, 2026-09-13)
   ta.addEventListener("blur", () => window.setTimeout(closeSlash, 120));   // close when leaving (a row's mousedown keeps focus, so it fires only on a real leave)
   window.addEventListener("resize", positionSlash);
 
@@ -20143,7 +20268,7 @@ setupSettings();
     // Clicking a tab leaves focus ON the tab (renderTabs rebuilds the tab during setActive, which dropped
     // focus to the body — so Enter afterward did nothing). Now focus the (rebuilt) active tab, so the model
     // is consistent: tab focused → Enter drops into the message box; Escape there returns to the tabs.
-    select: (el) => { const id = el.dataset.id; if (id) { setActive(id); focusActiveTab(); } },
+    select: (el) => { const id = el.dataset.id; if (id) withGesture(() => { setActive(id); focusActiveTab(); }); },   // the user's own pick: the feed follows this column (tiles)
     // a section header (tab groups): fold or open that group — the new state is the opposite of the
     // one the header RENDERED (data-folded), never a toggle of the stored bit (a header can render a
     // state the store does not hold). The write notifies (TABGROUPS_EVENT) and the listener re-renders:

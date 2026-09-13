@@ -62,7 +62,7 @@ test("every input the strip renders is in the signature", () => {
   const chip = RENDER.slice(RENDER.indexOf("function applyTabStatus("), RENDER.indexOf("function wireTabDrag("));
   assert.match(fn, /const st = applyTabStatus\(tab, s\);/);
   assert.match(chip, /const stateCls = tabStateClass\(s\.status\);\s*\n\s*if \(stateCls\) tab\.classList\.add\(stateCls\);/);
-  assert.match(RENDER, /^import \{ tabStateClass, sectionPip, sectionPipMembers, sectionPipTitle \} from "\.\/tab-state";/m);   // the dot rule moved into the dot widget (T379)
+  assert.match(RENDER, /^import \{ tabStateClass, tabDotClass, tabDotTitle, sectionPip, sectionPipMembers, sectionPipTitle \} from "\.\/tab-state";/m);   // the dot rule moved into the dot widget (T379)
   assert.match(RENDER, /^import \{ composeTabWidgets, tabHotkey \} from "\.\/tab-widgets";/m, "the widgets the strip composes, and the hot-key chord the signature reads");   // + tabDotClass: the dot slot every tab carries derives from st.state, already in the signature (the tab-strip fix, 2026-09-08); + tabDotTitle: the slot's hover title, from the same state
 });
 
@@ -87,7 +87,7 @@ test("the column partition (the chat split, 2026-09-11): the sets are read once 
   assert.match(RENDER, /function heldHere\(id: string\): boolean \{ return isSubId\(id\) \|\| isProvisionalId\(id\) \|\| columnHolds\(colSets, COL, id\); \}/,
     "a sub-agent viewer and a provisional tab are the page's own; every other id is the shell's sets' to place");
   assert.match(RENDER, /function tabInView\(id: string\): boolean \{ return \(id === peekId \|\| chatVisible\(id\)\) && heldHere\(id\); \}/);
-  assert.match(RENDER, /^import \{ colFromSearch, columnHolds, type ColSets \} from "\.\/chat-columns";/m);
+  assert.match(RENDER, /^import \{ colFromSearch, columnHolds, parseChatLayout, tileHeaderShown, type ColSets, type ChatLayout \} from "\.\/chat-columns";/m);
   assert.match(RENDER, /^const COL = colFromSearch\(location\.search\);/m);
   // the skip line and the signature list are unchanged: the partition reaches the signature through ids and visibleIds
   assert.match(fn, /if \(stripSig === tabStripSig && !\(mslotEl && !mslotEl\.firstChild\)\) \{ stripAftermath\(visibleIds, ids\); return; \}/);
