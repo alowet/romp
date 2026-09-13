@@ -20306,7 +20306,7 @@ setupSettings();
     // Clicking a tab leaves focus ON the tab (renderTabs rebuilds the tab during setActive, which dropped
     // focus to the body — so Enter afterward did nothing). Now focus the (rebuilt) active tab, so the model
     // is consistent: tab focused → Enter drops into the message box; Escape there returns to the tabs.
-    select: (el) => { const id = el.dataset.id; if (id) { setActive(id); focusActiveTab(); } },
+    select: (el) => { const id = el.dataset.id; if (id) { const wasOn = activeId === id; setActive(id); if (wasOn) notifyActive(true); focusActiveTab(); } },   // a click on the tab already shown is still the user's pick of THIS column (the feed follows it): re-announced, since setActive's fast path posts nothing and the tab, not the composer, takes focus (review round two, 2026-09-13)
     // a section header (tab groups): fold or open that group — the new state is the opposite of the
     // one the header RENDERED (data-folded), never a toggle of the stored bit (a header can render a
     // state the store does not hold). The write notifies (TABGROUPS_EVENT) and the listener re-renders:

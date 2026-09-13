@@ -290,7 +290,7 @@ class SplitSourcePins(unittest.TestCase):
                        "var se2=entry(from);if(se2&&se2.ids.length===1&&busy(src))return notify(BUSY);",
                        "if(!keep&&busy(f)){notify(BUSY);return false;}"]:
             self.assertIn(needle, split, needle)
-        mt = split[split.index("function moveTab(sid,to){"):split.index("function close(n,keep){")]
+        mt = split[split.index("function moveTab(sid,to){"):split.index("function close(n,keep,auto){")]
         self.assertLess(mt.index("var why=refusal(src,sid);"), mt.index("if(to==='new'){"), "refused before anything is taken or grown (the reason read first, T395)")
         self.assertLess(mt.index("busy(src)"), mt.index("var st=take(src,sid)"), "refused before the hand-off")
         # a column closed for emptiness tells the first column which of its gone ids the page's own cross removed, ahead of
@@ -299,12 +299,12 @@ class SplitSourcePins(unittest.TestCase):
         self.assertIn("home.contentWindow.postMessage({romp:'closing',ids:crossed},'*');", split)
         self.assertNotIn("{romp:'closing',ids:gone}", split)
         ce = split[split.index("if(m.romp==='colEmpty'"):split.index("if(m.romp==='orphanState'")]
-        self.assertLess(ce.index("{romp:'closing'"), ce.index("close(en.n)"))
+        self.assertLess(ce.index("{romp:'closing'"), ce.index("close(en.n,false,true)"), "…and that close is AUTOMATIC (auto): it publishes through autoSave, never this window's layout over a deferred write (round two)")
         # …and orphaned state offered by a page is handed to the owner's page when that page can hear it
         self.assertIn("if(m.romp==='orphanState'&&Array.isArray(m.sids)){", split)
         self.assertIn("if(t&&t!==sf&&loaded(t))adopt(t,sid,take(sf,sid));", split)
         # a closing column's width goes to the column on its left before its key is dropped (the halving's twin)
-        cl = split[split.index("function close(n,keep){"):split.index("function closeFocused(){")]
+        cl = split[split.index("function close(n,keep,auto){"):split.index("function closeFocused(){")]
         self.assertIn("if(window.__rompSplitShrink)window.__rompSplitShrink(left||'chat-pane',paneId(n));", cl, "in unmount(), the pane's teardown close() and a layout switch share (tiles, 2026-09-13); a tile hands back nothing (never registered)")
         self.assertIn("if(layout!=='grid'){if(window.__rompSplitShrink)", cl)
         self.assertLess(cl.index("__rompSplitShrink(left||'chat-pane',paneId(n))"), cl.index("__rompUnregisterPane(paneId(n))"))
@@ -1381,10 +1381,34 @@ msg({ romp: 'colBusy', busy: false }, 'f-chat-3');
 out.deferred.otherClear = { ids: ids(), layout: shellLayout() };
 msg({ romp: 'colBusy', busy: false });
 out.deferred.stranger = { ids: ids(), layout: shellLayout() };
+// …the AUTOMATIC writers while it waits (review round two): a member of tile 3 ends (colEmpty) — the tile stands empty here,
+// and the store is left as the other window wrote it; then tile 6's create LANDS and the page claims the real session for its
+// tile — this window's sets show it at once, the store is still the other window's (the first cut's save() here wrote this
+// window's 2×3 back over the row, and the busy clear then read that back and applied nothing)
+msg({ romp: 'colEmpty', gone: [S(3)] }, 'f-chat-3');
+out.deferred.colEmpty = { storedRaw: STORE['romp-chat-cols'], sets: window.__rompChatSets(), ids: ids(), saves: saves() };
+const claimed = window.__rompClaimSession(S(7), 6);
+out.deferred.claim = { r: claimed, storedRaw: STORE['romp-chat-cols'], sets: window.__rompChatSets(), saves: saves(), target: tgt(S(7)) };
+TAKE['f-chat-6'] = { [S(7)]: { draft: 'typed into the new session', citations: [], files: [], staged: [] } };
+CALLS.posted = []; CALLS.taken = [];
 BUSY['f-chat-6'] = false; msg({ romp: 'colBusy', busy: false }, 'f-chat-6');
-out.deferred.applied = { layout: shellLayout(), ids: ids(), sets: window.__rompChatSets(), saves: saves(), notify: CALLS.notify.slice(), grid: gridStyle(), order: order(), colGone: CALLS.colGone.slice() };
+out.deferred.applied = { layout: shellLayout(), ids: ids(), sets: window.__rompChatSets(), saves: saves(), notify: CALLS.notify.slice(), grid: gridStyle(), order: order(), colGone: CALLS.colGone.slice(),
+                        storedRaw: STORE['romp-chat-cols'], adopts: CALLS.posted.filter((p) => p.m && p.m.romp === 'adopt').map((p) => [p.id, p.m.sid, p.m.state.draft]), taken: CALLS.taken.filter((t) => t[2]), target7: tgt(S(7)) };
 msg({ romp: 'colBusy', busy: false }, 'f-chat-2');
 out.deferred.idle = { ids: ids(), layout: shellLayout() };
+// O) the claimed column SURVIVES the other window's arrangement: the claim is folded into it and published once, with THAT
+//    layout — both windows list the new session in its column; the column is re-made knowing its member
+boot({}, false);
+BYID['f-chat']._tabs = six.slice(); BYID['f-chat']._active = S(1);
+window.__rompChatTiles('2x3');
+BUSY['f-chat-6'] = true; CALLS.sets = []; CALLS.notify = [];
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [{ n: 2, ids: [S(2)] }, { n: 6, ids: [S(6)] }] });   // the other window: back to tabs but for columns 2 and 6
+window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
+out.folded = { deferredIds: ids(), claim: window.__rompClaimSession(S(7), 6), storedAfterClaim: STORE['romp-chat-cols'], setsAfterClaim: window.__rompChatSets() };
+BUSY['f-chat-6'] = false; CALLS.posted = []; msg({ romp: 'colBusy', busy: false }, 'f-chat-6');
+out.folded.applied = { layout: shellLayout(), ids: ids(), sets: window.__rompChatSets(), stored: cols(), saves: saves(), order: order(), notify: CALLS.notify.slice(), blob6: blob(6), target7: tgt(S(7)) };
+msg({ romp: 'colBusy', busy: false }, 'f-chat-6');
+out.folded.again = { saves: saves(), stored: cols() };
 console.log(JSON.stringify(out));
 """
 
@@ -1396,7 +1420,9 @@ class TilesExecute(unittest.TestCase):
     emptied tile stands, a fourth column is refused, 'new' lands in an empty tile), widening and folding, the swap,
     persistence and the restore, back to tabs, entering from a split, the phone, another tab's write — and the busy
     preflight of every transition (review 2026-09-13): a user's transition over a column with a create in flight refuses
-    whole, another dashboard's write over one waits for the create and applies the latest store. Synthetic only."""
+    whole, another dashboard's write over one waits for the create and applies the latest store — and while it waits, a
+    create landing (a claim) or a member ending publishes nothing over it; the claim is folded into the arrangement that
+    applies (round two). Synthetic only."""
     maxDiff = None
 
     @classmethod
@@ -1615,12 +1641,39 @@ class TilesExecute(unittest.TestCase):
         self.assertEqual(d["second"], held, "a later write (back to tabs but for one column) would re-make every later column: it waits too")
         self.assertEqual(d["otherClear"], held, "another column's clear asks again and finds tile 6 still busy")
         self.assertEqual(d["stranger"], held, "a message from no chat column is nobody's word")
+        other = json.dumps({"v": 2, "cols": [{"n": 2, "ids": [S(2)]}]}, separators=(",", ":"))
+        ce = d["colEmpty"]
+        self.assertEqual(ce["storedRaw"], other, "a member ending while the write waits publishes NOTHING: the store is still the other window's (round two)")
+        self.assertEqual(ce["sets"]["3"], [], "…while this window's tile 3 stands empty"); self.assertEqual(len(ce["ids"]), 6); self.assertEqual(ce["saves"], 0)
+        c = d["claim"]
+        self.assertTrue(c["r"], "the create landing in tile 6 claims its session"); self.assertEqual(c["target"], "f-chat-6", "…and this window's sets show it there at once")
+        self.assertEqual(c["sets"]["6"], [S(6), S(7)])
+        self.assertEqual(c["storedRaw"], other, "…but the store is STILL the other window's: the claim never publishes this window's 2×3 over the held row (the round-two find)")
+        self.assertEqual(c["saves"], 0)
         a = d["applied"]
         self.assertEqual(a["layout"], {"layout": "row", "rows": 1, "cols": 2}, "tile 6's create landed: the deferred write applies — the LATEST store, not the one first heard")
         self.assertEqual(a["ids"], ["f-chat", "f-chat-2"]); self.assertEqual(a["sets"], {"2": [S(2)]}); self.assertEqual(a["saves"], 0, "nothing written back"); self.assertEqual(a["notify"], [])
         self.assertEqual(a["grid"], {"cls": "", "rows": None, "cols": None}); self.assertEqual(a["order"], ["chat-pane", "gv-chat-2", "chat-pane-2", "gv-a", "fleet-pane", "gv-b", "feed-pane"])
         self.assertEqual(a["colGone"], ["3", "4", "5", "6", "2"], "the dropped tiles close, then the kept column is re-made in the row")
+        self.assertEqual(a["storedRaw"], other, "the other window's write stands, byte for byte: the claimed column is not in it, so there was nothing to publish")
+        self.assertEqual(a["adopts"], [["f-chat", S(7), "typed into the new session"]], "the session created meanwhile went home with its tile, drafts and all")
+        self.assertEqual(a["taken"], [["f-chat-6", S(7), True]]); self.assertEqual(a["target7"], "f-chat", "…and is the first column's now")
         self.assertEqual(d["idle"], {"ids": a["ids"], "layout": a["layout"]}, "a clear with nothing deferred re-reads nothing")
+
+    def test_a_claim_made_while_a_write_waited_is_folded_into_the_arrangement_that_applies_and_published_once_with_its_layout(self):
+        S = self.S
+        f = self.out["folded"]
+        self.assertEqual(len(f["deferredIds"]), 6, "deferred: tile 6 is busy and the row re-makes every column")
+        self.assertTrue(f["claim"]); self.assertEqual(f["setsAfterClaim"]["6"], [S(6), S(7)], "the claim lands in this window's sets")
+        self.assertEqual(json.loads(f["storedAfterClaim"]), {"v": 2, "cols": [{"n": 2, "ids": [S(2)]}, {"n": 6, "ids": [S(6)]}]}, "…and publishes nothing")
+        a = f["applied"]
+        self.assertEqual(a["layout"], {"layout": "row", "rows": 1, "cols": 3}, "the other window's row applied…")
+        self.assertEqual(a["ids"], ["f-chat", "f-chat-2", "f-chat-6"]); self.assertEqual(a["order"], ["chat-pane", "gv-chat-2", "chat-pane-2", "gv-chat-6", "chat-pane-6", "gv-a", "fleet-pane", "gv-b", "feed-pane"])
+        self.assertEqual(a["sets"], {"2": [S(2)], "6": [S(6), S(7)]}, "…with the session created meanwhile in the column it was created in, which survived")
+        self.assertEqual(a["stored"], {"v": 2, "cols": [{"n": 2, "ids": [S(2)]}, {"n": 6, "ids": [S(6), S(7)]}]}, "published ONCE, with the layout that applied (the row): the other window will list it too")
+        self.assertEqual(a["saves"], 1); self.assertEqual(a["notify"], []); self.assertEqual(a["target7"], "f-chat-6")
+        self.assertEqual(a["blob6"]["activeId"], S(6), "the re-made column was seeded on the other window's member; the claimed session rides its blob like any other member")
+        self.assertEqual(f["again"], {"saves": 1, "stored": a["stored"]}, "a later clear folds nothing twice")
 
     def test_a_drag_in_a_grid_mounts_a_zone_on_every_other_tile_and_no_edge_zone(self):
         d = self.out["dragGrid"]

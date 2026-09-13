@@ -14,7 +14,7 @@ const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "
 const TL = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "romp-timeline-view.js"), "utf8");
 
 test("clicking a tab focuses the (rebuilt) active tab so Enter drops into the box", () => {
-  assert.match(SRC, /select: \(el\) => \{ const id = el\.dataset\.id; if \(id\) \{ setActive\(id\); focusActiveTab\(\); \} \}/);
+  assert.match(SRC, /select: \(el\) => \{ const id = el\.dataset\.id; if \(id\) \{ const wasOn = activeId === id; setActive\(id\); if \(wasOn\) notifyActive\(true\); focusActiveTab\(\); \} \}/);
 });
 
 test("Enter on a focused tab → the message box (or the live-ask picker if one is up)", () => {

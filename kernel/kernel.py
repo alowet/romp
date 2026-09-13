@@ -55600,7 +55600,7 @@ function mobile(){var b=document.getElementById('mtabs');try{return !!b&&getComp
 function maxCols(){return layout==='grid'?grid[0]*grid[1]:ROW_MAX;}
 function gridKey(g){return g?g[0]+'x'+g[1]:'';}
 function gridOf(v){var k=typeof v==='string'?v:Array.isArray(v)?gridKey(v):'';return GRIDS[k]?GRIDS[k].slice():null;}   // a grid the offer knows, else null
-function save(){try{var o={v:2,cols:cols.map(function(c){return {n:c.n,ids:c.ids.slice()};})};if(layout==='grid'){o.layout='grid';o.grid=grid.slice();}localStorage.setItem(CK,JSON.stringify(o));}catch(e){}placeTiles();}
+function save(){try{var o={v:2,cols:cols.map(function(c){return {n:c.n,ids:c.ids.slice()};})};if(layout==='grid'){o.layout='grid';o.grid=grid.slice();}localStorage.setItem(CK,JSON.stringify(o));}catch(e){}claims=[];placeTiles();}   // a publish carries every claim made meanwhile (see autoSave): none is folded twice
 function paneId(n){return 'chat-pane-'+n;}function frameId(n){return 'f-chat-'+n;}
 function firstPane(){return layout==='grid'?paneId(1):'chat-pane';}   // the first column's pane: in a grid, its tile (a child of #chat-pane, which is the grid)
 function idx(n){for(var i=0;i<cols.length;i++){if(cols[i].n===n)return i;}return -1;}
@@ -55738,14 +55738,16 @@ try{tf.contentWindow.focus();}catch(e){}return tf;}
 // drafts and all (what the closing page holds for each is handed to the first column's page); the pane, its gutter
 // and its grow go; the Log drops its connection state; the ring moves to the column on its left. `keep` skips the
 // store write (a reconcile of another dashboard tab's write, which is already the truth — and one that preflighted
-// the busy question for the whole transition, see reconcile). True when the column closed, false when it refused (a
-// caller folding several must stop at a refusal, never fall through to a layout switch that re-makes the survivor).
-function close(n,keep){var i=idx(n);if(i<0)return false;
+// the busy question for the whole transition, see reconcile); `auto` publishes through autoSave (a colEmpty's close:
+// nothing the user did here, so it must not publish this window's layout over a deferred write). True when the column
+// closed, false when it refused (a caller folding several must stop at a refusal, never fall through to a layout
+// switch that re-makes the survivor).
+function close(n,keep,auto){var i=idx(n);if(i<0)return false;
 var f=document.getElementById(frameId(n)),home=document.getElementById('f-chat');
 if(!keep&&busy(f)){notify(BUSY);return false;}   // a create in flight would die with the document (its queued text with it)
 if(f&&home)cols[i].ids.forEach(function(sid){adopt(home,sid,take(f,sid));});
 var left=i>0?paneId(cols[i-1].n):'chat-pane';   // the column on its left: takes the ring below, and the width first
-cols.splice(i,1);if(!keep)save();
+cols.splice(i,1);if(!keep){if(auto)autoSave();else save();}
 unmount(n,left);
 var pf=document.getElementById(i>0?frameId(cols[i-1].n):'f-chat');   // the ring moves to the column before it
 try{pf&&pf.contentWindow.focus();}catch(e){}return true;}
@@ -55826,8 +55828,10 @@ window.__rompSwapTile=function(sid,col){var n=Number(col)||1;if(typeof sid!=='st
 if(n!==1){var e=entry(n);if(!e)return null;e.ids.slice().forEach(function(id){if(id!==sid)moveTab(id,1);});}
 return moveTab(sid,n);};
 // a session CREATED from a later column's plus button belongs to that column: the page claims the real id when its
-// provisional resolves; a session an entry already lists is never stolen
-window.__rompClaimSession=function(sid,col){var n=Number(col),e=entry(n);if(typeof sid!=='string'||!sid||!e||ownerOf(sid)!==1)return false;e.ids.push(sid);save();return true;};
+// provisional resolves; a session an entry already lists is never stolen. The claim is AUTOMATIC (autoSave): while a
+// write is deferred it lands in this window's sets at once, is remembered, and is published with the arrangement that
+// applies (reconcile folds it in) — never with this window's stale layout
+window.__rompClaimSession=function(sid,col){var n=Number(col),e=entry(n);if(typeof sid!=='string'||!sid||!e||ownerOf(sid)!==1)return false;e.ids.push(sid);if(deferred)claims.push({sid:sid,n:n});autoSave();return true;};
 window.__rompChatFrames=frames;window.__rompChatFrameIds=function(){return frames().map(function(f){return f.id;});};
 window.__rompChatPaneOf=function(fid){return fid==='f-chat'?firstPane():(String(fid).indexOf('f-chat-')===0?paneId(String(fid).slice(7)):null);};
 window.__rompLastChatPane=lastPane;window.__rompColOf=colOf;window.__rompFrameOfWin=frameOfWin;window.__rompChatTarget=target;
@@ -55878,7 +55882,7 @@ drag={sid:m.sid,name:typeof m.name==='string'?m.name:'',from:Number(colOf(e.sour
 // stands empty instead (the grid keeps its shape)
 if(m.romp==='colEmpty'&&Array.isArray(m.gone)){var c=Number(colOf(e.source)),en=c>=2?entry(c):null;if(!en)return;
 var gone=en.ids.filter(function(id){return m.gone.indexOf(id)>=0;});en.ids=en.ids.filter(function(id){return m.gone.indexOf(id)<0;});
-if(en.ids.length){save();return;}
+if(en.ids.length){autoSave();return;}   // automatic: never this window's layout over a deferred write (autoSave)
 // the ids return to the first column. One the page's own CROSS removed (m.crossed) the kernel may still list for a push or
 // two: the first column's page holds those back (closingTabs, the "Couldn't close" backstop behind it) until the kernel's
 // strip omits them, so no tab flashes into its strip on the way out (review find 2026-09-11; the message is queued ahead of
@@ -55887,8 +55891,8 @@ if(en.ids.length){save();return;}
 // and toasted a close nobody asked for (the vanishing tab, the user 2026-09-12)
 var crossed=Array.isArray(m.crossed)?gone.filter(function(id){return m.crossed.indexOf(id)>=0;}):[];
 var home=document.getElementById('f-chat');try{if(home&&crossed.length)home.contentWindow.postMessage({romp:'closing',ids:crossed},'*');}catch(e){}
-if(layout==='grid'){save();return;}
-close(en.n);return;}
+if(layout==='grid'){autoSave();return;}
+close(en.n,false,true);return;}
 // ORPHANED STATE (review find 2026-09-11): a page holds a draft, citations, attachments or staged messages for a session
 // it does not show — a column blob written before the partition (a v1 column was a whole chat page, so its blob may name
 // many sessions and the migration keeps one), a reused number's blob, another dashboard's write that moved a tab. The
@@ -55919,16 +55923,28 @@ function topUp(){if(layout!=='grid')return;while(cols.length+1<maxCols()){var n=
 // busy:false}, the event that clears the busy state (render.ts syncColumnBusy), never a timer — from a FRESH read of
 // the store, so a later write in between is what lands and the two dashboards converge. A storage event arriving
 // meanwhile simply asks again.
-var deferred=false;   // a store write this window has heard and not yet applied
+// AN AUTOMATIC WRITER while a write is deferred (review round two, 2026-09-13): a claim (a create landing) and a colEmpty
+// (a member ended) change the SETS, not the layout — yet save() publishes the whole arrangement, this window's stale
+// layout included, over the newer one the deferral is holding, and the colBusy that follows then read this window's own
+// write back and dropped the other window's change (observed: a two-column row before the claim, a 2×3 grid after it,
+// still 2×3 after busy cleared). So while deferred these apply LOCALLY — the pages read the sets from here — and publish
+// nothing; a claim is remembered (claims) and folded into the arrangement when the deferred write applies, published
+// once with THAT layout. A user's own move or close here still publishes: a later act of the user is the newer truth.
+var deferred=false,claims=[];   // deferred: a store write this window has heard and not yet applied; claims: {sid, n} created here meanwhile
+function autoSave(){if(deferred){placeTiles();return;}save();}
 function reconcile(r){var next=r.cols,change=(r.grid?'grid':'row')!==layout;
 var gone=cols.filter(function(c){return change||!next.some(function(d){return d.n===c.n;});}).map(function(c){return c.n;});
 if(anyBusy(gone)){deferred=true;return;}
-deferred=false;
-cols.filter(function(c){return !next.some(function(d){return d.n===c.n;});}).forEach(function(c){close(c.n,true);});
+var held=claims;deferred=false;claims=[];
+cols.filter(function(c){return !next.some(function(d){return d.n===c.n;});}).forEach(function(c){close(c.n,true);});   // a dropped column's sessions go home, drafts and all — a session claimed here meanwhile among them (its entry has it)
 cols=next.map(function(c){return {n:c.n,ids:c.ids.slice()};});
+// the claims made while the write waited: each into its column in the arrangement that applies, when that column is still
+// there (else it went home just above) — before the re-make below, so the column is made knowing its member
+var folded=false;held.forEach(function(k){var e=entry(k.n);if(e&&ownerOf(k.sid)===1){e.ids.push(k.sid);folded=true;}});
 applyLayout(r.grid?'grid':'row',r.grid);
 cols.forEach(function(c){if(!document.getElementById(frameId(c.n)))make(c.n,seedFor(c),null);});
-topUp();placeTiles();}
+topUp();placeTiles();
+if(folded)save();}   // the one write a reconcile makes: the other window's arrangement plus the session created here, so both windows list it
 window.addEventListener('storage',function(e){if(!e||e.key!==CK||mobile())return;var r=read();if(!r.migrated)reconcile(r);});
 window.addEventListener('message',function(e){var m=e&&e.data;if(!m||m.romp!=='colBusy'||m.busy||!deferred||mobile()||!frameOfWin(e.source))return;var r=read();if(!r.migrated)reconcile(r);});   // a column's create landed or was dropped: the deferred write applies now, from the store as it is
 // the columns this browser had open come back, each on a member of its own, in the layout it had (the phone restores

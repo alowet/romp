@@ -270,19 +270,19 @@ test("the paths: every write of activeId records the intent, the automatic paths
   assert.match(RENDER, /if \(m\.auto === true\) withAuto\(arrive\); else arrive\(\);/, "a focus message is a navigation unless its sender said `auto`");
   assert.equal((RENDER.match(/withAuto\(/g) || []).length, 7, "the definition and six automatic sites: restoreIfShown, staleActiveFallback, the two renderTabs re-points, the adoption, the auto focus — a seventh needs a reason here");
   // the navigations wear NO wrapper: the tab click, the keyboard, the window's arrows, next/prev, the trail, the shell's switcher
-  assert.match(RENDER, /select: \(el\) => \{ const id = el\.dataset\.id; if \(id\) \{ setActive\(id\); focusActiveTab\(\); \} \}/);
+  assert.match(RENDER, /select: \(el\) => \{ const id = el\.dataset\.id; if \(id\) \{ const wasOn = activeId === id; setActive\(id\); if \(wasOn\) notifyActive\(true\); focusActiveTab\(\); \} \}/, "the tab click: a navigation, and a click on the tab already shown re-announces (review round two)");
   assert.match(RENDER, /function onTabKey\(e: KeyboardEvent\) \{ tabKey\(e\); \}/);
   assert.match(RENDER, /if \(nb\) \{ e\.preventDefault\(\); setActive\(nb\); \}/);
   assert.match(RENDER, /^    setActive\(spot\.sid\);$/m, "the trail's apply");
   assert.match(RENDER, /if \(order\.includes\(m\.id\)\) \{ revealSelfPane\(\); closingTabs\.delete\(m\.id\); setActive\(m\.id\); \}/, "the shell's switcher");
   assert.match(RENDER, /else if \(m\.type === "nextTab"\) cycleTab\(1\);/);
   assert.doesNotMatch(RENDER, /withGesture|gestureActive/, "the gestures-only model is gone");
-  // the three re-announcements of where the user is: the composer taking focus, the shell's pane focus, and a focus message
-  // landing on the tab this column already shows (setActive's fast path posts nothing, and the feed may follow another tile)
+  // the re-announcements of where the user is: the composer taking focus, the shell's pane focus, a focus message landing on
+  // the tab this column already shows, and a click on it (setActive's fast path posts nothing, and the feed may follow another tile)
   assert.match(RENDER, /ta\.addEventListener\("focus", \(\) => notifyActive\(true\)\);/);
   assert.match(RENDER, /if \(m\.romp === "paneFocus"\) \{ notifyActive\(true\); return; \}/);
   assert.match(RENDER, /const wasOn = activeId === m\.id;/); assert.match(RENDER, /if \(wasOn && m\.auto !== true\) notifyActive\(true\);/, "an already-shown session's focus is still the user's arrival here; an `auto` one moves the feed nowhere");
-  assert.equal((RENDER.match(/notifyActive\(true\)/g) || []).length, 3, "the re-announcements are these three — a fourth needs a reason here");
+  assert.equal((RENDER.match(/notifyActive\(true\)/g) || []).length, 4, "the re-announcements are these four (the composer, the pane focus, the already-shown focus, the already-shown tab click) — a fifth needs a reason here");
   // the shell: the grid's fill lands a session with an automatic focus; a move the user made, without
   assert.ok(KERNEL.includes("tf&&tf.contentWindow.postMessage({type:'focus',id:sid,auto:true},'*');"), "place()");
   assert.ok(KERNEL.includes("adopt(tf,sid,st);try{tf.contentWindow.postMessage({type:'focus',id:sid},'*');}catch(e){}"), "moveTab()");
@@ -307,6 +307,18 @@ test("a column tells the shell when its busy answer flips, and the shell preflig
   assert.ok(KERNEL.includes("for(var i=0;i<ns.length;i++){if(!close(ns[i]))return false;}"), "a refused close never falls through to applyLayout");
   assert.ok(KERNEL.includes("if(anyBusy(gone)){deferred=true;return;}"), "reconcile defers");
   assert.ok(KERNEL.includes("if(!m||m.romp!=='colBusy'||m.busy||!deferred||mobile()||!frameOfWin(e.source))return;var r=read();if(!r.migrated)reconcile(r);"), "…and applies on the page's flip, from a fresh read");
+  // …and while it waits, no AUTOMATIC writer publishes this window's stale layout over the held write (review round two): a claim
+  // and a colEmpty apply locally through autoSave, a claim is remembered and folded into the arrangement that applies, published once
+  assert.ok(KERNEL.includes("function autoSave(){if(deferred){placeTiles();return;}save();}"));
+  assert.ok(KERNEL.includes("e.ids.push(sid);if(deferred)claims.push({sid:sid,n:n});autoSave();return true;};"), "the claim");
+  assert.ok(KERNEL.includes("if(en.ids.length){autoSave();return;}"), "a colEmpty that leaves members"); assert.ok(KERNEL.includes("if(layout==='grid'){autoSave();return;}\nclose(en.n,false,true);return;}"), "…and one that empties the entry: the tile stands, the row column closes as an automatic close");
+  assert.ok(KERNEL.includes("cols.splice(i,1);if(!keep){if(auto)autoSave();else save();}"), "close() publishes as its caller is: the user's, or automatic");
+  assert.ok(KERNEL.includes("var held=claims;deferred=false;claims=[];"));
+  assert.ok(KERNEL.includes("var folded=false;held.forEach(function(k){var e=entry(k.n);if(e&&ownerOf(k.sid)===1){e.ids.push(k.sid);folded=true;}});\napplyLayout("), "folded before the re-make, so the column is made knowing its member");
+  assert.ok(KERNEL.includes("topUp();placeTiles();\nif(folded)save();}"), "…and published once, with the layout that applied");
+  assert.ok(KERNEL.includes("catch(e){}claims=[];placeTiles();}"), "a publish carries the claims: none is folded twice");
+  const splitJs = KERNEL.slice(KERNEL.indexOf("_LANDING_SPLIT_JS = \"\"\""), KERNEL.indexOf("\"\"\"", KERNEL.indexOf("_LANDING_SPLIT_JS = \"\"\"") + 30));
+  assert.equal((splitJs.match(/(^|[^o])save\(\);/gm) || []).length, 9, "the split's save() calls, each a USER's act or one of three named others: moveTab's two, close's user path, vacate, leaveGrid, fill (the user's Tiles), the boot migration, autoSave's own, the fold — a new automatic writer goes through autoSave");
   const split = KERNEL.slice(KERNEL.indexOf("_LANDING_SPLIT_JS = \"\"\""), KERNEL.indexOf("\"\"\"", KERNEL.indexOf("_LANDING_SPLIT_JS = \"\"\"") + 30));
   assert.doesNotMatch(split, /setTimeout|setInterval/, "no timer: the deferral is keyed on the page's event");
 });

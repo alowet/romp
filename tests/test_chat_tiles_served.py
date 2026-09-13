@@ -21,7 +21,8 @@ at 1440×900, and ONE driver run walks the story, each step landing in its own a
   5. a reload restores the grid: four frames, the class, the headers;
   6. `focused`: every activeTab a tile posts at its boot says focused:false; a click into a tile's composer posts one
      with focused:true and the feed's activeChat follows it (the kernel lets the feed follow that tile,
-     tests/test_kernel_active_chat_relay.py); then a focus from the shell — what a feed card, a deep link or the switcher
+     tests/test_kernel_active_chat_relay.py); a click on the first tile's already-selected tab re-announces it and the
+     feed moves to it (round two: setActive's fast path posted nothing); then a focus from the shell — what a feed card, a deep link or the switcher
      deliver — to a session on the first tile's strip: that column reports it focused:true and the feed's activeChat
      moves to it (review 2026-09-13: the first cut sent every focus message unfocused, and the feed went stale);
   7. Back to tabs: one frame, the row, {v:2, cols:[]} byte for byte, no header, every session on the one strip.
@@ -267,6 +268,14 @@ activeTabs.length = 0; activeChats.length = 0;
 out.s6.sawFocused = await until(() => activeTabs.some((a) => a.col === "3" && a.focused === true), 5000);
 out.s6.feedFollowedClick = await until(() => activeChats.some((c) => c.id === fill22[1]), 5000);
 out.s6.afterClick = activeTabs.slice(); out.s6.feedAfterClick = activeChats.slice();
+// ---- 6a. a click on the FIRST tile's already-selected tab, while the feed follows tile 3: an explicit pick of this column, so it
+//          is re-announced focused:true though nothing changed, and the feed's activeChat moves to it (review round two) ----
+const same = await activeIn("f-chat");
+activeTabs.length = 0; activeChats.length = 0;
+await clickTab("f-chat", same);
+out.s6.sameTab = { sid: same, sawReport: await until(() => activeTabs.some((a) => a.col === "" && a.id === same && a.focused === true), 5000),
+                   sawFeed: await until(() => activeChats.some((c) => c.id === same), 5000) };
+out.s6.sameTab.reports = activeTabs.slice(); out.s6.sameTab.feed = activeChats.slice(); out.s6.sameTab.active = await activeIn("f-chat");
 // ---- 6b. a focus from the shell to a session on the first tile's strip (the frame a feed card, a deep link, the switcher
 //          and the kernel's reveal deliver): the first column reports it focused:true and the feed's activeChat follows ----
 const jump = keep22[1];
@@ -577,6 +586,22 @@ class ServedChatTiles(unittest.TestCase):
         self.assertTrue(all(a["focused"] is not True for a in s["afterClick"] if a["col"] != "3"), "no other tile claimed a gesture: %r" % s["afterClick"])
         self.assertTrue(s["feedFollowedClick"], "the kernel relayed the click's session to the feed's socket as activeChat: %r" % s["feedAfterClick"])
         self.assertEqual(s["feedAfterClick"][-1]["id"], self._order()[0][1])
+
+    def test_6a_a_click_on_the_first_tile_s_already_selected_tab_reclaims_the_feed_from_another_tile(self):
+        """Review round two (2026-09-13): the tab click called setActive, whose same-id fast path returns before the report, and
+        the tab (not the composer) takes focus, so clicking tile 1's selected tab while the feed followed tile 3 posted nothing
+        and the feed stayed on tile 3. An explicit pick of the tab already shown now re-announces, like a focus message for it."""
+        s = self._r()["s6"]
+        t = s["sameTab"]
+        fill22, _, keep22, _ = self._order()
+        self.assertIn(t["sid"], keep22, "the first tile's own active tab"); self.assertNotEqual(t["sid"], fill22[1], "…not tile 3's session, which the feed followed")
+        self.assertEqual(t["active"], t["sid"], "the click changed nothing on the strip")
+        self.assertTrue(t["sawReport"], "the first column re-announced its tab, focused:true: %r" % t["reports"])
+        first = [a for a in t["reports"] if a["col"] == ""]
+        self.assertEqual(first[-1], {"col": "", "id": t["sid"], "focused": True})
+        self.assertTrue(t["sawFeed"], "the feed's activeChat moved off tile 3's session to it: %r" % t["feed"])
+        self.assertEqual(t["feed"][-1]["id"], t["sid"])
+        self.assertTrue(all(a["focused"] is not True for a in t["reports"] if a["col"] != ""), "no tile claimed the pick: %r" % t["reports"])
 
     def test_6b_a_focus_from_the_shell_is_reported_focused_true_and_the_feed_s_active_chat_follows_it(self):
         """Review 2026-09-13: the first cut marked only the page's own gestures focused, so a focus MESSAGE (a feed card, a deep
