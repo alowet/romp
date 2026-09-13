@@ -128,7 +128,8 @@ test("the wiring: the dismiss branch, the unfocused body, the composer, the rest
   assert.doesNotMatch(RENDER, /setActive\(next\); \}, 0\);/, "the old re-point is gone");
   // the feed relay: showActive announces the active tab (null included) on every branch it takes
   assert.match(show, /^\s*notifyActive\(\);/m);
-  assert.match(fn("notifyActive"), /vscodeApi\.postMessage\(\{ type: "activeTab", id: activeId, focused: gestureActive \}\)/, "null rides as null (beside the gesture flag the feed's follow reads, tiles 2026-09-13)");
+  assert.match(fn("notifyActive"), /vscodeApi\.postMessage\(\{ type: "activeTab", id: activeId, focused \}\)/, "null rides as null (beside the navigation flag the feed's follow reads, tiles 2026-09-13)");
+  assert.match(fn("dismissSession"), /activeId = next\.activeId;\n\s*activeChanged\(\);/, "the fallback after a close is a navigation the feed follows: the record moves to the new tab, or clears");
   assert.match(CSS, /\.empty-state\.unfocused \{/); assert.match(CSS, /\.empty-state-name \{ font-weight: 600; \}/);
   // the statusline says nothing with no active session: not the vanished session's chips (the served lab's screenshot found it)
   assert.match(fn("updateStatusline"), /if \(!s\) \{ sl\.replaceChildren\(\); return; \}/);

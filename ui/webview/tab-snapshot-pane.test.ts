@@ -173,7 +173,7 @@ function lift(): (H: Hooks) => Api {
     const Date = { now: () => H.nowMs };
     const delegate = (root, handlers) => { H.delegates.push({ root, handlers }); };
     const setActive = (id) => { H.calls.push("setActive:" + id); activeId = id; };   // recorded, and the pick lands: focusActiveTab then reads the new active
-    const withGesture = (fn) => fn();   // the feed-follow flag's wrapper (tiles, 2026-09-13): transparent here
+    const withAuto = (fn) => fn(); const activeChanged = () => {};   // the feed-follow intent (tiles, 2026-09-13): transparent here
     const renderTabs = () => { H.calls.push("renderTabs"); };
     const showActive = () => { H.calls.push("showActive"); };
     const focusComposerOrAsk = () => { H.calls.push("focusComposerOrAsk"); return !H.composer.disabled; };
@@ -632,7 +632,7 @@ test("pinned: the wiring the lifted slices cannot reach: showActive's branch, th
   // the tab menu's closer marks the Escape it consumed, so the view's Escape yields to it
   assert.match(RENDER, /window\.addEventListener\("keydown", \(e\) => \{ if \(e\.key === "Escape" && ctxMenuEl\) \{ dismissTabMenu\(\); e\.preventDefault\(\); \} \}, true\);/);
   // the window's arrows and the host's next/prev commands step from the header's place too
-  assert.match(RENDER, /const nb = collapsedTabIds\.has\(activeId\) \? neighborOfFolded\(lastStripItems, activeId, dir\) : null;\s*\n\s*if \(nb\) \{ e\.preventDefault\(\); withGesture\(\(\) => setActive\(nb\)\); \}/, "the window's arrows (inside the gesture the feed follows, tiles 2026-09-13)");
+  assert.match(RENDER, /const nb = collapsedTabIds\.has\(activeId\) \? neighborOfFolded\(lastStripItems, activeId, dir\) : null;\s*\n\s*if \(nb\) \{ e\.preventDefault\(\); setActive\(nb\); \}/, "the window's arrows (a navigation the feed follows, tiles 2026-09-13)");
   assert.match(RENDER, /const nb = neighborOfFolded\(lastStripItems, activeId, dir > 0 \? 1 : -1\);\s*\n\s*if \(nb\) setActive\(nb\);/, "cycleTab (nextTab / prevTab)");
   // the client's Ledger type declares the two fields the rows read
   assert.match(RENDER, /^interface Ledger \{ summary: string; tree\?: LedgerTreeNode\[\]; current\?: \{ t\?: number \} \| null; recent\?: LedgerRecent\[\]; workingNote\?: string; needsInput\?: boolean \| null; \}/m);
