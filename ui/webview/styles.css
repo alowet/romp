@@ -432,6 +432,26 @@ body.chat-theme-yatharth #tabs .tab-row-line { display: none; }
   width: 36px; height: 3px; border-radius: 2px; background: var(--box-border); transition: background 0.12s, width 0.12s;
 }
 #tabbar-resize:hover::after, #tabbar-resize.dragging::after { background: var(--accent); width: 52px; }
+/* THE PANE HEADER (the layout tree, the user 2026-09-14): with two or more panes laid out, a pane showing ONE session wears
+   this one line in the tab strip's place — the strip's own dot (tab-dot, the same classes), the name at the session names'
+   weight in the identity colour with a remote session's quiet "host:" prefix, and the ⋯ at the right — in the strip's chrome
+   sizes (the tab's 0.92em and its 6px 7px padding, no new font size) on the strip's own plane and hairline. body.pane-head
+   hides the strip and its grip; render.ts syncPaneHead decides per render by chat-columns.ts paneHeaderShown. The dashed
+   ring an awaiting / blocked / retrying tab wears is the header's too, in the tab's own state colours. The header is a DRAG
+   SOURCE like a tab (grab cursor): dropped on another pane's edge or centre it moves the session there. */
+#pane-head { display: none; flex: 0 0 auto; align-items: center; gap: 6px; padding: 6px 8px 6px 10px; font-size: 0.92em; color: var(--fg);
+  border-bottom: 1px solid var(--box-border); background: var(--vscode-editor-background, var(--bg)); --state: transparent; cursor: grab; }
+body.pane-head #pane-head { display: flex; }
+body.pane-head #tabbar, body.pane-head #tabbar-resize { display: none; }
+#pane-head .pane-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+#pane-head .pane-name.host-off { opacity: 0.6; }
+#pane-head .pane-more { flex: 0 0 auto; background: none; border: 1px solid transparent; border-radius: 5px; color: var(--dim); cursor: pointer;
+  font: inherit; line-height: 1; padding: 1px 6px; }
+#pane-head .pane-more:hover, #pane-head .pane-more:focus-visible { color: var(--fg); background: var(--tab-active-bg); outline: none; }
+#pane-head.tab-awaiting { --state: var(--st-awaiting-bg); }
+#pane-head.tab-blocked { --state: var(--st-blocked-bg); }
+#pane-head.tab-retrying { --state: var(--st-retrying-bg); }
+#pane-head.tab-awaiting, #pane-head.tab-blocked, #pane-head.tab-retrying { outline: 2px dashed var(--state); outline-offset: -2px; }
 body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 /* TAB SECTIONS — groups are tags (the user 2026-09-04): one header per home tag in the strip, the
    untagged trail behind a plain separator. A header reads as a LABEL, not a session (the user

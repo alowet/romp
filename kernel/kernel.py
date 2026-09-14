@@ -50307,13 +50307,23 @@ def _forget_active_chat_if_last(client):
         _ACTIVE_CHAT_BY_WID.pop(wid, None)
 
 
-def _relay_active_chat(client, sid):
+def _relay_active_chat(client, sid, focused=None):
     """A chat client's activeTab: record the session under its window's wid (None for no tab) and send the window's
     live feed clients the frame (T347: the feed's focused-session section is a view of the chat pane's active tab,
     never a move of a card; one window's panes share a wid, and a pane outside a dashboard files under ""). The
-    two chat columns of a split window both report here and the later report stands. The client list is copied
-    under _clients_lock; the sends run outside it, as every other fan-out does."""
+    chat panes of a split window all report here. `focused` (the chat layout, the user 2026-09-13) says whether the
+    report follows a NAVIGATION in that pane — a tab click, the keyboard, a focus message (the feed's card, a deep
+    link, the shell's switcher), the trail, next/prev, the fallback when the active tab closes (the new tab, or None),
+    the composer taking focus, the shell's pane focus — or an AUTOMATIC path (False): a boot restore, the stale-active
+    fallback, an arriving tab's adoption, a re-render that changed nothing (render.ts notifyActive draws the line). With
+    several panes each re-rendering on its own pushes, the feed would otherwise follow whichever pane repainted last. An
+    unfocused report may SEED an empty focus (no record for the window yet, or None: a reload's first paint, as before)
+    but never DISPLACE a session the feed follows; a focused one always stands — a focused None clears the record, so
+    the feed's section empties with the pane; a report without the field (an older client) relays as it always did. The
+    client list is copied under _clients_lock; the sends run outside it, as every other fan-out does."""
     wid = _active_chat_wid(client)
+    if focused is False and _ACTIVE_CHAT_BY_WID.get(wid):
+        return
     _ACTIVE_CHAT_BY_WID[wid] = str(sid) if sid else None
     with _clients_lock:
         feeds = [c for c in _clients if c.get("alive") and c.get("app") == "feed" and _active_chat_wid(c) == wid]
@@ -53152,7 +53162,7 @@ var curFocus='f-chat', lastCol='f-chat';   // for Shift-Up out of the timeline: 
 // The active pane gets a focus RING (.pane-focused). Same-origin iframes, so the shell sets it directly on
 // pointerdown / focusin / window-focus — event-based, no polling. Exactly one pane is ringed at a time.
 var lastChat='f-chat';   // the chat column the user last worked in (split screen 2026-09-08): where shell relays land
-function paneOf(id){return PANE[id]||(window.__rompChatPaneOf?window.__rompChatPaneOf(id):null);}   // split columns are made after this map
+function paneOf(id){var c=window.__rompChatPaneOf?window.__rompChatPaneOf(id):null;return c||PANE[id]||null;}   // the split names a chat frame's pane first: later panes are made after this map, and with the layout tree up the first frame's pane is its placeholder, not #chat-pane (2026-09-14)
 function allCols(){var c=window.__rompChatFrameIds?window.__rompChatFrameIds():['f-chat'];return c.concat(COLS.slice(1));}   // every chat column, then Outline, Feed
 function setFocus(id){var pid=paneOf(id);if(!pid)return;curFocus=id;if(allCols().indexOf(id)>=0)lastCol=id;if(pid.indexOf('chat-pane')===0)lastChat=id;
 Array.prototype.forEach.call(document.querySelectorAll('.pane'),function(el){el.classList.toggle('pane-focused',el.id===pid);});}
@@ -56298,45 +56308,83 @@ _LANDING_COLLAPSE_JS = """
 """
 
 
-# CHAT COLUMNS (the user 2026-09-08, who wanted several sessions open at once instead of tabbing through them;
-# reworked 2026-09-11 into columns that PARTITION the sessions). Every chat column past the first is a client-made
-# twin of #chat-pane — <div class="pane chat-col"> around an iframe at /chat?col=N&skeleton=1, inserted before gv-a
-# with a .gv.gv-chat gutter ahead of it — so the row reads chat | chat … | outline | feed. Each column is a full chat
-# page (its own socket, state blob, drafts and scroll; the shim keys the blob by ?col=) FILTERED by one shell-owned
-# fact: which sessions each later column holds, persisted per browser under romp-chat-cols as {v:2, cols:[{n, ids}]}
-# in row order (a v1 array of column numbers is migrated once, each number to the session its blob named). The first
-# column has no entry and holds the rest: every session that arrives with no gesture (a peer's spawn, a remote host's
-# tabs, a revived session whose column has closed) lands there. Every column page reads the sets through
-# __rompChatSets and filters its strip (render.ts tabInView, through chat-columns.ts); ONE mutation, __rompMoveTab(sid,
-# to), changes them — the drop zones of a tab drag, the palette's commands and the column's cross all go through it — and it
-# carries the session's draft, citations, attachments and staged messages with the tab (__rompTakeSessionState on the
-# source page, {romp:'adopt'} into the target). A new column opens as a skeleton client of its one session (the blob's
-# activeId seeded before the frame exists; the kernel serves that tab whole and the rest as skeleton tabs). A column
-# whose last member leaves closes; its cross and the palette's close return its sessions to the first column. Desktop
-# only: the phone shows one pane at a time and filters nothing. A dashboard-aimed focus (a feed click, a kernel focus,
-# a revive prompt) reaches EVERY column's socket, so the columns ask the shell which of them holds the session
-# (__rompChatTarget: the owner column, else the first; with no session named, the column the user last worked in) and
-# the others stand down — render.ts focusIsOurs.
+# CHAT PANES (the user 2026-09-08, who wanted several sessions open at once instead of tabbing through them; reworked
+# 2026-09-11 into columns that PARTITION the sessions; laid out as a free-form tree 2026-09-14). The chat pane's slot
+# (#chat-pane, one flex item of the row as ever: the row's gutters and the rail see one chat pane) holds N chat PANES,
+# every one past the first an iframe at /chat?col=N&skeleton=1 appended to #chat-pane — a full chat page (its own
+# socket, state blob, drafts and scroll; the shim keys the blob by ?col=) FILTERED by one shell-owned fact: which sessions
+# each later pane holds, persisted per browser under romp-chat-cols as {v:3, cols:[{n, ids}], tree} — the columns in
+# creation order and THE LAYOUT TREE over them, a binary split tree ({leaf: n} | {dir: 'row'|'col', ratio, a, b}) whose
+# leaves are the first pane ('' in the store) and the column numbers (a v2 store reads as a right-leaning row chain of
+# equal shares; a v1 array of column numbers is migrated once, each number to the session its blob named). The first pane
+# has no entry and holds the rest: every session that arrives with no gesture (a peer's spawn, a remote host's tabs, a
+# revived session whose pane has closed) lands there, and it never collapses. Every pane page reads the sets through
+# __rompChatSets and filters its strip (render.ts tabInView, through chat-columns.ts), and the layout through
+# __rompChatLayout (a pane holding one session wears a header in the strip's place); ONE mutation, __rompMoveTab(sid, to),
+# changes the sets — the drop zones of a tab or header drag (a pane's centre moves the session in; its four edges split it
+# there), the palette's commands, a pane's cross and its header menu all go through it — and it carries the session's draft,
+# citations, attachments and staged messages with the tab (__rompTakeSessionState on the source page, {romp:'adopt'} into
+# the target). The tree is DRAWN as a pointer-through scaffold over the iframes, which never move (a moved iframe reloads):
+# nested flex containers with a gutter between siblings and a placeholder pane per leaf, each iframe placed on its
+# placeholder's rectangle. A pane whose last member leaves collapses into its sibling; its cross and the header's Close pane
+# return its sessions to the first pane; Back to tabs folds every pane home. Eight panes at most; desktop only: the phone
+# shows one pane at a time and filters nothing. A dashboard-aimed focus (a feed click, a kernel focus, a revive prompt)
+# reaches EVERY pane's socket, so the panes ask the shell which of them holds the session (__rompChatTarget: the owner, else
+# the first; with no session named, the pane the user last worked in) and the others stand down — render.ts focusIsOurs.
 _LANDING_SPLIT_JS = """
 (function(){
-var CK='romp-chat-cols',MAX=4,cols=[];   // cols: the later columns in ROW order, each {n: the column number, ids: the sessions it holds}; MAX counts the first column too
+var CK='romp-chat-cols',MAX=8,cols=[],tree={leaf:1};   // cols: the later panes in CREATION order, each {n: the column number, ids: the sessions it holds}; tree: THE LAYOUT over the first pane (1) and them; MAX counts the first pane too
 var BK='romp-vscode-state-chat:';   // a column's state blob (the shim's SK for /chat?col=N): its activeId is the shim's ?active= connect hint and render.ts's wantActive
-var row=document.querySelector('.row'),gva=document.getElementById('gv-a');
-if(!row||!gva)return;
+var MIN_W=240,MIN_H=160,GUT=7;   // the smallest pane a split may leave, and the gutter between two panes
+var row=document.querySelector('.row'),gva=document.getElementById('gv-a'),cp=document.getElementById('chat-pane');
+if(!row||!gva||!cp)return;
 function mobile(){var b=document.getElementById('mtabs');try{return !!b&&getComputedStyle(b).display!=='none';}catch(e){return false;}}
-function save(){try{localStorage.setItem(CK,JSON.stringify({v:2,cols:cols.map(function(c){return {n:c.n,ids:c.ids.slice()};})}));}catch(e){}}
+// THE LAYOUT TREE (the user 2026-09-14, who wanted a free-form layout: a chat dragged onto another pane's edge splits that
+// pane and docks there, gutters resize, no fixed grid). A binary split tree over the columns: node = {leaf: n} | {dir: 'row'
+// | 'col', ratio, a, b} — 'row' side by side, 'col' stacked, ratio the share of the container `a` takes, leaf n a column
+// number (1 the first pane). Membership stays in cols; the tree only places. Pure functions, each returning a new tree
+// where it changes anything (the layout rebuilds its scaffold from the tree, so no node is mutated in place but a
+// gutter's ratio).
+function leaf(n){return {leaf:n};}
+function isLeaf(t){return !!t&&typeof t.leaf!=='undefined';}
+function leaves(t){return isLeaf(t)?[t.leaf]:leaves(t.a).concat(leaves(t.b));}   // depth-first, a before b: the reading order
+function hasLeaf(t,n){return leaves(t).indexOf(n)>=0;}
+// SPLIT leaf n in a direction: the new leaf m takes that side of n's place, half each (ratio 0.5)
+function splitLeaf(t,n,dir,m){if(isLeaf(t)){if(t.leaf!==n)return t;var v=dir==='up'||dir==='down',first=dir==='left'||dir==='up';
+return {dir:v?'col':'row',ratio:0.5,a:first?leaf(m):t,b:first?t:leaf(m)};}
+return {dir:t.dir,ratio:t.ratio,a:splitLeaf(t.a,n,dir,m),b:splitLeaf(t.b,n,dir,m)};}
+// COLLAPSE leaf n: its sibling takes the whole of their parent (the ratio goes with the node); null when the tree was only n
+function removeLeaf(t,n){if(isLeaf(t))return t.leaf===n?null:t;var a=removeLeaf(t.a,n),b=removeLeaf(t.b,n);if(!a)return b;if(!b)return a;return {dir:t.dir,ratio:t.ratio,a:a,b:b};}
+// APPEND leaf n as a row leaf at the right of the whole tree, an equal share: a column the store lists that its tree does not place
+function appendLeaf(t,n){var k=leaves(t).length;return {dir:'row',ratio:k/(k+1),a:t,b:leaf(n)};}
+// a v2 store's columns (side by side, in order) as a right-leaning row chain of equal shares
+function chainOf(ns){if(ns.length===1)return leaf(ns[0]);return {dir:'row',ratio:1/ns.length,a:leaf(ns[0]),b:chainOf(ns.slice(1))};}
+// a STORED tree, sanitised: a leaf is '' or 1 (the first pane) or a number `nums` lists, each once — any other leaf is dropped
+// (its sibling takes the place), a node that is neither is dropped, a ratio outside (0, 1) is 0.5; the first pane is put back
+// at the left when the tree lost it, and every column the tree does not place is appended. Robust by construction: whatever
+// the store holds, every column has one place and the first pane exists.
+function readTree(t,nums){var seen={};
+function walk(x){if(!x||typeof x!=='object')return null;
+if('leaf' in x){var n=x.leaf===''||x.leaf==='1'?1:Number(x.leaf);if(!(n===1||nums.indexOf(n)>=0)||seen[n])return null;seen[n]=true;return leaf(n);}
+if(x.dir!=='row'&&x.dir!=='col')return null;var a=walk(x.a),b=walk(x.b);if(!a)return b;if(!b)return a;var r=Number(x.ratio);if(!(r>0&&r<1))r=0.5;return {dir:x.dir,ratio:r,a:a,b:b};}
+var out=walk(t);if(!out){out=leaf(1);seen[1]=true;}if(!seen[1])out={dir:'row',ratio:0.5,a:leaf(1),b:out};
+nums.forEach(function(n){if(!seen[n])out=appendLeaf(out,n);});return out;}
+function dump(t){return isLeaf(t)?{leaf:t.leaf===1?'':t.leaf}:{dir:t.dir,ratio:t.ratio,a:dump(t.a),b:dump(t.b)};}   // the persisted form: the first pane's leaf is ''
+// THE STORE, written: one key, atomically — the columns and the tree together, {v:3, cols, tree}. lastRaw: what this window
+// last wrote or applied (autoSave's freshness check, below)
+var lastRaw=null,deferred=false;
+function save(){try{var s=JSON.stringify({v:3,cols:cols.map(function(c){return {n:c.n,ids:c.ids.slice()};}),tree:dump(tree)});localStorage.setItem(CK,s);lastRaw=s;}catch(e){}}
 function paneId(n){return 'chat-pane-'+n;}function frameId(n){return 'f-chat-'+n;}
 function idx(n){for(var i=0;i<cols.length;i++){if(cols[i].n===n)return i;}return -1;}
 function entry(n){var i=idx(n);return i<0?null:cols[i];}
-function frames(){var out=[document.getElementById('f-chat')];cols.forEach(function(c){out.push(document.getElementById(frameId(c.n)));});return out.filter(Boolean);}
+function frameOfCol(n){return document.getElementById(n===1?'f-chat':frameId(n));}
+function frames(){return leaves(tree).map(frameOfCol).filter(Boolean);}   // every chat frame in the layout's reading order
 function frameOfWin(win){if(!win)return null;var fs=frames();for(var i=0;i<fs.length;i++){try{if(fs[i].contentWindow===win)return fs[i];}catch(e){}}return null;}
 function colOf(win){var f=frameOfWin(win);return f?String(f.getAttribute('data-col')||''):'';}
-function frameOfCol(n){return document.getElementById(n===1?'f-chat':frameId(n));}
-function lastPane(){return cols.length?paneId(cols[cols.length-1].n):'chat-pane';}
 // THE PARTITION, three pure readers of cols: the column holding a session (1, the first, when no entry lists it);
 // the sets every column page filters by (an id listed twice — a store another dashboard wrote — belongs to the
-// first entry in row order, so no two columns show it); the lowest free number (a reused number's blob and grow
-// key find their state where they left it).
+// first entry in creation order, so no two columns show it); the lowest free number (a reused number's blob finds its
+// state where it left it).
 function ownerOf(sid){for(var i=0;i<cols.length;i++){if(cols[i].ids.indexOf(sid)>=0)return cols[i].n;}return 1;}
 function sets(){var out={},seen={};cols.forEach(function(c){out[String(c.n)]=c.ids.filter(function(id){if(seen[id])return false;seen[id]=true;return true;});});return out;}
 function nextNumber(){var n=2;while(entry(n))n++;return n;}
@@ -56373,110 +56421,199 @@ function movable(f,sid){try{var m=f&&f.contentWindow&&f.contentWindow.__rompMova
 // the page's REASON behind movable (T395 round one): 'locked' means the tab lock, and the toast names the padlock; '' is movable
 function refusal(f,sid){try{var w=f&&f.contentWindow&&f.contentWindow.__rompMoveRefusal;return typeof w==='function'?String(w(sid)||''):'';}catch(e){return '';}}
 function busy(f){try{var b=f&&f.contentWindow&&f.contentWindow.__rompColumnBusy;return typeof b==='function'&&!!b();}catch(e){return false;}}
+function anyBusy(ns){for(var i=0;i<ns.length;i++){if(busy(frameOfCol(ns[i])))return true;}return false;}   // the preflight of anything that would destroy those columns' documents
 function loaded(f){try{return !!(f&&f.contentWindow&&typeof f.contentWindow.__rompTakeSessionState==='function');}catch(e){return false;}}   // the page's bundle has evaluated, so a posted message is heard
-var BUSY='A session is still being created in this column.';
+var BUSY='A session is still being created in this pane.';
 var LOCKED='The tabs are locked: unlock them in the settings (Chat, Tab strip) to move this session.';
+var CAP='Eight chat panes at most — close one to open another.';
+var SMALL='Not enough room to split this pane that way — make it bigger first.';
+var PHONE='The phone shows one pane at a time — no split here.';
+var ALONE='This session is already alone in its pane.';
+// THE SCAFFOLD (how the tree is drawn). Every chat iframe is a direct child of #chat-pane and NEVER MOVES: a moved iframe
+// reloads its document (Chromium and Firefox alike; the served test measures it), and a pane holding a create in flight
+// would lose it. The tree is drawn as a pointer-through scaffold over them — .lt-root, absolute inset 0 in #chat-pane,
+// nested flex containers (.lt-split, row or column) with a 7 px gutter between siblings and a PLACEHOLDER pane
+// (#chat-pane-N, the .pane the focus ring, the cross and the drop zones land on) for each leaf — and each iframe is placed
+// on its placeholder's rectangle through four vars the landing sheet reads (--lt-x/y/w/h), kept current by a
+// ResizeObserver on the placeholder (event-based: a gutter drag, the chat slot resizing, the window). With ONE leaf the
+// scaffold is not mounted and #chat-pane is the pane, as it always was. Placeholders are REUSED across rebuilds (a node
+// moved in the scaffold carries no iframe), so the ring and a lift survive a split or a collapse.
+var root=null;
+var ro=(typeof ResizeObserver==='function')?new ResizeObserver(function(es){es.forEach(function(e){place(e.target);});}):null;
+function firstPane(){return root?paneId(1):'chat-pane';}   // the first pane's element: its placeholder while the scaffold is up, else the chat slot itself
+function paneEl(n){return document.getElementById(n===1?firstPane():paneId(n));}
+function colOfPane(p){return Number(p.getAttribute('data-col'))||1;}
+function placeholder(n){var p=document.getElementById(paneId(n));if(p)return p;
+p=document.createElement('div');p.className='pane chat-col';p.id=paneId(n);p.setAttribute('data-col',n===1?'':String(n));
+if(n!==1){var x=document.createElement('div');x.className='col-x';x.title='Close this pane';x.setAttribute('role','button');x.textContent='×';
+x.addEventListener('click',function(ev){ev.stopPropagation();close(n);});p.appendChild(x);}
+if(ro)ro.observe(p);return p;}
+function build(t){if(isLeaf(t))return placeholder(t.leaf);
+var d=document.createElement('div');d.className='lt-split lt-'+t.dir;
+var a=build(t.a),b=build(t.b),g=document.createElement('div');g.className=(t.dir==='row'?'gv':'gh')+' lt-gv';
+a.style.flex=t.ratio+' 1 0';b.style.flex=(1-t.ratio)+' 1 0';
+d.appendChild(a);d.appendChild(g);d.appendChild(b);gutter(g,t,a,b);return d;}
+function place(p){var f=frameOfCol(colOfPane(p));if(!f||!root)return;var r=p.getBoundingClientRect(),c=cp.getBoundingClientRect();
+f.style.setProperty('--lt-x',(r.left-c.left)+'px');f.style.setProperty('--lt-y',(r.top-c.top)+'px');f.style.setProperty('--lt-w',r.width+'px');f.style.setProperty('--lt-h',r.height+'px');}
+function placeAll(){leaves(tree).forEach(function(n){var p=document.getElementById(paneId(n));if(p)place(p);});}
+function unplace(f){if(!f)return;['--lt-x','--lt-y','--lt-w','--lt-h'].forEach(function(k){f.style.removeProperty(k);});}
+function dropPlaceholder(n){var p=document.getElementById(paneId(n));if(!p)return;if(ro)ro.unobserve(p);p.remove();}
+// DRAW the tree: with two or more leaves the scaffold (rebuilt whole — placeholders reused, splits and gutters fresh, so
+// every gutter closes over the live node it resizes), else nothing. Then every page hears {romp:'layout'} and re-renders its
+// chrome (render.ts: a pane holding one session wears a header in the strip's place).
+function layout(){var ls=leaves(tree);
+if(ls.length<2){if(root){root.remove();root=null;}cp.classList.remove('lt');dropPlaceholder(1);unplace(document.getElementById('f-chat'));broadcast();return;}
+var nr=document.createElement('div');nr.className='lt-root';var inner=build(tree);inner.style.flex='1 1 0';nr.appendChild(inner);
+cp.appendChild(nr);if(root)root.remove();root=nr;cp.classList.add('lt');placeAll();broadcast();}
+function broadcast(){frames().forEach(function(f){try{f.contentWindow.postMessage({romp:'layout'},'*');}catch(e){}});}
+// A GUTTER between two siblings resizes their split: the landing line (#gv-ghost, the row gutters' own) follows the pointer
+// and the ratio is written ONCE at release — a ratio write re-lays out every pane document under it (the row gutters' rule).
+// Neither pane may go under MIN_W × MIN_H (or half the room, when there is less). The ratio persists with the tree.
+var gline=document.getElementById('gv-ghost');
+function gutter(g,t,a,b){g.addEventListener('mousedown',function(e){e.preventDefault();var v=t.dir==='col';
+var r=g.parentElement.getBoundingClientRect(),size=v?r.height:r.width,start=v?r.top:r.left,usable=size-GUT;if(usable<=0)return;
+var mn=Math.min(v?MIN_H:MIN_W,usable/2)/usable,ratio=t.ratio;
+document.body.classList.add('drag',v?'dragh':'dragv');
+function show(){if(!gline)return;gline.classList.toggle('h',v);
+if(v){gline.style.left=r.left+'px';gline.style.width=r.width+'px';gline.style.top=(start+ratio*usable)+'px';gline.style.height='';}
+else{gline.style.top=r.top+'px';gline.style.height=r.height+'px';gline.style.left=(start+ratio*usable)+'px';gline.style.width='';}
+gline.style.display='block';}
+function mv(ev){ratio=Math.max(mn,Math.min(1-mn,((v?ev.clientY:ev.clientX)-start)/usable));show();}
+function up(){document.body.classList.remove('drag','dragv','dragh');if(gline){gline.style.display='none';gline.classList.remove('h');}
+t.ratio=ratio;a.style.flex=ratio+' 1 0';b.style.flex=(1-ratio)+' 1 0';save();placeAll();
+window.removeEventListener('mousemove',mv);window.removeEventListener('mouseup',up);}
+show();window.addEventListener('mousemove',mv);window.addEventListener('mouseup',up);});}
+// A LATER PANE'S FRAME: /chat?col=N&skeleton=1, appended to #chat-pane (its placeholder is the layout's); the blob first,
+// then the src (the shim reads the hint at its connect). skeleton=1: a later column is a VIEW of its one session (the kernel
+// serves that tab whole and the rest as skeleton tabs that load on a click).
 function make(n,sid,state){var have=document.getElementById(frameId(n));if(have)return have;
-var g=document.createElement('div');g.className='gv gv-chat';g.id='gv-chat-'+n;
-var p=document.createElement('div');p.className='pane chat-col';p.id=paneId(n);p.setAttribute('data-col',String(n));
-p.style.flex='var(--g-chat'+n+',60) 1 0';
 var f=document.createElement('iframe');f.id=frameId(n);f.className='chat-col';f.setAttribute('data-col',String(n));
-seed(n,sid);f.src='/chat?col='+n+'&skeleton=1';   // the blob first, then the src: the shim reads the hint at its connect. skeleton=1: a later column is a VIEW of its one session (the kernel serves that tab whole and the rest as skeleton tabs that load on a click)
+seed(n,sid);f.src='/chat?col='+n+'&skeleton=1';
 if(state)f.addEventListener('load',function(){adopt(f,sid,state);state=null;});   // the moved tab's drafts, once the page can hear them; once — a later reload of the frame has them in its own blob
-var x=document.createElement('div');x.className='col-x';x.title='Close this column';x.setAttribute('role','button');x.textContent='×';
-x.addEventListener('click',function(ev){ev.stopPropagation();close(n);});
-p.appendChild(f);p.appendChild(x);
-row.insertBefore(g,gva);row.insertBefore(p,gva);
-if(window.__rompRegisterPane)window.__rompRegisterPane(p.id,'chat'+n);
-if(window.__rompGrowFairIfNew)window.__rompGrowFairIfNew('chat'+n);else if(window.__rompGrowFair)window.__rompGrowFair('chat'+n);   // the half __rompSplitGrow wrote, or a fair width at a restore — never a sliver — and a dragged width survives a reload
-if(window.__rompGutter)window.__rompGutter(g.id,function(){var i=idx(n);return i>0?paneId(cols[i-1].n):'chat-pane';},p.id);
+cp.appendChild(f);
 if(window.__rompWireFocus)window.__rompWireFocus(f);if(window.__rompWireEsc)window.__rompWireEsc(f);
 try{window.dispatchEvent(new CustomEvent('romp-chat-cols',{detail:{frame:f,col:n,open:true}}));}catch(e){}   // palette-main wires its keys
 return f;}
-function canSplit(){return !mobile()&&cols.length+1<MAX;}
-// a refused move says why (the click-acknowledgement rule): the cap, the phone's one-pane layout, or nothing to do
+function unmount(n){var f=document.getElementById(frameId(n));if(f)f.remove();dropPlaceholder(n);
+if(window.__rompColGone)window.__rompColGone(String(n));
+try{window.dispatchEvent(new CustomEvent('romp-chat-cols',{detail:{col:n,open:false}}));}catch(e){}}
+function canSplit(){return !mobile()&&leaves(tree).length<MAX;}
+// a refused move says why (the click-acknowledgement rule): the cap, the phone's one-pane layout, the room, or nothing to do
 function notify(why){try{if(window.__rompNotify)window.__rompNotify('warn',why);}catch(e){}return null;}
-function refuse(){return notify(mobile()?'The phone shows one pane at a time — no split here.':'Four chat columns at most — close one to open another.');}
+function refuse(){return notify(mobile()?PHONE:CAP);}
+function refuseSplit(why){return notify(why==='phone'?PHONE:why==='small'?SMALL:CAP);}
+function capShort(why){return why==='small'?'Too small to split':'Eight panes at most';}   // the drag's rectangle when refused
+// WHY a split of pane n in a direction cannot go, else '': the phone, the cap, or the room — half the pane less the gutter
+// would fall under the minimum. A pane that cannot be measured (0 × 0: hidden) is not judged; the drop's own rule stands.
+function splitRefusal(n,dir){if(mobile())return 'phone';if(!canSplit())return 'cap';var p=paneEl(n),r=p?p.getBoundingClientRect():null;
+var v=dir==='up'||dir==='down';if(r&&r.width>0&&r.height>0&&((v?r.height:r.width)-GUT)/2<(v?MIN_H:MIN_W))return 'small';return '';}
 function unlist(sid){for(var i=0;i<cols.length;i++){var c=cols[i],j=c.ids.indexOf(sid);if(j>=0){c.ids.splice(j,1);return c.ids.length?0:c.n;}}return 0;}   // the number of an entry the removal emptied, else 0
-// THE ONE MUTATION of the sets. `to` is a column number (1 = the first, which derives and takes no entry) or "new":
-// a column of its own to the right of the rightmost, half that column's width. Steps: the source page hands over
-// the session's drafts; the store changes (the id leaves its entry, an entry left empty is removed and its column
-// closed); the target adopts the drafts and shows the session; the ring moves there. Returns the target's iframe,
-// null when refused. A session already alone in a later column has nowhere new to go: a new column would be a twin
-// of the origin and the origin would close, so that is refused with a line rather than done for nothing.
+// THE ONE MUTATION of the sets. `to` is a column number (1 = the first, which derives and takes no entry), "new" (the
+// palette's: the session's own pane split to the right, the session in the new half) or {split: n, dir: 'left' | 'right' |
+// 'up' | 'down'} (a drop on pane n's edge: that pane split in that direction, the new pane on that side receives the
+// session, half each). Steps: the source page hands over the session's drafts; the store changes (the id leaves its entry;
+// an entry left empty is removed and its pane COLLAPSES, its sibling taking the room — never the first pane, which is the
+// overflow for every session no entry lists); the target adopts the drafts and shows the session; the ring moves there.
+// Returns the target's iframe, null when refused. A session already alone in a later pane has nowhere new to go from its
+// own edges: the new pane would be a twin of the origin and the origin would collapse, so that is refused with a line.
 function moveTab(sid,to){if(typeof sid!=='string'||!sid)return null;
 var from=ownerOf(sid),src=frameOfCol(from);
-var why=refusal(src,sid);if(why==='locked')return notify(LOCKED);if(why||!movable(src,sid))return notify('Only an open session can be moved between columns.');
-if(to==='new'){var se=entry(from);if(se&&se.ids.length===1)return notify('This session is already alone in its column.');
-if(!canSplit())return refuse();
+var why=refusal(src,sid);if(why==='locked')return notify(LOCKED);if(why||!movable(src,sid))return notify('Only an open session can be moved between panes.');
+var sp=to==='new'?{split:from,dir:'right'}:(to&&typeof to==='object'&&to.split!==undefined)?{split:Number(to.split)||1,dir:String(to.dir)}:null;
+if(sp){if(['left','right','up','down'].indexOf(sp.dir)<0||!hasLeaf(tree,sp.split))return null;
+var se=entry(from);if(sp.split===from&&se&&se.ids.length===1)return notify(ALONE);
+var sw=splitRefusal(sp.split,sp.dir);if(sw)return refuseSplit(sw);
 try{if(!document.body.classList.contains('po-chat')&&window.__rompPaneToggle)window.__rompPaneToggle('chat',true);}catch(e){}   // a hidden chat group comes forward first
-var state=take(src,sid),n=nextNumber();
-if(window.__rompSplitGrow)window.__rompSplitGrow(lastPane(),'chat'+n);   // the rightmost column and the new one each take half its width
-unlist(sid);cols.push({n:n,ids:[sid]});save();
-var nf=make(n,sid,state);try{nf.contentWindow.focus();}catch(e){}return nf;}
+var state=take(src,sid),n=nextNumber(),emptied=unlist(sid);
+cols.push({n:n,ids:[sid]});tree=splitLeaf(tree,sp.split,sp.dir,n);
+if(emptied)fold(emptied);   // the origin's last member left for another pane's edge: it collapses (its entry is empty, nothing goes home)
+save();var nf=make(n,sid,state);layout();try{nf.contentWindow.focus();}catch(e){}return nf;}
 var tn=Number(to);if(tn!==1&&!entry(tn))return null;
 var tf=frameOfCol(tn);if(!tf)return null;
 if(tn===from)return tf;   // already there: nothing moves
 var se2=entry(from);if(se2&&se2.ids.length===1&&busy(src))return notify(BUSY);   // its last listed member leaving would close it over a create in flight
-var st=take(src,sid),emptied=unlist(sid);if(tn!==1)entry(tn).ids.push(sid);save();
+var st=take(src,sid),emptied2=unlist(sid);if(tn!==1)entry(tn).ids.push(sid);save();
 adopt(tf,sid,st);try{tf.contentWindow.postMessage({type:'focus',id:sid},'*');}catch(e){}   // a plain focus: the target is the owner now, so its own gate takes it
-if(emptied)close(emptied);   // the origin's last member left: it closes (the ring lands on the target below, not on the origin's neighbour)
+if(emptied2)close(emptied2);   // the origin's last member left: it collapses (the ring lands on the target below, not on the origin's neighbour)
 try{tf.contentWindow.focus();}catch(e){}return tf;}
-// CLOSE a column: its sessions return to the first column — the entry goes whole, so the first column derives them —
-// drafts and all (what the closing page holds for each is handed to the first column's page); the pane, its gutter
-// and its grow go; the Log drops its connection state; the ring moves to the column on its left. `keep` skips the
-// store write (a reconcile of another dashboard tab's write, which is already the truth).
-function close(n,keep){var i=idx(n);if(i<0)return;
+// the entry and the leaf go, the frame and placeholder with them (the caller saves and lays out): an emptied origin
+function fold(n){var i=idx(n);if(i>=0)cols.splice(i,1);tree=removeLeaf(tree,n)||leaf(1);unmount(n);}
+// CLOSE a pane: its sessions return to the first pane — the entry goes whole, so the first pane derives them — drafts and
+// all (what the closing page holds for each is handed to the first pane's page); its leaf collapses, the sibling taking the
+// room; the frame and placeholder go; the Log drops its connection state; the ring moves to the pane before it in reading
+// order. `keep` skips the store write (a reconcile of another dashboard tab's write, which is already the truth — and one
+// that preflighted the busy question for the whole change, see reconcile); `auto` publishes through autoSave (a colEmpty's
+// close: nothing the user did here, so it must not publish this window's layout over a deferred write). True when the pane
+// closed, false when it refused (a caller folding several must stop at a refusal).
+function close(n,keep,auto){var i=idx(n);if(i<0)return false;
 var f=document.getElementById(frameId(n)),home=document.getElementById('f-chat');
-if(!keep&&busy(f)){notify(BUSY);return;}   // a create in flight would die with the document (its queued text with it)
+if(!keep&&busy(f)){notify(BUSY);return false;}   // a create in flight would die with the document (its queued text with it)
 if(f&&home)cols[i].ids.forEach(function(sid){adopt(home,sid,take(f,sid));});
-var left=i>0?paneId(cols[i-1].n):'chat-pane';   // the column on its left: takes the ring below, and the width first
-cols.splice(i,1);if(!keep)save();
-var p=document.getElementById(paneId(n)),g=document.getElementById('gv-chat-'+n);
-if(window.__rompSplitShrink)window.__rompSplitShrink(left,paneId(n));   // its pixels go to the column on its left (the halving's twin), while the pane is still in the row
-if(window.__rompUnregisterPane)window.__rompUnregisterPane(paneId(n));
-if(p)p.remove();if(g)g.remove();
-if(window.__rompColGone)window.__rompColGone(String(n));
-try{window.dispatchEvent(new CustomEvent('romp-chat-cols',{detail:{col:n,open:false}}));}catch(e){}
-var pf=document.getElementById(i>0?frameId(cols[i-1].n):'f-chat');   // the ring moves to the column before it
-try{pf&&pf.contentWindow.focus();}catch(e){}}
-function closeFocused(){var f=focused(),c=f?colOf(f.contentWindow):'';if(!c&&cols.length)c=String(cols[cols.length-1].n);if(c)close(Number(c));}
-// the palette's Move this session to a new column: the focused column's active tab (the one DOM read kept, for this)
-window.__rompSplitChat=function(sid){var id=typeof sid==='string'&&sid?sid:activeIn(focused());if(!id)return notify('No session is open in this column to move.');return moveTab(id,'new');};
+var ls=leaves(tree),k=ls.indexOf(n),prev=k>0?ls[k-1]:(ls[k+1]||1);   // the pane before it in reading order takes the ring (else the one after, else the first)
+cols.splice(i,1);tree=removeLeaf(tree,n)||leaf(1);if(!keep&&!auto)save();
+unmount(n);layout();if(!keep&&auto)autoSave();   // an automatic close publishes AFTER its pane is gone: autoSave may instead apply a remote arrangement that lists this very column, and that re-make must not find the old pane still standing
+var pf=frameOfCol(prev)||home;try{pf&&pf.contentWindow.focus();}catch(e){}return true;}
+function closeFocused(){var f=focused(),c=f?colOf(f.contentWindow):'';if(!c&&cols.length){var ls=leaves(tree);c=String(ls[ls.length-1]);}if(c)close(Number(c));}
+// BACK TO TABS: every later pane folds home (drafts and all) and the first pane is the whole chat again. Refused WHOLE when
+// any pane has a create in flight: the layout, the store and every frame stay as they were, and the line says why.
+function backToTabs(){if(!cols.length)return false;
+if(anyBusy(cols.map(function(c){return c.n;}))){notify(BUSY);return false;}
+cols.slice().forEach(function(c){close(c.n,true);});tree=leaf(1);save();layout();
+try{document.getElementById('f-chat').contentWindow.focus();}catch(e){}return true;}
+// the palette's Move this session to a new pane: the focused pane's active tab (the one DOM read kept, for this)
+window.__rompSplitChat=function(sid){var id=typeof sid==='string'&&sid?sid:activeIn(focused());if(!id)return notify('No session is open in this pane to move.');return moveTab(id,'new');};
 window.__rompCanSplit=canSplit;window.__rompMoveTab=moveTab;
+window.__rompSplitPane=function(sid,n,dir){return moveTab(sid,{split:n===''||n===undefined?1:Number(n),dir:dir});};   // a drop on pane n's edge, by hand
 window.__rompCloseSplit=function(n){if(n===undefined)closeFocused();else close(Number(n));};
+window.__rompBackToTabs=backToTabs;
 window.__rompChatSets=function(){return mobile()?null:sets();};   // null on the phone: the one chat shows everything
+// THE LAYOUT, read by every column page beside the sets: {panes: how many}; the phone is one pane. render.ts wears the
+// one-session header only with two or more.
+window.__rompChatLayout=function(){return {panes:mobile()?1:leaves(tree).length};};
+window.__rompChatTree=function(){return dump(tree);};   // the tree as persisted, for a reader (a test) — never written from outside
+// A PANE'S SWAP (its header's menu): the picked session comes into pane `col` and the pane's current session goes back to
+// the first pane — both through the one mutation, the pick first so the pane never stands empty and collapses between the
+// two. On the first pane the pick simply comes home.
+window.__rompSwapPane=function(sid,col){var n=Number(col)||1;if(typeof sid!=='string'||!sid)return null;
+if(n!==1&&!entry(n))return null;var r=moveTab(sid,n);if(!r)return r;
+if(n!==1)entry(n).ids.slice().forEach(function(id){if(id!==sid)moveTab(id,1);});return r;};
 // a session CREATED from a later column's plus button belongs to that column: the page claims the real id when its
-// provisional resolves; a session an entry already lists is never stolen
-window.__rompClaimSession=function(sid,col){var n=Number(col),e=entry(n);if(typeof sid!=='string'||!sid||!e||ownerOf(sid)!==1)return false;e.ids.push(sid);save();return true;};
+// provisional resolves; a session an entry already lists is never stolen. The claim is AUTOMATIC (autoSave): while a
+// write is deferred it lands in this window's sets at once and publishes nothing; when that write applies, the session
+// is the first pane's, like every session the applied arrangement does not list (see reconcile)
+window.__rompClaimSession=function(sid,col){var n=Number(col),e=entry(n);if(typeof sid!=='string'||!sid||!e||ownerOf(sid)!==1)return false;e.ids.push(sid);autoSave();return true;};
 window.__rompChatFrames=frames;window.__rompChatFrameIds=function(){return frames().map(function(f){return f.id;});};
-window.__rompChatPaneOf=function(fid){return fid==='f-chat'?'chat-pane':(String(fid).indexOf('f-chat-')===0?paneId(String(fid).slice(7)):null);};
-window.__rompLastChatPane=lastPane;window.__rompColOf=colOf;window.__rompFrameOfWin=frameOfWin;window.__rompChatTarget=target;
-// THE DRAG (the user 2026-09-11, who asked for a tab dragged to the right edge to make a column and onto another column
-// to move it). The page posts {romp:'tabDrag',on:true,sid,name,stripH} at its dragstart and {on:false} at dragend
-// (render.ts wireTabDrag); for the gesture's length the shell mounts transparent hit areas as children of the chat panes
-// (the iframes stay interactive: the source strip needs its own dragover for the live reorder, so body.drag's
-// pointer-through is NOT used): a COLUMN zone over every chat pane but the source (a drop anywhere in it, strip
-// included, moves the session there; no slot choice — the column shows its members in the kernel's one order), and an
-// EDGE zone at the right of the RIGHTMOST pane (a fifth of its width, 72 to 180 px; under the strip when that pane is
-// the source, so its strip stays reorder territory) whose drop opens a new column holding the session at the right
-// half of that pane — the geometry #col-ghost, the provisional rectangle, shows on entering the zone (honest to the
-// new gutter's 7 px). No edge zone when the source is a later column holding only the dragged session (a new column
-// would twin the origin and the origin would close). At the cap the edge zone is mounted refused: the rectangle wears
-// a thin ring and says so, and a drop there notifies and changes nothing. The source pane gets no zone (over its
-// strip the drag is the live reorder, over its transcript the drop cancels as today), nor do the other panes (a drop
-// there cancels). Nothing is read from dataTransfer: the sid rides the message, so a served test can drive the zones
-// with synthetic events. Every transition is a pointer crossing (dragenter, dragleave, drop, dragend); nothing is
-// timed. The page's own dragend, after the drop, takes its cancel path and re-renders from the new sets, so the moved
-// tab is simply gone there.
+window.__rompChatPaneOf=function(fid){return fid==='f-chat'?firstPane():(String(fid).indexOf('f-chat-')===0?paneId(String(fid).slice(7)):null);};
+window.__rompLastChatPane=function(){return 'chat-pane';};   // the row's gutters see ONE chat pane: the layout lives inside its slot
+window.__rompColOf=colOf;window.__rompFrameOfWin=frameOfWin;window.__rompChatTarget=target;
+// THE DRAG (the user 2026-09-11, who asked for a tab dragged to another column to move it; 2026-09-14, onto a pane's edge
+// to split it). The page posts {romp:'tabDrag',on:true,sid,name,stripH} at its dragstart — a tab's, or a one-session pane's
+// header's — and {on:false} at dragend (render.ts postTabDrag); for the gesture's length the shell mounts transparent hit
+// areas as children of the panes (the iframes stay interactive: the source strip needs its own dragover for the live
+// reorder, so body.drag's pointer-through is NOT used). On every pane but the source a CENTRE zone (a drop anywhere in it
+// moves the session there; no slot choice — the pane shows its members in the kernel's one order); on EVERY pane four EDGE
+// zones (left and right a fifth of the width, 72 to 180 px; top and bottom a fifth of the height, 48 to 120 px; under the
+// strip or header on the source pane, so its strip stays reorder territory) whose drop splits that pane in that direction
+// with the session in the new half — the geometry #col-ghost, the provisional rectangle, shows the half a drop would
+// produce (honest to the gutter's 7 px). No edge zone on a later pane holding only the dragged session (the new pane would
+// twin the origin and the origin would collapse). A zone the layout refuses — the cap, or a half too small — is mounted
+// refused: the rectangle wears a thin ring and says so, and a drop there notifies and changes nothing. Nothing is read
+// from dataTransfer: the sid rides the message, so a served test can drive the zones with synthetic events. Every
+// transition is a pointer crossing (dragenter, dragleave, drop, dragend); nothing is timed. The page's own dragend, after
+// the drop, takes its cancel path and re-renders from the new sets, so the moved tab is simply gone there.
 var drag=null,zones=[],ghost=document.getElementById('col-ghost');   // drag: {sid,name,from,stripH} while a tab drags, else null
-function edgeWidth(w){return Math.max(72,Math.min(180,0.2*w));}   // the edge zone's width for a pane w px wide
-function ghostRect(pane,rowRect){return {top:rowRect.top,height:rowRect.height,left:pane.left+pane.width/2,width:pane.width/2};}   // the right half of the rightmost pane, the row's height: what the drop produces
+var DIRS=['left','right','up','down'];
+function edgeWidth(w){return Math.max(72,Math.min(180,0.2*w));}   // a side zone's width for a pane w px wide
+function edgeHeight(h){return Math.max(48,Math.min(120,0.2*h));}   // a top or bottom zone's height for a pane h px tall
+// the half a split leaves on `dir`'s side of a pane with rect r, the gutter's 7 px taken off: what the drop produces
+function halfRect(r,dir){var w=(r.width-GUT)/2,h=(r.height-GUT)/2;
+if(dir==='left')return {left:r.left,top:r.top,width:w,height:r.height};if(dir==='right')return {left:r.left+r.width-w,top:r.top,width:w,height:r.height};
+if(dir==='up')return {left:r.left,top:r.top,width:r.width,height:h};return {left:r.left,top:r.top+r.height-h,width:r.width,height:h};}
 function showGhost(z){if(!ghost)return;if(!z||!drag){ghost.classList.remove('on','refused');ghost.textContent='';return;}
-var r=ghostRect(z.parentElement.getBoundingClientRect(),row.getBoundingClientRect()),refused=!!z.getAttribute('data-refused');
+var r=halfRect(z.parentElement.getBoundingClientRect(),z.getAttribute('data-dir')),why=z.getAttribute('data-refused')||'';
 ghost.style.top=r.top+'px';ghost.style.height=r.height+'px';ghost.style.left=r.left+'px';ghost.style.width=r.width+'px';
-ghost.textContent=refused?'Four columns at most':drag.name;ghost.classList.toggle('refused',refused);ghost.classList.add('on');}
-function cue(z,on){if(z.classList.contains('col-drop-edge'))showGhost(on?z:null);else z.classList.toggle('over',on);}   // the zone under the pointer: the rectangle for the edge, .over on a column zone itself
+ghost.textContent=why?capShort(why):drag.name;ghost.classList.toggle('refused',!!why);ghost.classList.add('on');}
+function cue(z,on){if(z.classList.contains('col-drop-edge'))showGhost(on?z:null);else z.classList.toggle('over',on);}   // the zone under the pointer: the rectangle for an edge, .over on a centre zone itself
 function unmountZones(){zones.forEach(function(z){z.remove();});zones=[];showGhost(null);}   // idempotent: every drop and the page's dragend call it
 function zone(p,cls,col,onDrop){var z=document.createElement('div');z.className='col-drop'+(cls?' '+cls:'');if(col!==null)z.setAttribute('data-col',col===1?'':String(col));
 z.addEventListener('dragenter',function(ev){ev.preventDefault();cue(z,true);});
@@ -56485,20 +56622,26 @@ z.addEventListener('dragleave',function(ev){if(ev.relatedTarget&&z.contains(ev.r
 z.addEventListener('drop',function(ev){ev.preventDefault();var d=drag;unmountZones();drag=null;if(d)onDrop(d.sid);});
 p.appendChild(z);zones.push(z);return z;}
 function mountZones(){unmountZones();if(!drag||mobile())return;
-var from=drag.from,last=lastPane(),se=from===1?null:entry(from),alone=!!(se&&se.ids.length===1&&se.ids[0]===drag.sid);
-[{n:1,pid:'chat-pane'}].concat(cols.map(function(c){return {n:c.n,pid:paneId(c.n)};})).forEach(function(c){var p=document.getElementById(c.pid);if(!p)return;
-if(c.n!==from)zone(p,'',c.n,function(sid){moveTab(sid,c.n);});   // the column zone: a drop anywhere in the pane moves the session here
-if(c.pid===last&&!alone){var e=zone(p,'col-drop-edge',null,function(sid){if(e.getAttribute('data-refused'))refuse();else moveTab(sid,'new');});   // the edge zone: a new column at the right
-e.style.width=edgeWidth(p.getBoundingClientRect().width)+'px';e.style.top=(c.n===from?drag.stripH:0)+'px';if(!canSplit())e.setAttribute('data-refused','1');}});}
+var from=drag.from,se=from===1?null:entry(from),alone=!!(se&&se.ids.length===1&&se.ids[0]===drag.sid);
+leaves(tree).forEach(function(n){var p=paneEl(n);if(!p)return;var r=p.getBoundingClientRect(),src=n===from,top=src?drag.stripH:0;
+if(!src)zone(p,'',n,function(sid){moveTab(sid,n);});   // the centre zone: a drop anywhere in the pane moves the session here
+if(src&&alone)return;   // its own edges would twin it
+DIRS.forEach(function(dir){var why=splitRefusal(n,dir);
+var e=zone(p,'col-drop-edge col-drop-'+dir,n,function(sid){if(e.getAttribute('data-refused'))refuseSplit(e.getAttribute('data-refused'));else moveTab(sid,{split:n,dir:dir});});
+e.setAttribute('data-dir',dir);if(why)e.setAttribute('data-refused',why);
+if(dir==='up'||dir==='down'){e.style.height=edgeHeight(r.height)+'px';if(dir==='up')e.style.top=top+'px';}
+else{e.style.width=edgeWidth(r.width)+'px';e.style.top=top+'px';}});});}
 window.addEventListener('message',function(e){var m=e&&e.data;if(!m)return;
 if(m.romp==='tabDrag'){if(!m.on){drag=null;unmountZones();return;}   // the page's dragend: the zones go, whatever ended the drag
 if(!frameOfWin(e.source)||mobile()||typeof m.sid!=='string'||!m.sid)return;   // a chat column's dragstart, on the desktop
 drag={sid:m.sid,name:typeof m.name==='string'?m.name:'',from:Number(colOf(e.source))||1,stripH:Math.max(0,Number(m.stripH)||0)};mountZones();return;}
+// a column's create landed or was dropped ({romp:'colBusy',busy:false}, render.ts syncColumnBusy): a deferred write applies now, from the store as it is
+if(m.romp==='colBusy'){if(m.busy||!deferred||mobile()||!frameOfWin(e.source))return;var rb=read();if(!rb.migrated)reconcile(rb);return;}
 // a column whose members the kernel's strip no longer lists (ended, or closed from a tab's cross) says so: the gone
-// ids leave its entry, and an entry left empty closes its column — a member added meanwhile keeps it open
+// ids leave its entry, and an entry left empty closes its pane — a member added meanwhile keeps it open
 if(m.romp==='colEmpty'&&Array.isArray(m.gone)){var c=Number(colOf(e.source)),en=c>=2?entry(c):null;if(!en)return;
 var gone=en.ids.filter(function(id){return m.gone.indexOf(id)>=0;});en.ids=en.ids.filter(function(id){return m.gone.indexOf(id)<0;});
-if(en.ids.length){save();return;}
+if(en.ids.length){autoSave();return;}   // automatic: never this window's layout over a deferred write (autoSave)
 // the ids return to the first column. One the page's own CROSS removed (m.crossed) the kernel may still list for a push or
 // two: the first column's page holds those back (closingTabs, the "Couldn't close" backstop behind it) until the kernel's
 // strip omits them, so no tab flashes into its strip on the way out (review find 2026-09-11; the message is queued ahead of
@@ -56507,7 +56650,7 @@ if(en.ids.length){save();return;}
 // and toasted a close nobody asked for (the vanishing tab, the user 2026-09-12)
 var crossed=Array.isArray(m.crossed)?gone.filter(function(id){return m.crossed.indexOf(id)>=0;}):[];
 var home=document.getElementById('f-chat');try{if(home&&crossed.length)home.contentWindow.postMessage({romp:'closing',ids:crossed},'*');}catch(e){}
-close(en.n);return;}
+close(en.n,false,true);return;}
 // ORPHANED STATE (review find 2026-09-11): a page holds a draft, citations, attachments or staged messages for a session
 // it does not show — a column blob written before the partition (a v1 column was a whole chat page, so its blob may name
 // many sessions and the migration keeps one), a reused number's blob, another dashboard's write that moved a tab. The
@@ -56515,25 +56658,56 @@ close(en.n);return;}
 // session, when that page can hear the message — else it stays where it is and the page offers it again on its next render
 if(m.romp==='orphanState'&&Array.isArray(m.sids)){var sf=frameOfWin(e.source);if(!sf)return;var sc=Number(colOf(e.source))||1;
 m.sids.forEach(function(sid){if(typeof sid!=='string'||!sid)return;var o=ownerOf(sid);if(o===sc)return;var t=frameOfCol(o);if(t&&t!==sf&&loaded(t))adopt(t,sid,take(sf,sid));});}});
-// THE STORE, read: the v2 object, or a v1 array of numbers migrated once (each number to the session its blob names;
-// a number with no session is dropped). Sanitised on the way in: integer numbers from 2, each once; string ids, each
-// in one entry; no empty entry; at most MAX-1 entries.
-function read(){var raw=null;try{raw=JSON.parse(localStorage.getItem(CK)||'null');}catch(e){}
-var out=[],seen={},migrated=false;
+// THE STORE, read: the v3 object (columns and tree), a v2 object (columns side by side: a right-leaning row chain of equal
+// shares), or a v1 array of numbers migrated once (each number to the session its blob names; a number with no session is
+// dropped). Sanitised on the way in: integer numbers from 2, each once; string ids, each in one entry; no empty entry; at
+// most MAX-1 entries; the tree repaired against the columns (readTree). raw: the store's string as read, for lastRaw.
+function read(){var s=null,raw=null;try{s=localStorage.getItem(CK);raw=JSON.parse(s||'null');}catch(e){}
+var out=[],seen={},migrated=false,obj=raw&&typeof raw==='object'&&!Array.isArray(raw)?raw:null;
 function add(n,ids){n=Number(n);if(!(n>=2&&n<100&&n===Math.floor(n))||out.length>=MAX-1)return;for(var i=0;i<out.length;i++){if(out[i].n===n)return;}
 var keep=[];(ids||[]).forEach(function(id){if(typeof id==='string'&&id&&!seen[id]){seen[id]=true;keep.push(id);}});if(keep.length)out.push({n:n,ids:keep});}
 if(Array.isArray(raw)){migrated=true;raw.forEach(function(n){var st=null;try{st=JSON.parse(localStorage.getItem(BK+Number(n))||'null');}catch(e){}add(n,[st&&typeof st.activeId==='string'?st.activeId:'']);});}
-else if(raw&&typeof raw==='object'&&raw.v===2&&Array.isArray(raw.cols))raw.cols.forEach(function(c){if(c&&typeof c==='object')add(c.n,Array.isArray(c.ids)?c.ids:[]);});
-return {cols:out,migrated:migrated};}
-// another dashboard tab's write (this window never hears its own): its arrangement is the truth — close what it
-// dropped, make what it added (seeded like a restore), take its sets — and nothing is written back
-function reconcile(next){cols.filter(function(c){return !next.some(function(d){return d.n===c.n;});}).forEach(function(c){close(c.n,true);});
-cols=next.map(function(c){return {n:c.n,ids:c.ids.slice()};});
-cols.forEach(function(c){if(!document.getElementById(frameId(c.n)))make(c.n,seedFor(c),null);});}
-window.addEventListener('storage',function(e){if(!e||e.key!==CK||mobile())return;var r=read();if(!r.migrated)reconcile(r.cols);});
-// the columns this browser had open come back, each on a member of its own (the phone restores nothing: the
-// arrangement stays in the store for the desktop); a v1 store is written back in the new shape, once
-try{if(!mobile()){var r0=read();cols=r0.cols;cols.forEach(function(c){make(c.n,seedFor(c),null);});if(r0.migrated)save();}}catch(e){}
+else if(obj&&(obj.v===2||obj.v===3)&&Array.isArray(obj.cols))obj.cols.forEach(function(c){if(c&&typeof c==='object')add(c.n,Array.isArray(c.ids)?c.ids:[]);});
+var nums=out.map(function(c){return c.n;});
+return {cols:out,tree:obj&&obj.v===3?readTree(obj.tree,nums):chainOf([1].concat(nums)),migrated:migrated,raw:s};}
+// another dashboard tab's write (this window never hears its own): its arrangement is the truth — close what it dropped
+// (their sessions go home, drafts and all), make what it added (seeded like a restore), take its sets AND its tree — and
+// nothing is written back. DEFERRED, not refused, while a pane it drops has a create in flight here: nothing here can
+// refuse another window's truth, and nothing may kill the document holding the user's text, so the write waits and is
+// applied the moment that page says its create is done — {romp:'colBusy', busy:false}, the event that clears the busy
+// state (render.ts syncColumnBusy), never a timer — from a FRESH read of the store, so a later write in between is what
+// lands and the two dashboards converge. A tree change alone destroys no document (the iframes never move), so it never
+// defers. A storage event arriving meanwhile simply asks again.
+// AN AUTOMATIC WRITER while a write is deferred (review rounds two to five, 2026-09-13): a claim (a create landing) and a
+// colEmpty (a member ended) change the SETS, not the layout — yet save() publishes the whole arrangement, this window's
+// stale layout included, over the newer one the deferral is holding. So while deferred these apply LOCALLY — the pages
+// read the sets from here — and publish NOTHING. When the deferred write applies, a session created here meanwhile is not
+// placed back into the pane it was created in: it is the first pane's, like every session the applied arrangement does
+// not list — its draft and queued text intact, adopted by the first pane's page when its pane is dropped (close), or
+// handed over by the orphan-state path when its pane survives. A user's own move, split or close here still publishes: a
+// later act of the user is the newer truth.
+// …AND `deferred` ALONE IS NOT ENOUGH (round six): it turns true only once THIS window has handled a storage
+// notification, and notifications can lag the write — so an automatic writer runs a FRESHNESS CHECK, no inference:
+// lastRaw is the raw store string this window last WROTE (save) or last APPLIED (reconcile, the boot read); if the
+// store's string is not that, the store moved under us — nothing is published, the remote arrangement is applied now (a
+// busy pane defers as ever) and the late notifications become no-ops. A user's save() runs no such check: a user's act is
+// the newer truth and may overwrite (last-writer-wins for user acts is the split's standing behaviour). ACCEPTED RESIDUAL:
+// the read-then-write in autoSave is not atomic across windows — a write landing between its read and its save is lost
+// to this window's publish, as any localStorage compare-and-swap would be.
+function autoSave(){if(deferred)return;
+var r=read();if(r.raw!==lastRaw){if(!r.migrated)reconcile(r);return;}   // the store moved under this window (a notification not yet delivered): apply it, publish nothing
+save();}
+function reconcile(r){var next=r.cols;
+var gone=cols.filter(function(c){return !next.some(function(d){return d.n===c.n;});}).map(function(c){return c.n;});
+if(anyBusy(gone)){deferred=true;return;}
+deferred=false;lastRaw=r.raw;   // applied: this is the store this window now reflects
+gone.forEach(function(n){close(n,true);});   // a dropped pane's sessions go home, drafts and all — one created here meanwhile among them (its entry has it)
+cols=next.map(function(c){return {n:c.n,ids:c.ids.slice()};});tree=r.tree;
+cols.forEach(function(c){if(!document.getElementById(frameId(c.n)))make(c.n,seedFor(c),null);});layout();}
+window.addEventListener('storage',function(e){if(!e||e.key!==CK||mobile())return;var r=read();if(!r.migrated)reconcile(r);});
+// the panes this browser had open come back, each on a member of its own, in the layout it had (the phone restores
+// nothing: the arrangement stays in the store for the desktop); a v1 store is written back in the new shape, once
+try{if(!mobile()){var r0=read();cols=r0.cols;tree=r0.tree;lastRaw=r0.raw;cols.forEach(function(c){make(c.n,seedFor(c),null);});layout();if(r0.migrated)save();}}catch(e){}
 })();
 """
 
@@ -57458,12 +57632,14 @@ def _landing():
             # off hides it AND the now-orphaned gutters. Fixed order: chat, outline, feed, files. Timeline is the band.
             "#chat-pane{flex:var(--g-chat,60) 1 0}#fleet-pane{flex:var(--g-fleet,34) 1 0}#feed-pane{flex:var(--g-feed,40) 1 0}#files-pane{flex:var(--g-files,40) 1 0}"
             "body:not(.po-chat) #chat-pane{display:none}body:not(.po-fleet) #fleet-pane{display:none}body:not(.po-feed) #feed-pane{display:none}body:not(.po-files) #files-pane{display:none}"
-            # split chat columns (the user 2026-09-08): every column past the first is a client-made .pane.chat-col
-            # (_LANDING_SPLIT_JS) with its own /chat?col=N iframe and its own grow var, set inline. They ride the
-            # chat group's toggle: off hides every column and the chat|chat gutters with it.
+            # split chat panes (the user 2026-09-08; the layout tree 2026-09-14): every pane past the first is a client-made
+            # iframe.chat-col under #chat-pane with a .pane.chat-col placeholder in the scaffold (_LANDING_SPLIT_JS). They
+            # ride the chat group's toggle: off hides every later pane (the row's chat|chat gutters are gone; .gv-chat kept
+            # for a stale element).
             "body:not(.po-chat) .chat-col,body:not(.po-chat) .gv-chat{display:none}"
-            # a split column's close: a small × in its top-right corner, shown on hover and while the column is
-            # focused, above the iframe and the focus ring (z 6) — the pane rail's action dress, not a new one
+            # a later pane's close: a small × in its placeholder's top-right corner, shown while the pane is focused (the
+            # placeholder is pointer-through, so :hover never lands on it), above the iframe and the focus ring (z 6) — the
+            # pane rail's action dress, not a new one
             ".chat-col>.col-x{position:absolute;top:4px;right:6px;z-index:7;width:20px;height:20px;border-radius:5px;"
             "background:rgba(30,30,30,0.85);color:#8a8a8a;font:600 13px/20px 'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;"
             "text-align:center;cursor:pointer;user-select:none;opacity:0;transition:opacity .12s,color .1s,background .1s}"
@@ -57499,24 +57675,38 @@ def _landing():
             # at the grab; above the focus ring (.pane-focused::after, z-index 6) so a focused pane does not cover it.
             "#gv-ghost{display:none;position:fixed;width:7px;pointer-events:none;z-index:40;"
             "background:linear-gradient(90deg,transparent 3px,var(--accent,#9cd2ff) 3px,var(--accent,#9cd2ff) 4px,transparent 4px)}"
+            # …and its horizontal twin for a stacked split's gutter (the layout tree): the script sets .h and the width inline
+            "#gv-ghost.h{width:auto;height:7px;background:linear-gradient(180deg,transparent 3px,var(--accent,#9cd2ff) 3px,var(--accent,#9cd2ff) 4px,transparent 4px)}"
             ".pane{position:relative;min-width:0;min-height:0;overflow:hidden}"
-            # a TAB DRAG's zones and rectangle (the chat split, 2026-09-11; _LANDING_SPLIT_JS mounts them for the gesture's
-            # length). A column zone covers its whole pane above the iframe and the cross (z 8); the edge zone at the rightmost
-            # pane's right sits above that pane's column zone (z 9), its width and top set inline. #col-ghost is the provisional
-            # rectangle: fixed, never a hit target, above the focus ring like #gv-ghost; the accent wash (the value --accent-wash
-            # resolves to in styles.css — the landing sheet defines no such token) inside a 2 px accent ring, one centred line in
-            # the rail's label dress: the dragged session's name, no verb, no icon. A column zone under the pointer wears the same
-            # dress on itself (.over: no pseudo-element, so it never competes with .pane-focused::after for one property; distinct
-            # from the focus ring's 0.55-alpha ring with no wash). At the cap the rectangle is .refused: no wash, a 1 px ring, its
-            # line saying so.
+            # a TAB DRAG's zones and rectangle (the chat split, 2026-09-11; the layout tree 2026-09-14; _LANDING_SPLIT_JS mounts
+            # them for the gesture's length). A centre zone covers its whole pane above the iframe and the cross (z 8); the four
+            # edge zones sit above it (z 9), each hugging one side, its width or height and its top set inline. #col-ghost is the
+            # provisional rectangle: fixed, never a hit target, above the focus ring like #gv-ghost; the accent wash (the value
+            # --accent-wash resolves to in styles.css — the landing sheet defines no such token) inside a 2 px accent ring, one
+            # centred line in the rail's label dress: the dragged session's name, no verb, no icon. A centre zone under the
+            # pointer wears the same dress on itself (.over: no pseudo-element, so it never competes with .pane-focused::after
+            # for one property; distinct from the focus ring's 0.55-alpha ring with no wash). A refused edge (the cap, a half too
+            # small) shows the rectangle .refused: no wash, a 1 px ring, its line saying so.
             ".col-drop{position:absolute;inset:0;z-index:8}"
-            ".col-drop.col-drop-edge{left:auto;z-index:9}"
+            ".col-drop.col-drop-edge{z-index:9}"
+            ".col-drop-left{right:auto}.col-drop-right{left:auto}.col-drop-up{bottom:auto}.col-drop-down{top:auto}"   # each edge zone hugs its side; its width or height is set inline
             ".col-drop.over,#col-ghost{background:rgba(156,210,255,0.12);box-shadow:inset 0 0 0 2px var(--accent,#9cd2ff)}"
             "#col-ghost{display:none;position:fixed;pointer-events:none;z-index:40;align-items:center;justify-content:center;"
             "font:600 11px 'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#8a8a8a;letter-spacing:.04em}"
             "#col-ghost.on{display:flex}"
             "#col-ghost.refused{background:transparent;box-shadow:inset 0 0 0 1px var(--accent,#9cd2ff)}"
             ".pane>iframe{position:absolute;inset:0;width:100%;height:100%}"
+            # THE LAYOUT TREE'S SCAFFOLD (_LANDING_SPLIT_JS layout, 2026-09-14): .lt-root fills #chat-pane above every chat
+            # iframe (z 5, under the ring's 6 and the cross's 7) and is pointer-through, so the frames stay interactive; its
+            # nested flex containers (.lt-split, row or column) hold a 7 px gutter between siblings — the row gutters' own
+            # dress, .gv and .gh — and a .pane.chat-col placeholder per leaf; the gutters, the cross and a drag's zones take
+            # the pointer back. Each iframe is placed on its placeholder's rectangle through the four vars the script sets
+            # (#chat-pane.lt); a LIFTED frame (the picker) keeps the lift rule below, so it spans the viewport as ever.
+            "#chat-pane>.lt-root{position:absolute;inset:0;z-index:5;display:flex;pointer-events:none}"
+            ".lt-split{display:flex;min-width:0;min-height:0}.lt-split.lt-col{flex-direction:column}"
+            ".lt-root .gv,.lt-root .gh{flex:0 0 7px;pointer-events:auto}"
+            ".lt-root .col-x,.lt-root .col-drop{pointer-events:auto}"
+            "#chat-pane.lt>iframe:not(.lifted){left:var(--lt-x,0);top:var(--lt-y,0);width:var(--lt-w,100%);height:var(--lt-h,100%);right:auto;bottom:auto}"
             # FOCUS cue (the user 2026-06-23): NO dimming — the active section is shown by a RING around it.
             # The focused pane gets a thin inset border (drawn as an inset box-shadow over the iframe edges);
             # the others get nothing, so the only lines on screen are the splitters + this focus ring. The ring
@@ -57557,7 +57747,9 @@ def _landing():
             # the Outline (fleet) rides the tab bar like every other pane (the user 2026-07-11, who couldn't
             # access the outline view in the mobile UI — it was desktop-only before)
             "#chat-pane,#fleet-pane,#feed-pane,#files-pane,#tl-pane{display:contents!important}"
-            ".chat-col,.gv-chat{display:none!important}"   # one pane at a time here: split columns never show (nor are made, see _LANDING_SPLIT_JS)
+            ".chat-col,.gv-chat{display:none!important}"   # one pane at a time here: split panes never show (nor are made, see _LANDING_SPLIT_JS)
+            ".lt-root{display:none!important}"   # a layout tree left up when the window narrows: its scaffold hides, and the first frame flows as the one chat
+            "#chat-pane.lt>iframe:not(.lifted){position:static;left:auto;top:auto;width:100%;height:100%}"
             # reset the desktop iframe absolute-fill (the bare `iframe` reset below re-flows them as tab panes)
             ".pane>iframe{position:static;inset:auto;width:100%;height:100%}"
             "iframe{position:static;display:none;width:100%;height:100%;border:0}"
@@ -60783,7 +60975,7 @@ class Handler(BaseHTTPRequestHandler):
             _pusher_wake.set()                 # …and that push starts when the in-flight cycle ends, not
             #                                     after the 0.5 s backstop (the tab switch IS the event)
             if client.get("app") == "chat":
-                _relay_active_chat(client, msg.get("id"))   # …and the window's feed learns which session is focused (T347)
+                _relay_active_chat(client, msg.get("id"), msg.get("focused"))   # …and the window's feed learns which session is focused (T347); `focused` says whether a navigation said so (the chat layout, 2026-09-13)
             return
         if msg and msg.get("type") == "needSlot" and msg.get("slot") in _DELTA_SLOTS:
             # The shim could not apply a view delta (its base revision did not match what it holds — a
