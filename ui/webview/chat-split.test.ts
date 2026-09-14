@@ -307,18 +307,22 @@ test("a column tells the shell when its busy answer flips, and the shell preflig
   assert.ok(KERNEL.includes("for(var i=0;i<ns.length;i++){if(!close(ns[i]))return false;}"), "a refused close never falls through to applyLayout");
   assert.ok(KERNEL.includes("if(anyBusy(gone)){deferred=true;return;}"), "reconcile defers");
   assert.ok(KERNEL.includes("if(!m||m.romp!=='colBusy'||m.busy||!deferred||mobile()||!frameOfWin(e.source))return;var r=read();if(!r.migrated)reconcile(r);"), "…and applies on the page's flip, from a fresh read");
-  // …and while it waits, no AUTOMATIC writer publishes this window's stale layout over the held write (review round two): a claim
-  // and a colEmpty apply locally through autoSave, a claim is remembered and folded into the arrangement that applies, published once
-  assert.ok(KERNEL.includes("function autoSave(){if(deferred){placeTiles();return;}save();}"));
-  assert.ok(KERNEL.includes("e.ids.push(sid);if(deferred)claims.push({sid:sid,n:n});autoSave();return true;};"), "the claim");
+  // …and while it waits, no AUTOMATIC writer publishes anything (review rounds two to five): a claim (a create landing) and a
+  // colEmpty apply locally through autoSave; when the deferred write applies, a session created meanwhile is simply the first
+  // column's, like every session no entry lists — nothing is remembered, folded or published (rounds three and four chased the
+  // fold's races with claim retirement from event payloads and a marker key; round five removed all of it)
+  assert.ok(KERNEL.includes("function autoSave(){if(deferred){placeTiles();return;}\nvar r=read();if(r.raw!==lastRaw){if(!r.migrated)reconcile(r);return;}"), "…and, with no deferral known, a freshness check first (round six): the store's raw string against the one this window last wrote or applied — moved, and the remote arrangement is applied instead of a publish");
+  assert.ok(KERNEL.includes("\nsave();}\nfunction reconcile(r){"), "…fresh, and it publishes");
+  assert.ok(KERNEL.includes("var s=JSON.stringify(o);localStorage.setItem(CK,s);lastRaw=s;}catch(e){}placeTiles();}"), "save() records what it wrote"); assert.ok(KERNEL.includes("return {cols:out,grid:g,migrated:migrated,raw:s};"), "read() hands back the raw string it parsed");
+  assert.ok(KERNEL.includes("var r0=read();cols=r0.cols;lastRaw=r0.raw;"), "the boot read is the first thing this window reflects");
+  assert.ok(KERNEL.includes("e.ids.push(sid);autoSave();return true;};"), "the claim: local while a write waits, published as before otherwise, nothing remembered");
   assert.ok(KERNEL.includes("if(en.ids.length){autoSave();return;}"), "a colEmpty that leaves members"); assert.ok(KERNEL.includes("if(layout==='grid'){autoSave();return;}\nclose(en.n,false,true);return;}"), "…and one that empties the entry: the tile stands, the row column closes as an automatic close");
-  assert.ok(KERNEL.includes("cols.splice(i,1);if(!keep){if(auto)autoSave();else save();}"), "close() publishes as its caller is: the user's, or automatic");
-  assert.ok(KERNEL.includes("var held=claims;deferred=false;claims=[];"));
-  assert.ok(KERNEL.includes("var folded=false;held.forEach(function(k){var e=entry(k.n);if(e&&ownerOf(k.sid)===1){e.ids.push(k.sid);folded=true;}});\napplyLayout("), "folded before the re-make, so the column is made knowing its member");
-  assert.ok(KERNEL.includes("topUp();placeTiles();\nif(folded)save();}"), "…and published once, with the layout that applied");
-  assert.ok(KERNEL.includes("catch(e){}claims=[];placeTiles();}"), "a publish carries the claims: none is folded twice");
+  assert.ok(KERNEL.includes("cols.splice(i,1);if(!keep&&!auto)save();\nunmount(n,left);if(!keep&&auto)autoSave();"), "close() publishes as its caller is: the user's before the teardown, an automatic one AFTER it (autoSave may apply a remote arrangement that re-makes this column)");
+  assert.ok(KERNEL.includes("if(anyBusy(gone)){deferred=true;return;}\ndeferred=false;lastRaw=r.raw;   // applied: this is the store this window now reflects\ncols.filter(function(c){return !next.some(function(d){return d.n===c.n;});}).forEach(function(c){close(c.n,true);});"), "the reconcile applies the other window's arrangement whole and records it as what this window reflects: a dropped tile's sessions go home (one created meanwhile among them), no fold");
+  assert.ok(KERNEL.includes("topUp();placeTiles();}\nwindow.addEventListener('storage',function(e){if(!e||e.key!==CK||mobile())return;var r=read();if(!r.migrated)reconcile(r);});"), "…and writes nothing; the listener applies the store as it reads");
   const splitJs = KERNEL.slice(KERNEL.indexOf("_LANDING_SPLIT_JS = \"\"\""), KERNEL.indexOf("\"\"\"", KERNEL.indexOf("_LANDING_SPLIT_JS = \"\"\"") + 30));
-  assert.equal((splitJs.match(/(^|[^o])save\(\);/gm) || []).length, 9, "the split's save() calls, each a USER's act or one of three named others: moveTab's two, close's user path, vacate, leaveGrid, fill (the user's Tiles), the boot migration, autoSave's own, the fold — a new automatic writer goes through autoSave");
+  for (const gone of ["claims.push", "claims=[]", "var held=", "folded=", "wasListed", "romp-chat-home", "markHome", "readHome", "snapshot(", "e.newValue"]) assert.ok(!splitJs.includes(gone), "the fold's machinery is gone: " + gone);
+  assert.equal((splitJs.match(/(^|[^o])save\(\);/gm) || []).length, 8, "the split's save() calls, each a USER's act or one of two named others: moveTab's two, close's user path, vacate, leaveGrid, fill (the user's Tiles), the boot migration, autoSave's own — a new automatic writer goes through autoSave, and nothing automatic publishes while a write waits");
   const split = KERNEL.slice(KERNEL.indexOf("_LANDING_SPLIT_JS = \"\"\""), KERNEL.indexOf("\"\"\"", KERNEL.indexOf("_LANDING_SPLIT_JS = \"\"\"") + 30));
   assert.doesNotMatch(split, /setTimeout|setInterval/, "no timer: the deferral is keyed on the page's event");
 });

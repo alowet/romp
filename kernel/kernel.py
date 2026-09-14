@@ -55600,7 +55600,7 @@ function mobile(){var b=document.getElementById('mtabs');try{return !!b&&getComp
 function maxCols(){return layout==='grid'?grid[0]*grid[1]:ROW_MAX;}
 function gridKey(g){return g?g[0]+'x'+g[1]:'';}
 function gridOf(v){var k=typeof v==='string'?v:Array.isArray(v)?gridKey(v):'';return GRIDS[k]?GRIDS[k].slice():null;}   // a grid the offer knows, else null
-function save(){try{var o={v:2,cols:cols.map(function(c){return {n:c.n,ids:c.ids.slice()};})};if(layout==='grid'){o.layout='grid';o.grid=grid.slice();}localStorage.setItem(CK,JSON.stringify(o));}catch(e){}claims=[];placeTiles();}   // a publish carries every claim made meanwhile (see autoSave): none is folded twice
+function save(){try{var o={v:2,cols:cols.map(function(c){return {n:c.n,ids:c.ids.slice()};})};if(layout==='grid'){o.layout='grid';o.grid=grid.slice();}var s=JSON.stringify(o);localStorage.setItem(CK,s);lastRaw=s;}catch(e){}placeTiles();}   // lastRaw: what this window last wrote or applied (autoSave's freshness check)
 function paneId(n){return 'chat-pane-'+n;}function frameId(n){return 'f-chat-'+n;}
 function firstPane(){return layout==='grid'?paneId(1):'chat-pane';}   // the first column's pane: in a grid, its tile (a child of #chat-pane, which is the grid)
 function idx(n){for(var i=0;i<cols.length;i++){if(cols[i].n===n)return i;}return -1;}
@@ -55747,8 +55747,8 @@ var f=document.getElementById(frameId(n)),home=document.getElementById('f-chat')
 if(!keep&&busy(f)){notify(BUSY);return false;}   // a create in flight would die with the document (its queued text with it)
 if(f&&home)cols[i].ids.forEach(function(sid){adopt(home,sid,take(f,sid));});
 var left=i>0?paneId(cols[i-1].n):'chat-pane';   // the column on its left: takes the ring below, and the width first
-cols.splice(i,1);if(!keep){if(auto)autoSave();else save();}
-unmount(n,left);
+cols.splice(i,1);if(!keep&&!auto)save();
+unmount(n,left);if(!keep&&auto)autoSave();   // an automatic close publishes AFTER its pane is gone: autoSave may instead apply a remote arrangement that lists this very column (the store moved under it, round six), and that re-make must not find the old pane still standing
 var pf=document.getElementById(i>0?frameId(cols[i-1].n):'f-chat');   // the ring moves to the column before it
 try{pf&&pf.contentWindow.focus();}catch(e){}return true;}
 // the pane, its gutter and its grow go (the entry is the caller's): a close, or a layout switch that re-makes the column
@@ -55829,9 +55829,9 @@ if(n!==1){var e=entry(n);if(!e)return null;e.ids.slice().forEach(function(id){if
 return moveTab(sid,n);};
 // a session CREATED from a later column's plus button belongs to that column: the page claims the real id when its
 // provisional resolves; a session an entry already lists is never stolen. The claim is AUTOMATIC (autoSave): while a
-// write is deferred it lands in this window's sets at once, is remembered, and is published with the arrangement that
-// applies (reconcile folds it in) — never with this window's stale layout
-window.__rompClaimSession=function(sid,col){var n=Number(col),e=entry(n);if(typeof sid!=='string'||!sid||!e||ownerOf(sid)!==1)return false;e.ids.push(sid);if(deferred)claims.push({sid:sid,n:n});autoSave();return true;};
+// write is deferred it lands in this window's sets at once and publishes nothing; when that write applies, the session
+// is the first column's, like every session the applied arrangement does not list (see reconcile)
+window.__rompClaimSession=function(sid,col){var n=Number(col),e=entry(n);if(typeof sid!=='string'||!sid||!e||ownerOf(sid)!==1)return false;e.ids.push(sid);autoSave();return true;};
 window.__rompChatFrames=frames;window.__rompChatFrameIds=function(){return frames().map(function(f){return f.id;});};
 window.__rompChatPaneOf=function(fid){return fid==='f-chat'?firstPane():(String(fid).indexOf('f-chat-')===0?paneId(String(fid).slice(7)):null);};
 window.__rompLastChatPane=lastPane;window.__rompColOf=colOf;window.__rompFrameOfWin=frameOfWin;window.__rompChatTarget=target;
@@ -55904,7 +55904,7 @@ m.sids.forEach(function(sid){if(typeof sid!=='string'||!sid)return;var o=ownerOf
 // a number with no session is dropped). Sanitised on the way in: the layout a grid the offer knows, else the row;
 // integer numbers from 2, each once; string ids, each in one entry; no empty entry (a grid keeps its empty tiles); at
 // most MAX-1 entries, MAX the layout's.
-function read(){var raw=null;try{raw=JSON.parse(localStorage.getItem(CK)||'null');}catch(e){}
+function read(){var s=null,raw=null;try{s=localStorage.getItem(CK);raw=JSON.parse(s||'null');}catch(e){}
 var out=[],seen={},migrated=false,g=null;
 if(raw&&typeof raw==='object'&&!Array.isArray(raw)&&raw.layout==='grid')g=gridOf(raw.grid);
 var cap=(g?g[0]*g[1]:ROW_MAX)-1;
@@ -55912,7 +55912,7 @@ function add(n,ids){n=Number(n);if(!(n>=2&&n<100&&n===Math.floor(n))||out.length
 var keep=[];(ids||[]).forEach(function(id){if(typeof id==='string'&&id&&!seen[id]){seen[id]=true;keep.push(id);}});if(keep.length||g)out.push({n:n,ids:keep});}
 if(Array.isArray(raw)){migrated=true;raw.forEach(function(n){var st=null;try{st=JSON.parse(localStorage.getItem(BK+Number(n))||'null');}catch(e){}add(n,[st&&typeof st.activeId==='string'?st.activeId:'']);});}
 else if(raw&&typeof raw==='object'&&raw.v===2&&Array.isArray(raw.cols))raw.cols.forEach(function(c){if(c&&typeof c==='object')add(c.n,Array.isArray(c.ids)?c.ids:[]);});
-return {cols:out,grid:g,migrated:migrated};}
+return {cols:out,grid:g,migrated:migrated,raw:s};}   // raw: the store's string as read, for lastRaw
 // a grid restored with fewer tiles than its shape (a store another shell wrote, a sanitised entry): spare tiles stand empty
 function topUp(){if(layout!=='grid')return;while(cols.length+1<maxCols()){var n=nextNumber();cols.push({n:n,ids:[]});make(n,'',null);}}
 // another dashboard tab's write (this window never hears its own): its arrangement is the truth — its layout, close
@@ -55923,33 +55923,47 @@ function topUp(){if(layout!=='grid')return;while(cols.length+1<maxCols()){var n=
 // busy:false}, the event that clears the busy state (render.ts syncColumnBusy), never a timer — from a FRESH read of
 // the store, so a later write in between is what lands and the two dashboards converge. A storage event arriving
 // meanwhile simply asks again.
-// AN AUTOMATIC WRITER while a write is deferred (review round two, 2026-09-13): a claim (a create landing) and a colEmpty
-// (a member ended) change the SETS, not the layout — yet save() publishes the whole arrangement, this window's stale
-// layout included, over the newer one the deferral is holding, and the colBusy that follows then read this window's own
-// write back and dropped the other window's change (observed: a two-column row before the claim, a 2×3 grid after it,
-// still 2×3 after busy cleared). So while deferred these apply LOCALLY — the pages read the sets from here — and publish
-// nothing; a claim is remembered (claims) and folded into the arrangement when the deferred write applies, published
-// once with THAT layout. A user's own move or close here still publishes: a later act of the user is the newer truth.
-var deferred=false,claims=[];   // deferred: a store write this window has heard and not yet applied; claims: {sid, n} created here meanwhile
-function autoSave(){if(deferred){placeTiles();return;}save();}
+// AN AUTOMATIC WRITER while a write is deferred (review rounds two to five, 2026-09-13): a claim (a create landing) and a
+// colEmpty (a member ended) change the SETS, not the layout — yet save() publishes the whole arrangement, this window's
+// stale layout included, over the newer one the deferral is holding, and the colBusy that follows then read this
+// window's own write back and dropped the other window's change (observed: a two-column row before the claim, a 2×3 grid
+// after it, still 2×3 after busy cleared). So while deferred these apply LOCALLY — the pages read the sets from here —
+// and publish NOTHING, ever. When the deferred write applies, a session created here meanwhile is not placed back into
+// the tile it was created in: it is the first column's, like every session the applied arrangement does not list — its
+// draft and queued text intact, adopted by the first column's page when its tile is dropped (close below), or handed
+// over by the orphan-state path when its tile survives and is re-made. The rare cost is one session appearing on the
+// first tile's strip instead of in its tile; the alternative (rounds three and four: remembering the claim and folding
+// it into the arrangement that applies, then telling a fold from the other window's own placement of that session by
+// event payloads and a marker key) raced the other window's writes in ways each fix only narrowed. A user's own move or
+// close here still publishes: a later act of the user is the newer truth.
+// …AND `deferred` ALONE IS NOT ENOUGH (review round six, 2026-09-13; the race predates every round): it turns true only
+// once THIS window has handled a storage notification, and notifications can lag the write by a while — so B's Back to
+// tabs could be in the store with A's notification still in flight when A's create resolved, and the claim's autoSave,
+// seeing no deferral, published A's old 2×3 (new session and all) over B's row; the held notification then read A's
+// own write back and B's choice was gone. So an automatic writer runs a FRESHNESS CHECK, no inference: lastRaw is the
+// raw store string this window last WROTE (save) or last APPLIED (reconcile, the boot read); if the store's string is
+// not that, the store moved under us — nothing is published, the remote arrangement is applied now (the created session
+// the first column's, per the rule above, draft intact; a busy column defers as ever) and the late notifications become
+// no-ops. A user's save() runs no such check: a user's act is the newer truth and may overwrite (last-writer-wins for
+// user acts is the split's standing behaviour).
+var deferred=false,lastRaw=null;   // deferred: a store write this window has heard and not yet applied; lastRaw: the store as this window last wrote or applied it
+function autoSave(){if(deferred){placeTiles();return;}
+var r=read();if(r.raw!==lastRaw){if(!r.migrated)reconcile(r);return;}   // the store moved under this window (a notification not yet delivered): apply it, publish nothing
+save();}
 function reconcile(r){var next=r.cols,change=(r.grid?'grid':'row')!==layout;
 var gone=cols.filter(function(c){return change||!next.some(function(d){return d.n===c.n;});}).map(function(c){return c.n;});
 if(anyBusy(gone)){deferred=true;return;}
-var held=claims;deferred=false;claims=[];
-cols.filter(function(c){return !next.some(function(d){return d.n===c.n;});}).forEach(function(c){close(c.n,true);});   // a dropped column's sessions go home, drafts and all — a session claimed here meanwhile among them (its entry has it)
+deferred=false;lastRaw=r.raw;   // applied: this is the store this window now reflects
+cols.filter(function(c){return !next.some(function(d){return d.n===c.n;});}).forEach(function(c){close(c.n,true);});   // a dropped column's sessions go home, drafts and all — one created here meanwhile among them (its entry has it)
 cols=next.map(function(c){return {n:c.n,ids:c.ids.slice()};});
-// the claims made while the write waited: each into its column in the arrangement that applies, when that column is still
-// there (else it went home just above) — before the re-make below, so the column is made knowing its member
-var folded=false;held.forEach(function(k){var e=entry(k.n);if(e&&ownerOf(k.sid)===1){e.ids.push(k.sid);folded=true;}});
 applyLayout(r.grid?'grid':'row',r.grid);
 cols.forEach(function(c){if(!document.getElementById(frameId(c.n)))make(c.n,seedFor(c),null);});
-topUp();placeTiles();
-if(folded)save();}   // the one write a reconcile makes: the other window's arrangement plus the session created here, so both windows list it
+topUp();placeTiles();}
 window.addEventListener('storage',function(e){if(!e||e.key!==CK||mobile())return;var r=read();if(!r.migrated)reconcile(r);});
 window.addEventListener('message',function(e){var m=e&&e.data;if(!m||m.romp!=='colBusy'||m.busy||!deferred||mobile()||!frameOfWin(e.source))return;var r=read();if(!r.migrated)reconcile(r);});   // a column's create landed or was dropped: the deferred write applies now, from the store as it is
 // the columns this browser had open come back, each on a member of its own, in the layout it had (the phone restores
 // nothing: the arrangement stays in the store for the desktop); a v1 store is written back in the new shape, once
-try{if(!mobile()){var r0=read();cols=r0.cols;if(r0.grid){layout='grid';grid=r0.grid;mountGrid();}cols.forEach(function(c){make(c.n,seedFor(c),null);});topUp();placeTiles();if(r0.migrated)save();}}catch(e){}
+try{if(!mobile()){var r0=read();cols=r0.cols;lastRaw=r0.raw;if(r0.grid){layout='grid';grid=r0.grid;mountGrid();}cols.forEach(function(c){make(c.n,seedFor(c),null);});topUp();placeTiles();if(r0.migrated)save();}}catch(e){}
 })();
 """
 
