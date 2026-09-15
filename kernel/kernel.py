@@ -54789,9 +54789,12 @@ window.addEventListener('mousemove',mv);window.addEventListener('mouseup',up);})
 // A chat|chat drag or a new column therefore never moves the chat area's share against the outline and the feed.
 var PANES=['chat-area','chat-pane','fleet-pane','feed-pane','files-pane'];
 var GK='romp-pane-grow',grow={chat:60,chat1:60,fleet:34,feed:40,files:40};
-// a store from before the rows carries no chat1: the first pane starts at the chat weight it wore, so a stored later
-// column keeps its proportion against it (60 against a stored 400 px would have opened the first pane as a sliver)
-try{var g=JSON.parse(localStorage.getItem(GK)||'null');if(g){if(typeof g.chat1!=='number'&&typeof g.chat==='number')g.chat1=g.chat;grow=Object.assign(grow,g);}}catch(e){}
+// a store from BEFORE the rows carries no chat1: the first pane starts at the chat weight it wore, so a stored later
+// column keeps its proportion against it (60 against a stored 400 px would have opened the first pane as a sliver) —
+// and the store is marked legacy, for __rompSeedAreaWeight below to set the outer weight once the split has restored
+// its columns (the old chat weight was ONE column's; the area's is every top-row column's together)
+var legacy=false;
+try{var g=JSON.parse(localStorage.getItem(GK)||'null');if(g){if(typeof g.chat1!=='number'){g.chat1=typeof g.chat==='number'?g.chat:grow.chat;legacy=true;}grow=Object.assign(grow,g);}}catch(e){}
 function setGrow(k,v){grow[k]=v;row.style.setProperty('--g-'+k,v);}
 for(var k in grow)setGrow(k,grow[k]);
 function persist(){try{localStorage.setItem(GK,JSON.stringify(grow));}catch(e){}}
@@ -54865,6 +54868,22 @@ window.removeEventListener('mousemove',mv);window.removeEventListener('mouseup',
 show();window.addEventListener('mousemove',mv);window.addEventListener('mouseup',up);});}
 window.__rompGutter=gutter;   // the split's chat|chat gutters are wired through the same code
 window.__rompRowGutter=function(gid,topId,botId,apply){gutter(gid,function(){return topId;},botId,true,apply);};   // …and the gutter between the two chat rows: the release reports the top row's share
+// THE UPGRADE of a pre-rows store (review find 2026-09-15: a persisted chat 640 / chat2 400 / feed 400 rendered 537 / 336 /
+// 550 where it had rendered 632 / 395 / 395, with no gesture — the old chat weight, ONE column's share of the row, had
+// become the whole area's share). Called once by the split at its boot with the keys of the top-row columns it actually
+// restored (never a stale key of a closed column): the pre-rows layout is computed from the stored weights — every
+// chat column and every shown outer pane in ONE row, the row's width less a gutter between each pair — and the panes take
+// those PIXELS as their weights: the chat columns inside the area, the outer panes beside it, and the area itself the
+// chat columns' pixels plus the gutters between them. Weights in px sum to the space each container distributes, so the
+// render matches the pre-rows one pixel for pixel; persisted, so the store carries chat1 from then on and this never runs again.
+window.__rompSeedAreaWeight=function(colKeys){if(!legacy)return false;legacy=false;
+var chatKeys=['chat1'].concat((colKeys||[]).filter(function(k){return typeof grow[k]==='number'&&isFinite(grow[k]);}));
+var outer=['fleet','feed','files'].filter(function(k){return shown(idOf(k));});
+var items=chatKeys.concat(outer),T=0,W=row.offsetWidth;items.forEach(function(k){T+=grow[k];});
+if(!(W>0)||!(T>0)){persist();return false;}
+var avail=W-7*(items.length-1),px={},sum=0;items.forEach(function(k){px[k]=avail*grow[k]/T;});
+items.forEach(function(k){setGrow(k,px[k]);});chatKeys.forEach(function(k){sum+=px[k];});
+setGrow('chat',sum+7*(chatKeys.length-1));persist();return true;};
 gutter('gv-a',function(){return lastChat();},'fleet-pane');
 gutter('gv-b',function(){return document.body.classList.contains('po-fleet')?'fleet-pane':lastChat();},'feed-pane');
 gutter('gv-c',function(){var c=document.body.classList;return c.contains('po-feed')?'feed-pane':c.contains('po-fleet')?'fleet-pane':lastChat();},'files-pane');
@@ -58112,7 +58131,8 @@ function frameOfWin(win){if(!win)return null;var fs=frames();for(var i=0;i<fs.le
 function colOf(win){var f=frameOfWin(win);return f?String(f.getAttribute('data-col')||''):'';}
 function frameOfCol(n){return document.getElementById(n===1?'f-chat':frameId(n));}
 // the rows on screen: the bottom row and the gutter above it show while an entry is in it (the class), and the two rows
-// share the chat area's height by rowSplit — as flex-grow weights out of 100 (--rs1/--rs2), never the bare share: grow
+// share the chat area's height by rowSplit — the half whenever the bottom row is made, forgotten when it folds, so the
+// rectangle's half IS what a drop produces — as flex-grow weights out of 100 (--rs1/--rs2), never the bare share: grow
 // factors summing below 1 hand out only that fraction of the free space, so a lone top row on 0.5 filled half the area
 function applyRows(){area.classList.toggle('rows',hasRow2());area.style.setProperty('--rs1',Math.round(rowSplit*1000)/10);area.style.setProperty('--rs2',Math.round((1-rowSplit)*1000)/10);}
 function tidy(){var k=ROWS[2].children;if(k.length&&String(k[0].className||'').indexOf('gv-chat')>=0)k[0].remove();}   // the bottom row's first column has nothing on its left: a gutter left ahead of it by a closed neighbour goes
@@ -58197,10 +58217,12 @@ var from=ownerOf(sid),src=frameOfCol(from);
 var why=refusal(src,sid);if(why==='locked')return notify(LOCKED);if(why||!movable(src,sid))return notify('Only an open session can be moved between columns.');
 var nr=to==='new'?1:to==='below'?2:0;
 if(nr){var se=entry(from);if(se&&se.ids.length===1&&rowOf(from)===nr)return notify('This session is already alone in its column.');
+if(se&&se.ids.length===1&&busy(src))return notify(BUSY);   // its last listed member leaving for the other row would close it over a create in flight (review find 2026-09-15: refused HERE, before any transfer, grow or store write — a close refused after the write left an empty entry persisted, which another dashboard's sanitised write then closed here past the check)
 if(!canSplit())return refuse();
 try{if(!document.body.classList.contains('po-chat')&&window.__rompPaneToggle)window.__rompPaneToggle('chat',true);}catch(e){}   // a hidden chat group comes forward first
 var state=take(src,sid),n=nextNumber(),lp=lastPaneIn(nr);
 if(lp&&window.__rompSplitGrow)window.__rompSplitGrow(lp,'chat'+n);   // that row's rightmost column and the new one each take half its width (the bottom row's first column has the row to itself)
+if(nr===2&&!hasRow2())rowSplit=0.5;   // a bottom row OPENS at the half the rectangle promised (review find 2026-09-15: a share left over from a folded row reopened it at that ratio under a half-height ghost)
 var left=unlist(sid);cols.push({n:n,ids:[sid],row:nr});save();
 var nf=make(n,sid,state);if(left)close(left);   // the origin's last member left for the other row: it closes
 try{nf.contentWindow.focus();}catch(e){}return nf;}
@@ -58227,7 +58249,7 @@ cols.splice(i,1);if(!keep)save();
 var p=document.getElementById(paneId(n)),g=document.getElementById('gv-chat-'+n);
 if(left&&window.__rompSplitShrink)window.__rompSplitShrink(left,paneId(n));   // its pixels go to the column on its left (the halving's twin), while the pane is still in the row
 if(window.__rompUnregisterPane)window.__rompUnregisterPane(paneId(n));
-if(p)p.remove();if(g)g.remove();tidy();applyRows();
+if(p)p.remove();if(g)g.remove();tidy();if(!hasRow2())rowSplit=0.5;applyRows();   // the bottom row's last column gone: the row folds and its share is forgotten with it (the store drops rowSplit; the memory must too)
 if(window.__rompColGone)window.__rompColGone(String(n));
 try{window.dispatchEvent(new CustomEvent('romp-chat-cols',{detail:{col:n,open:false}}));}catch(e){}
 try{pf&&pf.contentWindow.focus();}catch(e){}}
@@ -58346,7 +58368,8 @@ window.addEventListener('storage',function(e){if(!e||e.key!==CK||mobile())return
 if(window.__rompRowGutter)window.__rompRowGutter('gv-rows','chat-row-1','chat-row-2',function(s){rowSplit=Math.round(s*1000)/1000;applyRows();save();});
 // the columns this browser had open come back, each on a member of its own and in its row (the phone restores nothing:
 // the arrangement stays in the store for the desktop); a v1 store is written back in the new shape, once
-try{if(!mobile()){var r0=read();cols=r0.cols;rowSplit=r0.rowSplit;cols.forEach(function(c){make(c.n,seedFor(c),null);});applyRows();if(r0.migrated)save();}}catch(e){}
+try{if(!mobile()){var r0=read();cols=r0.cols;rowSplit=r0.rowSplit;cols.forEach(function(c){make(c.n,seedFor(c),null);});applyRows();if(r0.migrated)save();
+if(window.__rompSeedAreaWeight)window.__rompSeedAreaWeight(rowCols(1).map(function(c){return 'chat'+c.n;}));}}catch(e){}   // a pre-rows pane-weight store: the area's weight from the top-row columns this boot restored (_LANDING_JS)
 })();
 """
 

@@ -62,7 +62,7 @@ global.localStorage = {
   removeItem: (k) => { delete STORE[k]; },
 };
 const ROW = {};   // the --g-* vars the script sets on .row (its `grow` object is a closure)
-const rowEl = { style: { setProperty: (k, v) => { ROW[k] = v; }, removeProperty: (k) => { delete ROW[k]; } },
+const rowEl = { style: { setProperty: (k, v) => { ROW[k] = v; }, removeProperty: (k) => { delete ROW[k]; } }, offsetWidth: 1007,   // the shell's row: 1007 px wide (the upgrade hook's W)
                 getBoundingClientRect: () => ({ top: 0, height: 800, left: 0, bottom: 800 }) };   // the landing line is placed by the row's rect (main, 2026-09)
 const colEl = { style: { setProperty() {} }, getBoundingClientRect: () => ({ bottom: 800 }) };
 // the containers the panes sit in: the chat rows inside the chat area (the served markup, kernel.py _landing)
@@ -119,6 +119,22 @@ function winFire(k, ev) { (WL[k] || []).slice().forEach((f) => f(ev)); }
 function grows() { return Object.assign({}, ROW); }
 function store() { return JSON.parse(STORE['romp-pane-grow'] || 'null'); }
 function ghostH() { return Object.assign({}, EL['gv-ghost-h'].style); }
+// the browser's flex arithmetic for one container: `avail` px shared by weight (flex-basis 0, every item shown)
+function flex(avail, ws) { const T = ws.reduce((a, b) => a + b, 0); return ws.map((w) => avail * w / T); }
+// the widths a PRE-ROWS shell rendered from a pane store: every chat column and every shown outer pane in ONE row, a 7 px
+// gutter between each pair — and the widths the rows shell renders from the weights the upgrade hook leaves: the outer
+// row (the area, then the shown outer panes), then the chat columns inside the area behind their own gutters
+function legacyWidths(store, colKeys, outerShown) {
+  const chat = ['chat'].concat(colKeys), items = chat.concat(outerShown);
+  const px = flex(1007 - 7 * (items.length - 1), items.map((k) => store[k]));
+  const o = {}; items.forEach((k, i) => { o[k === 'chat' ? 'chat1' : k] = px[i]; }); return o;
+}
+function rowsWidths(g, colKeys, outerShown) {
+  const outer = ['chat'].concat(outerShown), opx = flex(1007 - 7 * (outer.length - 1), outer.map((k) => g[k]));
+  const o = {}; outer.forEach((k, i) => { if (k !== 'chat') o[k] = opx[i]; });
+  const inner = ['chat1'].concat(colKeys), ipx = flex(opx[0] - 7 * (inner.length - 1), inner.map((k) => g[k]));
+  inner.forEach((k, i) => { o[k] = ipx[i]; }); return o;
+}
 function drag(gid, x0, x1) {
   const snap = {};
   EL[gid].fire('mousedown', { preventDefault() {}, clientX: x0 });
@@ -234,6 +250,39 @@ for (const k in STORE) delete STORE[k];
 STORE['romp-pane-grow'] = JSON.stringify({ chat: 640, fleet: 34, feed: 400, chat2: 400 });
 BOOT();
 out.legacy = { grows: grows(), store: store() };
+// 12) THE UPGRADE of a pre-rows store (review find 2026-09-15): the old chat weight was ONE column's share of the row and had
+//     become the whole area's, so a persisted chat 640 / chat2 400 / feed 400 shrank the chat and grew the feed with no gesture.
+//     __rompSeedAreaWeight, called by the split with the top-row columns it restored, converts the pre-rows layout to pixels:
+//     the chat columns take theirs inside the area, the outer panes theirs beside it, and the area the chat columns' pixels plus
+//     the gutters between them — so the rows shell renders the widths the pre-rows shell did. One, two, three and four columns
+//     (the fourth with the outline shown), a stale key of a closed column left out of the sum, a store that already carries
+//     chat1 untouched, and the hook a one-shot: the second call is a no-op
+const LEGACY = [
+  { name: 'one', store: { chat: 700, fleet: 34, feed: 300, files: 40 }, cols: [], fleet: false },
+  { name: 'two', store: { chat: 640, fleet: 34, feed: 400, chat2: 400 }, cols: ['chat2'], fleet: false },
+  { name: 'three', store: { chat: 500, chat2: 300, chat3: 200, fleet: 34, feed: 400 }, cols: ['chat2', 'chat3'], fleet: false },
+  { name: 'four', store: { chat: 400, chat2: 300, chat3: 200, chat4: 100, fleet: 200, feed: 300, files: 40 }, cols: ['chat2', 'chat3', 'chat4'], fleet: true },
+  { name: 'stale', store: { chat: 640, chat2: 400, chat3: 999, fleet: 34, feed: 400 }, cols: ['chat2'], fleet: false },
+];
+out.upgrade = {};
+LEGACY.forEach((c) => {
+  resetDom(); for (const k in STORE) delete STORE[k];
+  STORE['romp-pane-grow'] = JSON.stringify(c.store);
+  showFleet(c.fleet);
+  BOOT();
+  c.cols.forEach((k) => { window.__rompRegisterPane('chat-pane-' + k.slice(4), k); window.__rompGrowFairIfNew(k); });   // what the split's make() does for a restored column
+  const outerShown = (c.fleet ? ['fleet'] : []).concat(['feed']);
+  const before = legacyWidths(c.store, c.cols, outerShown);
+  const wrote = window.__rompSeedAreaWeight(c.cols);
+  const g = Object.assign({}, ROW); const gk = {}; Object.keys(g).forEach((k) => { gk[k.slice(4)] = g[k]; });
+  out.upgrade[c.name] = { wrote, before, after: rowsWidths(gk, c.cols, outerShown), grows: g, store: store(), again: window.__rompSeedAreaWeight(c.cols), growsAgain: grows() };
+  showFleet(false);
+});
+resetDom(); for (const k in STORE) delete STORE[k];
+STORE['romp-pane-grow'] = JSON.stringify({ chat: 900, chat1: 640, chat2: 400, fleet: 34, feed: 400, files: 40 });
+BOOT();
+window.__rompRegisterPane('chat-pane-2', 'chat2'); window.__rompGrowFairIfNew('chat2');
+out.upgrade.current = { wrote: window.__rompSeedAreaWeight(['chat2']), grows: grows(), store: store() };
 console.log(JSON.stringify(out));
 """
 
@@ -380,11 +429,39 @@ class PaneGuttersExecute(unittest.TestCase):
         self.assertEqual(f["afterUp"]["applied"], [0.625, 0.85], "680 of 800")
         self.assertEqual(self.out["rowsAfter"], {"grows": boot, "store": None})
 
+    def test_12_the_upgrade_of_a_pre_rows_store_renders_the_widths_the_pre_rows_shell_did(self):
+        u = self.out["upgrade"]
+        for name in ("one", "two", "three", "four", "stale"):
+            c = u[name]
+            self.assertTrue(c["wrote"], name + ": a pre-rows store (no chat1) is upgraded")
+            self.assertEqual(sorted(c["after"]), sorted(c["before"]), name + ": every pane the pre-rows row held is laid out")
+            for k in c["before"]:
+                self.assertLessEqual(abs(c["after"][k] - c["before"][k]), 1, "%s: %s renders at %.2f px, was %.2f" % (name, k, c["after"][k], c["before"][k]))
+            self.assertIn("chat1", c["store"], name + ": the store carries chat1 from now on: the hook never runs again")
+            self.assertFalse(c["again"], name + ": a second call is a no-op…"); self.assertEqual(c["growsAgain"], c["grows"], name + ": …and changes nothing")
+        # the reviewer's case, in the hook's own numbers: 1007 - 14 shared 640 : 400 : 400, the area their two columns plus one gutter
+        two = u["two"]
+        self.assertAlmostEqual(two["grows"]["--g-chat1"], 993 * 640 / 1440, places=6); self.assertAlmostEqual(two["grows"]["--g-chat2"], 993 * 400 / 1440, places=6)
+        self.assertAlmostEqual(two["grows"]["--g-feed"], 993 * 400 / 1440, places=6)
+        self.assertAlmostEqual(two["grows"]["--g-chat"], 993 * 1040 / 1440 + 7, places=6, msg="the area: both columns' pixels plus the gutter between them")
+        self.assertEqual(two["grows"]["--g-fleet"], 34, "a hidden pane is not in the pre-rows row: its weight is left alone")
+        st = u["stale"]
+        self.assertAlmostEqual(st["grows"]["--g-chat"], two["grows"]["--g-chat"], places=6, msg="a stale key (chat3, no column restored) is not summed into the area")
+        self.assertEqual(st["grows"]["--g-chat3"], 999, "…and left where it was")
+        one = u["one"]
+        self.assertAlmostEqual(one["grows"]["--g-chat"], 1000 * 700 / 1000, places=6); self.assertAlmostEqual(one["grows"]["--g-chat1"], 700, places=6, msg="one column: the area is the pane")
+        four = u["four"]
+        self.assertAlmostEqual(four["grows"]["--g-fleet"], (1007 - 7 * 5) * 200 / 1500, places=6, msg="the outline shown: in the pre-rows row and normalised with it")
+        cur = u["current"]
+        self.assertFalse(cur["wrote"], "a store that already carries chat1 is not a pre-rows store: untouched")
+        self.assertEqual(cur["grows"]["--g-chat"], 900); self.assertEqual(cur["grows"]["--g-chat1"], 640)
+        self.assertEqual(cur["store"], {"chat": 900, "chat1": 640, "chat2": 400, "fleet": 34, "feed": 400, "files": 40}, "and nothing is written")
+
     def test_11_a_store_from_before_the_rows_seeds_the_first_pane_s_inner_weight_from_the_chat_weight(self):
         a = self.out["legacy"]
         self.assertEqual(a["grows"], {"--g-chat": 640, "--g-chat1": 640, "--g-fleet": 34, "--g-feed": 400, "--g-files": 40, "--g-chat2": 400},
                          "chat1 starts at the stored chat, so the stored column 2 keeps its 640:400 proportion against the first pane")
-        self.assertEqual(a["store"], {"chat": 640, "fleet": 34, "feed": 400, "chat2": 400}, "seeded in memory: the store is written with the next change, not at boot")
+        self.assertEqual(a["store"], {"chat": 640, "fleet": 34, "feed": 400, "chat2": 400}, "seeded in memory: the store is written by the upgrade hook once the split has restored its columns (test 12), not here")
 
 
 if __name__ == "__main__":

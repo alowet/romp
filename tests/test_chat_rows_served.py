@@ -23,8 +23,18 @@ the REAL page: a hermetic kernel serves the dashboard with FIVE synthetic sessio
   6. the FOLD: the bottom row's two sessions moved home one by one — the row stands on the second, folds on the last:
      #chat-row-2 and #gv-rows hidden, the top row at the area's full height, the store the bytes a never-stacked browser
      writes ({v:2, cols:[{n:4, ids:[D]}]}), the first pane's document still the one stamped after the reload;
+  6b. the BUSY guard across rows (review find 2026-09-15): D alone in the top row's second column, its page reporting a
+     create in flight (the page's __rompColumnBusy answer, stubbed on its window), dragged to the bottom zone: refused with
+     the existing notice, no row opens, the store's bytes are unchanged and D is still in its column;
+  6c. the SHARE is forgotten with the row (review find 2026-09-15): after step 5's resize and step 6's fold, B dragged to
+     the bottom edge again shows the area's bottom half and OPENS the row at that half — the rectangle's box and the row's
+     agree — where the folded row's share had reopened it under a half-height rectangle; folded again;
   7. back to one: the last column's close leaves {v:2, cols:[]} and the first column listing every session;
-  8. the whole story runs in under a minute and a half (the driver waits on conditions, never on fixed sleeps).
+  8. the UPGRADE of a pre-rows pane store (review find 2026-09-15): legacy one-, two-, three- and four-column stores with
+     persisted weights (chat, chatN, feed — no chat1) reloaded into the rows shell render every chat column and the feed at
+     the width the pre-rows shell gave them (one row, a gutter between each pair), within a pixel; the store then carries
+     chat1 and the area's weight, and a second reload renders the same;
+  9. the whole story runs in under two and a half minutes (the driver waits on conditions, never on fixed sleeps).
 Screenshots of the 1 + 1 stack and the 2 x 2, dark and light, land in the directory ROMP_ROWS_SHOTS names (default
 /tmp/chat-rows-shots) for a human look. Skips LOUDLY when the extension deps or a playwright browser are absent (CI
 installs none). Synthetic only: placeholder sids, invented notes-api prompt text, no real session data."""
@@ -261,10 +271,61 @@ await waitGone("chat-pane-3"); await waitTabs("f-chat", [cfg.a, cfg.b, cfg.c, cf
 await waitFn(() => !document.getElementById("chat-area").classList.contains("rows"), null, "the bottom row never folded");
 out.s6.onC = Object.assign(await geometry(), { nonce: await nonce(), bytes: await store() });
 
+// ---- 6b. the busy guard across rows: D alone in column 4 over a create in flight, dragged to the bottom zone ----
+await page.evaluate(() => { const w = document.getElementById("f-chat-4").contentWindow; w.__rompRowsBusyOrig = w.__rompColumnBusy; w.__rompColumnBusy = () => true; });
+const bytesBeforeBusy = await store();
+await dragStart("f-chat-4", cfg.d);
+await waitFn(() => !!document.querySelector(".col-drop.col-drop-bottom"), null, "the bottom zone never mounted for D's drag (alone in the top row: a row below is a move)");
+out.s6b = { zones: await zones() };
+const bottomBusy = out.s6b.zones.find((z) => z.cls.includes("col-drop-bottom"));
+out.s6b.ghost = await overZone(bottomBusy);
+await page.mouse.up();
+await waitFn(() => document.querySelectorAll(".col-drop").length === 0, null, "the zones never unmounted after the refused drop");
+out.s6b.after = Object.assign(await geometry(), { nonce: await nonce(), bytesBefore: bytesBeforeBusy, bytes: await store(), col4Tabs: await tabsIn("f-chat-4"), col1Tabs: await tabsIn("f-chat") });
+await page.evaluate(() => { const w = document.getElementById("f-chat-4").contentWindow; w.__rompColumnBusy = w.__rompRowsBusyOrig; delete w.__rompRowsBusyOrig; });
+
+// ---- 6c. the share is forgotten with the row: B to the bottom edge again, the rectangle's half is the row ----
+await dragStart("f-chat", cfg.b);
+await waitFn(() => !!document.querySelector(".col-drop.col-drop-bottom"), null, "the bottom zone never mounted for B's second drag");
+const bottomAgain = (await zones()).find((z) => z.cls.includes("col-drop-bottom"));
+out.s6c = { ghost: await overZone(bottomAgain), areaBefore: (await geometry()).area };
+await page.mouse.up();
+await waitTabs("f-chat-2", [cfg.b]); await waitActive("f-chat-2", cfg.b);
+out.s6c.after = Object.assign(await geometry(), { nonce: await nonce() });
+await page.evaluate((sid) => window.__rompMoveTab(sid, 1), cfg.b);
+await waitGone("chat-pane-2"); await waitFn(() => !document.getElementById("chat-area").classList.contains("rows"), null, "the bottom row never folded again");
+
 // ---- 7. back to one ----
 await page.evaluate(() => window.__rompCloseSplit(4));
 await waitGone("chat-pane-4"); await waitTabs("f-chat", [cfg.a, cfg.b, cfg.c, cfg.d, cfg.e]);
 out.s7 = Object.assign(await geometry(), { nonce: await nonce(), col1Tabs: await tabsIn("f-chat") });
+
+// ---- 8. the upgrade of a pre-rows pane store: legacy stores reload at the widths the pre-rows shell gave them ----
+const widthsNow = () => page.evaluate(() => {
+  const w = (id) => { const e = document.getElementById(id); return e ? e.getBoundingClientRect().width : null; };
+  return { row: w("chat-area") === null ? null : document.querySelector(".row").getBoundingClientRect().width, area: w("chat-area"), chat1: w("chat-pane"), chat2: w("chat-pane-2"), chat3: w("chat-pane-3"), chat4: w("chat-pane-4"), feed: w("feed-pane"), fleet: w("fleet-pane"),
+           grow: JSON.parse(localStorage.getItem("romp-pane-grow") || "null"), frames: window.__rompChatFrameIds() };
+});
+const LEGACY = [
+  { name: "one", grow: { chat: 700, fleet: 34, feed: 300, files: 40 }, cols: [] },
+  { name: "two", grow: { chat: 640, fleet: 34, feed: 400, chat2: 400 }, cols: [{ n: 2, ids: [cfg.b] }] },
+  { name: "three", grow: { chat: 500, chat2: 300, chat3: 200, fleet: 34, feed: 400 }, cols: [{ n: 2, ids: [cfg.b] }, { n: 3, ids: [cfg.c] }] },
+  { name: "four", grow: { chat: 400, chat2: 300, chat3: 200, chat4: 100, fleet: 34, feed: 300 }, cols: [{ n: 2, ids: [cfg.b] }, { n: 3, ids: [cfg.c] }, { n: 4, ids: [cfg.d] }] },
+];
+out.s8 = {};
+for (const c of LEGACY) {
+  await page.evaluate(([grow, cols]) => { localStorage.setItem("romp-pane-grow", JSON.stringify(grow)); localStorage.setItem("romp-chat-cols", JSON.stringify({ v: 2, cols })); }, [c.grow, c.cols]);
+  await page.reload();
+  await waitTabs("f-chat", [cfg.a]);
+  for (const col of c.cols) await waitTabs("f-chat-" + col.n, col.ids);
+  await waitBootGone();
+  const first = await widthsNow();
+  await page.reload();
+  await waitTabs("f-chat", [cfg.a]);
+  for (const col of c.cols) await waitTabs("f-chat-" + col.n, col.ids);
+  await waitBootGone();
+  out.s8[c.name] = { first, second: await widthsNow() };
+}
 out.ms = Date.now() - out.t0;
 fs.writeSync(1, "RESULT:" + JSON.stringify(out) + "\n");
 await browser.close();
@@ -543,6 +604,36 @@ class ServedChatRows(unittest.TestCase):
                          "BYTE-IDENTICAL to what a browser that never stacked writes: no row, no rowSplit")
         self.assertEqual(onC["nonce"], r["s5"]["nonce2"], "the fold re-parents nothing either")
 
+    def test_6b_a_lone_member_over_a_create_in_flight_is_refused_the_other_row_by_a_real_drop(self):
+        r = self._r()
+        s, prev = r["s6b"], r["s6"]["onC"]
+        bottom = [z for z in s["zones"] if "col-drop-bottom" in z["cls"]]
+        self.assertEqual(len(bottom), 1, "the bottom zone mounts for a session alone in the top row (a row below is a move): %r" % s["zones"])
+        self.assertEqual(s["ghost"]["text"], "docs", "the rectangle shows as for any drag: the busy answer is the drop's, not the mount's")
+        a = s["after"]
+        self.assertEqual(a["cls"], "", "no bottom row opened"); self.assertEqual(a["row2"]["display"], "none")
+        self.assertEqual(a["frames"], ["f-chat", "f-chat-4"], "no column made")
+        self.assertEqual(a["bytes"], a["bytesBefore"], "the store's bytes are untouched: no empty entry persisted for another dashboard to close past the check")
+        self.assertEqual(a["bytes"], prev["bytes"])
+        self.assertEqual(a["col4Tabs"], [SID_D], "D is still in its column, the page holding its creation intact")
+        self.assertNotIn(SID_D, a["col1Tabs"])
+        self.assertEqual(a["nonce"], r["s5"]["nonce2"])
+
+    def test_6c_the_rectangle_s_half_is_the_row_a_reopen_produces_after_a_resize_and_a_fold(self):
+        r = self._r()
+        s = r["s6c"]
+        gh, area = s["ghost"], s["areaBefore"]
+        self.assertLessEqual(abs(gh["top"] - (area["top"] + area["height"] / 2)), 2, "the rectangle is the area's bottom half: %r vs %r" % (gh, area))
+        self.assertLessEqual(abs(gh["height"] - area["height"] / 2), 2)
+        a = s["after"]
+        self._assert_rows_stacked(a, "reopened")
+        self.assertEqual(json.loads(a["cols"])["rowSplit"], 0.5, "the row opens at the half, not at step 5's dragged share: %r" % a["cols"])
+        # the row's box IS the rectangle's, to the half-gutter the rectangle rounds over (3.5 px: the 7 px gutter sits between the rows)
+        self.assertLessEqual(abs(a["row2"]["top"] - gh["top"]), 5, "the row starts where the rectangle did: %r vs %r" % (a["row2"], gh))
+        self.assertLessEqual(abs(a["row2"]["height"] - gh["height"]), 5, "…and is as tall: %r vs %r" % (a["row2"], gh))
+        self.assertLessEqual(abs(a["row1"]["height"] - a["row2"]["height"]), 2, "the two rows share the height evenly again")
+        self.assertEqual(a["nonce"], r["s5"]["nonce2"])
+
     def test_7_back_to_one_column(self):
         r = self._r()
         s = r["s7"]
@@ -551,9 +642,36 @@ class ServedChatRows(unittest.TestCase):
         self.assertEqual(sorted(s["col1Tabs"]), sorted([SID_A, SID_B, SID_C, SID_D, SID_E]))
         self.assertEqual(s["nonce"], r["s5"]["nonce2"])
 
-    def test_8_the_whole_story_runs_in_under_a_minute_and_a_half_and_left_its_screenshots(self):
+    def test_8_a_pre_rows_pane_store_reloads_at_the_widths_the_pre_rows_shell_gave_it(self):
         r = self._r()
-        self.assertLess(r["ms"], 90_000, "the driver waits on conditions, never on fixed sleeps: %d ms" % r["ms"])
+        cases = {"one": ([], {"chat": 700, "feed": 300}), "two": (["chat2"], {"chat": 640, "chat2": 400, "feed": 400}),
+                 "three": (["chat2", "chat3"], {"chat": 500, "chat2": 300, "chat3": 200, "feed": 400}),
+                 "four": (["chat2", "chat3", "chat4"], {"chat": 400, "chat2": 300, "chat3": 200, "chat4": 100, "feed": 300})}
+        for name, (cols, weights) in cases.items():
+            s = r["s8"][name]
+            for which in ("first", "second"):
+                m = s[which]
+                self.assertEqual(m["frames"], ["f-chat"] + ["f-chat-" + k[4:] for k in cols], "%s/%s: the legacy columns are restored: %r" % (name, which, m["frames"]))
+                # the pre-rows shell: one row of chat, chat2…, feed (the outline and the files pane hidden), the row's width less a 7 px gutter per pair
+                items = ["chat"] + cols + ["feed"]
+                total = sum(weights[k] for k in items)
+                avail = m["row"] - 7 * (len(items) - 1)
+                want = {k: avail * weights[k] / total for k in items}
+                got = {"chat": m["chat1"], "feed": m["feed"]}
+                for k in cols:
+                    got[k] = m[k]
+                for k in items:
+                    self.assertIsNotNone(got[k], "%s/%s: %s is on screen" % (name, which, k))
+                    self.assertLessEqual(abs(got[k] - want[k]), 1, "%s/%s: %s renders at %.2f px where the pre-rows shell gave %.2f (row %.1f): %r" % (name, which, k, got[k], want[k], m["row"], m))
+            g = s["first"]["grow"]
+            self.assertIn("chat1", g, "%s: the store carries chat1 after the first boot: the upgrade ran once" % name)
+            self.assertLessEqual(abs(g["chat1"] - s["first"]["chat1"]), 1, "%s: the first pane's inner weight is its pixels" % name)
+            self.assertLessEqual(abs(g["chat"] - s["first"]["area"]), 1, "%s: the area's weight is its pixels (the columns plus their gutters)" % name)
+            self.assertEqual(s["second"]["grow"], g, "%s: the second boot is not an upgrade: the store is as the first left it" % name)
+
+    def test_9_the_whole_story_runs_in_under_two_and_a_half_minutes_and_left_its_screenshots(self):
+        r = self._r()
+        self.assertLess(r["ms"], 150_000, "the driver waits on conditions, never on fixed sleeps: %d ms" % r["ms"])
         self.assertEqual(r.get("shots"), ["stack-1-1-dark.png", "stack-1-1-light.png", "grid-2-2-dark.png", "grid-2-2-light.png"])
         for name in r["shots"]:
             self.assertTrue(os.path.getsize(os.path.join(SHOTS, name)) > 10_000, name + " is a real screenshot")
