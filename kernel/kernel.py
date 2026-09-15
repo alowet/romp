@@ -54791,16 +54791,25 @@ var PANES=['chat-area','chat-pane','fleet-pane','feed-pane','files-pane'];
 var GK='romp-pane-grow',grow={chat:60,chat1:60,fleet:34,feed:40,files:40};
 // a store from BEFORE the rows carries no chat1: the first pane starts at the chat weight it wore, so a stored later
 // column keeps its proportion against it (60 against a stored 400 px would have opened the first pane as a sliver) —
-// and the store is marked legacy, for __rompSeedAreaWeight below to set the outer weight once the split has restored
-// its columns (the old chat weight was ONE column's; the area's is every top-row column's together)
-var legacy=false,legacyGrow=null,legacyKeys=null;   // legacyKeys: the top-row columns the split restored, held while the upgrade below waits for the chat pane to show
+// and the store is LEGACY until the upgrade below has run (the old chat weight was ONE column's; the area's is every
+// top-row column's together). While it is, this shell keeps the PRE-ROWS rules — the fair grow over every pane on screen
+// (__rompGrowFair), the store in its pre-rows shape (persist) — and the upgrade, whenever it runs, converts the layout the
+// old shell would have had at that moment from LIVE state: the live weights and the live column roster, never a boot
+// snapshot (review find 2026-09-15, fourth pass: a pane revealed, a gutter dragged or a column closed while the upgrade
+// waited for the chat pane was lost to the snapshot, and a closed column's weight came back from it).
+var legacy=false;
 try{var g=JSON.parse(localStorage.getItem(GK)||'null');if(g){if(typeof g.chat1!=='number'){g.chat1=typeof g.chat==='number'?g.chat:grow.chat;legacy=true;}grow=Object.assign(grow,g);}}catch(e){}
-if(legacy)legacyGrow=Object.assign({},grow);   // the pre-rows weights as stored, snapshotted BEFORE any restored column takes a fair grow of the rows' rule (review find 2026-09-15: a column with no stored weight took its row-siblings' average ahead of the upgrade, and the upgrade froze that)
 function setGrow(k,v){grow[k]=v;row.style.setProperty('--g-'+k,v);}
 for(var k in grow)setGrow(k,grow[k]);
-// while a pre-rows store's upgrade is PENDING (__rompSeedAreaWeight below: the chat pane is off) the store keeps its pre-rows
-// SHAPE — no chat1 — so a reload before the pane shows finds the upgrade pending again, the weights persisted meanwhile in hand
-function persist(){var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}try{localStorage.setItem(GK,JSON.stringify(o));}catch(e){}}
+function finite(v){return typeof v==='number'&&isFinite(v);}
+// a PEER dashboard may upgrade the shared store while this one is legacy: a store that carries chat1 is CURRENT, and its
+// weights are adopted — every one, the area's and the columns' — and this shell is current from then on; a pre-rows shape
+// is never written over it
+function sync(){if(!legacy)return false;var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}
+if(!cur||!finite(cur.chat1))return false;legacy=false;for(var k in cur){if(finite(cur[k]))setGrow(k,cur[k]);}return true;}
+// while legacy the store keeps its pre-rows SHAPE — no chat1 — so a reload before the upgrade finds it legacy again, the
+// weights persisted meanwhile in hand; a store a peer has upgraded meanwhile is adopted (sync) and left as written
+function persist(){if(sync())return;var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}try{localStorage.setItem(GK,JSON.stringify(o));}catch(e){}}
 // split chat columns (the user 2026-09-08) are made AFTER this runs: they register here so the grab's
 // normalisation and the fair-grow average see them.
 var KEYS={};
@@ -54822,7 +54831,8 @@ function normalise(ids){var px={};ids.forEach(function(id){px[id]=document.getEl
 // in as a sliver after the others were dragged to extreme widths (grows are stored as px). Timeline is the
 // bottom BAND now (fixed-height var, not a row grow), so it's excluded.
 window.__rompGrowFair=function(k){if(k==='timeline')return;
-if(k==='chat'&&legacy&&legacyKeys){upgrade(legacyKeys,true);return;}   // the chat pane coming on (the toggle's fair-grow call, ahead of its class flip) with a pre-rows upgrade waiting for it: finalised now, over the panes about to be on screen
+if(legacy){if(sync()){if(finite(grow[k])){setGrow(k,grow[k]);return;}}   // a peer upgraded the store meanwhile: its weight for this pane stands
+else{if(k==='chat'){upgrade(true);return;}setGrow(k,oldFair());persist();return;}}   // the pre-rows rule while the store is pre-rows-shaped; the chat pane coming on (the toggle's call, ahead of its class flip) is the upgrade's moment
 var id=idOf(k),pool=(id&&document.getElementById(id))?sibs(id):PANES.filter(shown);
 var v=pool.map(function(id){return grow[key(id)];})
 .filter(function(g){return typeof g==='number'&&isFinite(g);});   // a pane with no grow yet (a split column being made) must not average in as NaN (review find 2026-09-08: the first split opened 0px wide)
@@ -54881,30 +54891,29 @@ window.__rompRowGutter=function(gid,topId,botId,apply){gutter(gid,function(){ret
 // those PIXELS as their weights: the chat columns inside the area, the outer panes beside it, and the area itself the
 // chat columns' pixels plus the gutters between them. Weights in px sum to the space each container distributes, so the
 // render matches the pre-rows one pixel for pixel; persisted, so the store carries chat1 from then on and this never runs again.
-// A restored column with NO stored weight (a supported restore) is given the weight the PRE-ROWS shell gave it — its fair
-// grow then (__rompGrowFair at ab112d49, PANES.filter(shown)): the mean of the finite weights of the panes ON SCREEN as it
-// was made — the first pane, the columns restored before it, the outer panes, each only while shown; a hidden pane
-// contributes nothing, and a hidden column being resolved receives the mean of what IS visible (50 with nothing) — in
-// restoration order, each resolved weight counting for the next; read from the boot snapshot, never from the rows' sibling
-// average make() has since applied (which the pixels below overwrite); set and persisted at once, as the old shell persisted it.
-// With the CHAT PANE OFF the pixels would be a hidden layout's (review find 2026-09-15, third pass): the upgrade then WAITS for
-// the pane to show — __rompGrowFair('chat'), the toggle's own call ahead of its class flip, an event and no timer — and does
-// there what the old shell did there first: fair-grows the first pane over the panes on screen at that moment (the chat
-// panes still hidden), so a first pane at 640 beside a column resolved to the feed's 400 comes on as equal columns.
-function finite(v){return typeof v==='number'&&isFinite(v);}
+// Run at the split's boot once the columns are restored, when the chat pane is on; when it is off, at the moment it comes
+// on — __rompGrowFair('chat'), the toggle's own call ahead of its class flip, an event and no timer (review find
+// 2026-09-15, third pass: finalised hidden, the pixels were a layout nobody saw). Its inputs are all LIVE (fourth pass):
+// the top row's registered columns — what make() registered less what close() and a reconcile unregistered — with their
+// weights, the shown outer panes with theirs, and, at a show, the first pane fair-grown first over what is on screen
+// with the chat panes still hidden, as the old shell did there. A restored column with no stored weight has already
+// taken the pre-rows fair grow through __rompGrowFair above, the rule this shell keeps while legacy (__rompGrowFair at
+// ab112d49, PANES.filter(shown): the mean of the finite weights of every pane on screen, 50 with none — a hidden pane
+// contributes nothing, and a hidden column being resolved receives the mean of what IS visible), set and persisted as the
+// old shell's was; so did a pane the rail revealed during the wait, and a gutter dragged then moved the live weights.
 var OUTER=['fleet','feed','files'];
-function oldFair(lg,keys){var v=keys.filter(function(j){return shown(idOf(j))&&finite(lg[j]);}).map(function(j){return lg[j];});return v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;}
-function upgrade(colKeys,showing){var lg=legacyGrow||{},chatKeys=['chat1'];
-colKeys.forEach(function(k){if(!finite(lg[k])){lg[k]=oldFair(lg,chatKeys.concat(OUTER));setGrow(k,lg[k]);}chatKeys.push(k);});
-if(showing)lg.chat1=oldFair(lg,chatKeys.concat(OUTER));   // the old shell's show-time fair grow of the first pane
-else if(!shown('chat-pane')){legacyKeys=colKeys;persist();return false;}   // deferred to the show: the store keeps its pre-rows shape, the resolved weights in it
-legacy=false;legacyKeys=null;
-var outer=OUTER.filter(function(k){return shown(idOf(k));}),items=chatKeys.concat(outer),T=0,W=row.offsetWidth;items.forEach(function(k){T+=lg[k];});
+function oldFair(){var v=PANES.filter(function(id){return id!=='chat-area'&&shown(id);}).map(function(id){return grow[key(id)];}).filter(finite);return v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;}   // the chat area is no pane of the pre-rows row
+function upgrade(showing){if(!legacy||sync())return false;
+var first=document.getElementById('chat-pane'),host=first?first.parentElement:null;
+var cols=PANES.filter(function(id){var e=document.getElementById(id);return !!KEYS[id]&&!!e&&e.parentElement===host&&finite(grow[KEYS[id]]);}).map(function(id){return KEYS[id];});   // the top row's LIVE columns
+if(showing)setGrow('chat1',oldFair());   // the old shell's show-time fair grow of the first pane
+var chatKeys=['chat1'].concat(cols),outer=OUTER.filter(function(k){return shown(idOf(k));}),items=chatKeys.concat(outer),T=0,W=row.offsetWidth;items.forEach(function(k){T+=grow[k];});
+legacy=false;
 if(!(W>0)||!(T>0)){persist();return false;}
-var avail=W-7*(items.length-1),px={},sum=0;items.forEach(function(k){px[k]=avail*lg[k]/T;});
+var avail=W-7*(items.length-1),px={},sum=0;items.forEach(function(k){px[k]=avail*grow[k]/T;});
 items.forEach(function(k){setGrow(k,px[k]);});chatKeys.forEach(function(k){sum+=px[k];});
 setGrow('chat',sum+7*(chatKeys.length-1));persist();return true;}
-window.__rompSeedAreaWeight=function(colKeys){if(!legacy)return false;return upgrade(colKeys||[],false);};
+window.__rompSeedAreaWeight=function(){if(!legacy||sync())return false;if(!shown('chat-pane'))return false;return upgrade(false);};   // the chat pane off: the upgrade waits for __rompGrowFair('chat')
 gutter('gv-a',function(){return lastChat();},'fleet-pane');
 gutter('gv-b',function(){return document.body.classList.contains('po-fleet')?'fleet-pane':lastChat();},'feed-pane');
 gutter('gv-c',function(){var c=document.body.classList;return c.contains('po-feed')?'feed-pane':c.contains('po-fleet')?'fleet-pane':lastChat();},'files-pane');
@@ -58390,7 +58399,7 @@ if(window.__rompRowGutter)window.__rompRowGutter('gv-rows','chat-row-1','chat-ro
 // the columns this browser had open come back, each on a member of its own and in its row (the phone restores nothing:
 // the arrangement stays in the store for the desktop); a v1 store is written back in the new shape, once
 try{if(!mobile()){var r0=read();cols=r0.cols;rowSplit=r0.rowSplit;cols.forEach(function(c){make(c.n,seedFor(c),null);});applyRows();if(r0.migrated)save();
-if(window.__rompSeedAreaWeight)window.__rompSeedAreaWeight(rowCols(1).map(function(c){return 'chat'+c.n;}));}}catch(e){}   // a pre-rows pane-weight store: the area's weight from the top-row columns this boot restored (_LANDING_JS)
+if(window.__rompSeedAreaWeight)window.__rompSeedAreaWeight();}}catch(e){}   // a pre-rows pane-weight store: its upgrade, now that this boot's columns are made and registered (_LANDING_JS; it reads the live roster)
 })();
 """
 

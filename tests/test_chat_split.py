@@ -249,21 +249,23 @@ class SplitSourcePins(unittest.TestCase):
         self.assertIn("window.__rompRowGutter=function(gid,topId,botId,apply){", gut, "the row gutter rides the same drag code, reporting the top row's share")
         # a pre-rows pane store (no chat1): the area's weight is set once from the top-row columns the split restored, in the
         # pixels of the pre-rows layout (review find 2026-09-15; tests/test_pane_gutters.py runs it)
-        self.assertIn("window.__rompSeedAreaWeight=function(colKeys){if(!legacy)return false;return upgrade(colKeys||[],false);};", gut)
-        # …from a snapshot of the pre-rows weights taken at boot, a restored column with no stored weight given the pre-rows fair
-        # grow (the panes ON SCREEN as it was made — the old PANES.filter(shown) — in restoration order), never the rows' sibling
-        # average make() applied since; with the chat pane off the pixels wait for the toggle's own fair-grow call (an event)
-        self.assertIn("if(legacy)legacyGrow=Object.assign({},grow);", gut)
-        self.assertLess(gut.index("if(legacy)legacyGrow=Object.assign({},grow);"), gut.index("for(var k in grow)setGrow(k,grow[k]);"), "snapshotted before the first write")
-        self.assertIn("function oldFair(lg,keys){var v=keys.filter(function(j){return shown(idOf(j))&&finite(lg[j]);}).map(function(j){return lg[j];});return v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;}", gut)
-        self.assertIn("colKeys.forEach(function(k){if(!finite(lg[k])){lg[k]=oldFair(lg,chatKeys.concat(OUTER));setGrow(k,lg[k]);}chatKeys.push(k);});", gut)
-        self.assertIn("if(showing)lg.chat1=oldFair(lg,chatKeys.concat(OUTER));", gut)
-        self.assertIn("else if(!shown('chat-pane')){legacyKeys=colKeys;persist();return false;}", gut)
-        self.assertIn("if(k==='chat'&&legacy&&legacyKeys){upgrade(legacyKeys,true);return;}", gut, "the deferred upgrade rides __rompGrowFair('chat'), which togglePane calls ahead of its class flip")
-        self.assertIn("function persist(){var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}", gut, "the store keeps its pre-rows shape while the upgrade is pending")
-        self.assertIn("if(window.__rompSeedAreaWeight)window.__rompSeedAreaWeight(rowCols(1).map(function(c){return 'chat'+c.n;}));", km._LANDING_SPLIT_JS, "called at the split's boot with the TOP row's restored columns")
+        self.assertIn("window.__rompSeedAreaWeight=function(){if(!legacy||sync())return false;if(!shown('chat-pane'))return false;return upgrade(false);};", gut)
+        # …no snapshot (review find 2026-09-15, fourth pass): while the store is pre-rows-shaped this shell keeps the PRE-ROWS fair grow
+        # (the old PANES.filter(shown), the chat area no pane of it), the upgrade reads the LIVE roster and weights when it runs, a peer's
+        # upgraded store is adopted rather than written over, and the store keeps its pre-rows shape meanwhile
+        self.assertNotIn("legacyGrow", gut); self.assertNotIn("legacyKeys", gut)
+        self.assertIn("function oldFair(){var v=PANES.filter(function(id){return id!=='chat-area'&&shown(id);}).map(function(id){return grow[key(id)];}).filter(finite);return v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;}", gut)
+        self.assertIn("if(legacy){if(sync()){if(finite(grow[k])){setGrow(k,grow[k]);return;}}", gut)
+        self.assertIn("else{if(k==='chat'){upgrade(true);return;}setGrow(k,oldFair());persist();return;}}", gut, "the pre-rows rule while legacy; the chat pane coming on is the upgrade's moment")
+        self.assertIn("function upgrade(showing){if(!legacy||sync())return false;", gut)
+        self.assertIn("var cols=PANES.filter(function(id){var e=document.getElementById(id);return !!KEYS[id]&&!!e&&e.parentElement===host&&finite(grow[KEYS[id]]);}).map(function(id){return KEYS[id];});", gut, "the live roster: registered, present, in the first pane's row")
+        self.assertIn("if(showing)setGrow('chat1',oldFair());", gut)
+        self.assertIn("function sync(){if(!legacy)return false;var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}", gut)
+        self.assertIn("if(!cur||!finite(cur.chat1))return false;legacy=false;for(var k in cur){if(finite(cur[k]))setGrow(k,cur[k]);}return true;}", gut, "a current-shape store is adopted whole")
+        self.assertIn("function persist(){if(sync())return;var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}", gut, "the store keeps its pre-rows shape while legacy, and is never downgraded once a peer upgraded it")
+        self.assertIn("if(window.__rompSeedAreaWeight)window.__rompSeedAreaWeight();", km._LANDING_SPLIT_JS, "called at the split's boot, no arguments: the roster is live")
         boot = km._LANDING_SPLIT_JS[km._LANDING_SPLIT_JS.index("try{if(!mobile()){var r0=read();"):]
-        self.assertLess(boot.index("cols.forEach(function(c){make(c.n,seedFor(c),null);});"), boot.index("__rompSeedAreaWeight(rowCols(1)"), "…after they are made (their stored weights applied)")
+        self.assertLess(boot.index("cols.forEach(function(c){make(c.n,seedFor(c),null);});"), boot.index("__rompSeedAreaWeight();"), "…after they are made and registered")
         self.assertIn("window.__rompGutter=gutter;", gut)
         self.assertIn("gutter('gv-a',function(){return lastChat();},'fleet-pane');", gut)
         # a pane with no grow yet never averages in as NaN (the first split opened 0px wide — review find 2026-09-08),
@@ -452,7 +454,7 @@ global.__rompNotify = (kind, text) => CALLS.notify.push([kind, text]);
 global.__rompPaneToggle = (k, to) => CALLS.toggle.push([k, to]);
 global.__rompGutter = (gid, leftPick, rightId) => CALLS.gutter.push({ gid, leftPick, rightId });
 global.__rompRowGutter = (gid, top, bot, apply) => { CALLS.rowGutter.push({ gid, top, bot }); ROWAPPLY = apply; };
-global.__rompSeedAreaWeight = (keys) => { CALLS.seedArea.push(keys); return true; };   // the pre-rows store's upgrade hook (tests/test_pane_gutters.py runs the real one)
+global.__rompSeedAreaWeight = () => { CALLS.seedArea.push(true); return true; };   // the pre-rows store's upgrade hook (tests/test_pane_gutters.py runs the real one)
 global.__rompWireFocus = (f) => CALLS.wireFocus.push(f.id);
 global.__rompWireEsc = (f) => CALLS.wireEsc.push(f.id);
 global.__rompColGone = (c) => CALLS.colGone.push(c);
@@ -1453,8 +1455,8 @@ boot({ 'romp-chat-cols': JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB] }], ro
 out.reopen.junkShare = { before: areaState() };
 window.__rompMoveTab(API, 'below');
 out.reopen.junkShare.after = { area: areaState(), stored: cols() };
-// P) the pre-rows pane store's upgrade hook is called once at boot with the TOP row's restored columns (never a bottom-row one),
-//    after they are made; not on the phone
+// P) the pre-rows pane store's upgrade hook is called once at boot, after every column is made and registered (it reads the live
+//    roster itself); not on the phone
 boot({ 'romp-chat-cols': JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB] }, { n: 3, ids: [API], row: 2 }, { n: 4, ids: [TESTS] }], rowSplit: 0.5 }) }, false);
 out.seedArea = { calls: CALLS.seedArea.slice(), registered: CALLS.register.map((r) => r[0]) };
 boot({}, false); out.seedArea.fresh = CALLS.seedArea.slice();
@@ -1698,11 +1700,11 @@ class RowsExecute(unittest.TestCase):
         self.assertEqual(j["before"]["cls"], ""); self.assertEqual(j["after"]["area"], {"cls": "rows", "rs1": 50, "rs2": 50}, "a stray share in a store with no bottom row does not shape the row it opens")
         self.assertEqual(j["after"]["stored"]["rowSplit"], 0.5)
 
-    def test_the_pre_rows_pane_store_s_upgrade_hook_is_called_once_with_the_top_row_s_restored_columns(self):
+    def test_the_pre_rows_pane_store_s_upgrade_hook_is_called_once_after_the_columns_are_made(self):
         s = self.out["seedArea"]
-        self.assertEqual(s["calls"], [["chat2", "chat4"]], "the top row's columns, in store order; the bottom row's column 3 is not the area's width")
-        self.assertEqual(s["registered"], ["chat-pane-2", "chat-pane-3", "chat-pane-4"], "…called after every column is made and registered")
-        self.assertEqual(s["fresh"], [[]], "no columns: called with none (the hook then converts the one pane's weight alone)")
+        self.assertEqual(s["calls"], [True], "once, at boot")
+        self.assertEqual(s["registered"], ["chat-pane-2", "chat-pane-3", "chat-pane-4"], "…after every column is made and registered (the hook reads the live roster)")
+        self.assertEqual(s["fresh"], [True], "no columns: called all the same (the hook then converts the one pane's weight alone)")
         self.assertEqual(s["phone"], [], "not on the phone: nothing is restored there")
 
     def test_the_phone_restores_no_rows_and_refuses_the_move_below(self):

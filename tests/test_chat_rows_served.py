@@ -36,7 +36,9 @@ the REAL page: a hermetic kernel serves the dashboard with FIVE synthetic sessio
      chat1 and the area's weight, and a second reload renders the same; and with the CHAT PANE OFF (the rail's Chat, before
      the reload) a legacy store with a missing column weight resolves it over the visible feed, keeps its pre-rows shape while
      the pane is hidden, and on the rail's Chat lays out as the old shell did — the first pane fair-grown over the feed at the
-     show, equal columns — a reload after keeping it;
+     show, equal columns — a reload after keeping it; and what changes while the upgrade WAITS reaches it (the fourth pass): the
+     outline revealed from the rail before the chat pane shows lays out as four equal panes, the restored column closed from
+     the palette before the chat pane shows leaves two halves and no weight for it in the store;
   9. the whole story runs in under two and a half minutes (the driver waits on conditions, never on fixed sleeps).
 Screenshots of the 1 + 1 stack and the 2 x 2, dark and light, land in the directory ROMP_ROWS_SHOTS names (default
 /tmp/chat-rows-shots) for a human look. Skips LOUDLY when the extension deps or a playwright browser are absent (CI
@@ -349,6 +351,51 @@ const shownFirst = await widthsNow();
 await page.reload();
 await waitTabs("f-chat", [cfg.a]); await waitTabs("f-chat-2", [cfg.b]); await waitBootGone();
 out.s8["hidden-chat"] = { hidden, first: shownFirst, second: await widthsNow() };
+// …the outline REVEALED from the rail while the upgrade waits (the fourth pass): its fair grow is the pre-rows rule over the
+// feed alone, and the chat pane's show then lays out four equal panes
+await page.click(".rail-btn[data-pane=chat]");
+await waitFn(() => !document.body.classList.contains("po-chat"), null, "the rail never hid the chat pane (reveal case)");
+await page.evaluate(([grow, cols]) => { localStorage.setItem("romp-pane-grow", JSON.stringify(grow)); localStorage.setItem("romp-chat-cols", JSON.stringify({ v: 2, cols })); }, [{ chat: 640, fleet: 34, feed: 400 }, [{ n: 2, ids: [cfg.b] }]]);
+await page.reload();
+await waitBootGone();
+await waitFn(() => !document.body.classList.contains("po-chat") && !!window.__rompChatFrameIds && window.__rompChatFrameIds().length === 2, null, "column 2 never restored while hidden (reveal case)");
+await page.click(".rail-btn[data-pane=fleet]");
+await waitFn(() => document.body.classList.contains("po-fleet"), null, "the rail never showed the outline");
+const revealedPending = await widthsNow();
+await page.click(".rail-btn[data-pane=chat]");
+await waitFn(() => document.body.classList.contains("po-chat"), null, "the rail never showed the chat pane (reveal case)");
+await waitTabs("f-chat", [cfg.a]); await waitTabs("f-chat-2", [cfg.b]);
+const revealedShown = await widthsNow();
+await page.reload();
+await waitTabs("f-chat", [cfg.a]); await waitTabs("f-chat-2", [cfg.b]); await waitBootGone();
+out.s8["hidden-chat-reveal"] = { pending: revealedPending, first: revealedShown, second: await widthsNow() };
+await page.click(".rail-btn[data-pane=fleet]");
+await waitFn(() => !document.body.classList.contains("po-fleet"), null, "the rail never hid the outline again");
+// …and the restored column CLOSED from the palette while the upgrade waits: Close this column falls to the last split column
+// when the first frame holds the focus; the show then lays out the first pane and the feed as two halves, no chat2 anywhere
+await page.click(".rail-btn[data-pane=chat]");
+await waitFn(() => !document.body.classList.contains("po-chat"), null, "the rail never hid the chat pane (close case)");
+await page.evaluate(([grow, cols]) => { localStorage.setItem("romp-pane-grow", JSON.stringify(grow)); localStorage.setItem("romp-chat-cols", JSON.stringify({ v: 2, cols })); }, [{ chat: 640, fleet: 34, feed: 400 }, [{ n: 2, ids: [cfg.b] }]]);
+await page.reload();
+await waitBootGone();
+await waitFn(() => !document.body.classList.contains("po-chat") && !!window.__rompChatFrameIds && window.__rompChatFrameIds().length === 2, null, "column 2 never restored while hidden (close case)");
+const feedBox = await page.evaluate(() => { const r = document.getElementById("f-feed").getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + Math.min(r.height / 2, 200) }; });
+await page.mouse.click(feedBox.x, feedBox.y);   // the keyboard into the feed's document: the palette's chord is wired in every pane
+await page.keyboard.press("Control+P");
+await waitFn(() => { const b = document.getElementById("rpal-back"); return !!b && !b.hidden; }, null, "the palette never opened from the feed pane");
+await page.keyboard.type("Close this column");
+await waitFn(() => { const r = document.querySelector("#rpal-list .rpal-row.active"); return !!r && /Close this column/.test(r.textContent || ""); }, null, "the palette never matched Close this column");
+await page.keyboard.press("Enter");
+await waitFn(() => { const b = document.getElementById("rpal-back"); return !!b && b.hidden; }, null, "the palette never closed on Enter");
+await waitGone("chat-pane-2");
+const closedPending = await widthsNow();
+await page.click(".rail-btn[data-pane=chat]");
+await waitFn(() => document.body.classList.contains("po-chat"), null, "the rail never showed the chat pane (close case)");
+await waitTabs("f-chat", [cfg.a, cfg.b]);
+const closedShown = await widthsNow();
+await page.reload();
+await waitTabs("f-chat", [cfg.a, cfg.b]); await waitBootGone();
+out.s8["hidden-chat-close"] = { pending: closedPending, first: closedShown, second: await widthsNow() };
 out.ms = Date.now() - out.t0;
 fs.writeSync(1, "RESULT:" + JSON.stringify(out) + "\n");
 await browser.close();
@@ -670,22 +717,30 @@ class ServedChatRows(unittest.TestCase):
         self.assertEqual(s["nonce"], r["s5"]["nonce2"])
 
     @staticmethod
-    def _pre_rows_weights(stored, cols, visible=("feed",), chat_shown=True):
-        """The weights the PRE-ROWS shell laid the row out by: the store's, its defaults for keys the store lacks, and for a
-        restored column with no stored weight its fair grow as it was made — the mean of the panes then ON SCREEN (the first
-        pane and the columns made before it while the chat pane was shown, plus the `visible` outer panes), in restoration
-        order, 50 with nothing on screen. With the chat pane hidden at the restore, the rail's Chat fair-grew the first pane
-        over the visible outer panes (the chat panes still hidden) before showing it."""
+    def _pre_rows_weights(stored, cols, visible=("feed",), chat_shown=True, reveal=(), closed=()):
+        """The weights the PRE-ROWS shell laid the row out by, and the panes of that row in order: the store's weights, its
+        defaults for keys the store lacks, and for a restored column with no stored weight its fair grow as it was made — the
+        mean of the panes then ON SCREEN (the first pane and the columns made before it while the chat pane was shown, plus the
+        `visible` outer panes), in restoration order, 50 with nothing on screen. Then what happened while the chat pane stayed
+        hidden: an outer pane the rail revealed (`reveal`) took the same fair grow over what was on screen and joined it; a
+        column closed (`closed`) left the row and the store. With the chat pane hidden at the restore, the rail's Chat fair-grew
+        the first pane over the visible outer panes (the chat panes still hidden) before showing it."""
         w = dict({"chat": 60, "fleet": 34, "feed": 40, "files": 40}, **stored)
         mean = lambda v: (sum(v) / len(v)) if v else 50
-        made = ["chat"]
+        made, vis = ["chat"], list(visible)
         for k in cols:
             if k not in w:
-                w[k] = mean([w[j] for j in (made if chat_shown else []) + list(visible)])
+                w[k] = mean([w[j] for j in (made if chat_shown else []) + vis])
             made.append(k)
+        for k in reveal:
+            w[k] = mean([w[j] for j in (made if chat_shown else []) + vis])
+            vis.append(k)
+        for k in closed:
+            made.remove(k)
+            w.pop(k, None)
         if not chat_shown:
-            w["chat"] = mean([w[j] for j in visible])
-        return w
+            w["chat"] = mean([w[j] for j in vis])
+        return w, made + vis
 
     def test_8_a_pre_rows_pane_store_reloads_at_the_widths_the_pre_rows_shell_gave_it(self):
         r = self._r()
@@ -698,20 +753,24 @@ class ServedChatRows(unittest.TestCase):
                  "empty": (["chat2", "chat3"], {}),
                  # the chat pane OFF at the restore: chat2 resolves over the visible feed alone, 400, and the rail's Chat fair-grows
                  # the first pane to the feed's 400 before showing it: three equal columns
-                 "hidden-chat": (["chat2"], {"chat": 640, "feed": 400})}
+                 "hidden-chat": (["chat2"], {"chat": 640, "feed": 400}),
+                 # …and what changed while the upgrade waited (the fourth pass): the outline revealed (its fair grow the feed's 400, then
+                 # the first pane's (400 + 400) / 2 at the show: four equal panes), or the column closed (two halves, no chat2)
+                 "hidden-chat-reveal": (["chat2"], {"chat": 640, "feed": 400}), "hidden-chat-close": (["chat2"], {"chat": 640, "feed": 400})}
+        extras = {"hidden-chat-reveal": {"reveal": ("fleet",)}, "hidden-chat-close": {"closed": ("chat2",)}}
         for name, (cols, stored) in cases.items():
-            weights = self._pre_rows_weights(stored, cols, visible=("feed",), chat_shown=(name != "hidden-chat"))
+            weights, items = self._pre_rows_weights(stored, cols, visible=("feed",), chat_shown=not name.startswith("hidden-chat"), **extras.get(name, {}))
+            shown_cols = [k for k in cols if k in weights]
             s = r["s8"][name]
             for which in ("first", "second"):
                 m = s[which]
-                self.assertEqual(m["frames"], ["f-chat"] + ["f-chat-" + k[4:] for k in cols], "%s/%s: the legacy columns are restored: %r" % (name, which, m["frames"]))
-                # the pre-rows shell: one row of chat, chat2…, feed (the outline and the files pane hidden), the row's width less a 7 px gutter per pair
-                items = ["chat"] + cols + ["feed"]
+                self.assertEqual(m["frames"], ["f-chat"] + ["f-chat-" + k[4:] for k in shown_cols], "%s/%s: the legacy columns are restored: %r" % (name, which, m["frames"]))
+                # the pre-rows shell: one row of the panes on screen (chat, its columns, the outer panes shown), the row's width less a 7 px gutter per pair
                 total = sum(weights[k] for k in items)
                 avail = m["row"] - 7 * (len(items) - 1)
                 want = {k: avail * weights[k] / total for k in items}
-                got = {"chat": m["chat1"], "feed": m["feed"]}
-                for k in cols:
+                got = {"chat": m["chat1"], "feed": m["feed"], "fleet": m["fleet"]}
+                for k in shown_cols:
                     got[k] = m[k]
                 for k in items:
                     self.assertIsNotNone(got[k], "%s/%s: %s is on screen" % (name, which, k))
@@ -735,6 +794,24 @@ class ServedChatRows(unittest.TestCase):
         self.assertLessEqual(abs(f["chat1"] - f["chat2"]), 1, "shown: equal columns (the first pane fair-grown to the feed's 400 at the show): %r" % f)
         self.assertLessEqual(abs(f["chat1"] - f["feed"]), 1)
         self.assertIn("chat1", f["grow"], "finalised at the show")
+
+    def test_8c_what_changes_while_the_upgrade_waits_reaches_it(self):
+        r = self._r()
+        rv = r["s8"]["hidden-chat-reveal"]
+        self.assertEqual(rv["pending"]["frames"], ["f-chat", "f-chat-2"]); self.assertNotIn("chat1", rv["pending"]["grow"], "still pending after the outline's reveal")
+        self.assertEqual(rv["pending"]["grow"]["fleet"], 400, "the outline revealed from the rail took the pre-rows fair grow: the feed's 400 (the chat panes hidden), persisted")
+        f = rv["first"]
+        for k in ("chat2", "fleet", "feed"):
+            self.assertLessEqual(abs(f["chat1"] - f[k]), 1, "shown: four equal panes, the first fair-grown to (400 + 400) / 2 at the show: %r" % f)
+        self.assertLessEqual(abs(f["fleet"] - (f["row"] - 21) / 4), 1)
+        self.assertEqual(f["grow"]["fleet"], rv["second"]["grow"]["fleet"], "a reload keeps the outline's live weight")
+        cl = r["s8"]["hidden-chat-close"]
+        self.assertEqual(cl["pending"]["frames"], ["f-chat"], "the palette's Close this column closed the restored column while hidden")
+        self.assertNotIn("chat2", cl["pending"]["grow"], "…and its weight left the store at once"); self.assertNotIn("chat1", cl["pending"]["grow"], "still pending")
+        f = cl["first"]
+        self.assertLessEqual(abs(f["chat1"] - f["feed"]), 1, "shown: two halves: %r" % f); self.assertIsNone(f["chat2"])
+        self.assertNotIn("chat2", f["grow"], "no phantom weight for a column that no longer exists"); self.assertIn("chat1", f["grow"])
+        self.assertNotIn("chat2", cl["second"]["grow"])
 
     def test_9_the_whole_story_runs_in_under_two_and_a_half_minutes_and_left_its_screenshots(self):
         r = self._r()

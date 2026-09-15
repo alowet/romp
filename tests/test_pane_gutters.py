@@ -94,6 +94,7 @@ function resetDom() {
   EL['files-pane'] = mkEl('files-pane', 400, 'none');   // the fourth top pane (main, 2026-09), hidden by default
   EL['chat-pane-2'] = mkEl('chat-pane-2', 500, 'flex', row1El);   // the split's client-made column (shown once made), in the top row
   EL['chat-pane-3'] = mkEl('chat-pane-3', 450, 'flex', row1El);
+  EL['chat-pane-4'] = mkEl('chat-pane-4', 300, 'flex', row1El);
   EL['chat-row-1'] = mkEl('chat-row-1', 600, 'flex', areaEl, 400);   // the two chat rows, 400 px each behind the 7 px row gutter
   EL['chat-row-2'] = mkEl('chat-row-2', 600, 'flex', areaEl, 400); EL['chat-row-2']._top = 407;
   for (const k in ROW) delete ROW[k];
@@ -296,22 +297,22 @@ LEGACY.forEach((c) => {
   c.cols.forEach((k) => { window.__rompRegisterPane('chat-pane-' + k.slice(4), k); window.__rompGrowFairIfNew(k); });   // what the split's make() does for a restored column
   const outerShown = (c.fleet ? ['fleet'] : []).concat(['feed']);
   const before = legacyWidths(c.store, c.cols, outerShown);
-  const wrote = window.__rompSeedAreaWeight(c.cols);
+  const wrote = window.__rompSeedAreaWeight();
   const g = Object.assign({}, ROW); const gk = {}; Object.keys(g).forEach((k) => { gk[k.slice(4)] = g[k]; });
-  out.upgrade[c.name] = { wrote, before, after: rowsWidths(gk, c.cols, outerShown), grows: g, store: store(), again: window.__rompSeedAreaWeight(c.cols), growsAgain: grows() };
+  out.upgrade[c.name] = { wrote, before, after: rowsWidths(gk, c.cols, outerShown), grows: g, store: store(), again: window.__rompSeedAreaWeight(), growsAgain: grows() };
   showFleet(false);
 });
 resetDom(); for (const k in STORE) delete STORE[k];
 STORE['romp-pane-grow'] = JSON.stringify({ chat: 900, chat1: 640, chat2: 400, fleet: 34, feed: 400, files: 40 });
 BOOT();
 window.__rompRegisterPane('chat-pane-2', 'chat2'); window.__rompGrowFairIfNew('chat2');
-out.upgrade.current = { wrote: window.__rompSeedAreaWeight(['chat2']), grows: grows(), store: store() };
+out.upgrade.current = { wrote: window.__rompSeedAreaWeight(), grows: grows(), store: store() };
 // 13) the CHAT PANE OFF at a legacy restore (review find 2026-09-15, third pass): the missing weight resolves over what is on
 //     screen — the feed alone, 400 — and is persisted; the pixels WAIT (the store keeps its pre-rows shape, no chat1); a reload
 //     while hidden is pending again with the resolved weight in hand; the rail's Chat (the toggle's __rompGrowFair('chat'),
 //     ahead of its class flip) fair-grows the first pane over the feed alone — 400 — then finalises: equal columns, the widths
 //     the old shell gave; a reload after keeps them
-const CHAT_IDS = ['chat-area', 'chat-pane', 'chat-pane-2', 'chat-pane-3'];
+const CHAT_IDS = ['chat-area', 'chat-pane', 'chat-pane-2', 'chat-pane-3', 'chat-pane-4'];
 const gk = (g) => { const o = {}; Object.keys(g).forEach((k) => { o[k.slice(4)] = g[k]; }); return o; };
 const HSTORE = { chat: 640, fleet: 34, feed: 400 };
 resetDom(); for (const k in STORE) delete STORE[k];
@@ -320,17 +321,112 @@ CHAT_IDS.forEach((id) => { EL[id]._display = 'none'; });
 BOOT();
 window.__rompRegisterPane('chat-pane-2', 'chat2'); window.__rompGrowFairIfNew('chat2');
 const hb = { madeGrow: ROW['--g-chat2'], storeAfterMake: store() };
-hb.deferred = window.__rompSeedAreaWeight(['chat2']); hb.grows = grows(); hb.store = store();
+hb.deferred = window.__rompSeedAreaWeight(); hb.grows = grows(); hb.store = store();
 resetDom(); CHAT_IDS.forEach((id) => { EL[id]._display = 'none'; });
 BOOT(); window.__rompRegisterPane('chat-pane-2', 'chat2'); window.__rompGrowFairIfNew('chat2');
-hb.reloadHidden = { deferred: window.__rompSeedAreaWeight(['chat2']), grows: grows(), store: store() };
+hb.reloadHidden = { deferred: window.__rompSeedAreaWeight(), grows: grows(), store: store() };
 window.__rompGrowFair('chat');   // the rail's Chat: togglePane fair-grows the pane, then flips the class
 CHAT_IDS.forEach((id) => { EL[id]._display = 'flex'; });
 hb.shown = { grows: grows(), store: store(), before: legacyWidths(HSTORE, ['chat2'], ['feed'], true), after: rowsWidths(gk(grows()), ['chat2'], ['feed']) };
 resetDom(); BOOT(); window.__rompRegisterPane('chat-pane-2', 'chat2'); window.__rompGrowFairIfNew('chat2');
-hb.reloadShown = { wrote: window.__rompSeedAreaWeight(['chat2']), after: rowsWidths(gk(grows()), ['chat2'], ['feed']), store: store() };
+hb.reloadShown = { wrote: window.__rompSeedAreaWeight(), after: rowsWidths(gk(grows()), ['chat2'], ['feed']), store: store() };
 // …and with the chat pane ON at the restore the same store resolves the column over chat 640 and feed 400 (test 12's missingOne)
 out.upgrade.hiddenChat = hb;
+// 14) THE MATRIX against the pre-rows shell itself (the fourth review pass ran it: 1-4 columns x saved / missing / mixed weights
+//     x the 8 outer visibility combinations x the chat pane shown or hidden at boot, 192 cases). OLD_SHELL is the pane-weight
+//     helper of _LANDING_JS at ab112d49, verbatim (the registry, the fair grow, the store); both shells restore the same store
+//     into the same stub, the hidden ones are shown through the toggle's fair-grow call, and the widths each lays out — the old
+//     one row, the new the outer row then the top chat row — must agree to the pixel
+const OLD_SHELL = function () {
+var row=document.querySelector('.row');
+var PANES=['chat-pane','fleet-pane','feed-pane','files-pane'];
+var GK='romp-pane-grow',grow={chat:60,fleet:34,feed:40,files:40};
+try{var g=JSON.parse(localStorage.getItem(GK)||'null');if(g)grow=Object.assign(grow,g);}catch(e){}
+function setGrow(k,v){grow[k]=v;row.style.setProperty('--g-'+k,v);}
+for(var k in grow)setGrow(k,grow[k]);
+var KEYS={};
+window.__rompRegisterPane=function(id,k){KEYS[id]=k;if(PANES.indexOf(id)<0)PANES.splice(PANES.indexOf('fleet-pane'),0,id);};
+window.__rompUnregisterPane=function(id){var k=KEYS[id];delete KEYS[id];var i=PANES.indexOf(id);if(i>=0)PANES.splice(i,1);
+if(k){delete grow[k];row.style.removeProperty('--g-'+k);try{localStorage.setItem(GK,JSON.stringify(grow));}catch(e){}}};
+function key(id){return KEYS[id]||(id==='chat-pane'?'chat':id==='fleet-pane'?'fleet':id==='feed-pane'?'feed':'files');}
+function shown(id){var p=document.getElementById(id);return p&&getComputedStyle(p).display!=='none';}
+window.__rompGrowFair=function(k){if(k==='timeline')return;var v=PANES.filter(shown).map(function(id){return grow[key(id)];})
+.filter(function(g){return typeof g==='number'&&isFinite(g);});
+var avg=v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;setGrow(k,avg);
+try{localStorage.setItem(GK,JSON.stringify(grow));}catch(e){}};
+window.__rompGrowFairIfNew=function(k){if(typeof grow[k]==='number'&&isFinite(grow[k])){setGrow(k,grow[k]);return;}window.__rompGrowFair(k);};
+};
+const OUTER_ALL = ['fleet', 'feed', 'files'];
+function setChat(on) { CHAT_IDS.forEach((id) => { if (EL[id]) EL[id]._display = on ? 'flex' : 'none'; }); }
+function setOuter(combo) { OUTER_ALL.forEach((k, i) => { EL[k + '-pane']._display = combo[i] ? 'flex' : 'none'; }); }
+function oldWidths(cols, outerShown) { const g = gk(grows()); const items = ['chat'].concat(cols).concat(outerShown); const px = flex(1007 - 7 * (items.length - 1), items.map((k) => g[k])); const o = {}; items.forEach((k, i) => { o[k === 'chat' ? 'chat1' : k] = px[i]; }); return o; }
+function fresh(store, chatShown, combo) { resetDom(); for (const k in STORE) delete STORE[k]; STORE['romp-pane-grow'] = JSON.stringify(store); setChat(chatShown); setOuter(combo); }
+function restore(cols) { cols.forEach((k) => { window.__rompRegisterPane('chat-pane-' + k.slice(4), k); window.__rompGrowFairIfNew(k); }); }
+// one case, both shells: `between` runs after the restore (the old shell's version of the mutation, then the new's) while the
+// chat pane is still hidden; the show is the toggle's fair-grow call, then the class flip
+function compare(store, cols, combo, chatShown, between) {
+  const outerShown = OUTER_ALL.filter((k, i) => combo[i]);
+  fresh(store, chatShown, combo); OLD_SHELL(); restore(cols); if (between) between.old();
+  if (!chatShown) { window.__rompGrowFair('chat'); setChat(true); }
+  const before = oldWidths((between && between.cols) || cols, (between && between.outer) || outerShown), oldStore = store_();
+  fresh(store, chatShown, combo); BOOT(); restore(cols); window.__rompSeedAreaWeight(); if (between) between.now();
+  if (!chatShown) { window.__rompGrowFair('chat'); setChat(true); }
+  const after = rowsWidths(gk(grows()), (between && between.cols) || cols, (between && between.outer) || outerShown), newStore = store_();
+  let maxDiff = 0; Object.keys(before).forEach((k) => { maxDiff = Math.max(maxDiff, Math.abs(before[k] - after[k])); });
+  return { before, after, maxDiff, keys: Object.keys(before).length, oldStore, newStore };
+}
+function store_() { return JSON.parse(STORE['romp-pane-grow'] || 'null'); }
+const matrix = { cases: 0, mismatches: [], maxDiff: 0 };
+[1, 2, 3, 4].forEach((n) => ['saved', 'missing', 'mixed'].forEach((pattern) => [0, 1, 2, 3, 4, 5, 6, 7].forEach((bits) => [true, false].forEach((chatShown) => {
+  const cols = []; for (let c = 2; c <= n; c++) cols.push('chat' + c);
+  const store = { chat: 640, fleet: 200, feed: 400, files: 300 };
+  cols.forEach((k, i) => { if (pattern === 'saved' || (pattern === 'mixed' && i % 2 === 0)) store[k] = 100 * (i + 2); });
+  const combo = [!!(bits & 1), !!(bits & 2), !!(bits & 4)];
+  const r = compare(store, cols, combo, chatShown, null);
+  matrix.cases++; matrix.maxDiff = Math.max(matrix.maxDiff, r.maxDiff);
+  if (r.maxDiff > 1e-6 || r.keys !== cols.length + 1 + combo.filter(Boolean).length) matrix.mismatches.push({ n, pattern, bits, chatShown, r });
+}))));
+out.matrix = matrix;
+// 15) MUTATIONS during the wait (the fourth review pass: a boot snapshot lost them). The chat pane hidden at the restore, the
+//     legacy store missing the column's weight, and before the rail's Chat: (a) the rail reveals the outline — the toggle's
+//     fair grow, then its class flip; (b) the outer gutter between the outline and the feed is dragged 50 px; (c) the restored
+//     column is closed (unregistered, its pane gone); (d) a peer dashboard publishes a CURRENT-shape store and its arrangement
+//     makes a third column here: adopted, the store left as the peer wrote it
+const L = { chat: 640, fleet: 34, feed: 400 };
+out.mut = {};
+out.mut.reveal = compare(L, ['chat2'], [false, true, false], false, {
+  old() { window.__rompGrowFair('fleet'); EL['fleet-pane']._display = 'flex'; },
+  now() { window.__rompGrowFair('fleet'); EL['fleet-pane']._display = 'flex'; },
+  cols: ['chat2'], outer: ['fleet', 'feed'] });
+const LG = { chat: 640, fleet: 200, feed: 400 };   // the outline shown: gv-b is the outline | feed gutter
+out.mut.drag = (() => {
+  // the old shell's gutter normalised every shown pane to px and moved the pair by the pointer: here the outline (300 px) and
+  // the feed (400 px), +50 → 350 / 350; the pre-rows fair grow gave chat2 (200 + 400) / 2 = 300 at the restore, and the first
+  // pane (350 + 350) / 2 = 350 at the show
+  fresh(LG, false, [true, true, false]); BOOT(); restore(['chat2']); window.__rompSeedAreaWeight();
+  window.__rompGutter('gv-b', function () { return 'fleet-pane'; }, 'feed-pane');
+  const d = drag('gv-b', 300, 350);
+  window.__rompGrowFair('chat'); setChat(true);
+  const after = rowsWidths(gk(grows()), ['chat2'], ['fleet', 'feed']);
+  const items = ['chat', 'chat2', 'fleet', 'feed'], oldW = { chat: 350, chat2: 300, fleet: 350, feed: 350 };
+  const px = flex(1007 - 21, items.map((k) => oldW[k])); const before = {}; items.forEach((k, i) => { before[k === 'chat' ? 'chat1' : k] = px[i]; });
+  let maxDiff = 0; Object.keys(before).forEach((k) => { maxDiff = Math.max(maxDiff, Math.abs(before[k] - after[k])); });
+  return { before, after, maxDiff, dragged: d.afterUp, storeAtDrag: d.store };
+})();
+out.mut.close = compare(L, ['chat2'], [false, true, false], false, {
+  old() { window.__rompUnregisterPane('chat-pane-2'); delete EL['chat-pane-2']; },
+  now() { window.__rompUnregisterPane('chat-pane-2'); delete EL['chat-pane-2']; },
+  cols: [], outer: ['feed'] });
+const PEER = { chat: 669, chat1: 331, chat2: 331, chat3: 331, fleet: 34, feed: 331, files: 40 };
+out.mut.peer = (() => {
+  fresh(L, false, [false, true, false]); BOOT(); restore(['chat2']); window.__rompSeedAreaWeight();
+  const pending = { store: store_(), grows: grows() };
+  STORE['romp-pane-grow'] = JSON.stringify(PEER);   // the peer's upgraded store lands…
+  restore(['chat3']);                                // …and its arrangement makes a third column here (the split's reconcile)
+  const adopted = { store: store_(), grows: grows(), seed: window.__rompSeedAreaWeight() };
+  window.__rompGrowFair('chat'); setChat(true);       // the rail's Chat later: a current dashboard's show, no upgrade
+  return { pending, adopted, shown: { store: store_(), grows: grows() } };
+})();
 console.log(JSON.stringify(out));
 """
 
@@ -520,7 +616,7 @@ class PaneGuttersExecute(unittest.TestCase):
 
     def test_13_a_legacy_restore_with_the_chat_pane_off_waits_for_the_pane_to_show_and_then_lays_out_as_the_old_shell_did(self):
         h = self.out["upgrade"]["hiddenChat"]
-        self.assertEqual(h["madeGrow"], 50, "make()'s rows' rule with every row sibling hidden: 50 — the value the upgrade must not keep")
+        self.assertEqual(h["madeGrow"], 400, "make()'s fair grow while the store is pre-rows-shaped IS the pre-rows rule: the feed alone is on screen, 400")
         self.assertNotIn("chat1", h["storeAfterMake"], "make()'s persist keeps the pre-rows shape while the upgrade is pending")
         self.assertFalse(h["deferred"], "the chat pane is off: the pixels wait")
         self.assertEqual(h["grows"]["--g-chat2"], 400, "the missing weight resolves over what is on screen — the feed alone — as the old shell's fair grow did")
@@ -539,6 +635,48 @@ class PaneGuttersExecute(unittest.TestCase):
         rs = h["reloadShown"]
         self.assertFalse(rs["wrote"], "a reload after: not a pre-rows store any more")
         self.assertEqual(rs["after"], sh["after"], "…and the widths are kept"); self.assertEqual(rs["store"], sh["store"])
+
+    def test_14_the_matrix_against_the_pre_rows_shell_lays_every_case_out_to_the_pixel(self):
+        m = self.out["matrix"]
+        self.assertEqual(m["cases"], 192, "1-4 columns x saved / missing / mixed weights x 8 outer combinations x the chat pane shown or hidden")
+        self.assertEqual(m["mismatches"], [], "every case within 1e-6 px of the pre-rows shell; the first mismatches: %r" % m["mismatches"][:3])
+        self.assertLessEqual(m["maxDiff"], 1e-6)
+
+    def test_14b_the_embedded_pre_rows_helper_is_ab112d49_s_verbatim(self):
+        # the oracle is the old _LANDING_JS's pane-weight helper, copied into this file; when the history is at hand (a full
+        # clone), every executable line of the copy must be a line of that revision — a shallow checkout skips
+        r = subprocess.run(["git", "show", "ab112d49:kernel/kernel.py"], cwd=os.path.dirname(HERE), capture_output=True, text=True)
+        if r.returncode != 0:
+            self.skipTest("ab112d49 is not in this checkout's history (a shallow clone): the copy cannot be checked against it")
+        old = r.stdout
+        body = DRIVER[DRIVER.index("const OLD_SHELL = function () {") + len("const OLD_SHELL = function () {"):DRIVER.index("\n};\nconst OUTER_ALL")]
+        lines = [ln for ln in body.strip().splitlines() if ln and not ln.startswith("var row=")]
+        self.assertGreaterEqual(len(lines), 12)
+        for ln in lines:
+            self.assertIn(ln, old, "not a line of ab112d49's _LANDING_JS: %r" % ln)
+
+    def test_15_a_mutation_during_the_wait_reaches_the_upgrade(self):
+        a = self.out["mut"]["reveal"]
+        self.assertEqual(a["before"], {"chat1": 246.5, "chat2": 246.5, "fleet": 246.5, "feed": 246.5}, "the old shell: the outline fair-grown to the feed's 400 at its reveal, then the first pane to (400 + 400) / 2 at the show — four equal panes of (1007 - 21) / 4")
+        self.assertLessEqual(a["maxDiff"], 1e-6, "the rows shell lays the same four out: %r" % a["after"])
+        self.assertEqual(a["newStore"]["fleet"], 246.5, "…and persisted the outline's live weight, not a boot snapshot's 34")
+        b = self.out["mut"]["drag"]
+        self.assertLessEqual(b["maxDiff"], 1e-6, "an outer gutter drag during the wait reaches the upgrade: %r vs %r" % (b["after"], b["before"]))
+        self.assertEqual(b["dragged"]["--g-fleet"], 350); self.assertEqual(b["dragged"]["--g-feed"], 350)
+        self.assertNotIn("chat1", b["storeAtDrag"], "the drag's persist kept the pre-rows shape")
+        c = self.out["mut"]["close"]
+        self.assertEqual(c["before"], {"chat1": 500, "feed": 500}, "the old shell: the column closed, the first pane fair-grown to the feed's 400 at the show — two halves")
+        self.assertLessEqual(c["maxDiff"], 1e-6, "the rows shell too: %r" % c["after"])
+        self.assertNotIn("chat2", c["newStore"], "the closed column's key does not come back into the store")
+        self.assertIn("chat1", c["newStore"])
+        d = self.out["mut"]["peer"]
+        self.assertNotIn("chat1", d["pending"]["store"], "pending: the pre-rows shape")
+        self.assertEqual(d["adopted"]["store"], {"chat": 669, "chat1": 331, "chat2": 331, "chat3": 331, "fleet": 34, "feed": 331, "files": 40}, "the peer's store is left exactly as it wrote it: no legacy-shape write over it")
+        self.assertEqual(d["adopted"]["grows"]["--g-chat3"], 331, "the new column at the published weight, not a provisional 50")
+        self.assertEqual(d["adopted"]["grows"]["--g-chat"], 669); self.assertEqual(d["adopted"]["grows"]["--g-chat1"], 331); self.assertEqual(d["adopted"]["grows"]["--g-feed"], 331)
+        self.assertFalse(d["adopted"]["seed"], "adopted: this dashboard is current, nothing left to upgrade")
+        self.assertEqual(d["shown"]["store"]["chat1"], 331, "the show later is a current dashboard's: the store keeps chat1")
+        self.assertEqual(d["shown"]["grows"]["--g-chat1"], 331, "…and the first pane's inner weight is not re-fair-grown")
 
     def test_11_a_store_from_before_the_rows_seeds_the_first_pane_s_inner_weight_from_the_chat_weight(self):
         a = self.out["legacy"]
