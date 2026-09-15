@@ -241,10 +241,15 @@ class SplitSourcePins(unittest.TestCase):
         self.assertIn("window.__rompWireEsc=function(f){", km._LANDING_ESC_JS)
         # the gutters: later columns register, gv-a/gv-b's left neighbour is the rightmost chat column
         gut = km._LANDING_JS
-        self.assertIn("window.__rompRegisterPane=function(id,k){KEYS[id]=k;if(PANES.indexOf(id)<0)PANES.splice(PANES.indexOf('fleet-pane'),0,id);};", gut)
+        self.assertIn("window.__rompRegisterPane=function(id,k){cancelGesture();KEYS[id]=k;if(PANES.indexOf(id)<0)PANES.splice(PANES.indexOf('fleet-pane'),0,id);};", gut)   # a pane made under a drag ends the drag first (2026-09-15)
         self.assertIn("window.__rompUnregisterPane=function(id){", gut)
         # the chat AREA wears the outer weight the first pane wore; the first pane has an inner one against its row's columns (the chat rows, 2026-09-15)
-        self.assertIn("function key(id){return KEYS[id]||(id==='chat-area'?'chat':id==='chat-pane'?'chat1':id==='fleet-pane'?'fleet':id==='feed-pane'?'feed':'files');}", gut)
+        # an explicit map for the fixed panes, a split column's registration, and NONE for any other id (the seventh pass: an
+        # unregistered pane fell to 'files'); setGrow on no key is a no-op
+        self.assertIn("var FIXED={'chat-area':'chat','chat-pane':'chat1','fleet-pane':'fleet','feed-pane':'feed','files-pane':'files'};", gut)
+        self.assertIn("function key(id){return KEYS[id]||FIXED[id]||null;}", gut); self.assertIn("window.__rompPaneKey=key;", gut)
+        self.assertIn("function setGrow(k,v){if(!k)return;grow[k]=v;row.style.setProperty('--g-'+k,v);}", gut)
+        self.assertNotIn("?'feed':'files'", gut)
         self.assertIn("function lastChat(){return 'chat-area';}", gut)
         self.assertIn("window.__rompRowGutter=function(gid,topId,botId,apply){", gut, "the row gutter rides the same drag code, reporting the top row's share")
         # a pre-rows pane store (no chat1): the area's weight is set once from the top-row columns the split restored, in the
@@ -258,35 +263,52 @@ class SplitSourcePins(unittest.TestCase):
         # a peer's upgrade is INGESTED at the event and FIRST in every entry point that reads or changes a weight, never from persist
         # (review find 2026-09-15, fifth pass: adopting at the final write threw away the very action that wrote)
         self.assertNotIn("sync(", gut)
-        self.assertIn("window.addEventListener('storage',function(e){if(e&&e.key===GK)ingest();});", gut, "the peer's write is the event")
-        self.assertIn("window.__rompGrowFair=function(k){if(k==='timeline')return;ingest();", gut, "the rail's fair grow: ingest first, then the CURRENT rule (or the pre-rows one while still legacy)")
+        self.assertIn("window.addEventListener('storage',function(e){if(!e||e.key!==GK)return;", gut, "the peer's write is the event")
+        self.assertIn("window.__rompGrowFair=function(k){if(k==='timeline')return;cancelGesture();ingest();", gut, "the rail's fair grow: a drag ended first, a peer's upgrade ingested, then the CURRENT rule (or the pre-rows one while still legacy)")
         self.assertIn("if(legacy){if(k==='chat'){upgrade(true);return;}setGrow(k,oldFair());persist();return;}", gut, "the pre-rows rule while legacy; the chat pane coming on is the upgrade's moment")
         self.assertIn("window.__rompGrowFairIfNew=function(k){ingest();if(typeof grow[k]==='number'&&isFinite(grow[k])){setGrow(k,grow[k]);return;}window.__rompGrowFair(k);};", gut, "a restored or peer-made column keeps a published weight")
-        self.assertIn("window.__rompUnregisterPane=function(id){ingest();var k=KEYS[id];", gut, "unregister: ingest, delete, then the write carries the deletion")
-        self.assertIn("window.__rompSplitGrow=function(leftId,newKey){ingest();", gut); self.assertIn("window.__rompSplitShrink=function(leftId,goneId){ingest();", gut)
+        self.assertIn("window.__rompUnregisterPane=function(id){cancelGesture();ingest();var k=KEYS[id];", gut, "unregister: a drag ended first, a peer's upgrade ingested, the key deleted, then the write carries the deletion")
+        self.assertIn("window.__rompSplitGrow=function(leftId,newKey){cancelGesture();ingest();", gut); self.assertIn("window.__rompSplitShrink=function(leftId,goneId){cancelGesture();ingest();", gut)
         # a drag is ONE TRANSACTION (the sixth pass): a peer's write during it is only noted, endGesture is the one exit for every gutter,
         # a commit rebases the pair against the ingested siblings so the divider lands where the line was, a cancel restores and writes nothing
         self.assertNotIn("held", gut)
-        self.assertIn("var gesture=null,ingestDue=false;", gut)
-        self.assertIn("function ingest(){if(!legacy)return false;if(gesture){ingestDue=true;return false;}", gut, "deferred while a gesture stands")
+        self.assertIn("var gesture=null;", gut); self.assertNotIn("ingestDue", gut)
+        self.assertIn("function ingest(val){if(!legacy)return false;if(gesture)return false;var cur=val;if(cur===undefined){", gut, "nothing applied while a gesture stands; a storage event's value adopted as written")
+        self.assertIn("window.addEventListener('storage',function(e){if(!e||e.key!==GK)return;var v;if(typeof e.newValue==='string'){try{v=JSON.parse(e.newValue);}catch(x){v=null;}}ingest(v);});", gut, "the listener honours newValue")
         self.assertIn("function endGesture(commit){var g=gesture;if(!g)return;gesture=null;", gut)
         self.assertIn("window.removeEventListener('mousemove',g.mv);window.removeEventListener('mouseup',g.up);", gut, "the gesture's listeners go at its end")
-        self.assertIn("if(!commit){for(var k in g.w0)setGrow(k,g.w0[k]);if(due)ingest();return;}", gut, "a cancel: the press-time weights back, nothing written, then the deferred ingest")
-        self.assertIn("if(due&&ingest()&&a+b<g.W)g.others.forEach(function(k){if(finite(grow[k]))so+=grow[k];});", gut)
-        self.assertIn("if(so>0){var pair=so*(a+b)/(g.W-a-b);setGrow(lk,pair*a/(a+b));setGrow(rk,pair*b/(a+b));}else{setGrow(lk,a);setGrow(rk,b);}", gut, "the rebase; the plain write with nothing noted")
+        self.assertIn("if(g.vert){if(commit&&g.apply)g.apply(g.nL/g.sum);ingest();return;}", gut)
+        self.assertIn("var intact=commit&&!!g.L.isConnected&&!!g.R.isConnected&&key(g.L.id)===g.kL&&key(g.R.id)===g.kR;", gut, "a commit needs the pair as pressed: present and under the press-time keys")
+        self.assertIn("if(!intact){for(var k in g.w0)setGrow(k,g.w0[k]);ingest();return;}", gut, "a cancel: the press-time weights back, nothing written, then whatever the store holds")
+        self.assertIn("if(ingest()&&a+b<g.W)g.others.forEach(function(k){if(finite(grow[k]))so+=grow[k];});", gut, "the release ingests UNCONDITIONALLY, then rebases against what it adopted")
+        self.assertIn("if(so>0){var pair=so*(a+b)/(g.W-a-b);setGrow(g.kL,pair*a/(a+b));setGrow(g.kR,pair*b/(a+b));}else{setGrow(g.kL,a);setGrow(g.kR,b);}", gut, "the rebase; the plain write with nothing adopted; the press-time keys")
+        self.assertIn("var kL=key(L.id),kR=key(R.id);if(!vert&&(!kL||!kR))return;", gut, "a pane gutter's pair must be registered panes")
+        # a structural change ends a drag first: the pane-weight script's own mutations, the split's and the rail's
+        self.assertIn("function cancelGesture(){if(gesture)endGesture(false);}", gut); self.assertIn("window.__rompCancelGesture=cancelGesture;", gut)
+        for site in ["window.__rompRegisterPane=function(id,k){cancelGesture();", "window.__rompUnregisterPane=function(id){cancelGesture();ingest();",
+                     "window.__rompGrowFair=function(k){if(k==='timeline')return;cancelGesture();ingest();", "window.__rompSplitGrow=function(leftId,newKey){cancelGesture();ingest();",
+                     "window.__rompSplitShrink=function(leftId,goneId){cancelGesture();ingest();"]:
+            self.assertIn(site, gut, "a structural site ends the drag first: " + site)
+        for site in ["function make(n,sid,state){var have=document.getElementById(frameId(n));if(have)return have;cancelDrag();", "function moveTab(sid,to){if(typeof sid!=='string'||!sid)return null;cancelDrag();",
+                     "function close(n,keep){var i=idx(n);if(i<0)return;cancelDrag();", "function reconcile(r){cancelDrag();var next=r.cols;"]:
+            self.assertIn(site, km._LANDING_SPLIT_JS, "the split's structural site ends the drag first: " + site)
+        self.assertIn("function cancelDrag(){try{if(window.__rompCancelGesture)window.__rompCancelGesture();}catch(e){}}", km._LANDING_SPLIT_JS)
+        self.assertIn("if(window.__rompCancelGesture)window.__rompCancelGesture();   // a pane coming or going under a gutter drag ends the drag first", km._LANDING_COLLAPSE_JS)
+        # persist is write-only, and refuses (says so) rather than write a pre-rows shape over a peer's upgrade; the write is exported for that guard's test alone
+        self.assertIn("function persist(){if(legacy){var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}", gut)
+        self.assertIn("if(cur&&finite(cur.chat1)){try{console.warn(", gut); self.assertIn("window.__rompPersistGrow=persist;", gut)
         for src in ["window.addEventListener('pointercancel',function(){endGesture(false);});", "window.addEventListener('blur',function(){endGesture(false);});",
                     "document.addEventListener('visibilitychange',function(){if(document.visibilityState==='hidden')endGesture(false);});", "if(gesture)endGesture(false);   // a new press while one stands"]:
             self.assertIn(src, gut, "a cancel source: " + src)
         self.assertIn("var w0=Object.assign({},grow),others=[],W=0;", gut, "the press-time weights, before the press's own normalisation")
         self.assertIn("function mv(ev){if(gesture!==g)return;", gut); self.assertIn("function up(){if(gesture!==g)return;endGesture(true);}", gut, "a stale release is a no-op")
         self.assertIn("window.__rompRowGutter=function(gid,topId,botId,apply){gutter(gid,function(){return topId;},botId,true,apply);};", gut, "the row gutter is the same gutter(): the same transaction")
-        self.assertIn("if(g.vert){if(commit&&g.apply)g.apply(g.nL/g.sum);if(due)ingest();return;}", gut)
         self.assertIn("function upgrade(showing){if(ingest()||!legacy)return false;", gut)
         self.assertIn("window.__rompGrowLegacy=function(){return legacy;};", gut)
         self.assertIn("var cols=PANES.filter(function(id){var e=document.getElementById(id);return !!KEYS[id]&&!!e&&e.parentElement===host&&finite(grow[KEYS[id]]);}).map(function(id){return KEYS[id];});", gut, "the live roster: registered, present, in the first pane's row")
         self.assertIn("if(showing)setGrow('chat1',oldFair());", gut)
-        self.assertIn("function ingest(){if(!legacy)return false;if(gesture){ingestDue=true;return false;}var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}", gut)
-        self.assertIn("function persist(){var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}try{localStorage.setItem(GK,JSON.stringify(o));}catch(e){}}", gut, "persist writes what its caller produced: the pre-rows shape while legacy, nothing ingested here")
+        self.assertIn("if(!cur||!finite(cur.chat1))return false;legacy=false;for(var k in cur){if(finite(cur[k]))setGrow(k,cur[k]);}return true;}", gut, "a current-shape store is adopted whole")
+        self.assertIn("var o=Object.assign({},grow);delete o.chat1;try{localStorage.setItem(GK,JSON.stringify(o));}catch(e){}return;}", gut, "persist writes what its caller produced: the pre-rows shape while legacy, nothing ingested here")
         self.assertIn("if(window.__rompSeedAreaWeight)window.__rompSeedAreaWeight();", km._LANDING_SPLIT_JS, "called at the split's boot, no arguments: the roster is live")
         boot = km._LANDING_SPLIT_JS[km._LANDING_SPLIT_JS.index("try{if(!mobile()){var r0=read();"):]
         self.assertLess(boot.index("cols.forEach(function(c){make(c.n,seedFor(c),null);});"), boot.index("__rompSeedAreaWeight();"), "…after they are made and registered")

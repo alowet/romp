@@ -79,7 +79,7 @@ const areaEl = { id: 'chat-area-box', getBoundingClientRect: () => ({ left: 0, t
 const row1El = { id: 'chat-row-1-box', getBoundingClientRect: () => ({ left: 0, top: 24, width: 600, height: 400 }) };
 function mkEl(id, w, left, display, parent, h, top) {
   return {
-    id: id, offsetWidth: w, offsetHeight: h || 800, _left: left, _top: top || 0, _display: display, _ls: {}, parentElement: parent || rowEl,
+    id: id, offsetWidth: w, offsetHeight: h || 800, _left: left, _top: top || 0, _display: display, _ls: {}, parentElement: parent || rowEl, isConnected: true,
     style: {},   // a plain record: the script writes top / height / left / display on the ghost
     getBoundingClientRect() { return { left: this._left, top: this._top, width: this.offsetWidth, height: this.offsetHeight }; },
     addEventListener(k, f) { (this._ls[k] = this._ls[k] || []).push(f); },

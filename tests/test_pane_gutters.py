@@ -70,7 +70,7 @@ const areaEl = { id: 'chat-area-box', getBoundingClientRect: () => ({ left: 0, t
 const row1El = { id: 'chat-row-1-box', getBoundingClientRect: () => ({ left: 0, top: 0, width: 600, height: 400, bottom: 400 }) };
 function mkEl(id, w, display, parent, h) {
   return {
-    id: id, offsetWidth: w, offsetHeight: h || 800, _display: display, _ls: {}, parentElement: parent || rowEl, style: {},
+    id: id, offsetWidth: w, offsetHeight: h || 800, _display: display, _ls: {}, parentElement: parent || rowEl, style: {}, isConnected: true,
     getBoundingClientRect() { return { left: 0, top: this._top || 0, width: this.offsetWidth, height: this.offsetHeight, bottom: (this._top || 0) + this.offsetHeight }; },   // the drag's landing line reads the left pane's rect
     addEventListener(k, f) { (this._ls[k] = this._ls[k] || []).push(f); },
     fire(k, ev) { (this._ls[k] || []).slice().forEach((f) => f(ev)); },
@@ -535,6 +535,233 @@ winFire('mouseup', {});
 out.tx.row.crossed.committed = { grows: grows(), store: store_(), applied: APPLIED.slice() };
 console.log(JSON.stringify(out));
 """
+
+
+# BOTH scripts, run together (the seventh review pass drove them so): the pane-weight helper (_LANDING_JS) and the split
+# (_LANDING_SPLIT_JS) against one DOM stub with the served markup — the shell's row, the chat area and its rows, the first
+# pane, the outer panes and gutters, the landing lines — a document that hears listeners, a body whose po-* classes the
+# stub's getComputedStyle reads as the stylesheet would, elements that know whether they are connected, a store that
+# records every write, a console that records every warning. A peer's action is its two writes on the store and the two
+# storage events that follow, in the order a real close makes them.
+HARNESS2 = r"""
+'use strict';
+let STORE = {}, WRITES = [], BYID = {}, WL = {}, DL = {}, WARNS = [];
+let BODY = new Set();
+global.localStorage = { getItem: (k) => (k in STORE ? STORE[k] : null), setItem: (k, v) => { STORE[k] = String(v); WRITES.push([k, String(v)]); }, removeItem: (k) => { delete STORE[k]; } };
+console.warn = (...a) => { WARNS.push(a.join(' ')); };
+function isChatish(el) { const c = el.className || ''; return el.id === 'chat-area' || el.id === 'chat-pane' || /\bchat-col\b/.test(c) || /\bgv-chat\b/.test(c); }
+function disp(el) {
+  if (el._display) return el._display;
+  if (isChatish(el)) return BODY.has('po-chat') ? 'flex' : 'none';
+  if (el.id === 'fleet-pane' || el.id === 'gv-a') return BODY.has('po-fleet') ? 'flex' : 'none';
+  if (el.id === 'feed-pane') return BODY.has('po-feed') ? 'flex' : 'none';
+  if (el.id === 'files-pane') return BODY.has('po-files') ? 'flex' : 'none';
+  if (el.id === 'chat-row-2' || el.id === 'gv-rows') { const a = BYID['chat-area']; return a && /\brows\b/.test(a.className) ? 'flex' : 'none'; }
+  return 'flex';
+}
+function mkEl(tag) {
+  const el = {
+    tagName: tag, className: '', title: '', textContent: '', src: '', parentElement: null, _id: '', _w: 400, _h: 800, _display: null, _root: false,
+    style: { _props: {}, setProperty(k, v) { this._props[k] = v; }, removeProperty(k) { delete this._props[k]; } },
+    _attrs: {}, _ls: {}, children: [],
+    _rect: { left: 0, top: 0, width: 0, height: 0 }, getBoundingClientRect() { return Object.assign({}, this._rect); },
+    get offsetWidth() { return this._w; }, get offsetHeight() { return this._h; },
+    get isConnected() { let n = this; while (n) { if (n._root) return true; n = n.parentElement; } return false; },
+    contains(n) { return n === this || this.children.some((c) => c.contains && c.contains(n)); },
+    setAttribute(k, v) { this._attrs[k] = String(v); }, getAttribute(k) { return k in this._attrs ? this._attrs[k] : null; },
+    appendChild(c) { c.parentElement = this; this.children.push(c); return c; },
+    insertBefore(c, ref) { c.parentElement = this; const i = this.children.indexOf(ref); if (i < 0) this.children.push(c); else this.children.splice(i, 0, c); return c; },
+    remove() { const p = this.parentElement; if (p) { const i = p.children.indexOf(this); if (i >= 0) p.children.splice(i, 1); } const drop = (n) => { if (n._id) delete BYID[n._id]; n.children.forEach(drop); }; drop(this); this.parentElement = null; },
+    addEventListener(k, f) { (this._ls[k] = this._ls[k] || []).push(f); },
+    fire(k, ev) { (this._ls[k] || []).slice().forEach((f) => f(ev || { preventDefault() {}, stopPropagation() {} })); },
+  };
+  Object.defineProperty(el, 'id', { get() { return this._id; }, set(v) { if (this._id) delete BYID[this._id]; this._id = String(v); if (v) BYID[v] = this; } });
+  const cls = () => el.className.split(/\s+/).filter(Boolean);
+  el.classList = { contains: (c) => cls().includes(c), add: (...cs) => { const l = cls(); cs.forEach((c) => { if (!l.includes(c)) l.push(c); }); el.className = l.join(' '); },
+    remove: (...cs) => { el.className = cls().filter((c) => !cs.includes(c)).join(' '); }, toggle: (c, force) => { const want = force === undefined ? !cls().includes(c) : !!force; if (want) el.classList.add(c); else el.classList.remove(c); return want; } };
+  if (tag === 'iframe') { el.contentWindow = { postMessage() {}, focus() {} }; el.contentDocument = { querySelector() { return null; } }; }
+  return el;
+}
+let ROW = null, COL = null;
+global.document = { body: { classList: { contains: (c) => BODY.has(c), add: (...cs) => cs.forEach((c) => BODY.add(c)), remove: (...cs) => cs.forEach((c) => BODY.delete(c)) } },
+  querySelector(sel) { return sel === '.row' ? ROW : sel === '.col' ? COL : null; }, getElementById(id) { return BYID[id] || null; }, createElement(tag) { return mkEl(tag); },
+  visibilityState: 'visible', addEventListener: (k, f) => { (DL[k] = DL[k] || []).push(f); } };
+global.getComputedStyle = (el) => ({ display: disp(el) });
+global.window = global; global.innerHeight = 900;
+global.addEventListener = (t, f) => { (WL[t] = WL[t] || []).push(f); };
+global.removeEventListener = (t, f) => { WL[t] = (WL[t] || []).filter((g) => g !== f); };
+global.dispatchEvent = (ev) => { (WL[ev.type] || []).forEach((f) => f(ev)); return true; };
+global.CustomEvent = class { constructor(type, o) { this.type = type; this.detail = (o || {}).detail; } };
+function el(tag, id, cls, parent, w) { const e = mkEl(tag); if (id) e.id = id; if (cls) e.className = cls; if (w) e._w = w; if (parent) parent.appendChild(e); return e; }
+// a fresh dashboard: the stores as given, the body's pane classes, the served markup, then the two scripts in the shell's order
+function boot(grow, cols, classes) {
+  STORE = {}; WRITES = []; BYID = {}; WL = {}; DL = {}; BODY = new Set(classes);
+  if (grow) STORE['romp-pane-grow'] = JSON.stringify(grow); if (cols) STORE['romp-chat-cols'] = JSON.stringify(cols);
+  Object.keys(global).filter((k) => k.startsWith('__romp')).forEach((k) => { delete global[k]; });
+  COL = el('div', null, 'col'); COL._root = true; COL._rect = { left: 0, top: 0, width: 1007, height: 900, bottom: 900 };
+  ROW = el('div', null, 'row', COL, 1007); ROW._rect = { left: 0, top: 30, width: 1007, height: 800 };
+  const area = el('div', 'chat-area', '', ROW, 600); area._rect = { left: 0, top: 30, width: 600, height: 800 };
+  const r1 = el('div', 'chat-row-1', 'chat-row', area, 600); r1._rect = { left: 0, top: 30, width: 600, height: 800 };
+  const cp = el('div', 'chat-pane', 'pane', r1, 400); el('iframe', 'f-chat', '', cp);
+  el('div', 'gv-rows', 'gh', area); const r2 = el('div', 'chat-row-2', 'chat-row', area, 600); r2._rect = { left: 0, top: 830, width: 600, height: 0 };
+  el('div', 'gv-a', 'gv', ROW); el('div', 'fleet-pane', 'pane', ROW, 300); el('div', 'gv-b', 'gv', ROW); el('div', 'feed-pane', 'pane', ROW, 400); el('div', 'gv-c', 'gv', ROW); el('div', 'files-pane', 'pane', ROW, 300);
+  el('div', 'gv-ghost', '', COL); el('div', 'col-ghost', '', COL); el('div', 'gv-ghost-h', '', COL);
+  (0, eval)(LANDING_JS); (0, eval)(SPLIT_JS);
+}
+const LANDING_JS = __LANDING_JS__;
+const SPLIT_JS = __SPLIT_JS__;
+const gk = () => { const o = {}; Object.keys(ROW.style._props).forEach((k) => { if (k.startsWith('--g-')) o[k.slice(4)] = ROW.style._props[k]; }); return o; };
+const store = () => JSON.parse(STORE['romp-pane-grow'] || 'null');
+const frames = () => window.__rompChatFrameIds();
+const legacy = () => window.__rompGrowLegacy();
+const listeners = () => ({ move: (WL.mousemove || []).length, up: (WL.mouseup || []).length });
+const press = (gid, x) => BYID[gid].fire('mousedown', { preventDefault() {}, clientX: x });
+const move = (x) => (WL.mousemove || []).slice().forEach((f) => f({ clientX: x }));
+const up = () => (WL.mouseup || []).slice().forEach((f) => f({}));   // a copy of the list: a listener the release removes is still called once, as a stale one would be
+const storageEvent = (key, value) => (WL.storage || []).slice().forEach((f) => f({ key, newValue: value }));
+const growWrites = (from) => WRITES.slice(from).filter((w) => w[0] === 'romp-pane-grow').map((w) => JSON.parse(w[1]));
+"""
+
+DRIVER2 = r"""
+const out = {};
+const X = '11111111-2222-3333-4444-555555555501', Y = '11111111-2222-3333-4444-555555555502';
+const HIDDEN = ['po-fleet', 'po-feed', 'po-files'];   // the chat pane off; the outline, the feed and the files pane on (300 / 400 / 300 px)
+const LEGACY = { chat: 640, fleet: 300, feed: 400, files: 150 };
+const PEER_CLOSED = { chat: 669, chat1: 331, fleet: 34, feed: 331, files: 900 };
+const PEER_OPEN = { chat: 669, chat1: 331, chat2: 331, fleet: 34, feed: 331, files: 900 };
+const CURRENT = { chat: 669, chat1: 331, chat2: 331, fleet: 34, feed: 331, files: 40 };
+// (1) legacy A mid-drag; the peer closes the restored column — its column-store event reaches A first, its pane-store event after
+boot(LEGACY, { v: 2, cols: [{ n: 2, ids: [X] }] }, HIDDEN);
+out.s1 = { boot: { frames: frames(), legacy: legacy(), chat2: gk().chat2 } };
+press('gv-b', 300); move(350);
+out.s1.pressed = { grows: gk(), listeners: listeners(), drag: BODY.has('drag') };
+const mark1 = WRITES.length;
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [] }); STORE['romp-pane-grow'] = JSON.stringify(PEER_CLOSED);
+storageEvent('romp-chat-cols', STORE['romp-chat-cols']);
+out.s1.afterCols = { frames: frames(), legacy: legacy(), grows: gk(), listeners: listeners(), store: store(), drag: BODY.has('drag') };
+storageEvent('romp-pane-grow', STORE['romp-pane-grow']);
+up();
+out.s1.after = { grows: gk(), store: store(), legacy: legacy(), writes: growWrites(mark1), listeners: listeners(), warns: WARNS.length };
+// (2) legacy A mid-drag; the peer's upgraded store is on disk but its event is delayed past the release
+boot(LEGACY, { v: 2, cols: [{ n: 2, ids: [X] }] }, HIDDEN);
+press('gv-b', 300); move(350);
+const mark2 = WRITES.length;
+STORE['romp-pane-grow'] = JSON.stringify(PEER_OPEN);
+up();
+out.s2 = { released: { grows: gk(), store: store(), legacy: legacy(), listeners: listeners() } };
+storageEvent('romp-pane-grow', JSON.stringify(PEER_OPEN));
+out.s2.afterEvent = { grows: gk(), store: store(), writes: growWrites(mark2) };
+// (3) a CURRENT dashboard, its chat pane on, drags the gutter left of column 2; the peer closes column 2
+boot(CURRENT, { v: 2, cols: [{ n: 2, ids: [X] }] }, ['po-chat', 'po-feed']);
+out.s3 = { boot: { frames: frames(), legacy: legacy(), key2: window.__rompPaneKey('chat-pane-2') } };
+press('gv-chat-2', 400); move(450);
+out.s3.pressed = { grows: gk(), listeners: listeners() };
+const mark3 = WRITES.length;
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [] });
+storageEvent('romp-chat-cols', STORE['romp-chat-cols']);
+out.s3.afterCols = { frames: frames(), grows: gk(), listeners: listeners(), key2: window.__rompPaneKey('chat-pane-2'), drag: BODY.has('drag') };
+up();
+out.s3.after = { grows: gk(), store: store(), writes: growWrites(mark3), listeners: listeners() };
+// (4) the keys: the fixed panes, a registered column, and nothing else; a write on no key is a no-op
+boot(CURRENT, { v: 2, cols: [{ n: 2, ids: [X] }] }, ['po-chat', 'po-feed']);
+out.s4 = { none: window.__rompPaneKey('chat-pane-9'), files: window.__rompPaneKey('files-pane'), area: window.__rompPaneKey('chat-area'), first: window.__rompPaneKey('chat-pane'),
+           fleet: window.__rompPaneKey('fleet-pane'), feed: window.__rompPaneKey('feed-pane'), col2: window.__rompPaneKey('chat-pane-2') };
+const before4 = { grows: JSON.stringify(gk()), store: store() };
+window.__rompGrowFair(null);
+out.s4.nullFair = { sameGrows: JSON.stringify(gk()) === before4.grows, storeBefore: before4.store, storeAfter: store() };
+// (5) a palette command mid-drag — Close this column, then Move this session to a new column — ends the drag first
+boot(CURRENT, { v: 2, cols: [{ n: 2, ids: [X] }] }, ['po-chat', 'po-feed']);
+press('gv-b', 600); move(650);   // the outline off: gv-b is the chat area | feed gutter
+out.s5 = { pressed: { chat: gk().chat, feed: gk().feed } };
+window.__rompCloseSplit(2);
+out.s5.close = { grows: gk(), frames: frames(), listeners: listeners(), drag: BODY.has('drag') };
+up();
+out.s5.close.afterStale = { grows: gk(), store: store() };
+press('gv-b', 600); move(650);
+window.__rompMoveTab(Y, 'new');
+out.s5.move = { grows: gk(), frames: frames(), listeners: listeners(), drag: BODY.has('drag') };
+up();
+out.s5.move.afterStale = { grows: gk(), store: store() };
+// (6) the guard in persist: a pre-rows shape is never written over a peer's upgrade — reached by no path of the scripts (no
+//     warning so far), so the write itself is called
+boot(LEGACY, { v: 2, cols: [{ n: 2, ids: [X] }] }, HIDDEN);
+const warnsBefore = WARNS.length;
+STORE['romp-pane-grow'] = JSON.stringify(PEER_OPEN);
+window.__rompPersistGrow();
+out.s6 = { warnsBefore, warns: WARNS.length, bytes: STORE['romp-pane-grow'], peer: JSON.stringify(PEER_OPEN), legacy: legacy() };
+console.log(JSON.stringify(out));
+"""
+
+
+class GestureUnderStructuralChange(unittest.TestCase):
+    """The seventh review pass: a peer closing a column while a drag is live. Both scripts, the real ones, against the served
+    markup's stub; the peer's action is its writes and the storage events they raise, in the close path's order."""
+    maxDiff = None
+
+    @classmethod
+    def setUpClass(cls):
+        script = HARNESS2.replace("__LANDING_JS__", json.dumps(km._LANDING_JS)).replace("__SPLIT_JS__", json.dumps(km._LANDING_SPLIT_JS)) + DRIVER2
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            r = subprocess.run(["node", path], capture_output=True, text=True, timeout=30)
+        finally:
+            os.unlink(path)
+        assert r.returncode == 0, "the two scripts threw: " + r.stderr[:1500]
+        cls.out = json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_18_a_peer_closing_a_column_under_a_drag_ends_the_drag_and_a_pre_rows_shape_is_never_written_over_its_store(self):
+        peer_closed = {"chat": 669, "chat1": 331, "fleet": 34, "feed": 331, "files": 900}
+        s = self.out["s1"]
+        self.assertEqual(s["boot"], {"frames": ["f-chat", "f-chat-2"], "legacy": True, "chat2": 850 / 3}, "pending: the column restored at the pre-rows fair grow over the outline, the feed and the files pane")
+        self.assertEqual((s["pressed"]["grows"]["fleet"], s["pressed"]["grows"]["feed"], s["pressed"]["grows"]["files"]), (300, 400, 300), "the press normalised the outer row to px")
+        self.assertEqual(s["pressed"]["listeners"], {"move": 1, "up": 1}); self.assertTrue(s["pressed"]["drag"])
+        a = s["afterCols"]
+        self.assertEqual(a["frames"], ["f-chat"], "the peer's arrangement closed the column here…")
+        self.assertEqual(a["listeners"], {"move": 0, "up": 0}, "…the drag ended first"); self.assertFalse(a["drag"])
+        self.assertFalse(a["legacy"], "…and the peer's upgraded store was taken in at the drag's end")
+        self.assertEqual(a["grows"], {"chat": 669, "chat1": 331, "fleet": 34, "feed": 331, "files": 900}, "the peer's weights on the vars, the closed column's gone")
+        self.assertEqual(a["store"], peer_closed, "the unregister's write is the current shape: chat1 kept, chat2 gone, the peer's weights")
+        f = s["after"]
+        self.assertEqual(f["store"], peer_closed, "the pane-store event and the stale release changed nothing")
+        self.assertTrue(all("chat1" in w for w in f["writes"]), "no pre-rows-shaped write at any point after the peer's upgrade: %r" % f["writes"])
+        self.assertTrue(all("chat2" not in w for w in f["writes"]))
+        self.assertEqual(f["listeners"], {"move": 0, "up": 0}); self.assertEqual(f["warns"], 0, "no refusal reached")
+        peer_open = {"chat": 669, "chat1": 331, "chat2": 331, "fleet": 34, "feed": 331, "files": 900}
+        r = self.out["s2"]["released"]
+        self.assertFalse(r["legacy"], "the release ingested the store on disk though its event had not arrived")
+        self.assertAlmostEqual(r["grows"]["fleet"], 1050, places=6, msg="…and rebased the pair against the peer's files 900: 900 · 700 / 300, split 350 : 350"); self.assertAlmostEqual(r["grows"]["feed"], 1050, places=6)
+        self.assertEqual((r["grows"]["files"], r["grows"]["chat"], r["grows"]["chat1"], r["grows"]["chat2"]), (900, 669, 331, 331))
+        self.assertEqual(r["store"], dict(peer_open, fleet=1050, feed=1050), "the store stays current")
+        e = self.out["s2"]["afterEvent"]
+        self.assertEqual(e["store"], r["store"], "the delayed event changes nothing"); self.assertTrue(all("chat1" in w for w in e["writes"]))
+        c = self.out["s3"]
+        self.assertEqual(c["boot"], {"frames": ["f-chat", "f-chat-2"], "legacy": False, "key2": "chat2"})
+        self.assertEqual((c["pressed"]["grows"]["chat1"], c["pressed"]["grows"]["chat2"]), (400, 400), "the press normalised the top row to px")
+        ac = c["afterCols"]
+        self.assertEqual(ac["frames"], ["f-chat"]); self.assertIsNone(ac["key2"], "the closed column's id has no key any more"); self.assertEqual(ac["listeners"], {"move": 0, "up": 0}); self.assertFalse(ac["drag"])
+        self.assertEqual(ac["grows"]["files"], 40, "the files pane is untouched by the close under the drag")
+        af = c["after"]
+        self.assertEqual(af["grows"]["files"], 40, "…and by the stale release"); self.assertEqual(af["store"]["files"], 40)
+        self.assertNotIn("chat2", af["store"]); self.assertTrue(all("chat1" in w for w in af["writes"])); self.assertEqual(af["listeners"], {"move": 0, "up": 0})
+        k = self.out["s4"]
+        self.assertEqual({x: k[x] for x in ("none", "files", "area", "first", "fleet", "feed", "col2")}, {"none": None, "files": "files", "area": "chat", "first": "chat1", "fleet": "fleet", "feed": "feed", "col2": "chat2"},
+                         "an explicit map: the fixed panes, a registered column, and nothing for any other id")
+        self.assertTrue(k["nullFair"]["sameGrows"], "a fair grow on no key changes no weight")
+        self.assertEqual(k["nullFair"]["storeAfter"], k["nullFair"]["storeBefore"], "…and the store holds the same weights (its write is the same content)")
+        p = self.out["s5"]
+        self.assertEqual((p["pressed"]["chat"], p["pressed"]["feed"]), (600, 400), "the press normalised the outer row")
+        self.assertEqual((p["close"]["grows"]["chat"], p["close"]["grows"]["feed"]), (669, 331), "the palette's close ended the drag first: the press-time weights back")
+        self.assertEqual(p["close"]["frames"], ["f-chat"]); self.assertEqual(p["close"]["listeners"], {"move": 0, "up": 0}); self.assertFalse(p["close"]["drag"])
+        self.assertEqual((p["close"]["afterStale"]["grows"]["chat"], p["close"]["afterStale"]["grows"]["feed"]), (669, 331), "the stale release wrote nothing")
+        self.assertEqual((p["move"]["grows"]["chat"], p["move"]["grows"]["feed"]), (669, 331), "the palette's move ended the drag first")
+        self.assertEqual(p["move"]["frames"], ["f-chat", "f-chat-2"], "the new column takes the lowest free number, the closed column's"); self.assertEqual(p["move"]["listeners"], {"move": 0, "up": 0}); self.assertFalse(p["move"]["drag"])
+        self.assertEqual((p["move"]["afterStale"]["grows"]["chat"], p["move"]["afterStale"]["grows"]["feed"]), (669, 331))
+        g = self.out["s6"]
+        self.assertEqual(g["warnsBefore"], 0, "no path of the scripts reached the refusal in the scenarios above")
+        self.assertEqual(g["warns"], 1, "the write itself, pre-rows-shaped against a peer's upgrade on disk, refuses and says so")
+        self.assertEqual(g["bytes"], g["peer"], "…and writes nothing"); self.assertTrue(g["legacy"])
 
 
 class PaneGuttersExecute(unittest.TestCase):

@@ -43,7 +43,9 @@ the REAL page: a hermetic kernel serves the dashboard with FIVE synthetic sessio
      after it — the rail's Outline — fair-grows as a fresh current page does, and the palette's close leaves no chat2; and a
      gutter DRAG is one transaction (the sixth pass): a peer's upgrade landing mid-drag moves nothing under the hand, the
      release lands the divider where the line was and carries the peer's weights, and a drag abandoned to the window's blur
-     writes nothing;
+     writes nothing; and a peer CLOSING A COLUMN under a live drag (the seventh pass) ends the drag first — a pending page
+     takes the peer's upgraded store in and its release writes nothing, and a current page dragging the gutter beside the
+     closed column leaves the files pane untouched;
   9. the whole story runs in under two and a half minutes (the driver waits on conditions, never on fixed sleeps).
 Screenshots of the 1 + 1 stack and the 2 x 2, dark and light, land in the directory ROMP_ROWS_SHOTS names (default
 /tmp/chat-rows-shots) for a human look. Skips LOUDLY when the extension deps or a playwright browser are absent (CI
@@ -491,6 +493,59 @@ await page.mouse.up();   // the stale release
 const afterStale = { boxes: await boxes(), bytes: await page.evaluate(() => localStorage.getItem("romp-pane-grow")) };
 await pageP.close();
 out.s8e = { pre, midBoxes, afterWrite, released, beforeAbandon, abandonMid, abandoned, afterStale };
+// ---- 8f. a PEER CLOSES A COLUMN under a live drag (the seventh pass). A (this page) pending with the column restored and its chat
+//      pane off holds the outline | feed gutter; B (same context) shows its chat pane (upgrading the store) and closes the column from
+//      its palette: A's drag ends at the arrangement's arrival, A takes B's store in, and A's release writes nothing — the store
+//      current, chat2 gone, the drag's +50 never landed. Then the mirror on a current page: the gutter beside column 2 held while B
+//      closes column 2 — the files pane is untouched.
+await page.evaluate(([grow, cols]) => {
+  localStorage.setItem("romp-pane-grow", JSON.stringify(grow)); localStorage.setItem("romp-chat-cols", JSON.stringify({ v: 2, cols }));
+  localStorage.setItem("romp-panes", JSON.stringify({ chat: false, fleet: true, feed: true, timeline: true, files: true }));
+}, [{ chat: 640, fleet: 300, feed: 400, files: 300 }, [{ n: 2, ids: [cfg.b] }]]);
+await page.reload(); await waitBootGone();
+await waitFn(() => !document.body.classList.contains("po-chat") && window.__rompGrowLegacy() === true && window.__rompChatFrameIds().length === 2, null, "A never came up pending (close-under-drag case)");
+const pageB = await context.newPage();
+const dieB = async (why) => { try { await pageB.close(); } catch (e) { /* */ } await die(why); };
+await pageB.goto(cfg.url);
+await pageB.waitForFunction(() => !document.getElementById("romp-boot") && !!window.__rompGrowLegacy && window.__rompChatFrameIds().length === 2 && !document.body.classList.contains("po-chat"), null, { timeout: T }).catch(async (e) => { await dieB("B never came up with the column: " + String(e).split("\n")[0]); });
+const preF = await boxes(); const gF = preF.gvb;
+await page.mouse.move(gF.left + gF.width / 2, gF.top + gF.height / 2); await page.mouse.down();
+await page.mouse.move(gF.left + gF.width / 2 + 50, gF.top + gF.height / 2, { steps: 5 });
+const heldF = { drag: await page.evaluate(() => document.body.classList.contains("drag")), ghostLeft: await page.evaluate(() => parseFloat(document.getElementById("gv-ghost").style.left)) };
+await pageB.click(".rail-btn[data-pane=chat]");   // B shows its chat pane: the upgrade, written while A holds the gutter
+await pageB.waitForFunction(() => document.body.classList.contains("po-chat") && window.__rompGrowLegacy() === false, null, { timeout: T }).catch(async (e) => { await dieB("B never upgraded: " + String(e).split("\n")[0]); });
+await pageB.waitForFunction(([sid]) => { const d = document.getElementById("f-chat-2").contentDocument; return !!d && !!d.querySelector('#tabs .tab[data-id="' + sid + '"]'); }, [cfg.b], { timeout: T }).catch(async (e) => { await dieB("B's column never showed its tab: " + String(e).split("\n")[0]); });
+const chatBoxB = await pageB.evaluate(() => { const f = document.getElementById("f-chat"); const r = f.getBoundingClientRect(); const c = f.contentDocument.getElementById("content").getBoundingClientRect(); return { x: r.left + c.left + c.width / 2, y: r.top + c.top + Math.min(c.height / 2, 120) }; });
+await pageB.mouse.click(chatBoxB.x, chatBoxB.y);
+await pageB.keyboard.press("Control+P");
+await pageB.waitForFunction(() => { const b = document.getElementById("rpal-back"); return !!b && !b.hidden; }, null, { timeout: T }).catch(async (e) => { await dieB("B's palette never opened: " + String(e).split("\n")[0]); });
+await pageB.keyboard.type("Close this column");
+await pageB.waitForFunction(() => { const r = document.querySelector("#rpal-list .rpal-row.active"); return !!r && /Close this column/.test(r.textContent || ""); }, null, { timeout: T }).catch(async (e) => { await dieB("B's palette never matched: " + String(e).split("\n")[0]); });
+await pageB.keyboard.press("Enter");
+await pageB.waitForFunction(() => !document.getElementById("chat-pane-2"), null, { timeout: T }).catch(async (e) => { await dieB("B never closed the column: " + String(e).split("\n")[0]); });
+await waitFn(() => window.__rompChatFrameIds().length === 1 && !document.body.classList.contains("drag"), null, "A never closed column 2 on B's arrangement, or never ended its drag");
+const cancelledF = { boxes: await boxes(), legacy: await legacyOf(page), store: await page.evaluate(() => JSON.parse(localStorage.getItem("romp-pane-grow"))), bytes: await page.evaluate(() => localStorage.getItem("romp-pane-grow")), frames: await page.evaluate(() => window.__rompChatFrameIds()) };
+await page.mouse.up();   // the stale release
+const releasedF = { boxes: await boxes(), bytes: await page.evaluate(() => localStorage.getItem("romp-pane-grow")), legacy: await legacyOf(page) };
+// the mirror: A current now, its chat pane on, a column of its own; the gutter beside that column held while B closes it
+await page.click(".rail-btn[data-pane=chat]");
+await waitFn(() => document.body.classList.contains("po-chat"), null, "the rail never showed A's chat pane (mirror)");
+await page.evaluate((sid) => window.__rompMoveTab(sid, "new"), cfg.c);
+await waitTabs("f-chat-2", [cfg.c]);
+await pageB.waitForFunction(() => window.__rompChatFrameIds().length === 2, null, { timeout: T }).catch(async (e) => { await dieB("B never made A's column (mirror): " + String(e).split("\n")[0]); });
+const filesBefore = { v: await inlineVar(page, "files"), store: await page.evaluate(() => JSON.parse(localStorage.getItem("romp-pane-grow")).files) };
+const gM = await boxOf("gv-chat-2");
+await page.mouse.move(gM.left + gM.width / 2, gM.top + gM.height / 2); await page.mouse.down();
+await page.mouse.move(gM.left + gM.width / 2 + 60, gM.top + gM.height / 2, { steps: 5 });
+const heldM = { drag: await page.evaluate(() => document.body.classList.contains("drag")) };
+await pageB.evaluate(() => window.__rompCloseSplit(2));
+await pageB.waitForFunction(() => window.__rompChatFrameIds().length === 1, null, { timeout: T }).catch(async (e) => { await dieB("B never closed column 2 (mirror): " + String(e).split("\n")[0]); });
+await waitFn(() => window.__rompChatFrameIds().length === 1 && !document.body.classList.contains("drag"), null, "A never closed column 2 on B's close, or never ended its drag (mirror)");
+const mirrorCancelled = { filesV: await inlineVar(page, "files"), bytes: await page.evaluate(() => localStorage.getItem("romp-pane-grow")) };
+await page.mouse.up();
+const mirror = { held: heldM, cancelled: mirrorCancelled, filesV: await inlineVar(page, "files"), store: await page.evaluate(() => JSON.parse(localStorage.getItem("romp-pane-grow"))), frames: await page.evaluate(() => window.__rompChatFrameIds()), bytes: await page.evaluate(() => localStorage.getItem("romp-pane-grow")) };
+await pageB.close();
+out.s8f = { pre: preF, held: heldF, cancelled: cancelledF, released: releasedF, filesBefore, mirror };
 out.ms = Date.now() - out.t0;
 fs.writeSync(1, "RESULT:" + JSON.stringify(out) + "\n");
 await browser.close();
@@ -946,9 +1001,29 @@ class ServedChatRows(unittest.TestCase):
             self.assertLessEqual(abs(ab["boxes"][k]["left"] - s["beforeAbandon"]["boxes"][k]["left"]), 0.5, "%s is back where it was: %r vs %r" % (k, ab["boxes"][k], s["beforeAbandon"]["boxes"][k]))
         self.assertEqual(s["afterStale"]["bytes"], ab["bytes"], "the stale release writes nothing"); self.assertLessEqual(abs(s["afterStale"]["boxes"]["gvb"]["left"] - ab["boxes"]["gvb"]["left"]), 0.5)
 
+    def test_8f_a_peer_closing_a_column_under_a_live_drag_ends_the_drag_and_the_release_writes_nothing(self):
+        r = self._r()
+        s = r["s8f"]
+        self.assertTrue(s["held"]["drag"], "A held the gutter")
+        c = s["cancelled"]
+        self.assertEqual(c["frames"], ["f-chat"], "B's close reached A"); self.assertFalse(c["legacy"], "A took B's upgraded store in at the drag's end")
+        self.assertIn("chat1", c["store"], "the store is current-shaped…"); self.assertNotIn("chat2", c["store"], "…without the closed column")
+        self.assertGreater(abs(c["boxes"]["gvb"]["left"] - s["held"]["ghostLeft"]), 5, "the drag's +50 never landed: the divider is not where the line was: %r vs %r" % (c["boxes"]["gvb"], s["held"]["ghostLeft"]))
+        ratio_seen = c["boxes"]["fleet"]["width"] / c["boxes"]["feed"]["width"]; ratio_store = c["store"]["fleet"] / c["store"]["feed"]
+        self.assertLessEqual(abs(ratio_seen - ratio_store) / ratio_store, 0.02, "the panes stand at the store's (the peer's) proportions: %r vs %r" % (c["boxes"], c["store"]))
+        rl = s["released"]
+        self.assertEqual(rl["bytes"], c["bytes"], "A's stale release wrote nothing"); self.assertFalse(rl["legacy"])
+        for k in ("fleet", "feed", "files", "gvb"):
+            self.assertLessEqual(abs(rl["boxes"][k]["left"] - c["boxes"][k]["left"]), 0.5, "%s did not move on the stale release" % k)
+        m = s["mirror"]
+        self.assertTrue(m["held"]["drag"]); self.assertEqual(m["frames"], ["f-chat"], "B's close reached A (mirror)")
+        self.assertLessEqual(abs(m["cancelled"]["filesV"] - s["filesBefore"]["v"]), 1e-6, "the files pane's weight is untouched by the close under the drag: %r vs %r" % (m["cancelled"]["filesV"], s["filesBefore"]["v"]))
+        self.assertLessEqual(abs(m["filesV"] - s["filesBefore"]["v"]), 1e-6, "…and by the stale release"); self.assertLessEqual(abs(m["store"]["files"] - s["filesBefore"]["store"]), 1e-6)
+        self.assertEqual(m["bytes"], m["cancelled"]["bytes"], "the stale release wrote nothing (mirror)"); self.assertNotIn("chat2", m["store"])
+
     def test_9_the_whole_story_runs_in_under_two_and_a_half_minutes_and_left_its_screenshots(self):
         r = self._r()
-        self.assertLess(r["ms"], 180_000, "the driver waits on conditions, never on fixed sleeps: %d ms" % r["ms"])
+        self.assertLess(r["ms"], 240_000, "the driver waits on conditions, never on fixed sleeps: %d ms" % r["ms"])
         self.assertEqual(r.get("shots"), ["stack-1-1-dark.png", "stack-1-1-light.png", "grid-2-2-dark.png", "grid-2-2-light.png"])
         for name in r["shots"]:
             self.assertTrue(os.path.getsize(os.path.join(SHOTS, name)) > 10_000, name + " is a real screenshot")

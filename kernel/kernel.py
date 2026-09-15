@@ -54799,7 +54799,7 @@ var GK='romp-pane-grow',grow={chat:60,chat1:60,fleet:34,feed:40,files:40};
 // waited for the chat pane was lost to the snapshot, and a closed column's weight came back from it).
 var legacy=false;
 try{var g=JSON.parse(localStorage.getItem(GK)||'null');if(g){if(typeof g.chat1!=='number'){g.chat1=typeof g.chat==='number'?g.chat:grow.chat;legacy=true;}grow=Object.assign(grow,g);}}catch(e){}
-function setGrow(k,v){grow[k]=v;row.style.setProperty('--g-'+k,v);}
+function setGrow(k,v){if(!k)return;grow[k]=v;row.style.setProperty('--g-'+k,v);}   // no key (an id nothing registered): nothing written
 for(var k in grow)setGrow(k,grow[k]);
 function finite(v){return typeof v==='number'&&isFinite(v);}
 // a PEER dashboard may upgrade the shared store while this one is legacy: a store that carries chat1 is CURRENT, and its
@@ -54809,23 +54809,38 @@ function finite(v){return typeof v==='number'&&isFinite(v);}
 // unregister, the split's halving and hand-back, the upgrade — never from persist, which writes what its caller produced
 // (review find 2026-09-15, fifth pass: adopting at the final write threw away the very action that wrote — a drag snapped
 // back, a reveal kept the peer's weight, a closed column's weight came back). While a gutter DRAG stands (`gesture`, below)
-// a peer's write is only NOTED (ingestDue): nothing moves under the hand, and the drag's end ingests it (sixth pass).
-var gesture=null,ingestDue=false;   // the gutter drag in flight — one transaction — and a peer's write heard during it
-function ingest(){if(!legacy)return false;if(gesture){ingestDue=true;return false;}var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}
+// nothing is applied under the hand: the drag's end ingests, unconditionally, whatever the store holds (sixth and seventh
+// passes). `val`: the value a peer's storage event carried, adopted as written even if the store has moved on since.
+var gesture=null;   // the gutter drag in flight — one transaction
+function ingest(val){if(!legacy)return false;if(gesture)return false;var cur=val;if(cur===undefined){cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}}
 if(!cur||!finite(cur.chat1))return false;legacy=false;for(var k in cur){if(finite(cur[k]))setGrow(k,cur[k]);}return true;}
-window.addEventListener('storage',function(e){if(e&&e.key===GK)ingest();});   // the peer's write IS the event; a peer's column-store write reaching the split's reconcile first is covered by the ingest at that path's entry
+window.addEventListener('storage',function(e){if(!e||e.key!==GK)return;var v;if(typeof e.newValue==='string'){try{v=JSON.parse(e.newValue);}catch(x){v=null;}}ingest(v);});   // the peer's write IS the event, its value the one adopted; a peer's column-store write reaching the split's reconcile first is covered by the ingest at that path's entry
 window.__rompGrowLegacy=function(){return legacy;};   // whether the store is still pre-rows-shaped here (the served tests read it)
 // while legacy the store keeps its pre-rows SHAPE — no chat1 — so a reload before the upgrade finds it legacy again, the
-// weights persisted meanwhile in hand; persist writes what its caller produced, and only that
-function persist(){var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}try{localStorage.setItem(GK,JSON.stringify(o));}catch(e){}}
+// weights persisted meanwhile in hand; persist writes what its caller produced, and only that. The invariant as a guard: a
+// pre-rows shape is NEVER written over a store another dashboard has upgraded — every write path here ingests first, so the
+// refusal is unreachable from them; it says so rather than downgrade
+function persist(){if(legacy){var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}
+if(cur&&finite(cur.chat1)){try{console.warn('romp: the pane weights were not written: another dashboard upgraded their store and this one has not taken it in');}catch(e){}return;}
+var o=Object.assign({},grow);delete o.chat1;try{localStorage.setItem(GK,JSON.stringify(o));}catch(e){}return;}
+try{localStorage.setItem(GK,JSON.stringify(grow));}catch(e){}}
+window.__rompPersistGrow=persist;   // the write itself, for the guard's own test (no path of this script reaches the refusal)
 // split chat columns (the user 2026-09-08) are made AFTER this runs: they register here so the grab's
 // normalisation and the fair-grow average see them.
 var KEYS={};
-window.__rompRegisterPane=function(id,k){KEYS[id]=k;if(PANES.indexOf(id)<0)PANES.splice(PANES.indexOf('fleet-pane'),0,id);};
-window.__rompUnregisterPane=function(id){ingest();var k=KEYS[id];delete KEYS[id];var i=PANES.indexOf(id);if(i>=0)PANES.splice(i,1);   // a peer's upgrade first, so the deletion below is written over the store it produced, not before it
+// A STRUCTURAL change — a pane made, closed, moved, shown or hidden — ends a drag in flight first (review find 2026-09-15,
+// seventh pass: a column closed under a drag left the gesture live, and its release rewrote another pane; a reconcile's
+// unregister persisted a pre-rows shape over a peer's upgrade). The press-time weights go back, nothing is written, and
+// the store is taken in. The split's make, close, moveTab and reconcile and the rail's toggle call it too.
+function cancelGesture(){if(gesture)endGesture(false);}
+window.__rompCancelGesture=cancelGesture;
+window.__rompRegisterPane=function(id,k){cancelGesture();KEYS[id]=k;if(PANES.indexOf(id)<0)PANES.splice(PANES.indexOf('fleet-pane'),0,id);};
+window.__rompUnregisterPane=function(id){cancelGesture();ingest();var k=KEYS[id];delete KEYS[id];var i=PANES.indexOf(id);if(i>=0)PANES.splice(i,1);   // a peer's upgrade first, so the deletion below is written over the store it produced, not before it
 if(k){delete grow[k];row.style.removeProperty('--g-'+k);persist();}};
 function lastChat(){return 'chat-area';}   // the chat side of gv-a/gv-b/gv-c: the whole chat area, whatever columns and rows it holds
-function key(id){return KEYS[id]||(id==='chat-area'?'chat':id==='chat-pane'?'chat1':id==='fleet-pane'?'fleet':id==='feed-pane'?'feed':'files');}
+var FIXED={'chat-area':'chat','chat-pane':'chat1','fleet-pane':'fleet','feed-pane':'feed','files-pane':'files'};   // the fixed panes' keys; a split column's is its registration
+function key(id){return KEYS[id]||FIXED[id]||null;}   // …and any other id has NONE (review find 2026-09-15, seventh pass: a pane unregistered under a drag fell to 'files', and the release rewrote the files pane)
+window.__rompPaneKey=key;
 function idOf(k){for(var id in KEYS){if(KEYS[id]===k)return id;}return k==='chat'?'chat-area':k==='chat1'?'chat-pane':k==='fleet'?'fleet-pane':k==='feed'?'feed-pane':k==='files'?'files-pane':null;}
 function shown(id){var p=document.getElementById(id);return p&&getComputedStyle(p).display!=='none';}
 // the shown panes sharing `id`'s container (the outer row, or one chat row): what a grab normalises and a fair grow
@@ -54838,7 +54853,7 @@ function normalise(ids){var px={};ids.forEach(function(id){px[id]=document.getEl
 // a pane re-shown from the rail gets a grow comparable to the panes already visible beside it, so it never slots back
 // in as a sliver after the others were dragged to extreme widths (grows are stored as px). Timeline is the
 // bottom BAND now (fixed-height var, not a row grow), so it's excluded.
-window.__rompGrowFair=function(k){if(k==='timeline')return;ingest();   // a peer's upgrade first: after one, the pane joins the layout the store now holds by the rule below, as it would on a page booted current
+window.__rompGrowFair=function(k){if(k==='timeline')return;cancelGesture();ingest();   // a pane coming on ends a drag first; then a peer's upgrade: after one, the pane joins the layout the store now holds by the rule below, as it would on a page booted current
 if(legacy){if(k==='chat'){upgrade(true);return;}setGrow(k,oldFair());persist();return;}   // the pre-rows rule while the store is pre-rows-shaped; the chat pane coming on (the toggle's call, ahead of its class flip) is the upgrade's moment
 var id=idOf(k),pool=(id&&document.getElementById(id))?sibs(id):PANES.filter(shown);
 var v=pool.map(function(id){return grow[key(id)];})
@@ -54852,7 +54867,7 @@ window.__rompGrowFairIfNew=function(k){ingest();if(typeof grow[k]==='number'&&is
 // finds the value when the column is made and keeps it (the fair average stays the rule for a column with no stored
 // width: a boot restore). The new pane is not in the row yet, so it is never read; a hidden pane is never written;
 // the outer row is not touched. Returns whether it wrote (a hidden or missing left pane: nothing).
-window.__rompSplitGrow=function(leftId,newKey){ingest();var L=document.getElementById(leftId);if(!L||!shown(leftId)||!newKey)return false;
+window.__rompSplitGrow=function(leftId,newKey){cancelGesture();ingest();var L=document.getElementById(leftId);if(!L||!shown(leftId)||!newKey)return false;
 var px=normalise(sibs(leftId));
 var w=px[leftId];setGrow(key(leftId),w/2);setGrow(newKey,w/2);persist();return true;};
 // …and a CLOSING chat column hands its width to the column on its LEFT (review find 2026-09-11): the twin of the halving,
@@ -54861,7 +54876,7 @@ var w=px[leftId];setGrow(key(leftId),w/2);setGrow(newKey,w/2);persist();return t
 // then the left pane's key takes the closing pane's width plus the 7 px gutter that goes with it (the row keeps its
 // width: one gutter fewer). Runs while the closing pane is still in the row and shown; __rompUnregisterPane drops its
 // key after.
-window.__rompSplitShrink=function(leftId,goneId){ingest();var L=document.getElementById(leftId),G=document.getElementById(goneId);if(!L||!G||!shown(leftId)||!shown(goneId))return false;
+window.__rompSplitShrink=function(leftId,goneId){cancelGesture();ingest();var L=document.getElementById(leftId),G=document.getElementById(goneId);if(!L||!G||!shown(leftId)||!shown(goneId))return false;
 var px=normalise(sibs(leftId));
 setGrow(key(leftId),px[leftId]+px[goneId]+7);persist();return true;};
 // A drag moves a LANDING LINE and the panes take their widths ONCE, at release. A grow write re-lays out the row
@@ -54886,16 +54901,19 @@ var ghost=document.getElementById('gv-ghost'),ghostH=document.getElementById('gv
 // REBASES the pair against the ingested siblings so the divider lands exactly where the line was: with a and b the pair's
 // pixels at release, Σo the other shown siblings' ingested weights and W the container's pixels, w_L + w_R = Σo·(a+b)/(W−a−b)
 // and w_L = (w_L+w_R)·a/(a+b); with nothing noted, or nothing else in the container, this is the plain write of a and b.
-// Either exit runs the deferred ingest last and removes the gesture's listeners: a stale release is a no-op.
+// Either exit ingests last — UNCONDITIONALLY: a store upgraded meanwhile is adopted whether or not its event was heard, so a
+// pre-rows page never writes over it (seventh pass) — and removes the gesture's listeners: a stale release is a no-op. A
+// commit needs the pair as it was pressed: both panes still in the document and registered under the press-time keys; else
+// it is a cancel (the structural change that broke the pair ended the drag ahead of this; the check is the backstop).
 function endGesture(commit){var g=gesture;if(!g)return;gesture=null;
 window.removeEventListener('mousemove',g.mv);window.removeEventListener('mouseup',g.up);
 document.body.classList.remove('drag',g.vert?'dragh':'dragv');if(g.gh)g.gh.style.display='none';
-var due=ingestDue;ingestDue=false;
-if(g.vert){if(commit&&g.apply)g.apply(g.nL/g.sum);if(due)ingest();return;}
-if(!commit){for(var k in g.w0)setGrow(k,g.w0[k]);if(due)ingest();return;}   // cancelled: the press-time weights back, nothing written, then the peer's store
-var a=g.nL,b=g.sum-g.nL,lk=key(g.L.id),rk=key(g.R.id),so=0;
-if(due&&ingest()&&a+b<g.W)g.others.forEach(function(k){if(finite(grow[k]))so+=grow[k];});
-if(so>0){var pair=so*(a+b)/(g.W-a-b);setGrow(lk,pair*a/(a+b));setGrow(rk,pair*b/(a+b));}else{setGrow(lk,a);setGrow(rk,b);}
+if(g.vert){if(commit&&g.apply)g.apply(g.nL/g.sum);ingest();return;}
+var intact=commit&&!!g.L.isConnected&&!!g.R.isConnected&&key(g.L.id)===g.kL&&key(g.R.id)===g.kR;
+if(!intact){for(var k in g.w0)setGrow(k,g.w0[k]);ingest();return;}   // cancelled: the press-time weights back, nothing written, then whatever the store holds
+var a=g.nL,b=g.sum-g.nL,so=0;
+if(ingest()&&a+b<g.W)g.others.forEach(function(k){if(finite(grow[k]))so+=grow[k];});   // a store upgraded meanwhile: adopted, and the pair rebased against it
+if(so>0){var pair=so*(a+b)/(g.W-a-b);setGrow(g.kL,pair*a/(a+b));setGrow(g.kR,pair*b/(a+b));}else{setGrow(g.kL,a);setGrow(g.kR,b);}
 persist();}
 window.addEventListener('pointercancel',function(){endGesture(false);});
 window.addEventListener('blur',function(){endGesture(false);});
@@ -54903,6 +54921,7 @@ document.addEventListener('visibilitychange',function(){if(document.visibilitySt
 function gutter(gid,leftPick,rightId,vert,apply){var h=document.getElementById(gid);if(!h)return;
 h.addEventListener('mousedown',function(e){e.preventDefault();
 var L=document.getElementById(leftPick()),R=document.getElementById(rightId);if(!L||!R)return;
+var kL=key(L.id),kR=key(R.id);if(!vert&&(!kL||!kR))return;   // a pane gutter's pair must be registered panes: their keys are fixed at the press
 if(gesture)endGesture(false);   // a new press while one stands: the prior is cancelled, never committed
 ingest();   // a peer's upgrade first, before the press is measured
 var w0=Object.assign({},grow),others=[],W=0;
@@ -54910,7 +54929,7 @@ if(!vert){var ids=sibs(L.id),px=normalise(ids);ids.forEach(function(id){W+=px[id
 document.body.classList.add('drag',vert?'dragh':'dragv');
 var sz=vert?'offsetHeight':'offsetWidth',ax=vert?'clientY':'clientX',gh=vert?ghostH:ghost;
 var wL=L[sz],wR=R[sz],sum=wL+wR,s0=e[ax],mn=Math.min(120,sum*0.25),lr=L.getBoundingClientRect(),l0=vert?lr.top:lr.left,rr=(L.parentElement||row).getBoundingClientRect();
-var g={gid:gid,L:L,R:R,vert:vert,apply:apply,gh:gh,w0:w0,others:others,W:W,sum:sum,nL:wL,l0:l0};
+var g={gid:gid,L:L,R:R,kL:kL,kR:kR,vert:vert,apply:apply,gh:gh,w0:w0,others:others,W:W,sum:sum,nL:wL,l0:l0};
 function show(){if(!gh)return;if(vert){gh.style.left=rr.left+'px';gh.style.width=rr.width+'px';gh.style.top=(l0+g.nL)+'px';}else{gh.style.top=rr.top+'px';gh.style.height=rr.height+'px';gh.style.left=(l0+g.nL)+'px';}gh.style.display='block';}
 function mv(ev){if(gesture!==g)return;g.nL=Math.max(mn,Math.min(sum-mn,wL+(ev[ax]-s0)));show();}
 function up(){if(gesture!==g)return;endGesture(true);}
@@ -58131,6 +58150,7 @@ _LANDING_COLLAPSE_JS = """
   }
   function togglePane(k,to){if(!(k in po))return;if(k==='files'&&!filesCtl())return;var nv=(to===undefined)?!po[k]:!!to;
     if(nv===!!po[k])return;   // already so (a relay's bring-forward on an open pane): nothing changed, so no re-apply and no broadcast claiming one
+    if(window.__rompCancelGesture)window.__rompCancelGesture();   // a pane coming or going under a gutter drag ends the drag first (the chat rows, 2026-09-15)
     if(nv&&!po[k]&&window.__rompGrowFair)window.__rompGrowFair(k);   // newly shown → fair width, not a sliver
     po[k]=nv;apply();saveP();}
   window.__rompPaneToggle=togglePane;
@@ -58246,7 +58266,8 @@ var BUSY='A session is still being created in this column.';
 var LOCKED='The tabs are locked: unlock them in the settings (Chat, Tab strip) to move this session.';
 // MAKE a column's pane in its row: a gutter ahead of it when a column (or the first pane) sits on its left, none for the
 // bottom row's first column; appended at the row's end, so the row reads in store order
-function make(n,sid,state){var have=document.getElementById(frameId(n));if(have)return have;
+function cancelDrag(){try{if(window.__rompCancelGesture)window.__rompCancelGesture();}catch(e){}}   // a column made, closed or moved under a gutter drag ends the drag first (_LANDING_JS; the chat rows, 2026-09-15)
+function make(n,sid,state){var have=document.getElementById(frameId(n));if(have)return have;cancelDrag();
 var r=rowOf(n),host=ROWS[r],g=null;
 if(prevIn(n)){g=document.createElement('div');g.className='gv gv-chat';g.id='gv-chat-'+n;}
 var p=document.createElement('div');p.className='pane chat-col';p.id=paneId(n);p.setAttribute('data-col',String(n));
@@ -58277,7 +58298,7 @@ function unlist(sid){for(var i=0;i<cols.length;i++){var c=cols[i],j=c.ids.indexO
 // Returns the target's iframe, null when refused. A session already alone in a later column has nowhere new to go IN
 // ITS OWN ROW: a new column there would be a twin of the origin and the origin would close, so that is refused with a
 // line rather than done for nothing; a new column in the OTHER row moves it there, and the emptied origin closes.
-function moveTab(sid,to){if(typeof sid!=='string'||!sid)return null;
+function moveTab(sid,to){if(typeof sid!=='string'||!sid)return null;cancelDrag();
 var from=ownerOf(sid),src=frameOfCol(from);
 var why=refusal(src,sid);if(why==='locked')return notify(LOCKED);if(why||!movable(src,sid))return notify('Only an open session can be moved between columns.');
 var nr=to==='new'?1:to==='below'?2:0;
@@ -58305,7 +58326,7 @@ try{tf.contentWindow.focus();}catch(e){}return tf;}
 // bottom row's last column closing folds the row: the gutter and the row hide, the top row takes the height, and
 // the store loses rowSplit with the row. `keep` skips the store write (a reconcile of another dashboard tab's write,
 // which is already the truth).
-function close(n,keep){var i=idx(n);if(i<0)return;
+function close(n,keep){var i=idx(n);if(i<0)return;cancelDrag();
 var f=document.getElementById(frameId(n)),home=document.getElementById('f-chat');
 if(!keep&&busy(f)){notify(BUSY);return;}   // a create in flight would die with the document (its queued text with it)
 if(f&&home)cols[i].ids.forEach(function(sid){adopt(home,sid,take(f,sid));});
@@ -58423,7 +58444,7 @@ return {cols:out,migrated:migrated,rowSplit:rs};}
 // another dashboard tab's write (this window never hears its own): its arrangement is the truth — close what it
 // dropped or moved to the other row (a page cannot change rows in place: its frame is remade there), make what it
 // added (seeded like a restore), take its sets and its rows' split — and nothing is written back
-function reconcile(r){var next=r.cols;
+function reconcile(r){cancelDrag();var next=r.cols;
 cols.filter(function(c){return !next.some(function(d){return d.n===c.n&&d.row===c.row;});}).forEach(function(c){close(c.n,true);});
 cols=next.map(function(c){return {n:c.n,ids:c.ids.slice(),row:c.row};});rowSplit=r.rowSplit;
 cols.forEach(function(c){if(!document.getElementById(frameId(c.n)))make(c.n,seedFor(c),null);});applyRows();}
