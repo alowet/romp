@@ -249,13 +249,18 @@ class SplitSourcePins(unittest.TestCase):
         self.assertIn("window.__rompRowGutter=function(gid,topId,botId,apply){", gut, "the row gutter rides the same drag code, reporting the top row's share")
         # a pre-rows pane store (no chat1): the area's weight is set once from the top-row columns the split restored, in the
         # pixels of the pre-rows layout (review find 2026-09-15; tests/test_pane_gutters.py runs it)
-        self.assertIn("window.__rompSeedAreaWeight=function(colKeys){if(!legacy)return false;legacy=false;", gut)
+        self.assertIn("window.__rompSeedAreaWeight=function(colKeys){if(!legacy)return false;return upgrade(colKeys||[],false);};", gut)
         # …from a snapshot of the pre-rows weights taken at boot, a restored column with no stored weight given the pre-rows fair
-        # grow (the panes on screen as it was made, in restoration order), never the rows' sibling average make() applied since
+        # grow (the panes ON SCREEN as it was made — the old PANES.filter(shown) — in restoration order), never the rows' sibling
+        # average make() applied since; with the chat pane off the pixels wait for the toggle's own fair-grow call (an event)
         self.assertIn("if(legacy)legacyGrow=Object.assign({},grow);", gut)
         self.assertLess(gut.index("if(legacy)legacyGrow=Object.assign({},grow);"), gut.index("for(var k in grow)setGrow(k,grow[k]);"), "snapshotted before the first write")
-        self.assertIn("var lg=legacyGrow||{},outer=['fleet','feed','files'].filter(function(k){return shown(idOf(k));}),chatKeys=['chat1'];", gut)
-        self.assertIn("(colKeys||[]).forEach(function(k){if(!finite(lg[k])){var v=chatKeys.concat(outer).map(function(j){return lg[j];}).filter(finite);lg[k]=v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;}chatKeys.push(k);});", gut)
+        self.assertIn("function oldFair(lg,keys){var v=keys.filter(function(j){return shown(idOf(j))&&finite(lg[j]);}).map(function(j){return lg[j];});return v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;}", gut)
+        self.assertIn("colKeys.forEach(function(k){if(!finite(lg[k])){lg[k]=oldFair(lg,chatKeys.concat(OUTER));setGrow(k,lg[k]);}chatKeys.push(k);});", gut)
+        self.assertIn("if(showing)lg.chat1=oldFair(lg,chatKeys.concat(OUTER));", gut)
+        self.assertIn("else if(!shown('chat-pane')){legacyKeys=colKeys;persist();return false;}", gut)
+        self.assertIn("if(k==='chat'&&legacy&&legacyKeys){upgrade(legacyKeys,true);return;}", gut, "the deferred upgrade rides __rompGrowFair('chat'), which togglePane calls ahead of its class flip")
+        self.assertIn("function persist(){var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}", gut, "the store keeps its pre-rows shape while the upgrade is pending")
         self.assertIn("if(window.__rompSeedAreaWeight)window.__rompSeedAreaWeight(rowCols(1).map(function(c){return 'chat'+c.n;}));", km._LANDING_SPLIT_JS, "called at the split's boot with the TOP row's restored columns")
         boot = km._LANDING_SPLIT_JS[km._LANDING_SPLIT_JS.index("try{if(!mobile()){var r0=read();"):]
         self.assertLess(boot.index("cols.forEach(function(c){make(c.n,seedFor(c),null);});"), boot.index("__rompSeedAreaWeight(rowCols(1)"), "…after they are made (their stored weights applied)")

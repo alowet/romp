@@ -54793,12 +54793,14 @@ var GK='romp-pane-grow',grow={chat:60,chat1:60,fleet:34,feed:40,files:40};
 // column keeps its proportion against it (60 against a stored 400 px would have opened the first pane as a sliver) —
 // and the store is marked legacy, for __rompSeedAreaWeight below to set the outer weight once the split has restored
 // its columns (the old chat weight was ONE column's; the area's is every top-row column's together)
-var legacy=false,legacyGrow=null;
+var legacy=false,legacyGrow=null,legacyKeys=null;   // legacyKeys: the top-row columns the split restored, held while the upgrade below waits for the chat pane to show
 try{var g=JSON.parse(localStorage.getItem(GK)||'null');if(g){if(typeof g.chat1!=='number'){g.chat1=typeof g.chat==='number'?g.chat:grow.chat;legacy=true;}grow=Object.assign(grow,g);}}catch(e){}
 if(legacy)legacyGrow=Object.assign({},grow);   // the pre-rows weights as stored, snapshotted BEFORE any restored column takes a fair grow of the rows' rule (review find 2026-09-15: a column with no stored weight took its row-siblings' average ahead of the upgrade, and the upgrade froze that)
 function setGrow(k,v){grow[k]=v;row.style.setProperty('--g-'+k,v);}
 for(var k in grow)setGrow(k,grow[k]);
-function persist(){try{localStorage.setItem(GK,JSON.stringify(grow));}catch(e){}}
+// while a pre-rows store's upgrade is PENDING (__rompSeedAreaWeight below: the chat pane is off) the store keeps its pre-rows
+// SHAPE — no chat1 — so a reload before the pane shows finds the upgrade pending again, the weights persisted meanwhile in hand
+function persist(){var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}try{localStorage.setItem(GK,JSON.stringify(o));}catch(e){}}
 // split chat columns (the user 2026-09-08) are made AFTER this runs: they register here so the grab's
 // normalisation and the fair-grow average see them.
 var KEYS={};
@@ -54819,7 +54821,9 @@ function normalise(ids){var px={};ids.forEach(function(id){px[id]=document.getEl
 // a pane re-shown from the rail gets a grow comparable to the panes already visible beside it, so it never slots back
 // in as a sliver after the others were dragged to extreme widths (grows are stored as px). Timeline is the
 // bottom BAND now (fixed-height var, not a row grow), so it's excluded.
-window.__rompGrowFair=function(k){if(k==='timeline')return;var id=idOf(k),pool=(id&&document.getElementById(id))?sibs(id):PANES.filter(shown);
+window.__rompGrowFair=function(k){if(k==='timeline')return;
+if(k==='chat'&&legacy&&legacyKeys){upgrade(legacyKeys,true);return;}   // the chat pane coming on (the toggle's fair-grow call, ahead of its class flip) with a pre-rows upgrade waiting for it: finalised now, over the panes about to be on screen
+var id=idOf(k),pool=(id&&document.getElementById(id))?sibs(id):PANES.filter(shown);
 var v=pool.map(function(id){return grow[key(id)];})
 .filter(function(g){return typeof g==='number'&&isFinite(g);});   // a pane with no grow yet (a split column being made) must not average in as NaN (review find 2026-09-08: the first split opened 0px wide)
 var avg=v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;setGrow(k,avg);persist();};
@@ -54878,18 +54882,29 @@ window.__rompRowGutter=function(gid,topId,botId,apply){gutter(gid,function(){ret
 // chat columns' pixels plus the gutters between them. Weights in px sum to the space each container distributes, so the
 // render matches the pre-rows one pixel for pixel; persisted, so the store carries chat1 from then on and this never runs again.
 // A restored column with NO stored weight (a supported restore) is given the weight the PRE-ROWS shell gave it — its fair
-// grow then: the average of the finite weights of the panes on screen as it was made, the first pane, the columns restored
-// before it and the shown outer panes — in restoration order, each resolved weight counting for the next; read from the
-// boot snapshot, never from the rows' sibling average make() has since applied (which the pixels below overwrite).
+// grow then (__rompGrowFair at ab112d49, PANES.filter(shown)): the mean of the finite weights of the panes ON SCREEN as it
+// was made — the first pane, the columns restored before it, the outer panes, each only while shown; a hidden pane
+// contributes nothing, and a hidden column being resolved receives the mean of what IS visible (50 with nothing) — in
+// restoration order, each resolved weight counting for the next; read from the boot snapshot, never from the rows' sibling
+// average make() has since applied (which the pixels below overwrite); set and persisted at once, as the old shell persisted it.
+// With the CHAT PANE OFF the pixels would be a hidden layout's (review find 2026-09-15, third pass): the upgrade then WAITS for
+// the pane to show — __rompGrowFair('chat'), the toggle's own call ahead of its class flip, an event and no timer — and does
+// there what the old shell did there first: fair-grows the first pane over the panes on screen at that moment (the chat
+// panes still hidden), so a first pane at 640 beside a column resolved to the feed's 400 comes on as equal columns.
 function finite(v){return typeof v==='number'&&isFinite(v);}
-window.__rompSeedAreaWeight=function(colKeys){if(!legacy)return false;legacy=false;
-var lg=legacyGrow||{},outer=['fleet','feed','files'].filter(function(k){return shown(idOf(k));}),chatKeys=['chat1'];
-(colKeys||[]).forEach(function(k){if(!finite(lg[k])){var v=chatKeys.concat(outer).map(function(j){return lg[j];}).filter(finite);lg[k]=v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;}chatKeys.push(k);});
-var items=chatKeys.concat(outer),T=0,W=row.offsetWidth;items.forEach(function(k){T+=lg[k];});
+var OUTER=['fleet','feed','files'];
+function oldFair(lg,keys){var v=keys.filter(function(j){return shown(idOf(j))&&finite(lg[j]);}).map(function(j){return lg[j];});return v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;}
+function upgrade(colKeys,showing){var lg=legacyGrow||{},chatKeys=['chat1'];
+colKeys.forEach(function(k){if(!finite(lg[k])){lg[k]=oldFair(lg,chatKeys.concat(OUTER));setGrow(k,lg[k]);}chatKeys.push(k);});
+if(showing)lg.chat1=oldFair(lg,chatKeys.concat(OUTER));   // the old shell's show-time fair grow of the first pane
+else if(!shown('chat-pane')){legacyKeys=colKeys;persist();return false;}   // deferred to the show: the store keeps its pre-rows shape, the resolved weights in it
+legacy=false;legacyKeys=null;
+var outer=OUTER.filter(function(k){return shown(idOf(k));}),items=chatKeys.concat(outer),T=0,W=row.offsetWidth;items.forEach(function(k){T+=lg[k];});
 if(!(W>0)||!(T>0)){persist();return false;}
 var avail=W-7*(items.length-1),px={},sum=0;items.forEach(function(k){px[k]=avail*lg[k]/T;});
 items.forEach(function(k){setGrow(k,px[k]);});chatKeys.forEach(function(k){sum+=px[k];});
-setGrow('chat',sum+7*(chatKeys.length-1));persist();return true;};
+setGrow('chat',sum+7*(chatKeys.length-1));persist();return true;}
+window.__rompSeedAreaWeight=function(colKeys){if(!legacy)return false;return upgrade(colKeys||[],false);};
 gutter('gv-a',function(){return lastChat();},'fleet-pane');
 gutter('gv-b',function(){return document.body.classList.contains('po-fleet')?'fleet-pane':lastChat();},'feed-pane');
 gutter('gv-c',function(){var c=document.body.classList;return c.contains('po-feed')?'feed-pane':c.contains('po-fleet')?'fleet-pane':lastChat();},'files-pane');

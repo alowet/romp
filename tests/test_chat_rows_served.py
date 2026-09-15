@@ -33,7 +33,10 @@ the REAL page: a hermetic kernel serves the dashboard with FIVE synthetic sessio
   8. the UPGRADE of a pre-rows pane store (review find 2026-09-15): legacy one-, two-, three- and four-column stores with
      persisted weights (chat, chatN, feed — no chat1) reloaded into the rows shell render every chat column and the feed at
      the width the pre-rows shell gave them (one row, a gutter between each pair), within a pixel; the store then carries
-     chat1 and the area's weight, and a second reload renders the same;
+     chat1 and the area's weight, and a second reload renders the same; and with the CHAT PANE OFF (the rail's Chat, before
+     the reload) a legacy store with a missing column weight resolves it over the visible feed, keeps its pre-rows shape while
+     the pane is hidden, and on the rail's Chat lays out as the old shell did — the first pane fair-grown over the feed at the
+     show, equal columns — a reload after keeping it;
   9. the whole story runs in under two and a half minutes (the driver waits on conditions, never on fixed sleeps).
 Screenshots of the 1 + 1 stack and the 2 x 2, dark and light, land in the directory ROMP_ROWS_SHOTS names (default
 /tmp/chat-rows-shots) for a human look. Skips LOUDLY when the extension deps or a playwright browser are absent (CI
@@ -330,6 +333,22 @@ for (const c of LEGACY) {
   await waitBootGone();
   out.s8[c.name] = { first, second: await widthsNow() };
 }
+// …and the chat pane OFF at the restore (review find 2026-09-15, third pass): the rail's Chat before the reload, the legacy
+// store with a missing column weight, the reload (the upgrade waits), the rail's Chat again (the upgrade runs), a reload after
+await page.click(".rail-btn[data-pane=chat]");
+await waitFn(() => !document.body.classList.contains("po-chat"), null, "the rail never hid the chat pane");
+await page.evaluate(([grow, cols]) => { localStorage.setItem("romp-pane-grow", JSON.stringify(grow)); localStorage.setItem("romp-chat-cols", JSON.stringify({ v: 2, cols })); }, [{ chat: 640, fleet: 34, feed: 400 }, [{ n: 2, ids: [cfg.b] }]]);
+await page.reload();
+await waitBootGone();
+await waitFn(() => !document.body.classList.contains("po-chat") && !!window.__rompChatFrameIds && window.__rompChatFrameIds().length === 2, null, "column 2 never restored while the chat pane was hidden");
+const hidden = await widthsNow();
+await page.click(".rail-btn[data-pane=chat]");
+await waitFn(() => document.body.classList.contains("po-chat"), null, "the rail never showed the chat pane");
+await waitTabs("f-chat", [cfg.a]); await waitTabs("f-chat-2", [cfg.b]);
+const shownFirst = await widthsNow();
+await page.reload();
+await waitTabs("f-chat", [cfg.a]); await waitTabs("f-chat-2", [cfg.b]); await waitBootGone();
+out.s8["hidden-chat"] = { hidden, first: shownFirst, second: await widthsNow() };
 out.ms = Date.now() - out.t0;
 fs.writeSync(1, "RESULT:" + JSON.stringify(out) + "\n");
 await browser.close();
@@ -651,17 +670,21 @@ class ServedChatRows(unittest.TestCase):
         self.assertEqual(s["nonce"], r["s5"]["nonce2"])
 
     @staticmethod
-    def _pre_rows_weights(stored, cols):
-        """The weights the PRE-ROWS shell laid the row out by: the store's, its defaults (chat 60, feed 40) for keys the store
-        lacks, and for a restored column with no stored weight its fair grow as it was made — the average of the panes then on
-        screen (the first pane, the columns made before it, the feed), in restoration order."""
-        w = dict({"chat": 60, "feed": 40}, **stored)
+    def _pre_rows_weights(stored, cols, visible=("feed",), chat_shown=True):
+        """The weights the PRE-ROWS shell laid the row out by: the store's, its defaults for keys the store lacks, and for a
+        restored column with no stored weight its fair grow as it was made — the mean of the panes then ON SCREEN (the first
+        pane and the columns made before it while the chat pane was shown, plus the `visible` outer panes), in restoration
+        order, 50 with nothing on screen. With the chat pane hidden at the restore, the rail's Chat fair-grew the first pane
+        over the visible outer panes (the chat panes still hidden) before showing it."""
+        w = dict({"chat": 60, "fleet": 34, "feed": 40, "files": 40}, **stored)
+        mean = lambda v: (sum(v) / len(v)) if v else 50
         made = ["chat"]
         for k in cols:
             if k not in w:
-                pool = [w[j] for j in made + ["feed"]]
-                w[k] = sum(pool) / len(pool)
+                w[k] = mean([w[j] for j in (made if chat_shown else []) + list(visible)])
             made.append(k)
+        if not chat_shown:
+            w["chat"] = mean([w[j] for j in visible])
         return w
 
     def test_8_a_pre_rows_pane_store_reloads_at_the_widths_the_pre_rows_shell_gave_it(self):
@@ -672,9 +695,12 @@ class ServedChatRows(unittest.TestCase):
                  # the missing-weight cases: chat2 resolves to (640 + 400) / 2 = 520, chat3 to (640 + 520 + 400) / 3 = 520; the empty
                  # object to the pre-rows defaults, both columns at (60 + 40) / 2 = 50
                  "missing-one": (["chat2"], {"chat": 640, "feed": 400}), "missing-two": (["chat2", "chat3"], {"chat": 640, "feed": 400}),
-                 "empty": (["chat2", "chat3"], {})}
+                 "empty": (["chat2", "chat3"], {}),
+                 # the chat pane OFF at the restore: chat2 resolves over the visible feed alone, 400, and the rail's Chat fair-grows
+                 # the first pane to the feed's 400 before showing it: three equal columns
+                 "hidden-chat": (["chat2"], {"chat": 640, "feed": 400})}
         for name, (cols, stored) in cases.items():
-            weights = self._pre_rows_weights(stored, cols)
+            weights = self._pre_rows_weights(stored, cols, visible=("feed",), chat_shown=(name != "hidden-chat"))
             s = r["s8"][name]
             for which in ("first", "second"):
                 m = s[which]
@@ -691,10 +717,24 @@ class ServedChatRows(unittest.TestCase):
                     self.assertIsNotNone(got[k], "%s/%s: %s is on screen" % (name, which, k))
                     self.assertLessEqual(abs(got[k] - want[k]), 1, "%s/%s: %s renders at %.2f px where the pre-rows shell gave %.2f (row %.1f): %r" % (name, which, k, got[k], want[k], m["row"], m))
             g = s["first"]["grow"]
-            self.assertIn("chat1", g, "%s: the store carries chat1 after the first boot: the upgrade ran once" % name)
+            self.assertIn("chat1", g, "%s: the store carries chat1 once the upgrade has run" % name)
             self.assertLessEqual(abs(g["chat1"] - s["first"]["chat1"]), 1, "%s: the first pane's inner weight is its pixels" % name)
             self.assertLessEqual(abs(g["chat"] - s["first"]["area"]), 1, "%s: the area's weight is its pixels (the columns plus their gutters)" % name)
             self.assertEqual(s["second"]["grow"], g, "%s: the second boot is not an upgrade: the store is as the first left it" % name)
+
+    def test_8b_with_the_chat_pane_off_the_upgrade_waits_for_the_pane_to_show(self):
+        r = self._r()
+        h = r["s8"]["hidden-chat"]["hidden"]
+        self.assertEqual(h["frames"], ["f-chat", "f-chat-2"], "the column is restored while the chat pane is hidden")
+        self.assertEqual(h["area"], 0, "…off screen"); self.assertEqual(h["chat2"], 0)
+        g = h["grow"]
+        self.assertNotIn("chat1", g, "the store keeps its pre-rows shape while the upgrade waits: no chat1")
+        self.assertEqual(g["chat2"], 400, "the missing weight resolved over what was on screen — the feed alone — and persisted, as the old shell did")
+        self.assertEqual(g["chat"], 640, "the first pane's weight untouched until the show")
+        f = r["s8"]["hidden-chat"]["first"]
+        self.assertLessEqual(abs(f["chat1"] - f["chat2"]), 1, "shown: equal columns (the first pane fair-grown to the feed's 400 at the show): %r" % f)
+        self.assertLessEqual(abs(f["chat1"] - f["feed"]), 1)
+        self.assertIn("chat1", f["grow"], "finalised at the show")
 
     def test_9_the_whole_story_runs_in_under_two_and_a_half_minutes_and_left_its_screenshots(self):
         r = self._r()

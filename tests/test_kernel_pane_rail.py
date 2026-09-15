@@ -132,7 +132,8 @@ class PaneRailTest(unittest.TestCase):
         self.assertIn("function normalise(ids){var px={};ids.forEach(function(id){px[id]=document.getElementById(id).offsetWidth;});Object.keys(px).forEach(function(id){setGrow(key(id),px[id]);});return px;}", self.html)
         self.assertIn("function sibs(id){var el=document.getElementById(id),par=el?el.parentElement:null;return PANES.filter(function(p){var e=document.getElementById(p);return !!e&&shown(p)&&e.parentElement===par;});}", self.html)
         self.assertIn("if(!vert)normalise(sibs(L.id));", self.html)
-        self.assertIn("localStorage.setItem(GK,JSON.stringify(grow))", self.html)
+        # the one write of the store (persist): the pre-rows shape — no chat1 — while a pre-rows store's upgrade waits for the chat pane to show
+        self.assertIn("function persist(){var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}try{localStorage.setItem(GK,JSON.stringify(o));}catch(e){}}", self.html)
         # gv-b picks its left neighbour live: the outline (fleet) when shown, else the chat AREA (so it's the chat|feed
         # gutter too; lastChat() is #chat-area, the wrapper every chat column lives in — the chat rows, 2026-09-15)
         self.assertIn("document.body.classList.contains('po-fleet')?'fleet-pane':lastChat()", self.html)

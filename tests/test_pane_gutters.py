@@ -124,17 +124,21 @@ function flex(avail, ws) { const T = ws.reduce((a, b) => a + b, 0); return ws.ma
 // the widths a PRE-ROWS shell rendered from a pane store: every chat column and every shown outer pane in ONE row, a 7 px
 // gutter between each pair — and the widths the rows shell renders from the weights the upgrade hook leaves: the outer
 // row (the area, then the shown outer panes), then the chat columns inside the area behind their own gutters
-// …a column the pre-rows store held NO weight for took the pre-rows fair grow as it was made: the average of the finite
-// weights of the panes then on screen (the first pane, the columns made before it, the shown outer panes), in
-// restoration order; the pre-rows defaults stand in for keys the store lacks (chat 60, feed 40, fleet 34, files 40)
+// …a column the pre-rows store held NO weight for took the pre-rows fair grow as it was made: the mean of the finite weights
+// of the panes then ON SCREEN (the first pane and the columns made before it while the chat pane is shown, the shown outer
+// panes), in restoration order, 50 with nothing on screen; the pre-rows defaults stand in for keys the store lacks (chat 60,
+// feed 40, fleet 34, files 40). With the chat pane HIDDEN at the restore, the rail's Chat later fair-grew the first pane over
+// the panes on screen at that moment (the chat panes still hidden), then showed it: the show-time step below.
 const OLD_DEFAULTS = { chat: 60, fleet: 34, feed: 40, files: 40 };
-function legacyResolved(store, colKeys, outerShown) {
+const mean = (v) => (v.length ? v.reduce((a, b) => a + b, 0) / v.length : 50);
+function legacyResolved(store, colKeys, outerShown, chatHidden) {
   const w = Object.assign({}, OLD_DEFAULTS, store); const made = ['chat'];
-  colKeys.forEach((k) => { if (typeof w[k] !== 'number') { const v = made.concat(outerShown).map((j) => w[j]); w[k] = v.reduce((a, b) => a + b, 0) / v.length; } made.push(k); });
+  colKeys.forEach((k) => { if (typeof w[k] !== 'number') w[k] = mean((chatHidden ? [] : made).concat(outerShown).map((j) => w[j])); made.push(k); });
+  if (chatHidden) w.chat = mean(outerShown.map((j) => w[j]));
   return w;
 }
-function legacyWidths(store, colKeys, outerShown) {
-  const w = legacyResolved(store, colKeys, outerShown);
+function legacyWidths(store, colKeys, outerShown, chatHidden) {
+  const w = legacyResolved(store, colKeys, outerShown, chatHidden);
   const chat = ['chat'].concat(colKeys), items = chat.concat(outerShown);
   const px = flex(1007 - 7 * (items.length - 1), items.map((k) => w[k]));
   const o = {}; items.forEach((k, i) => { o[k === 'chat' ? 'chat1' : k] = px[i]; }); return o;
@@ -187,16 +191,18 @@ window.__rompRegisterPane('chat-pane-2', 'chat2');
 window.__rompGrowFair('chat2');
 out.fair = { grows: grows(), store: store(),
   finite: typeof ROW['--g-chat2'] === 'number' && isFinite(ROW['--g-chat2']) };
-// 3a) a RELOAD with a stored width for the column: __rompGrowFairIfNew keeps it (no re-fair)
+// 3a) a RELOAD with a stored width for the column: __rompGrowFairIfNew keeps it (no re-fair). The stores from here to 9)
+//     carry chat1: current-shape stores, since a pre-rows one (no chat1) is upgraded by the split's boot call and keeps its
+//     pre-rows shape until then — tests 11 to 13 cover that path; these are about fair grows and drags
 resetDom();
-STORE['romp-pane-grow'] = JSON.stringify({ chat: 60, fleet: 34, feed: 40, chat2: 123 });
+STORE['romp-pane-grow'] = JSON.stringify({ chat: 60, chat1: 60, fleet: 34, feed: 40, chat2: 123 });
 BOOT();
 window.__rompRegisterPane('chat-pane-2', 'chat2');
 window.__rompGrowFairIfNew('chat2');
 out.ifNewKept = { grows: grows(), store: store() };
 // 3b) a RELOAD with nothing stored for the column: it falls through to the fair average
 resetDom();
-STORE['romp-pane-grow'] = JSON.stringify({ chat: 60, fleet: 34, feed: 40 });
+STORE['romp-pane-grow'] = JSON.stringify({ chat: 60, chat1: 60, fleet: 34, feed: 40 });
 BOOT();
 window.__rompRegisterPane('chat-pane-2', 'chat2');
 window.__rompGrowFairIfNew('chat2');
@@ -226,7 +232,7 @@ out.dragGvB = drag('gv-b', 500, 480);
 //    the ROW's shown panes to their pixels first (the outer row is another container: not written), then the left pane's
 //    key and the new key each take half the left pane's width, persisted; a hidden or missing left pane writes nothing
 resetDom();
-STORE['romp-pane-grow'] = JSON.stringify({ chat: 60, fleet: 34, feed: 40, chat2: 25 });
+STORE['romp-pane-grow'] = JSON.stringify({ chat: 60, chat1: 60, fleet: 34, feed: 40, chat2: 25 });
 BOOT();
 window.__rompRegisterPane('chat-pane-2', 'chat2');
 out.splitGrow = { wrote: window.__rompSplitGrow('chat-pane-2', 'chat3'), grows: grows(), store: store(),
@@ -236,7 +242,7 @@ out.splitGrow = { wrote: window.__rompSplitGrow('chat-pane-2', 'chat3'), grows: 
 //    goes with it (the row keeps its width: one gutter fewer); the outer row is not written; a hidden or missing pane on
 //    either side writes nothing; the closing pane's own key is dropped by the unregister that follows
 resetDom();
-STORE['romp-pane-grow'] = JSON.stringify({ chat: 60, fleet: 34, feed: 40, chat2: 25 });
+STORE['romp-pane-grow'] = JSON.stringify({ chat: 60, chat1: 60, fleet: 34, feed: 40, chat2: 25 });
 BOOT();
 window.__rompRegisterPane('chat-pane-2', 'chat2');
 out.splitShrink = { wrote: window.__rompSplitShrink('chat-pane', 'chat-pane-2'), grows: grows(), store: store(),
@@ -300,6 +306,31 @@ STORE['romp-pane-grow'] = JSON.stringify({ chat: 900, chat1: 640, chat2: 400, fl
 BOOT();
 window.__rompRegisterPane('chat-pane-2', 'chat2'); window.__rompGrowFairIfNew('chat2');
 out.upgrade.current = { wrote: window.__rompSeedAreaWeight(['chat2']), grows: grows(), store: store() };
+// 13) the CHAT PANE OFF at a legacy restore (review find 2026-09-15, third pass): the missing weight resolves over what is on
+//     screen — the feed alone, 400 — and is persisted; the pixels WAIT (the store keeps its pre-rows shape, no chat1); a reload
+//     while hidden is pending again with the resolved weight in hand; the rail's Chat (the toggle's __rompGrowFair('chat'),
+//     ahead of its class flip) fair-grows the first pane over the feed alone — 400 — then finalises: equal columns, the widths
+//     the old shell gave; a reload after keeps them
+const CHAT_IDS = ['chat-area', 'chat-pane', 'chat-pane-2', 'chat-pane-3'];
+const gk = (g) => { const o = {}; Object.keys(g).forEach((k) => { o[k.slice(4)] = g[k]; }); return o; };
+const HSTORE = { chat: 640, fleet: 34, feed: 400 };
+resetDom(); for (const k in STORE) delete STORE[k];
+STORE['romp-pane-grow'] = JSON.stringify(HSTORE);
+CHAT_IDS.forEach((id) => { EL[id]._display = 'none'; });
+BOOT();
+window.__rompRegisterPane('chat-pane-2', 'chat2'); window.__rompGrowFairIfNew('chat2');
+const hb = { madeGrow: ROW['--g-chat2'], storeAfterMake: store() };
+hb.deferred = window.__rompSeedAreaWeight(['chat2']); hb.grows = grows(); hb.store = store();
+resetDom(); CHAT_IDS.forEach((id) => { EL[id]._display = 'none'; });
+BOOT(); window.__rompRegisterPane('chat-pane-2', 'chat2'); window.__rompGrowFairIfNew('chat2');
+hb.reloadHidden = { deferred: window.__rompSeedAreaWeight(['chat2']), grows: grows(), store: store() };
+window.__rompGrowFair('chat');   // the rail's Chat: togglePane fair-grows the pane, then flips the class
+CHAT_IDS.forEach((id) => { EL[id]._display = 'flex'; });
+hb.shown = { grows: grows(), store: store(), before: legacyWidths(HSTORE, ['chat2'], ['feed'], true), after: rowsWidths(gk(grows()), ['chat2'], ['feed']) };
+resetDom(); BOOT(); window.__rompRegisterPane('chat-pane-2', 'chat2'); window.__rompGrowFairIfNew('chat2');
+hb.reloadShown = { wrote: window.__rompSeedAreaWeight(['chat2']), after: rowsWidths(gk(grows()), ['chat2'], ['feed']), store: store() };
+// …and with the chat pane ON at the restore the same store resolves the column over chat 640 and feed 400 (test 12's missingOne)
+out.upgrade.hiddenChat = hb;
 console.log(JSON.stringify(out));
 """
 
@@ -341,7 +372,7 @@ class PaneGuttersExecute(unittest.TestCase):
         self.assertEqual(kept["store"]["chat2"], 123)
         fair = self.out["ifNewFair"]
         self.assertEqual(fair["grows"]["--g-chat2"], 60, "nothing stored for it → the fair average over its row")
-        self.assertEqual(fair["store"], {"chat": 60, "chat1": 60, "fleet": 34, "feed": 40, "files": 40, "chat2": 60}, "chat1 seeded from the stored chat (a store from before the rows)")
+        self.assertEqual(fair["store"], {"chat": 60, "chat1": 60, "fleet": 34, "feed": 40, "files": 40, "chat2": 60})
 
     def test_4_a_chat_chat_gutter_drag_moves_only_that_pair(self):
         a = self.out["dragChatChat"]
@@ -486,6 +517,28 @@ class PaneGuttersExecute(unittest.TestCase):
         self.assertFalse(cur["wrote"], "a store that already carries chat1 is not a pre-rows store: untouched")
         self.assertEqual(cur["grows"]["--g-chat"], 900); self.assertEqual(cur["grows"]["--g-chat1"], 640)
         self.assertEqual(cur["store"], {"chat": 900, "chat1": 640, "chat2": 400, "fleet": 34, "feed": 400, "files": 40}, "and nothing is written")
+
+    def test_13_a_legacy_restore_with_the_chat_pane_off_waits_for_the_pane_to_show_and_then_lays_out_as_the_old_shell_did(self):
+        h = self.out["upgrade"]["hiddenChat"]
+        self.assertEqual(h["madeGrow"], 50, "make()'s rows' rule with every row sibling hidden: 50 — the value the upgrade must not keep")
+        self.assertNotIn("chat1", h["storeAfterMake"], "make()'s persist keeps the pre-rows shape while the upgrade is pending")
+        self.assertFalse(h["deferred"], "the chat pane is off: the pixels wait")
+        self.assertEqual(h["grows"]["--g-chat2"], 400, "the missing weight resolves over what is on screen — the feed alone — as the old shell's fair grow did")
+        self.assertEqual(h["grows"]["--g-chat1"], 640, "the first pane's weight is not touched yet"); self.assertEqual(h["grows"]["--g-chat"], 640)
+        self.assertEqual(h["store"], {"chat": 640, "fleet": 34, "feed": 400, "files": 40, "chat2": 400}, "persisted in the pre-rows shape: the resolved weight, no chat1")
+        rh = h["reloadHidden"]
+        self.assertFalse(rh["deferred"], "a reload while hidden: pending again"); self.assertEqual(rh["store"], h["store"], "…and nothing changes: the resolved weight is found in the store")
+        self.assertEqual(rh["grows"]["--g-chat2"], 400)
+        sh = h["shown"]
+        self.assertEqual(sh["before"], {"chat1": 331, "chat2": 331, "feed": 331}, "the old shell: chat fair-grown to the feed's 400 at the show, three equal columns of (1007 - 14) / 3")
+        for k in sh["before"]:
+            self.assertLessEqual(abs(sh["after"][k] - sh["before"][k]), 1, "%s renders at %.2f px, the old shell gave %.2f" % (k, sh["after"][k], sh["before"][k]))
+        self.assertEqual(sh["grows"]["--g-chat"], 669, "the area: the two columns' 331 each plus the gutter between them")
+        self.assertIn("chat1", sh["store"], "finalised: the store carries chat1 from now on")
+        self.assertEqual(sh["store"]["chat1"], 331); self.assertEqual(sh["store"]["chat2"], 331); self.assertEqual(sh["store"]["feed"], 331)
+        rs = h["reloadShown"]
+        self.assertFalse(rs["wrote"], "a reload after: not a pre-rows store any more")
+        self.assertEqual(rs["after"], sh["after"], "…and the widths are kept"); self.assertEqual(rs["store"], sh["store"])
 
     def test_11_a_store_from_before_the_rows_seeds_the_first_pane_s_inner_weight_from_the_chat_weight(self):
         a = self.out["legacy"]
