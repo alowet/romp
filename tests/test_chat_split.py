@@ -249,20 +249,31 @@ class SplitSourcePins(unittest.TestCase):
         self.assertIn("window.__rompRowGutter=function(gid,topId,botId,apply){", gut, "the row gutter rides the same drag code, reporting the top row's share")
         # a pre-rows pane store (no chat1): the area's weight is set once from the top-row columns the split restored, in the
         # pixels of the pre-rows layout (review find 2026-09-15; tests/test_pane_gutters.py runs it)
-        self.assertIn("window.__rompSeedAreaWeight=function(){if(!legacy||sync())return false;if(!shown('chat-pane'))return false;return upgrade(false);};", gut)
+        self.assertIn("window.__rompSeedAreaWeight=function(){if(ingest()||!legacy)return false;if(!shown('chat-pane'))return false;return upgrade(false);};", gut)
         # …no snapshot (review find 2026-09-15, fourth pass): while the store is pre-rows-shaped this shell keeps the PRE-ROWS fair grow
         # (the old PANES.filter(shown), the chat area no pane of it), the upgrade reads the LIVE roster and weights when it runs, a peer's
         # upgraded store is adopted rather than written over, and the store keeps its pre-rows shape meanwhile
         self.assertNotIn("legacyGrow", gut); self.assertNotIn("legacyKeys", gut)
         self.assertIn("function oldFair(){var v=PANES.filter(function(id){return id!=='chat-area'&&shown(id);}).map(function(id){return grow[key(id)];}).filter(finite);return v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;}", gut)
-        self.assertIn("if(legacy){if(sync()){if(finite(grow[k])){setGrow(k,grow[k]);return;}}", gut)
-        self.assertIn("else{if(k==='chat'){upgrade(true);return;}setGrow(k,oldFair());persist();return;}}", gut, "the pre-rows rule while legacy; the chat pane coming on is the upgrade's moment")
-        self.assertIn("function upgrade(showing){if(!legacy||sync())return false;", gut)
+        # a peer's upgrade is INGESTED at the event and FIRST in every entry point that reads or changes a weight, never from persist
+        # (review find 2026-09-15, fifth pass: adopting at the final write threw away the very action that wrote)
+        self.assertNotIn("sync(", gut)
+        self.assertIn("window.addEventListener('storage',function(e){if(e&&e.key===GK)ingest();});", gut, "the peer's write is the event")
+        self.assertIn("window.__rompGrowFair=function(k){if(k==='timeline')return;ingest();", gut, "the rail's fair grow: ingest first, then the CURRENT rule (or the pre-rows one while still legacy)")
+        self.assertIn("if(legacy){if(k==='chat'){upgrade(true);return;}setGrow(k,oldFair());persist();return;}", gut, "the pre-rows rule while legacy; the chat pane coming on is the upgrade's moment")
+        self.assertIn("window.__rompGrowFairIfNew=function(k){ingest();if(typeof grow[k]==='number'&&isFinite(grow[k])){setGrow(k,grow[k]);return;}window.__rompGrowFair(k);};", gut, "a restored or peer-made column keeps a published weight")
+        self.assertIn("window.__rompUnregisterPane=function(id){ingest();var k=KEYS[id];", gut, "unregister: ingest, delete, then the write carries the deletion")
+        self.assertIn("window.__rompSplitGrow=function(leftId,newKey){ingest();", gut); self.assertIn("window.__rompSplitShrink=function(leftId,goneId){ingest();", gut)
+        self.assertIn("ingest();if(!vert){held=[key(L.id),key(R.id)];normalise(sibs(L.id));}", gut, "a gutter's press: ingest, then hold the pair against a peer's write mid-drag")
+        self.assertIn("if(!cur||!finite(cur.chat1))return false;legacy=false;for(var k in cur){if(finite(cur[k])&&!(held&&held.indexOf(k)>=0))setGrow(k,cur[k]);}return true;}", gut, "the held pair keeps the gesture's values")
+        self.assertIn("ingest();   // a peer's upgrade that landed mid-drag, the held pair excepted", gut)
+        self.assertIn("if(vert){if(apply)apply(nL/sum);}else{setGrow(key(L.id),nL);setGrow(key(R.id),sum-nL);held=null;persist();}", gut, "the release writes the merged view")
+        self.assertIn("function upgrade(showing){if(ingest()||!legacy)return false;", gut)
+        self.assertIn("window.__rompGrowLegacy=function(){return legacy;};", gut)
         self.assertIn("var cols=PANES.filter(function(id){var e=document.getElementById(id);return !!KEYS[id]&&!!e&&e.parentElement===host&&finite(grow[KEYS[id]]);}).map(function(id){return KEYS[id];});", gut, "the live roster: registered, present, in the first pane's row")
         self.assertIn("if(showing)setGrow('chat1',oldFair());", gut)
-        self.assertIn("function sync(){if(!legacy)return false;var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}", gut)
-        self.assertIn("if(!cur||!finite(cur.chat1))return false;legacy=false;for(var k in cur){if(finite(cur[k]))setGrow(k,cur[k]);}return true;}", gut, "a current-shape store is adopted whole")
-        self.assertIn("function persist(){if(sync())return;var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}", gut, "the store keeps its pre-rows shape while legacy, and is never downgraded once a peer upgraded it")
+        self.assertIn("function ingest(){if(!legacy)return false;var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}", gut)
+        self.assertIn("function persist(){var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}try{localStorage.setItem(GK,JSON.stringify(o));}catch(e){}}", gut, "persist writes what its caller produced: the pre-rows shape while legacy, nothing ingested here")
         self.assertIn("if(window.__rompSeedAreaWeight)window.__rompSeedAreaWeight();", km._LANDING_SPLIT_JS, "called at the split's boot, no arguments: the roster is live")
         boot = km._LANDING_SPLIT_JS[km._LANDING_SPLIT_JS.index("try{if(!mobile()){var r0=read();"):]
         self.assertLess(boot.index("cols.forEach(function(c){make(c.n,seedFor(c),null);});"), boot.index("__rompSeedAreaWeight();"), "…after they are made and registered")
@@ -271,7 +282,7 @@ class SplitSourcePins(unittest.TestCase):
         # a pane with no grow yet never averages in as NaN (the first split opened 0px wide — review find 2026-09-08),
         # and a column keeps the width it was dragged to across reloads
         self.assertIn(".filter(function(g){return typeof g==='number'&&isFinite(g);});", gut)
-        self.assertIn("window.__rompGrowFairIfNew=function(k){if(typeof grow[k]==='number'&&isFinite(grow[k])){setGrow(k,grow[k]);return;}window.__rompGrowFair(k);};", gut)
+        self.assertIn("window.__rompGrowFairIfNew=function(k){ingest();if(typeof grow[k]==='number'&&isFinite(grow[k])){setGrow(k,grow[k]);return;}window.__rompGrowFair(k);};", gut)   # a peer's upgrade ingested first (2026-09-15)
         # …and a new column takes HALF the rightmost one (2026-09-11), through the gutters' own normalisation
         # (tests/test_pane_gutters.py runs it); the split calls it with the rightmost pane and the new key
         self.assertIn("window.__rompSplitGrow=function(leftId,newKey){", gut)

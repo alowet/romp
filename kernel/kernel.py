@@ -54804,17 +54804,26 @@ for(var k in grow)setGrow(k,grow[k]);
 function finite(v){return typeof v==='number'&&isFinite(v);}
 // a PEER dashboard may upgrade the shared store while this one is legacy: a store that carries chat1 is CURRENT, and its
 // weights are adopted — every one, the area's and the columns' — and this shell is current from then on; a pre-rows shape
-// is never written over it
-function sync(){if(!legacy)return false;var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}
-if(!cur||!finite(cur.chat1))return false;legacy=false;for(var k in cur){if(finite(cur[k]))setGrow(k,cur[k]);}return true;}
+// is never written over it. INGESTED at the EVENT (the peer's write is a storage event: the listener below) and FIRST in
+// every entry point that reads or changes a weight — the rail's fair grow, a gutter's press and release, a column's
+// unregister, the split's halving and hand-back, the upgrade — never from persist, which writes what its caller produced
+// (review find 2026-09-15, fifth pass: adopting at the final write threw away the very action that wrote — a drag snapped
+// back, a reveal kept the peer's weight, a closed column's weight came back). A peer's write landing MID-DRAG is ingested
+// but for the two panes under the pointer (`held`): the gesture's result stands for those, and the release writes the
+// merged view.
+var held=null;   // the two keys under a gutter drag, from its press to its release
+function ingest(){if(!legacy)return false;var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}
+if(!cur||!finite(cur.chat1))return false;legacy=false;for(var k in cur){if(finite(cur[k])&&!(held&&held.indexOf(k)>=0))setGrow(k,cur[k]);}return true;}
+window.addEventListener('storage',function(e){if(e&&e.key===GK)ingest();});   // the peer's write IS the event; a peer's column-store write reaching the split's reconcile first is covered by the ingest at that path's entry
+window.__rompGrowLegacy=function(){return legacy;};   // whether the store is still pre-rows-shaped here (the served tests read it)
 // while legacy the store keeps its pre-rows SHAPE — no chat1 — so a reload before the upgrade finds it legacy again, the
-// weights persisted meanwhile in hand; a store a peer has upgraded meanwhile is adopted (sync) and left as written
-function persist(){if(sync())return;var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}try{localStorage.setItem(GK,JSON.stringify(o));}catch(e){}}
+// weights persisted meanwhile in hand; persist writes what its caller produced, and only that
+function persist(){var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}try{localStorage.setItem(GK,JSON.stringify(o));}catch(e){}}
 // split chat columns (the user 2026-09-08) are made AFTER this runs: they register here so the grab's
 // normalisation and the fair-grow average see them.
 var KEYS={};
 window.__rompRegisterPane=function(id,k){KEYS[id]=k;if(PANES.indexOf(id)<0)PANES.splice(PANES.indexOf('fleet-pane'),0,id);};
-window.__rompUnregisterPane=function(id){var k=KEYS[id];delete KEYS[id];var i=PANES.indexOf(id);if(i>=0)PANES.splice(i,1);
+window.__rompUnregisterPane=function(id){ingest();var k=KEYS[id];delete KEYS[id];var i=PANES.indexOf(id);if(i>=0)PANES.splice(i,1);   // a peer's upgrade first, so the deletion below is written over the store it produced, not before it
 if(k){delete grow[k];row.style.removeProperty('--g-'+k);persist();}};
 function lastChat(){return 'chat-area';}   // the chat side of gv-a/gv-b/gv-c: the whole chat area, whatever columns and rows it holds
 function key(id){return KEYS[id]||(id==='chat-area'?'chat':id==='chat-pane'?'chat1':id==='fleet-pane'?'fleet':id==='feed-pane'?'feed':'files');}
@@ -54830,22 +54839,21 @@ function normalise(ids){var px={};ids.forEach(function(id){px[id]=document.getEl
 // a pane re-shown from the rail gets a grow comparable to the panes already visible beside it, so it never slots back
 // in as a sliver after the others were dragged to extreme widths (grows are stored as px). Timeline is the
 // bottom BAND now (fixed-height var, not a row grow), so it's excluded.
-window.__rompGrowFair=function(k){if(k==='timeline')return;
-if(legacy){if(sync()){if(finite(grow[k])){setGrow(k,grow[k]);return;}}   // a peer upgraded the store meanwhile: its weight for this pane stands
-else{if(k==='chat'){upgrade(true);return;}setGrow(k,oldFair());persist();return;}}   // the pre-rows rule while the store is pre-rows-shaped; the chat pane coming on (the toggle's call, ahead of its class flip) is the upgrade's moment
+window.__rompGrowFair=function(k){if(k==='timeline')return;ingest();   // a peer's upgrade first: after one, the pane joins the layout the store now holds by the rule below, as it would on a page booted current
+if(legacy){if(k==='chat'){upgrade(true);return;}setGrow(k,oldFair());persist();return;}   // the pre-rows rule while the store is pre-rows-shaped; the chat pane coming on (the toggle's call, ahead of its class flip) is the upgrade's moment
 var id=idOf(k),pool=(id&&document.getElementById(id))?sibs(id):PANES.filter(shown);
 var v=pool.map(function(id){return grow[key(id)];})
 .filter(function(g){return typeof g==='number'&&isFinite(g);});   // a pane with no grow yet (a split column being made) must not average in as NaN (review find 2026-09-08: the first split opened 0px wide)
 var avg=v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;setGrow(k,avg);persist();};
 // a split column keeps the width it was dragged to across reloads: fair only when the store holds nothing for it
-window.__rompGrowFairIfNew=function(k){if(typeof grow[k]==='number'&&isFinite(grow[k])){setGrow(k,grow[k]);return;}window.__rompGrowFair(k);};
+window.__rompGrowFairIfNew=function(k){ingest();if(typeof grow[k]==='number'&&isFinite(grow[k])){setGrow(k,grow[k]);return;}window.__rompGrowFair(k);};   // a peer's upgrade first: a column it made keeps the weight it published
 // A NEW CHAT COLUMN takes HALF the rightmost column of its row (the chat split, 2026-09-11: the width the drop's
 // rectangle promises). That row's shown panes are normalised to their pixels first — the grab's read-all-then-write
 // rule — then the left pane's key and the new key each take half of its width, persisted, so __rompGrowFairIfNew
 // finds the value when the column is made and keeps it (the fair average stays the rule for a column with no stored
 // width: a boot restore). The new pane is not in the row yet, so it is never read; a hidden pane is never written;
 // the outer row is not touched. Returns whether it wrote (a hidden or missing left pane: nothing).
-window.__rompSplitGrow=function(leftId,newKey){var L=document.getElementById(leftId);if(!L||!shown(leftId)||!newKey)return false;
+window.__rompSplitGrow=function(leftId,newKey){ingest();var L=document.getElementById(leftId);if(!L||!shown(leftId)||!newKey)return false;
 var px=normalise(sibs(leftId));
 var w=px[leftId];setGrow(key(leftId),w/2);setGrow(newKey,w/2);persist();return true;};
 // …and a CLOSING chat column hands its width to the column on its LEFT (review find 2026-09-11): the twin of the halving,
@@ -54854,7 +54862,7 @@ var w=px[leftId];setGrow(key(leftId),w/2);setGrow(newKey,w/2);persist();return t
 // then the left pane's key takes the closing pane's width plus the 7 px gutter that goes with it (the row keeps its
 // width: one gutter fewer). Runs while the closing pane is still in the row and shown; __rompUnregisterPane drops its
 // key after.
-window.__rompSplitShrink=function(leftId,goneId){var L=document.getElementById(leftId),G=document.getElementById(goneId);if(!L||!G||!shown(leftId)||!shown(goneId))return false;
+window.__rompSplitShrink=function(leftId,goneId){ingest();var L=document.getElementById(leftId),G=document.getElementById(goneId);if(!L||!G||!shown(leftId)||!shown(goneId))return false;
 var px=normalise(sibs(leftId));
 setGrow(key(leftId),px[leftId]+px[goneId]+7);persist();return true;};
 // A drag moves a LANDING LINE and the panes take their widths ONCE, at release. A grow write re-lays out the row
@@ -54872,13 +54880,14 @@ function gutter(gid,leftPick,rightId,vert,apply){var h=document.getElementById(g
 h.addEventListener('mousedown',function(e){e.preventDefault();
 var L=document.getElementById(leftPick()),R=document.getElementById(rightId);if(!L||!R)return;
 document.body.classList.add('drag',vert?'dragh':'dragv');
-if(!vert)normalise(sibs(L.id));   // the pair's container to px (a row pair is a ratio, never px)
+ingest();if(!vert){held=[key(L.id),key(R.id)];normalise(sibs(L.id));}   // a peer's upgrade first; then the pair is held against one landing mid-drag, and the pair's container goes to px (a row pair is a ratio, never px)
 var sz=vert?'offsetHeight':'offsetWidth',ax=vert?'clientY':'clientX',gh=vert?ghostH:ghost;
 var wL=L[sz],wR=R[sz],sum=wL+wR,s0=e[ax],mn=Math.min(120,sum*0.25),nL=wL,lr=L.getBoundingClientRect(),l0=vert?lr.top:lr.left,rr=(L.parentElement||row).getBoundingClientRect();
 function show(){if(!gh)return;if(vert){gh.style.left=rr.left+'px';gh.style.width=rr.width+'px';gh.style.top=(l0+nL)+'px';}else{gh.style.top=rr.top+'px';gh.style.height=rr.height+'px';gh.style.left=(l0+nL)+'px';}gh.style.display='block';}
 function mv(ev){nL=Math.max(mn,Math.min(sum-mn,wL+(ev[ax]-s0)));show();}
 function up(){document.body.classList.remove('drag',vert?'dragh':'dragv');if(gh)gh.style.display='none';
-if(vert){if(apply)apply(nL/sum);}else{setGrow(key(L.id),nL);setGrow(key(R.id),sum-nL);persist();}
+ingest();   // a peer's upgrade that landed mid-drag, the held pair excepted: the gesture's result stands for those two, and the write below carries both
+if(vert){if(apply)apply(nL/sum);}else{setGrow(key(L.id),nL);setGrow(key(R.id),sum-nL);held=null;persist();}
 window.removeEventListener('mousemove',mv);window.removeEventListener('mouseup',up);}
 show();window.addEventListener('mousemove',mv);window.addEventListener('mouseup',up);});}
 window.__rompGutter=gutter;   // the split's chat|chat gutters are wired through the same code
@@ -54903,7 +54912,7 @@ window.__rompRowGutter=function(gid,topId,botId,apply){gutter(gid,function(){ret
 // old shell's was; so did a pane the rail revealed during the wait, and a gutter dragged then moved the live weights.
 var OUTER=['fleet','feed','files'];
 function oldFair(){var v=PANES.filter(function(id){return id!=='chat-area'&&shown(id);}).map(function(id){return grow[key(id)];}).filter(finite);return v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;}   // the chat area is no pane of the pre-rows row
-function upgrade(showing){if(!legacy||sync())return false;
+function upgrade(showing){if(ingest()||!legacy)return false;   // a peer's upgrade first: nothing left to convert
 var first=document.getElementById('chat-pane'),host=first?first.parentElement:null;
 var cols=PANES.filter(function(id){var e=document.getElementById(id);return !!KEYS[id]&&!!e&&e.parentElement===host&&finite(grow[KEYS[id]]);}).map(function(id){return KEYS[id];});   // the top row's LIVE columns
 if(showing)setGrow('chat1',oldFair());   // the old shell's show-time fair grow of the first pane
@@ -54913,7 +54922,7 @@ if(!(W>0)||!(T>0)){persist();return false;}
 var avail=W-7*(items.length-1),px={},sum=0;items.forEach(function(k){px[k]=avail*grow[k]/T;});
 items.forEach(function(k){setGrow(k,px[k]);});chatKeys.forEach(function(k){sum+=px[k];});
 setGrow('chat',sum+7*(chatKeys.length-1));persist();return true;}
-window.__rompSeedAreaWeight=function(){if(!legacy||sync())return false;if(!shown('chat-pane'))return false;return upgrade(false);};   // the chat pane off: the upgrade waits for __rompGrowFair('chat')
+window.__rompSeedAreaWeight=function(){if(ingest()||!legacy)return false;if(!shown('chat-pane'))return false;return upgrade(false);};   // the chat pane off: the upgrade waits for __rompGrowFair('chat')
 gutter('gv-a',function(){return lastChat();},'fleet-pane');
 gutter('gv-b',function(){return document.body.classList.contains('po-fleet')?'fleet-pane':lastChat();},'feed-pane');
 gutter('gv-c',function(){var c=document.body.classList;return c.contains('po-feed')?'feed-pane':c.contains('po-fleet')?'fleet-pane':lastChat();},'files-pane');

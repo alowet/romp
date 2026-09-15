@@ -360,7 +360,8 @@ const OUTER_ALL = ['fleet', 'feed', 'files'];
 function setChat(on) { CHAT_IDS.forEach((id) => { if (EL[id]) EL[id]._display = on ? 'flex' : 'none'; }); }
 function setOuter(combo) { OUTER_ALL.forEach((k, i) => { EL[k + '-pane']._display = combo[i] ? 'flex' : 'none'; }); }
 function oldWidths(cols, outerShown) { const g = gk(grows()); const items = ['chat'].concat(cols).concat(outerShown); const px = flex(1007 - 7 * (items.length - 1), items.map((k) => g[k])); const o = {}; items.forEach((k, i) => { o[k === 'chat' ? 'chat1' : k] = px[i]; }); return o; }
-function fresh(store, chatShown, combo) { resetDom(); for (const k in STORE) delete STORE[k]; STORE['romp-pane-grow'] = JSON.stringify(store); setChat(chatShown); setOuter(combo); }
+// …the body's po-fleet follows the outline's display, as the rail keeps them: BOOT wires gv-b as the outline | feed gutter when it is on, else chat | feed
+function fresh(store, chatShown, combo) { resetDom(); for (const k in STORE) delete STORE[k]; STORE['romp-pane-grow'] = JSON.stringify(store); setChat(chatShown); setOuter(combo); if (combo[0]) BODY.add('po-fleet'); else BODY.delete('po-fleet'); }
 function restore(cols) { cols.forEach((k) => { window.__rompRegisterPane('chat-pane-' + k.slice(4), k); window.__rompGrowFairIfNew(k); }); }
 // one case, both shells: `between` runs after the restore (the old shell's version of the mutation, then the new's) while the
 // chat pane is still hidden; the show is the toggle's fair-grow call, then the class flip
@@ -404,8 +405,7 @@ out.mut.drag = (() => {
   // the feed (400 px), +50 → 350 / 350; the pre-rows fair grow gave chat2 (200 + 400) / 2 = 300 at the restore, and the first
   // pane (350 + 350) / 2 = 350 at the show
   fresh(LG, false, [true, true, false]); BOOT(); restore(['chat2']); window.__rompSeedAreaWeight();
-  window.__rompGutter('gv-b', function () { return 'fleet-pane'; }, 'feed-pane');
-  const d = drag('gv-b', 300, 350);
+  const d = drag('gv-b', 300, 350);   // BOOT's gv-b: the outline | feed gutter (po-fleet on)
   window.__rompGrowFair('chat'); setChat(true);
   const after = rowsWidths(gk(grows()), ['chat2'], ['fleet', 'feed']);
   const items = ['chat', 'chat2', 'fleet', 'feed'], oldW = { chat: 350, chat2: 300, fleet: 350, feed: 350 };
@@ -427,6 +427,44 @@ out.mut.peer = (() => {
   window.__rompGrowFair('chat'); setChat(true);       // the rail's Chat later: a current dashboard's show, no upgrade
   return { pending, adopted, shown: { store: store_(), grows: grows() } };
 })();
+// 16) a PEER'S UPGRADE ALREADY WRITTEN when this pending dashboard acts (the fifth review pass: adopting at the final write threw
+//     the action away). The peer's current store is in localStorage and — but for (4) — its storage event has NOT been heard here.
+//     The first local action must start from the ingested state and its result must reach the store:
+//     (1) the outline | feed gutter dragged +50: the two panes end where the drag put them, every other weight is the peer's, one write carries both;
+//     (2) the outline revealed from the rail: fair-grown by the CURRENT rule, the value a page booted current from the same store gets;
+//     (3) the restored column closed: the store loses chat2, the CSS property goes, the write carries the deletion;
+//     (4) the peer writes while this dashboard is idle: the storage listener ingests, no local action;
+//     (5) the peer's write lands mid-drag: on release the dragged pair stands, the rest is the peer's.
+const PEER2 = { chat: 669, chat1: 331, chat2: 331, chat3: 331, fleet: 34, feed: 331, files: 40 };
+function pendingWithPeer(fleetShown) {   // this dashboard pending (chat hidden, the column restored at the pre-rows fair grow), the peer's store written, no event
+  fresh(L, false, [fleetShown, true, false]); BOOT(); restore(['chat2']); window.__rompSeedAreaWeight();
+  STORE['romp-pane-grow'] = JSON.stringify(PEER2);
+}
+out.peerFirst = {};
+pendingWithPeer(true);
+const d1 = drag('gv-b', 300, 350);   // BOOT's gv-b: the outline | feed gutter
+out.peerFirst.drag = { grows: grows(), store: store_(), legacy: window.__rompGrowLegacy(), afterDown: d1.afterDown };
+pendingWithPeer(false);
+window.__rompGrowFair('fleet'); EL['fleet-pane']._display = 'flex';
+out.peerFirst.reveal = { fleet: ROW['--g-fleet'], store: store_(), legacy: window.__rompGrowLegacy() };
+resetDom(); for (const k in STORE) delete STORE[k]; STORE['romp-pane-grow'] = JSON.stringify(PEER2); setChat(false); setOuter([false, true, false]);
+BOOT(); restore(['chat2']); window.__rompSeedAreaWeight();   // a page booted CURRENT from the same store, the same panes on screen
+window.__rompGrowFair('fleet'); EL['fleet-pane']._display = 'flex';
+out.peerFirst.revealCurrent = { fleet: ROW['--g-fleet'], store: store_(), legacy: window.__rompGrowLegacy() };
+pendingWithPeer(false);
+window.__rompUnregisterPane('chat-pane-2'); delete EL['chat-pane-2'];
+out.peerFirst.close = { grows: grows(), store: store_(), legacy: window.__rompGrowLegacy() };
+pendingWithPeer(false);
+const before4 = { grows: grows(), legacy: window.__rompGrowLegacy() };
+winFire('storage', { key: 'romp-pane-grow' });
+out.peerFirst.idle = { before: before4, grows: grows(), store: store_(), legacy: window.__rompGrowLegacy(), seed: window.__rompSeedAreaWeight() };
+fresh(L, false, [true, true, false]); BOOT(); restore(['chat2']); window.__rompSeedAreaWeight();   // pending, the peer not yet written
+EL['gv-b'].fire('mousedown', { preventDefault() {}, clientX: 300 });   // BOOT's gv-b: the outline | feed gutter
+const midDown = { grows: grows(), legacy: window.__rompGrowLegacy() };
+STORE['romp-pane-grow'] = JSON.stringify(PEER2); winFire('storage', { key: 'romp-pane-grow' });   // …lands mid-drag
+const midHeld = { grows: grows(), legacy: window.__rompGrowLegacy() };
+winFire('mousemove', { clientX: 350 }); winFire('mouseup', {});
+out.peerFirst.midDrag = { down: midDown, held: midHeld, grows: grows(), store: store_() };
 console.log(JSON.stringify(out));
 """
 
@@ -677,6 +715,32 @@ class PaneGuttersExecute(unittest.TestCase):
         self.assertFalse(d["adopted"]["seed"], "adopted: this dashboard is current, nothing left to upgrade")
         self.assertEqual(d["shown"]["store"]["chat1"], 331, "the show later is a current dashboard's: the store keeps chat1")
         self.assertEqual(d["shown"]["grows"]["--g-chat1"], 331, "…and the first pane's inner weight is not re-fair-grown")
+
+    def test_16_the_first_local_action_after_a_peer_s_upgrade_starts_from_it_and_reaches_the_store(self):
+        peer = {"chat": 669, "chat1": 331, "chat2": 331, "chat3": 331, "fleet": 34, "feed": 331, "files": 40}
+        d = self.out["peerFirst"]["drag"]
+        self.assertFalse(d["legacy"], "the press ingested the peer's store")
+        self.assertEqual(d["afterDown"]["--g-chat1"], 331, "…before the pair was normalised: the other weights are the peer's from the press on")
+        self.assertEqual((d["grows"]["--g-fleet"], d["grows"]["--g-feed"]), (350, 350), "the two panes end where the drag put them")
+        self.assertEqual(d["store"], dict(peer, fleet=350, feed=350), "one write carries the drag AND the peer's weights")
+        r, c = self.out["peerFirst"]["reveal"], self.out["peerFirst"]["revealCurrent"]
+        self.assertFalse(r["legacy"])
+        self.assertEqual(r["fleet"], c["fleet"], "the outline revealed after the ingest fair-grows exactly as on a page booted current from the same store")
+        self.assertEqual(r["store"], c["store"]); self.assertNotEqual(r["fleet"], 34, "…not the peer's stale weight for a pane the peer never showed")
+        cl = self.out["peerFirst"]["close"]
+        self.assertFalse(cl["legacy"]); self.assertNotIn("--g-chat2", cl["grows"], "the CSS property is gone")
+        self.assertEqual(cl["store"], {k: v for k, v in peer.items() if k != "chat2"}, "the write carries the deletion over the peer's store: no chat2, chat1 kept")
+        i = self.out["peerFirst"]["idle"]
+        self.assertTrue(i["before"]["legacy"]); self.assertFalse(i["legacy"], "the storage event alone ingests")
+        self.assertEqual(i["grows"]["--g-chat1"], 331); self.assertEqual(i["grows"]["--g-chat"], 669); self.assertEqual(i["grows"]["--g-chat3"], 331)
+        self.assertEqual(i["store"], peer, "…and writes nothing"); self.assertFalse(i["seed"])
+        m = self.out["peerFirst"]["midDrag"]
+        self.assertTrue(m["down"]["legacy"]); self.assertEqual((m["down"]["grows"]["--g-fleet"], m["down"]["grows"]["--g-feed"]), (300, 300 + 100), "the press normalised the pair to px")
+        self.assertFalse(m["held"]["legacy"], "the peer's write mid-drag was ingested…")
+        self.assertEqual((m["held"]["grows"]["--g-fleet"], m["held"]["grows"]["--g-feed"]), (300, 400), "…but for the pair under the pointer")
+        self.assertEqual(m["held"]["grows"]["--g-chat1"], 331)
+        self.assertEqual((m["grows"]["--g-fleet"], m["grows"]["--g-feed"]), (350, 350), "on release the dragged pair stands")
+        self.assertEqual(m["store"], dict(peer, fleet=350, feed=350), "…and the write carries the merged view")
 
     def test_11_a_store_from_before_the_rows_seeds_the_first_pane_s_inner_weight_from_the_chat_weight(self):
         a = self.out["legacy"]

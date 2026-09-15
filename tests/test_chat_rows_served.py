@@ -38,7 +38,9 @@ the REAL page: a hermetic kernel serves the dashboard with FIVE synthetic sessio
      the pane is hidden, and on the rail's Chat lays out as the old shell did — the first pane fair-grown over the feed at the
      show, equal columns — a reload after keeping it; and what changes while the upgrade WAITS reaches it (the fourth pass): the
      outline revealed from the rail before the chat pane shows lays out as four equal panes, the restored column closed from
-     the palette before the chat pane shows leaves two halves and no weight for it in the store;
+     the palette before the chat pane shows leaves two halves and no weight for it in the store; and a PEER's upgrade (the fifth
+     pass: a second page of the same browser, sharing the store) is ingested at its storage event, so this page's first action
+     after it — the rail's Outline — fair-grows as a fresh current page does, and the palette's close leaves no chat2;
   9. the whole story runs in under two and a half minutes (the driver waits on conditions, never on fixed sleeps).
 Screenshots of the 1 + 1 stack and the 2 x 2, dark and light, land in the directory ROMP_ROWS_SHOTS names (default
 /tmp/chat-rows-shots) for a human look. Skips LOUDLY when the extension deps or a playwright browser are absent (CI
@@ -121,7 +123,8 @@ const cfg = JSON.parse(fs.readFileSync(process.env.CFG, "utf8"));
 let browser;
 try { browser = await chromium.launch(); }
 catch (e) { console.error("browser-launch-failed: " + e); process.exit(3); }
-const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });   // an explicit context: step 8d opens peer pages in it, sharing this page's localStorage
+const page = await context.newPage();
 const out = { t0: Date.now() };
 const die = async (why) => {
   out.ms = Date.now() - out.t0;
@@ -396,6 +399,51 @@ const closedShown = await widthsNow();
 await page.reload();
 await waitTabs("f-chat", [cfg.a, cfg.b]); await waitBootGone();
 out.s8["hidden-chat-close"] = { pending: closedPending, first: closedShown, second: await widthsNow() };
+// ---- 8d. a PEER upgrades while this page waits (the fifth pass): page A, in the same browser context (one localStorage), shows its
+//      Chat pane and upgrades the store; this page ingests at the storage event; its FIRST action — the rail's Outline — fair-grows the
+//      pane exactly as page C, fresh from the upgraded store with the same panes on screen; then the palette's close leaves no chat2
+const inlineVar = (pg, k) => pg.evaluate((k) => parseFloat(document.querySelector(".row").style.getPropertyValue("--g-" + k)), k);
+const legacyOf = (pg) => pg.evaluate(() => window.__rompGrowLegacy && window.__rompGrowLegacy());
+await page.click(".rail-btn[data-pane=chat]");
+await waitFn(() => !document.body.classList.contains("po-chat"), null, "the rail never hid the chat pane (peer case)");
+await page.evaluate(([grow, cols]) => { localStorage.setItem("romp-pane-grow", JSON.stringify(grow)); localStorage.setItem("romp-chat-cols", JSON.stringify({ v: 2, cols })); }, [{ chat: 640, fleet: 34, feed: 400 }, [{ n: 2, ids: [cfg.b] }]]);
+await page.reload();
+await waitBootGone();
+await waitFn(() => !document.body.classList.contains("po-chat") && !!window.__rompChatFrameIds && window.__rompChatFrameIds().length === 2 && window.__rompGrowLegacy() === true, null, "this page never came up pending (peer case)");
+const pageA = await context.newPage();
+const dieA = async (why) => { try { await pageA.close(); } catch (e) { /* */ } await die(why); };
+await pageA.goto(cfg.url);
+await pageA.waitForFunction(() => !document.getElementById("romp-boot") && !!window.__rompGrowLegacy && window.__rompGrowLegacy() === true && !document.body.classList.contains("po-chat") && window.__rompChatFrameIds().length === 2, null, { timeout: T }).catch(async (e) => { await dieA("page A never came up pending: " + String(e).split("\n")[0]); });
+await pageA.click(".rail-btn[data-pane=chat]");
+await pageA.waitForFunction(() => document.body.classList.contains("po-chat") && window.__rompGrowLegacy() === false, null, { timeout: T }).catch(async (e) => { await dieA("page A never upgraded: " + String(e).split("\n")[0]); });
+const upgraded = await pageA.evaluate(() => JSON.parse(localStorage.getItem("romp-pane-grow")));
+await waitFn(() => window.__rompGrowLegacy() === false, null, "this page never ingested the peer's upgrade at its storage event");
+const ingested = { chat1: await inlineVar(page, "chat1"), chat: await inlineVar(page, "chat"), feed: await inlineVar(page, "feed"), chatHidden: await page.evaluate(() => !document.body.classList.contains("po-chat")) };
+await pageA.click(".rail-btn[data-pane=chat]");   // A hides its chat pane again, so a fresh page boots with the panes this one shows
+await pageA.waitForFunction(() => !document.body.classList.contains("po-chat"), null, { timeout: T }).catch(async (e) => { await dieA("page A never hid its chat pane again: " + String(e).split("\n")[0]); });
+const pageC = await context.newPage();
+const dieC = async (why) => { try { await pageA.close(); await pageC.close(); } catch (e) { /* */ } await die(why); };
+await pageC.goto(cfg.url);
+await pageC.waitForFunction(() => !document.getElementById("romp-boot") && !!window.__rompGrowLegacy && window.__rompGrowLegacy() === false && !document.body.classList.contains("po-chat") && !document.body.classList.contains("po-fleet") && window.__rompChatFrameIds().length === 2, null, { timeout: T }).catch(async (e) => { await dieC("page C never came up current with the chat and the outline hidden: " + String(e).split("\n")[0]); });
+await pageC.click(".rail-btn[data-pane=fleet]");
+await pageC.waitForFunction(() => document.body.classList.contains("po-fleet"), null, { timeout: T }).catch(async (e) => { await dieC("page C never showed the outline: " + String(e).split("\n")[0]); });
+const fleetC = await inlineVar(pageC, "fleet");
+await page.click(".rail-btn[data-pane=fleet]");
+await waitFn(() => document.body.classList.contains("po-fleet"), null, "the rail never showed the outline (peer case)");
+const fleetB = await inlineVar(page, "fleet");
+await pageA.close(); await pageC.close();
+const feedBox2 = await page.evaluate(() => { const r = document.getElementById("f-feed").getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + Math.min(r.height / 2, 200) }; });
+await page.mouse.click(feedBox2.x, feedBox2.y);
+await page.keyboard.press("Control+P");
+await waitFn(() => { const b = document.getElementById("rpal-back"); return !!b && !b.hidden; }, null, "the palette never opened from the feed pane (peer case)");
+await page.keyboard.type("Close this column");
+await waitFn(() => { const r = document.querySelector("#rpal-list .rpal-row.active"); return !!r && /Close this column/.test(r.textContent || ""); }, null, "the palette never matched Close this column (peer case)");
+await page.keyboard.press("Enter");
+await waitFn(() => { const b = document.getElementById("rpal-back"); return !!b && b.hidden; }, null, "the palette never closed on Enter (peer case)");
+await waitGone("chat-pane-2");
+out.s8d = { upgraded, ingested, fleetB, fleetC, afterClose: await widthsNow(), legacyAfter: await legacyOf(page) };
+await page.click(".rail-btn[data-pane=fleet]");
+await waitFn(() => !document.body.classList.contains("po-fleet"), null, "the rail never hid the outline again (peer case)");
 out.ms = Date.now() - out.t0;
 fs.writeSync(1, "RESULT:" + JSON.stringify(out) + "\n");
 await browser.close();
@@ -812,6 +860,22 @@ class ServedChatRows(unittest.TestCase):
         self.assertLessEqual(abs(f["chat1"] - f["feed"]), 1, "shown: two halves: %r" % f); self.assertIsNone(f["chat2"])
         self.assertNotIn("chat2", f["grow"], "no phantom weight for a column that no longer exists"); self.assertIn("chat1", f["grow"])
         self.assertNotIn("chat2", cl["second"]["grow"])
+
+    def test_8d_a_peer_s_upgrade_is_ingested_at_its_event_and_the_first_local_action_starts_from_it(self):
+        r = self._r()
+        s = r["s8d"]
+        u = s["upgraded"]
+        self.assertIn("chat1", u, "page A upgraded the shared store: %r" % u)
+        i = s["ingested"]
+        self.assertTrue(i["chatHidden"], "this page's chat pane stayed hidden: the ingest was the storage event's, not a show's")
+        self.assertLessEqual(abs(i["chat1"] - u["chat1"]), 1e-6, "this page adopted the peer's first-pane weight at the event: %r vs %r" % (i, u))
+        self.assertLessEqual(abs(i["chat"] - u["chat"]), 1e-6); self.assertLessEqual(abs(i["feed"] - u["feed"]), 1e-6)
+        self.assertLessEqual(abs(s["fleetB"] - s["fleetC"]), 1e-6, "the first action after the ingest, the rail's Outline, fair-grows exactly as a fresh current page with the same panes on screen: %r vs %r" % (s["fleetB"], s["fleetC"]))
+        self.assertNotEqual(s["fleetB"], 34, "…not the peer's stale weight for a pane it never showed")
+        a = s["afterClose"]
+        self.assertEqual(a["frames"], ["f-chat"], "the palette's Close this column closed the restored column")
+        self.assertNotIn("chat2", a["grow"], "…and the store has no chat2: the write carried the deletion over the peer's store")
+        self.assertIn("chat1", a["grow"], "…in its current shape"); self.assertFalse(s["legacyAfter"])
 
     def test_9_the_whole_story_runs_in_under_two_and_a_half_minutes_and_left_its_screenshots(self):
         r = self._r()
