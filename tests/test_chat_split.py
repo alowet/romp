@@ -16,7 +16,8 @@ halves are checked here:
     seed, no focus posted), a move between columns closing the emptied one, the owner lookup, the emptiness
     message, another dashboard tab's write reconciled, the cross returning sessions home with their drafts,
     drafts travelling on a move, a created session claimed once and never stolen, the restore's seeding, the
-    cap, and nothing on the phone — and THE DRAG (DragZonesExecute): a tab drag's zones mounted and unmounted, the
+    cap, a column another dashboard dropped HELD while its create is in flight and closed on the page's flip, and
+    nothing on the phone — and THE DRAG (DragZonesExecute): a tab drag's zones mounted and unmounted, the
     rectangle's geometry and cue, the drops calling the one mutation, the refused edge at the cap.
 
 Synthetic only — invented sids, no network, no real DOM.
@@ -254,7 +255,8 @@ class SplitSourcePins(unittest.TestCase):
     def test_the_partition_s_functions_exist_and_the_owner_lookup_reads_no_pane_s_dom(self):
         split = km._LANDING_SPLIT_JS
         # the store's shape and its one-shot migration
-        self.assertIn("JSON.stringify({v:2,cols:cols.map(function(c){return {n:c.n,ids:c.ids.slice()};})})", split)
+        self.assertIn("JSON.stringify({v:2,cols:cols.filter(function(c){return c.ids.length;}).map(function(c){return {n:c.n,ids:c.ids.slice()};})})", split,
+                      "the store never lists a column with no members (read()'s shape): a column a reconcile holds is mounted but unlisted")
         self.assertIn("if(Array.isArray(raw)){migrated=true;", split, "a v1 array of numbers is read once more…")
         self.assertIn("if(r0.migrated)save();", split, "…and written back in the new shape")
         # the three pure readers, the sets the pages read, the one mutation, the claim
@@ -283,6 +285,14 @@ class SplitSourcePins(unittest.TestCase):
                        "var se2=entry(from);if(se2&&se2.ids.length===1&&busy(src))return notify(BUSY);",
                        "if(!keep&&busy(f)){notify(BUSY);return;}"]:
             self.assertIn(needle, split, needle)
+        # …and the one caller that skips close()'s refusal, the reconcile of another dashboard's write, HOLDS a busy column
+        # instead of closing it (2026-09-15): nothing said (a peer's act, nothing refused), the close completing on the page's
+        # colBusy flip, read against the store as it stands then
+        self.assertIn("if(busy(frameOfCol(c.n)))held[c.n]=true;else close(c.n,true);", split)
+        self.assertEqual(split.count("close(c.n,true)"), 1, "the reconcile is the only close with `keep`")
+        rc = split[split.index("function reconcile(next){"):split.index("window.addEventListener('storage'")]
+        self.assertNotIn("notify(", rc)
+        self.assertIn("if(!m||m.romp!=='colBusy'||m.busy||mobile())return;var c=Number(colOf(e.source));if(!c||!held[c])return;var r=read();if(!r.migrated)reconcile(r.cols);", split)
         mt = split[split.index("function moveTab(sid,to){"):split.index("function close(n,keep){")]
         self.assertLess(mt.index("var why=refusal(src,sid);"), mt.index("if(to==='new'){"), "refused before anything is taken or grown (the reason read first, T395)")
         self.assertLess(mt.index("busy(src)"), mt.index("var st=take(src,sid)"), "refused before the hand-off")
@@ -416,7 +426,7 @@ function blob(n) { return JSON.parse(STORE['romp-vscode-state-chat:' + n] || 'nu
 function saves() { return CALLS.sets.filter((k) => k === 'romp-chat-cols').length; }
 function tgt(sid) { const f = window.__rompChatTarget(sid); return f ? f.id : null; }
 function crossOf(fid) { return BYID[fid].parentElement.children.filter((c) => c.className === 'col-x')[0]; }
-function msg(data, fromId) { window.dispatchEvent({ type: 'message', data, source: fromId ? BYID[fromId].contentWindow : null }); }
+function msg(data, fromId) { window.dispatchEvent({ type: 'message', data, source: fromId && BYID[fromId] ? BYID[fromId].contentWindow : null }); }   // a frame already gone: its window matches no column, as in a browser
 """
 
 DRIVER = r"""
@@ -576,10 +586,63 @@ window.__rompMoveTab(TESTS, 2); CALLS.notify = [];
 out.busy.twoMembers = { home: (window.__rompMoveTab(TESTS, 1) || {}).id, stored: cols(), notify: CALLS.notify.slice(), ids: ids() };
 BUSY['f-chat-2'] = false; CALLS.notify = [];
 out.busy.thenFree = { home: (window.__rompMoveTab(API, 1) || {}).id, ids: ids(), stored: cols(), notify: CALLS.notify.slice() };
-boot({ 'romp-chat-cols': JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB] }] }) }, false);
-BUSY['f-chat-2'] = true; STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [] }); CALLS.notify = [];
+// P) HELD (2026-09-15): another dashboard's write drops a column whose document is busy — its create's queued text would die
+//    with the document — so the reconcile HOLDS it instead of closing it: mounted, unlisted (the member went where the peer
+//    put it), no toast (a peer's act, not this user's; nothing is refused), nothing written. The page's colBusy flip is the
+//    event: the store is read again and reconciled — the column closes when the store still omits it (the create was
+//    cancelled, or resolved to a running session), following the store as it stands THEN (the world moved meanwhile), and
+//    stays when the create landed a session in it (claimed and written back through the path every create takes)
+boot({ 'romp-chat-cols': JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB] }, { n: 3, ids: [API] }] }) }, false);
+BUSY['f-chat-2'] = true; CALLS.notify = []; CALLS.sets = []; CALLS.unregister = []; CALLS.posted = []; CALLS.taken = []; CALLS.colGone = [];
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [{ n: 3, ids: [API, WEB] }] });   // the peer moved column 2's one member into column 3: column 2 left the store
 window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
-out.busy.reconciled = { ids: ids(), notify: CALLS.notify.slice() };
+out.held = { ids: ids(), order: order(), sets: window.__rompChatSets(), notify: CALLS.notify.slice(), saves: saves(), unregister: CALLS.unregister.slice(),
+             taken: CALLS.taken.slice(), posted: CALLS.posted.slice(), targetWeb: tgt(WEB), stored: STORE['romp-chat-cols'] };
+// noise: a flip that says busy, one from a column not held, one from no chat frame — nothing
+msg({ romp: 'colBusy', busy: true }, 'f-chat-2'); msg({ romp: 'colBusy', busy: false }, 'f-chat-3'); msg({ romp: 'colBusy', busy: false });
+out.held.noise = { ids: ids(), saves: saves(), notify: CALLS.notify.length };
+// a user's act meanwhile writes the store: no empty entry for the held column rides along
+window.__rompMoveTab(TESTS, 3);
+out.held.savedMeanwhile = { stored: cols(), sets: window.__rompChatSets(), ids: ids() };
+// the world moves again before the flip: the peer drops column 3 too and opens column 4 — reconciled now, the hold standing
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [{ n: 4, ids: [WEB] }] }); STORE['romp-vscode-state-chat:4'] = JSON.stringify({ activeId: WEB });
+window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
+out.held.moved = { ids: ids(), order: order(), sets: window.__rompChatSets(), notify: CALLS.notify.length, unregister: CALLS.unregister.slice() };
+// the create is cancelled (or resolves to a running session): the page's flip completes the close, against the store as it stands
+BUSY['f-chat-2'] = false; CALLS.sets = []; CALLS.taken = []; CALLS.posted = [];
+msg({ romp: 'colBusy', busy: false }, 'f-chat-2');
+out.held.closed = { ids: ids(), order: order(), sets: window.__rompChatSets(), notify: CALLS.notify.slice(), saves: saves(), unregister: CALLS.unregister.slice(), colGone: CALLS.colGone.slice(),
+                    stored: STORE['romp-chat-cols'], taken: CALLS.taken.slice(), adopted: CALLS.posted.filter((p) => p.m && p.m.romp === 'adopt'), focused: CALLS.focus.slice(-1) };
+// …the create LANDS a session while the column is held: the page claims it for the column, the store lists the column again
+// (the write every create makes), and the flip's reconcile keeps it
+boot({ 'romp-chat-cols': JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB] }] }) }, false);
+BUSY['f-chat-2'] = true; CALLS.notify = []; CALLS.sets = []; CALLS.unregister = [];
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [] });   // the peer closed column 2 (WEB went home there)
+window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
+out.held.landed = { held: { ids: ids(), sets: window.__rompChatSets(), targetWeb: tgt(WEB), saves: saves() },
+                    claim: window.__rompClaimSession(X, 2), stored: cols(), sets: window.__rompChatSets(), targetX: tgt(X), saves: saves() };
+BUSY['f-chat-2'] = false;
+msg({ romp: 'colBusy', busy: false }, 'f-chat-2');
+out.held.landed.after = { ids: ids(), stored: cols(), sets: window.__rompChatSets(), notify: CALLS.notify.slice(), unregister: CALLS.unregister.slice(), saves: saves() };
+// …a peer that lists the column again before the flip ends the hold by itself: the flip then changes nothing
+boot({ 'romp-chat-cols': JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB] }] }) }, false);
+BUSY['f-chat-2'] = true; CALLS.sets = []; CALLS.unregister = [];
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [] });
+window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [{ n: 2, ids: [TESTS] }] });
+window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
+BUSY['f-chat-2'] = false;
+msg({ romp: 'colBusy', busy: false }, 'f-chat-2');
+out.held.relisted = { ids: ids(), sets: window.__rompChatSets(), saves: saves(), unregister: CALLS.unregister.slice() };
+// …and the user's OWN cross on a held column is refused with the line, as on any busy column; the flip then closes it
+boot({ 'romp-chat-cols': JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB] }] }) }, false);
+BUSY['f-chat-2'] = true; CALLS.notify = [];
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [] });
+window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
+const heldX = BYID['f-chat-2'] ? crossOf('f-chat-2') : null; if (heldX) heldX.fire('click', { stopPropagation() {} });   // (no cross to click where the column was closed under the create)
+out.held.cross = { ids: ids(), notify: CALLS.notify.slice() };
+BUSY['f-chat-2'] = false; msg({ romp: 'colBusy', busy: false }, 'f-chat-2');
+out.held.cross.then = { ids: ids(), notify: CALLS.notify.length };
 // M) a colEmpty that closes a column tells the first column which of its gone ids the page's own cross removed (crossed),
 //    ahead of the store write; a prune that leaves members says nothing; a gone id nobody crossed is not held (it is the
 //    first column's the moment its strip repaints); a crossed id the entry did not hold is ignored
@@ -884,7 +947,7 @@ class SplitExecutes(unittest.TestCase):
     def test_a_column_with_a_create_in_flight_keeps_its_last_member_and_stays_open(self):
         # its queued text and draft would die with the document (review find 2026-09-11): the move that would empty it,
         # its cross and the palette's close are refused with the line; a column with two members lets one go; the create
-        # resolving frees it; another dashboard tab's write is the truth and is not refused
+        # resolving frees it (another dashboard tab's write is neither refused nor obeyed at once: it is HELD, the next test)
         b = self.out["busy"]
         self.assertIsNone(b["home"], "the move that would empty the column is refused")
         self.assertEqual(b["notify"], [["warn", "A session is still being created in this column."]])
@@ -901,7 +964,50 @@ class SplitExecutes(unittest.TestCase):
         f = b["thenFree"]
         self.assertEqual(f["home"], "f-chat", "the create resolved: the last member leaves and the column closes")
         self.assertEqual(f["ids"], ["f-chat"]); self.assertEqual(f["stored"], {"v": 2, "cols": []}); self.assertEqual(f["notify"], [])
-        self.assertEqual(b["reconciled"], {"ids": ["f-chat"], "notify": []}, "another dashboard tab's write closes a busy column all the same, and says nothing")
+
+    def test_a_column_another_dashboard_dropped_is_held_while_its_create_is_in_flight_and_closes_on_the_page_s_flip(self):
+        # the one door close()'s busy refusal did not guard (2026-09-15): the reconcile of another dashboard's write closed with
+        # `keep`, so a peer moving a busy column's last member (or closing the column) killed the create's queued text with
+        # the document. Now the column is HELD — mounted, unlisted, nothing written, no toast (a peer's act, nothing refused)
+        # — and the page's colBusy flip is the event: the store is read again and reconciled
+        raw = lambda cols: json.dumps({"v": 2, "cols": cols}, separators=(",", ":"))   # the store's raw string, as JSON.stringify writes it
+        h = self.out["held"]
+        self.assertEqual(h["ids"], ["f-chat", "f-chat-2", "f-chat-3"], "the busy column stands")
+        self.assertEqual(h["order"], ["chat-pane", "gv-chat-2", "chat-pane-2", "gv-chat-3", "chat-pane-3", "gv-a", "fleet-pane", "gv-b", "feed-pane"], "pane and gutter, in its place")
+        self.assertEqual(h["sets"], {"2": [], "3": [API, WEB]}, "unlisted: its member went where the peer put it, so its page shows the create alone")
+        self.assertEqual(h["targetWeb"], "f-chat-3")
+        self.assertEqual(h["notify"], [], "no toast: the write is a peer's act, and nothing is refused")
+        self.assertEqual(h["saves"], 0); self.assertEqual(h["stored"], raw([{"n": 3, "ids": [API, WEB]}]), "nothing written back")
+        self.assertEqual(h["unregister"], []); self.assertEqual(h["taken"], []); self.assertEqual(h["posted"], [])
+        self.assertEqual(h["noise"], {"ids": ["f-chat", "f-chat-2", "f-chat-3"], "saves": 0, "notify": 0}, "a flip that says busy, one from a column not held, one from no chat frame: nothing")
+        s = h["savedMeanwhile"]
+        self.assertEqual(s["stored"], {"v": 2, "cols": [{"n": 3, "ids": [API, WEB, TESTS]}]}, "a user's write meanwhile lists no empty entry for the held column")
+        self.assertEqual(s["sets"], {"2": [], "3": [API, WEB, TESTS]}); self.assertEqual(s["ids"], ["f-chat", "f-chat-2", "f-chat-3"])
+        m = h["moved"]
+        self.assertEqual(m["ids"], ["f-chat", "f-chat-2", "f-chat-4"], "the world moved before the flip: column 3 closed, column 4 made, the hold standing")
+        self.assertEqual(m["order"], ["chat-pane", "gv-chat-2", "chat-pane-2", "gv-chat-4", "chat-pane-4", "gv-a", "fleet-pane", "gv-b", "feed-pane"])
+        self.assertEqual(m["sets"], {"2": [], "4": [WEB]}); self.assertEqual(m["unregister"], ["chat-pane-3"]); self.assertEqual(m["notify"], 0)
+        c = h["closed"]
+        self.assertEqual(c["ids"], ["f-chat", "f-chat-4"], "the flip completes the close, against the store as it stands then")
+        self.assertEqual(c["order"], ["chat-pane", "gv-chat-4", "chat-pane-4", "gv-a", "fleet-pane", "gv-b", "feed-pane"], "pane and gutter gone")
+        self.assertEqual(c["sets"], {"4": [WEB]}); self.assertEqual(c["unregister"], ["chat-pane-3", "chat-pane-2"]); self.assertEqual(c["colGone"], ["3", "2"])
+        self.assertEqual(c["saves"], 0); self.assertEqual(c["stored"], raw([{"n": 4, "ids": [WEB]}]), "the store is untouched: the peer's write was the truth")
+        self.assertEqual(c["notify"], []); self.assertEqual(c["taken"], []); self.assertEqual(c["adopted"], [], "an unlisted column has nothing to hand home")
+        self.assertEqual(c["focused"], ["f-chat"], "the ring lands on the column to its left")
+        l = h["landed"]
+        self.assertEqual(l["held"], {"ids": ["f-chat", "f-chat-2"], "sets": {"2": []}, "targetWeb": "f-chat", "saves": 0})
+        self.assertTrue(l["claim"], "the create landed: the page claims the session for the held column, the path every create takes")
+        self.assertEqual(l["stored"], {"v": 2, "cols": [{"n": 2, "ids": [X]}]}, "…and the store names the column again"); self.assertEqual(l["saves"], 1)
+        self.assertEqual(l["sets"], {"2": [X]}); self.assertEqual(l["targetX"], "f-chat-2")
+        a = l["after"]
+        self.assertEqual(a["ids"], ["f-chat", "f-chat-2"], "the flip's reconcile keeps a column the store lists")
+        self.assertEqual(a["stored"], {"v": 2, "cols": [{"n": 2, "ids": [X]}]}); self.assertEqual(a["sets"], {"2": [X]}); self.assertEqual(a["saves"], 1)
+        self.assertEqual(a["notify"], []); self.assertEqual(a["unregister"], [])
+        r = h["relisted"]
+        self.assertEqual(r, {"ids": ["f-chat", "f-chat-2"], "sets": {"2": [TESTS]}, "saves": 0, "unregister": []}, "a peer listing the column again ends the hold; the flip changes nothing")
+        x = h["cross"]
+        self.assertEqual(x["ids"], ["f-chat", "f-chat-2"]); self.assertEqual(x["notify"], [["warn", "A session is still being created in this column."]], "the user's own cross is refused with the line")
+        self.assertEqual(x["then"], {"ids": ["f-chat"], "notify": 1}, "…and the flip closes it, saying nothing more")
 
     def test_a_column_closed_for_emptiness_tells_the_first_column_which_ids_are_on_their_way_home(self):
         # the kernel may still list a member closed from its own cross for a push or two, and the first column would draw

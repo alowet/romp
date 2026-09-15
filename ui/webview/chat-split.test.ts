@@ -101,6 +101,16 @@ test("a pick of a session another column holds is shown where it lives: the setA
   assert.match(RENDER, /\(window as any\)\.__rompColumnBusy = \(\): boolean => !!provisionalId \|\| failedProvisionals\.size > 0;/);
   assert.match(KERNEL, /function movable\(f,sid\)\{[^\n]*__rompMovableSession/);
   assert.match(KERNEL, /function busy\(f\)\{[^\n]*__rompColumnBusy/);
+  // …and the shell hears the busy answer CHANGE (2026-09-15): a column another dashboard's write dropped is HELD while its page
+  // is busy (closing it would kill the create's queued text) and closed on the page's colBusy flip, posted from every write of
+  // the two facts the answer reads, only when it flipped (tests/test_chat_split.py runs the hold and both of its ends)
+  assert.match(RENDER, /let columnBusyTold = false;\nfunction syncColumnBusy\(\): void \{\n\s*const busy = !!provisionalId \|\| failedProvisionals\.size > 0;\n\s*if \(busy === columnBusyTold\) return;\n\s*columnBusyTold = busy;\n\s*try \{ if \(window\.parent && window\.parent !== window\) window\.parent\.postMessage\(\{ romp: "colBusy", busy \}, "\*"\); \}/);
+  assert.match(RENDER, /\n  provisionalId = id;\n  syncColumnBusy\(\);/, "openProvisional: busy now");
+  assert.match(RENDER, /dismissSession\(id, "close"\);[^\n]*\n  \}\n  syncColumnBusy\(\);[^\n]*\n  return \{ queued, draft \};\n\}/, "dropProvisional: the create settled (landed, cancelled, resolved to a running session)");
+  assert.match(RENDER, /\n  failedProvisionals\.add\(id\);\n  syncColumnBusy\(\);/, "failProvisional: still busy, said for the invariant");
+  assert.match(RENDER, /else \{ failedProvisionals\.delete\(id\); dismissSession\(id, "close"\); syncColumnBusy\(\); \}/, "a failed tab's discard: the text went with it");
+  assert.ok(KERNEL.includes("if(busy(frameOfCol(c.n)))held[c.n]=true;else close(c.n,true);"), "the reconcile holds a busy column instead of closing it");
+  assert.ok(KERNEL.includes("m.romp!=='colBusy'||m.busy||mobile())return;var c=Number(colOf(e.source));if(!c||!held[c])return;var r=read();if(!r.migrated)reconcile(r.cols);"), "…and completes the close on the flip, against the store as it stands then");
   // the ids a colEmpty close sends home are held back on the first column's strip until the kernel's strip omits them
   // (the same closingTabs a ✕ uses), so no tab flashes into that strip on its way out
   assert.match(RENDER, /if \(m\.romp === "closing"\) \{ if \(Array\.isArray\(m\.ids\)\) for \(const id of m\.ids\) \{ if \(typeof id === "string" && id\) closingTabs\.set\(id, Date\.now\(\)\); \} renderTabs\(\); return; \}/);

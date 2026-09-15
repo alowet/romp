@@ -58202,7 +58202,7 @@ var BK='romp-vscode-state-chat:';   // a column's state blob (the shim's SK for 
 var row=document.querySelector('.row'),gva=document.getElementById('gv-a');
 if(!row||!gva)return;
 function mobile(){var b=document.getElementById('mtabs');try{return !!b&&getComputedStyle(b).display!=='none';}catch(e){return false;}}
-function save(){try{localStorage.setItem(CK,JSON.stringify({v:2,cols:cols.map(function(c){return {n:c.n,ids:c.ids.slice()};})}));}catch(e){}}
+function save(){try{localStorage.setItem(CK,JSON.stringify({v:2,cols:cols.filter(function(c){return c.ids.length;}).map(function(c){return {n:c.n,ids:c.ids.slice()};})}));}catch(e){}}   // no empty entry (read()'s shape): a column a reconcile HOLDS is mounted but unlisted
 function paneId(n){return 'chat-pane-'+n;}function frameId(n){return 'f-chat-'+n;}
 function idx(n){for(var i=0;i<cols.length;i++){if(cols[i].n===n)return i;}return -1;}
 function entry(n){var i=idx(n);return i<0?null:cols[i];}
@@ -58303,7 +58303,8 @@ try{tf.contentWindow.focus();}catch(e){}return tf;}
 // CLOSE a column: its sessions return to the first column — the entry goes whole, so the first column derives them —
 // drafts and all (what the closing page holds for each is handed to the first column's page); the pane, its gutter
 // and its grow go; the Log drops its connection state; the ring moves to the column on its left. `keep` skips the
-// store write (a reconcile of another dashboard tab's write, which is already the truth).
+// store write and the busy refusal (a reconcile of another dashboard tab's write, which is already the truth — and
+// which HOLDS a busy column itself rather than close it, see reconcile).
 function close(n,keep){var i=idx(n);if(i<0)return;
 var f=document.getElementById(frameId(n)),home=document.getElementById('f-chat');
 if(!keep&&busy(f)){notify(BUSY);return;}   // a create in flight would die with the document (its queued text with it)
@@ -58404,11 +58405,26 @@ if(Array.isArray(raw)){migrated=true;raw.forEach(function(n){var st=null;try{st=
 else if(raw&&typeof raw==='object'&&raw.v===2&&Array.isArray(raw.cols))raw.cols.forEach(function(c){if(c&&typeof c==='object')add(c.n,Array.isArray(c.ids)?c.ids:[]);});
 return {cols:out,migrated:migrated};}
 // another dashboard tab's write (this window never hears its own): its arrangement is the truth — close what it
-// dropped, make what it added (seeded like a restore), take its sets — and nothing is written back
-function reconcile(next){cols.filter(function(c){return !next.some(function(d){return d.n===c.n;});}).forEach(function(c){close(c.n,true);});
-cols=next.map(function(c){return {n:c.n,ids:c.ids.slice()};});
+// dropped, make what it added (seeded like a restore), take its sets — and nothing is written back. EXCEPT a dropped
+// column whose document is BUSY (a create in flight, or a failed one still holding its text: busy()), which a close
+// would kill, queued text and all — the one door close()'s own refusal did not guard, since `keep` skipped it
+// (2026-09-15). Such a column is HELD: it stays mounted, unlisted (its members went where the peer put them, so its page
+// shows the create alone), and closes on the page's colBusy flip below, against the store as it stands THEN. No toast:
+// the write is a peer's act, not this user's, and nothing is refused — the close completes by itself. Should the create
+// LAND first, the page claims the session for the column (__rompClaimSession lists it and writes the store, the path
+// every create takes) and the store names the column again, so the flip's reconcile keeps it. A page that reloads
+// while a hold is pending loses nothing a close would not have: the document, and the create with it, is gone.
+var held={};   // column numbers a reconcile could not close for a busy document: each close waits on its page's colBusy flip
+function reconcile(next){var of=function(n){for(var i=0;i<next.length;i++){if(next[i].n===n)return next[i];}return null;};
+held={};cols.filter(function(c){return !of(c.n);}).forEach(function(c){if(busy(frameOfCol(c.n)))held[c.n]=true;else close(c.n,true);});
+cols=cols.map(function(c){var d=of(c.n);return {n:c.n,ids:d?d.ids.slice():[]};});   // what stands, in row order: the store's members, a held column's none
+next.forEach(function(d){if(!entry(d.n))cols.push({n:d.n,ids:d.ids.slice()});});
 cols.forEach(function(c){if(!document.getElementById(frameId(c.n)))make(c.n,seedFor(c),null);});}
 window.addEventListener('storage',function(e){if(!e||e.key!==CK||mobile())return;var r=read();if(!r.migrated)reconcile(r.cols);});
+// the page's busy answer FLIPPED (render.ts syncColumnBusy: its create landed, was cancelled, resolved to a running
+// session, or a failed one's tab was discarded). For a held column that is the event its deferred close waited for: the
+// store is read again (the world may have moved) and reconciled, which closes the column unless the store lists it now
+window.addEventListener('message',function(e){var m=e&&e.data;if(!m||m.romp!=='colBusy'||m.busy||mobile())return;var c=Number(colOf(e.source));if(!c||!held[c])return;var r=read();if(!r.migrated)reconcile(r.cols);});
 // the columns this browser had open come back, each on a member of its own (the phone restores nothing: the
 // arrangement stays in the store for the desktop); a v1 store is written back in the new shape, once
 try{if(!mobile()){var r0=read();cols=r0.cols;cols.forEach(function(c){make(c.n,seedFor(c),null);});if(r0.migrated)save();}}catch(e){}

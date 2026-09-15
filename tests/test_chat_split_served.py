@@ -40,7 +40,10 @@ driver run walks the whole story in order, each step landing in its own assertio
      is posted, column 1 re-points to a member of its own, and past the close backstop (shortened for the lab) a strip
      change raises no "Couldn't close" toast;
  12. the hold behind that toast is for the user's own cross: a colEmpty naming a session the kernel still lists, with no
-     cross, closes the column and B is on column 1's strip at once, no toast.
+     cross, closes the column and B is on column 1's strip at once, no toast;
+ 13. a column another dashboard's write dropped while its page is BUSY (a create in flight) is held, not closed under the
+     create: it stands, unlisted, nothing written, no notice; the page's colBusy flip closes it, pane and gutter, the
+     store untouched (2026-09-15; the busy answer and its flip are set by hand — no create is spawned).
 Skips LOUDLY when the extension deps or a playwright browser are absent (CI installs none). Synthetic only:
 placeholder sids, invented notes-api prompt text, no real session data."""
 import json
@@ -706,6 +709,23 @@ out.s12.rename = await rename(cfg.sidC, "tests-again");
 out.s12.renamedSeen = await labelSeen(cfg.sidC, "tests-again");
 out.s12.toasts1 = await toastsIn("f-chat");
 out.s12.log = await shellLog();
+// ---- step 13 (2026-09-15): a column another dashboard dropped is HELD while its page is busy, and closes on the page's flip ----
+// The page's busy answer is set by hand (no create is spawned: the flag is what the shell reads), the peer's write is a synthetic
+// storage event over a store without the column (exactly how another window's write lands here), and the flip is the page's
+// colBusy message from that column's window. Before the fix the storage event closed the column at once, create and all.
+const f13 = await page.evaluate((sid) => { const f = window.__rompMoveTab(sid, "new"); return f ? f.id : null; }, cfg.sidB);
+await waitTabs("f-chat-2", [cfg.sidB]);
+await page.evaluate(() => {
+  document.getElementById("f-chat-2").contentWindow.__rompColumnBusy = () => true;
+  window.__notes13 = []; const n = window.__rompNotify; window.__rompNotify = (k, t, g) => { window.__notes13.push([k, String(t)]); return n(k, t, g); };   // every shell notice from here on
+});
+const t13 = Date.now();
+await page.evaluate(() => { const v = JSON.stringify({ v: 2, cols: [] }); localStorage.setItem("romp-chat-cols", v); window.dispatchEvent(new StorageEvent("storage", { key: "romp-chat-cols", newValue: v })); });
+out.s13 = { frame: f13, held: await shell(), notes: await page.evaluate(() => window.__notes13.slice()) };
+const fr13 = await (await page.$("#f-chat-2")).contentFrame();
+await fr13.evaluate(() => { window.__rompColumnBusy = () => false; window.parent.postMessage({ romp: "colBusy", busy: false }, "*"); });   // the create settled
+out.s13.colGone = await page.waitForFunction(() => !document.getElementById("chat-pane-2") && !document.getElementById("gv-chat-2"), null, { timeout: T }).then(() => true).catch(() => false);
+out.s13.after = await shell(); out.s13.notesAfter = await page.evaluate(() => window.__notes13.slice()); out.s13.ms = Date.now() - t13;
 } catch (e) { out.lateError = String((e && e.stack) || e); }
 out.ms = Date.now() - out.t0;
 fs.writeSync(1, "RESULT:" + JSON.stringify(out) + "\n");
@@ -1121,6 +1141,28 @@ class ServedChatSplit(unittest.TestCase):
         posts = [e for e in s["log"] if e.get("romp") == "colEmpty"]
         self.assertEqual([(e["src"], e["gone"], e.get("crossed")) for e in posts], [("f-chat-2", [SID_B], None)],
                          "the one colEmpty at the shell is the driver's own, from column 2's window, naming no cross: %r" % s["log"])
+
+    def test_13_a_column_another_dashboard_dropped_is_held_while_its_page_is_busy_and_closes_on_the_page_s_flip(self):
+        """The reconcile of another dashboard's write closed with `keep`, past close()'s busy refusal (2026-09-15): a peer
+        moving a busy column's last member (or closing the column) killed the create's queued text with the document. Held
+        now: the column stands, unlisted, nothing written, no notice (a peer's act, nothing refused); the page's colBusy flip
+        closes it, pane and gutter, the store untouched. The busy answer and its flip are set by hand (no create is spawned);
+        tests/test_chat_split.py runs the shell's whole hold against a stub, this runs it in the served shell."""
+        r = self._r()
+        self.assertNotIn("lateError", r, "step 13 raised: %s" % r.get("lateError"))
+        s = r["s13"]
+        self.assertEqual(s["frame"], "f-chat-2")
+        h = s["held"]
+        self.assertEqual(h["frameIds"], ["f-chat", "f-chat-2"], "the busy column stands under the peer's write: %r" % h)
+        self.assertIn("gv-chat-2", h["rowKids"]); self.assertIn("chat-pane-2", h["rowKids"])
+        self.assertEqual(h["sets"], {"2": []}, "unlisted: its member is the first column's, as the peer wrote")
+        self.assertEqual(json.loads(h["cols"]), {"v": 2, "cols": []}, "nothing written back")
+        self.assertEqual(s["notes"], [], "no notice: the write is a peer's act, and nothing is refused")
+        self.assertTrue(s["colGone"], "the flip closed it: %r" % s)
+        a = s["after"]
+        self.assertEqual(a["frameIds"], ["f-chat"]); self.assertNotIn("gv-chat-2", a["rowKids"]); self.assertNotIn("chat-pane-2", a["rowKids"])
+        self.assertEqual(a["sets"], {}); self.assertEqual(json.loads(a["cols"]), {"v": 2, "cols": []}, "the store is untouched: the peer's write was the truth")
+        self.assertEqual(s["notesAfter"], [], "…and still no notice")
 
     def test_per_tab_hot_keys_switch_to_the_column_holding_the_session_and_the_split_cycles(self):
         # the user 2026-09-10: a hot key per tab (set from its menu; the keycap on the tab is the T379 widget, reading the same

@@ -8131,6 +8131,18 @@ const PROVISIONAL_WAIT_MS = 90_000;
 // "only an open session" for the rest, instead of one line for both
 (window as any).__rompMoveRefusal = (sid: unknown): string => typeof sid !== "string" || !sid || isProvisionalId(sid) || isSubId(sid) ? "not-open" : settings.tabsLocked ? "locked" : "";
 (window as any).__rompColumnBusy = (): boolean => !!provisionalId || failedProvisionals.size > 0;
+// …and the shell hears the answer CHANGE (2026-09-15): a column another dashboard's write dropped is HELD by the shell
+// while this page is busy — closing it would kill the create's queued text and draft with the document — and closed the
+// moment the create lands, is cancelled, resolves to a running session, or a failed one's tab is discarded
+// (_LANDING_SPLIT_JS reconcile). That moment is this message, posted from every write of the two facts the answer reads,
+// only when the answer flipped; no timer anywhere.
+let columnBusyTold = false;
+function syncColumnBusy(): void {
+  const busy = !!provisionalId || failedProvisionals.size > 0;
+  if (busy === columnBusyTold) return;
+  columnBusyTold = busy;
+  try { if (window.parent && window.parent !== window) window.parent.postMessage({ romp: "colBusy", busy }, "*"); } catch (e) { /* no shell */ }
+}
 
 function openProvisional(req: CreateReq): void {
   dropProvisional();                       // never two at once: a second create supersedes the first
@@ -8138,6 +8150,7 @@ function openProvisional(req: CreateReq): void {
   pendingNewSession = display;
   const id = mintProvisionalId(Date.now().toString(36) + Math.random().toString(36).slice(2));
   provisionalId = id;
+  syncColumnBusy();                        // this column is busy now: the shell holds a peer's drop of it until the create settles
   provisionalTags = req.tags?.slice() ?? [];   // the strip sections it under each of these from the first paint
   // state "opening", NOT "working": updateStatusline renders the working chip with an elapsed timer off
   // sinceEpoch, and a provisional tab has no honest work clock — the seed showed "Working" + a giant
@@ -8176,6 +8189,7 @@ function dropProvisional(): { queued: string[]; draft: string } {
     pendingSent.delete(id);                // the optimistic bubbles belong to a tab that is going away
     dismissSession(id, "close");           // drops it from sessions/order/views and reselects
   }
+  syncColumnBusy();                        // the create settled (landed, cancelled, or resolved to a running session): a held drop of this column applies now
   return { queued, draft };
 }
 
@@ -8236,6 +8250,7 @@ function failProvisional(why: string): void {
   const held = [...queued, draft].filter(Boolean).join("\n\n");
   pendingSent.delete(id);            // the dashed "received" bubbles fold into the held text instead
   failedProvisionals.add(id);
+  syncColumnBusy();                  // still busy (the failed tab holds the text): no flip, said for the invariant — every write of the two facts
   const s = sessions.get(id);
   // "closed" gives the tab the dead treatment (struck label, plain ✕) — but the composer stays LIVE
   // for a failed provisional (the read-only exemption below), since the held text must stay editable
@@ -18042,7 +18057,7 @@ function closeTabLocally(id: string): void {
   // (and the kernel never knew the id): its ✕ is a plain local discard — tab, draft, and all.
   if (isProvisionalId(id)) {
     if (id === provisionalId) cancelProvisional();
-    else { failedProvisionals.delete(id); dismissSession(id, "close"); }
+    else { failedProvisionals.delete(id); dismissSession(id, "close"); syncColumnBusy(); }   // the text went with the discard: a held drop of this column applies now
     return;
   }
   dismissSession(id, "close");
