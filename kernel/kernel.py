@@ -54810,11 +54810,14 @@ function finite(v){return typeof v==='number'&&isFinite(v);}
 // (review find 2026-09-15, fifth pass: adopting at the final write threw away the very action that wrote — a drag snapped
 // back, a reveal kept the peer's weight, a closed column's weight came back). While a gutter DRAG stands (`gesture`, below)
 // nothing is applied under the hand: the drag's end ingests, unconditionally, whatever the store holds (sixth and seventh
-// passes). `val`: the value a peer's storage event carried, adopted as written even if the store has moved on since.
+// passes). The store on disk is the ONE source (eighth pass): a storage event's own value is not read — two current writes
+// queued behind a slow page had the OLDER adopted and the newer then written over — and a current store is never replaced
+// by a pre-rows shape from a page running this code (every write path ingests first; persist refuses), so a re-read is
+// never staler than the event that prompted it.
 var gesture=null;   // the gutter drag in flight — one transaction
-function ingest(val){if(!legacy)return false;if(gesture)return false;var cur=val;if(cur===undefined){cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}}
+function ingest(){if(!legacy)return false;if(gesture)return false;var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}
 if(!cur||!finite(cur.chat1))return false;legacy=false;for(var k in cur){if(finite(cur[k]))setGrow(k,cur[k]);}return true;}
-window.addEventListener('storage',function(e){if(!e||e.key!==GK)return;var v;if(typeof e.newValue==='string'){try{v=JSON.parse(e.newValue);}catch(x){v=null;}}ingest(v);});   // the peer's write IS the event, its value the one adopted; a peer's column-store write reaching the split's reconcile first is covered by the ingest at that path's entry
+window.addEventListener('storage',function(e){if(e&&e.key===GK)ingest();});   // the peer's write IS the event; what is adopted is the store as it stands now; a peer's column-store write reaching the split's reconcile first is covered by the ingest at that path's entry
 window.__rompGrowLegacy=function(){return legacy;};   // whether the store is still pre-rows-shaped here (the served tests read it)
 // while legacy the store keeps its pre-rows SHAPE — no chat1 — so a reload before the upgrade finds it legacy again, the
 // weights persisted meanwhile in hand; persist writes what its caller produced, and only that. The invariant as a guard: a

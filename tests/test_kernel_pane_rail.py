@@ -137,7 +137,7 @@ class PaneRailTest(unittest.TestCase):
         # to show; a peer's upgrade is ingested at its storage event and first in every entry point, never here
         self.assertIn("function persist(){if(legacy){var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}", self.html)
         self.assertIn("var o=Object.assign({},grow);delete o.chat1;try{localStorage.setItem(GK,JSON.stringify(o));}catch(e){}return;}", self.html)   # …and refuses, saying so, rather than write that shape over a store a peer has upgraded (2026-09-15)
-        self.assertIn("window.addEventListener('storage',function(e){if(!e||e.key!==GK)return;var v;if(typeof e.newValue==='string'){try{v=JSON.parse(e.newValue);}catch(x){v=null;}}ingest(v);});", self.html)   # the value the peer wrote is the one adopted (2026-09-15)
+        self.assertIn("window.addEventListener('storage',function(e){if(e&&e.key===GK)ingest();});", self.html)   # the store as it stands is what is adopted, never the event's own value (2026-09-15, eighth pass)
         # gv-b picks its left neighbour live: the outline (fleet) when shown, else the chat AREA (so it's the chat|feed
         # gutter too; lastChat() is #chat-area, the wrapper every chat column lives in — the chat rows, 2026-09-15)
         self.assertIn("document.body.classList.contains('po-fleet')?'fleet-pane':lastChat()", self.html)

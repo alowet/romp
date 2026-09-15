@@ -533,6 +533,34 @@ rowStaleUp();
 out.tx.row.crossed = { applied: APPLIED.slice(), grows: grows(), bytes: STORE['romp-pane-grow'], listeners: listeners() };
 winFire('mouseup', {});
 out.tx.row.crossed.committed = { grows: grows(), store: store_(), applied: APPLIED.slice() };
+// 19) THE STORE ON DISK IS THE ONE SOURCE (the eighth review pass). A pending page handles its storage events late: a peer wrote a
+//     current store twice before the first event is heard. (1) the first event, carrying the OLDER value, adopts the store as it
+//     stands — the newer — and the second event changes nothing; the next local action, the outline revealed, persists the newer
+//     store with the outline fair-grown, never the older's numbers. (2) By construction no page running this code puts a pre-rows
+//     shape over a current store: with a peer's current store on disk and no event heard, every write path of a pending page
+//     leaves the store current-shaped. (3) So an event whose own value is current while the store on disk is pre-rows-shaped
+//     (an old build's write, the one way that state can arise) adopts nothing: the disk is the truth.
+const V1 = { chat: 669, chat1: 331, chat2: 331, fleet: 34, feed: 331, files: 40 };
+const V2 = { chat: 800, chat1: 400, chat2: 400, fleet: 500, feed: 200, files: 100 };
+function pendingLate() { fresh(L, false, [false, true, false]); BOOT(); restore(['chat2']); window.__rompSeedAreaWeight(); }
+pendingLate();
+STORE['romp-pane-grow'] = JSON.stringify(V2);   // both writes landed before this page heard the first
+winFire('storage', { key: 'romp-pane-grow', newValue: JSON.stringify(V1) });
+const afterFirst = { grows: grows(), legacy: window.__rompGrowLegacy() };
+winFire('storage', { key: 'romp-pane-grow', newValue: JSON.stringify(V2) });
+const afterSecond = { grows: grows() };
+window.__rompGrowFair('fleet'); EL['fleet-pane']._display = 'flex';   // the next local action: the rail's Outline
+out.source = { queued: { afterFirst, afterSecond, revealed: { fleet: ROW['--g-fleet'], store: store_() } } };
+const paths = {};
+pendingLate(); STORE['romp-pane-grow'] = JSON.stringify(V1); window.__rompGrowFair('fleet'); paths.fairGrow = store_();
+pendingLate(); STORE['romp-pane-grow'] = JSON.stringify(V1); window.__rompUnregisterPane('chat-pane-2'); paths.unregister = store_();
+pendingLate(); STORE['romp-pane-grow'] = JSON.stringify(V1); BODY.add('po-fleet'); EL['fleet-pane']._display = 'flex'; drag('gv-b', 300, 350); paths.dragRelease = store_();
+pendingLate(); STORE['romp-pane-grow'] = JSON.stringify(V1); paths.seed = { wrote: window.__rompSeedAreaWeight(), store: store_(), legacy: window.__rompGrowLegacy() };
+out.source.byConstruction = paths;
+pendingLate();
+const legacyOnDisk = STORE['romp-pane-grow'];
+winFire('storage', { key: 'romp-pane-grow', newValue: JSON.stringify(V1) });   // a current value in the event, a pre-rows shape on disk
+out.source.diskWins = { legacy: window.__rompGrowLegacy(), grows: grows(), bytes: STORE['romp-pane-grow'], sameBytes: STORE['romp-pane-grow'] === legacyOnDisk };
 console.log(JSON.stringify(out));
 """
 
@@ -1072,6 +1100,23 @@ class PaneGuttersExecute(unittest.TestCase):
         self.assertEqual(c["applied"], [], "the row gutter's stale release reports nothing…"); self.assertEqual((c["grows"]["--g-fleet"], c["grows"]["--g-feed"]), (300, 400), "…and commits no pane gutter's drag")
         self.assertEqual(c["listeners"], {"move": 1, "up": 1})
         self.assertEqual((c["committed"]["store"]["fleet"], c["committed"]["store"]["feed"]), (350, 350), "the pane gutter's own release commits"); self.assertEqual(c["committed"]["applied"], [])
+
+    def test_19_the_store_on_disk_is_the_one_source_a_late_page_adopts_the_newest_write_never_an_older_event_s_value(self):
+        v2 = {"chat": 800, "chat1": 400, "chat2": 400, "fleet": 500, "feed": 200, "files": 100}
+        q = self.out["source"]["queued"]
+        self.assertFalse(q["afterFirst"]["legacy"], "the first event adopted…")
+        self.assertEqual({k[4:]: v for k, v in q["afterFirst"]["grows"].items() if k[4:] in v2}, v2, "…the store as it stands, the NEWER write, not the older value the event carried")
+        self.assertEqual(q["afterSecond"]["grows"], q["afterFirst"]["grows"], "the second event changes nothing")
+        self.assertEqual(q["revealed"]["fleet"], 200, "the outline revealed after: the current rule over the feed's 200 (the newer store's), never 331")
+        self.assertEqual(q["revealed"]["store"], dict(v2, fleet=200), "…and the write is the newer store with the outline fair-grown: the older numbers appear nowhere")
+        b = self.out["source"]["byConstruction"]
+        for path in ("fairGrow", "unregister", "dragRelease"):
+            self.assertIn("chat1", b[path], path + ": a pending page's write path, with a peer's current store on disk and no event heard, leaves the store current-shaped")
+        self.assertNotIn("chat2", b["unregister"]); self.assertEqual((b["dragRelease"]["fleet"], b["dragRelease"]["feed"]), (350, 350))
+        self.assertEqual(b["seed"], {"wrote": False, "store": {"chat": 669, "chat1": 331, "chat2": 331, "fleet": 34, "feed": 331, "files": 40}, "legacy": False}, "the upgrade path adopts and writes nothing")
+        d = self.out["source"]["diskWins"]
+        self.assertTrue(d["legacy"], "an event carrying a current value over a pre-rows store on disk adopts nothing: the disk is the truth")
+        self.assertTrue(d["sameBytes"]); self.assertEqual(d["grows"]["--g-chat1"], 640)
 
     def test_11_a_store_from_before_the_rows_seeds_the_first_pane_s_inner_weight_from_the_chat_weight(self):
         a = self.out["legacy"]

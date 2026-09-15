@@ -263,7 +263,7 @@ class SplitSourcePins(unittest.TestCase):
         # a peer's upgrade is INGESTED at the event and FIRST in every entry point that reads or changes a weight, never from persist
         # (review find 2026-09-15, fifth pass: adopting at the final write threw away the very action that wrote)
         self.assertNotIn("sync(", gut)
-        self.assertIn("window.addEventListener('storage',function(e){if(!e||e.key!==GK)return;", gut, "the peer's write is the event")
+        self.assertIn("window.addEventListener('storage',function(e){if(e&&e.key===GK)ingest();});", gut, "the peer's write is the event")
         self.assertIn("window.__rompGrowFair=function(k){if(k==='timeline')return;cancelGesture();ingest();", gut, "the rail's fair grow: a drag ended first, a peer's upgrade ingested, then the CURRENT rule (or the pre-rows one while still legacy)")
         self.assertIn("if(legacy){if(k==='chat'){upgrade(true);return;}setGrow(k,oldFair());persist();return;}", gut, "the pre-rows rule while legacy; the chat pane coming on is the upgrade's moment")
         self.assertIn("window.__rompGrowFairIfNew=function(k){ingest();if(typeof grow[k]==='number'&&isFinite(grow[k])){setGrow(k,grow[k]);return;}window.__rompGrowFair(k);};", gut, "a restored or peer-made column keeps a published weight")
@@ -273,8 +273,11 @@ class SplitSourcePins(unittest.TestCase):
         # a commit rebases the pair against the ingested siblings so the divider lands where the line was, a cancel restores and writes nothing
         self.assertNotIn("held", gut)
         self.assertIn("var gesture=null;", gut); self.assertNotIn("ingestDue", gut)
-        self.assertIn("function ingest(val){if(!legacy)return false;if(gesture)return false;var cur=val;if(cur===undefined){", gut, "nothing applied while a gesture stands; a storage event's value adopted as written")
-        self.assertIn("window.addEventListener('storage',function(e){if(!e||e.key!==GK)return;var v;if(typeof e.newValue==='string'){try{v=JSON.parse(e.newValue);}catch(x){v=null;}}ingest(v);});", gut, "the listener honours newValue")
+        # the store on disk is the ONE source (the eighth pass): the listener re-reads it, never the event's own value — two current
+        # writes queued behind a slow page had the older adopted and the newer written over; a re-read is never staler than the event
+        self.assertIn("function ingest(){if(!legacy)return false;if(gesture)return false;var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}", gut, "nothing applied while a gesture stands; the store re-read")
+        self.assertIn("window.addEventListener('storage',function(e){if(e&&e.key===GK)ingest();});", gut, "the peer's write is the event; the store as it stands is what is adopted")
+        self.assertNotIn("newValue", gut)
         self.assertIn("function endGesture(commit){var g=gesture;if(!g)return;gesture=null;", gut)
         self.assertIn("window.removeEventListener('mousemove',g.mv);window.removeEventListener('mouseup',g.up);", gut, "the gesture's listeners go at its end")
         self.assertIn("if(g.vert){if(commit&&g.apply)g.apply(g.nL/g.sum);ingest();return;}", gut)
