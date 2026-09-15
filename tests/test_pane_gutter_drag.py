@@ -115,6 +115,7 @@ const BODY = new Set(['po-chat', 'po-feed', 'po-timeline']);
 global.document = {
   querySelector: (sel) => (sel === '.col' ? colEl : sel === '.row' ? rowEl : null),
   getElementById: (id) => EL[id] || null,
+  visibilityState: 'visible', addEventListener() {},   // a gesture's cancel source (visibilitychange), never fired here
   body: { classList: {
     contains: (c) => BODY.has(c),
     add: (...cs) => cs.forEach((c) => BODY.add(c)),

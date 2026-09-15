@@ -78,6 +78,7 @@ function mkEl(id, w, display, parent, h) {
 }
 let EL = {};
 let WL = {};
+let DL = {};        // the document's listeners (visibilitychange: a gesture's cancel source)
 let APPLIED = [];   // the shares the row gutter's release reports
 // Fresh gutters, panes and window listeners for every boot of the blob: a re-run models a RELOAD, and the
 // previous instance's mousedown handlers must not linger on the same stub gutter (two closures dragging
@@ -85,7 +86,9 @@ let APPLIED = [];   // the shares the row gutter's release reports
 function resetDom() {
   EL = {};
   WL = {};
+  DL = {};
   APPLIED = [];
+  document.visibilityState = 'visible';
   ['gh', 'gv-a', 'gv-b', 'gv-c', 'gv-chat-2', 'gv-chat-3', 'gv-rows', 'f-timeline', 'gv-ghost', 'gv-ghost-h'].forEach((id) => { EL[id] = mkEl(id, 0, 'flex'); });
   EL['chat-area'] = mkEl('chat-area', 600, 'flex');   // the chat area: the outer row's chat side (the rows, 2026-09-15)
   EL['chat-pane'] = mkEl('chat-pane', 600, 'flex', row1El);
@@ -109,12 +112,15 @@ global.getComputedStyle = (el) => ({ display: el._display });
 global.document = {
   querySelector: (sel) => (sel === '.col' ? colEl : sel === '.row' ? rowEl : null),
   getElementById: (id) => EL[id] || null,
+  visibilityState: 'visible',
+  addEventListener: (k, f) => { (DL[k] = DL[k] || []).push(f); },
   body: { classList: {
     contains: (c) => BODY.has(c),
     add: (...cs) => cs.forEach((c) => BODY.add(c)),
     remove: (...cs) => cs.forEach((c) => BODY.delete(c)),
   } },
 };
+function docFire(k, ev) { (DL[k] || []).slice().forEach((f) => f(ev)); }
 function showFleet(on) { EL['fleet-pane']._display = on ? 'flex' : 'none'; if (on) BODY.add('po-fleet'); else BODY.delete('po-fleet'); }
 function winFire(k, ev) { (WL[k] || []).slice().forEach((f) => f(ev)); }
 function grows() { return Object.assign({}, ROW); }
@@ -462,9 +468,71 @@ fresh(L, false, [true, true, false]); BOOT(); restore(['chat2']); window.__rompS
 EL['gv-b'].fire('mousedown', { preventDefault() {}, clientX: 300 });   // BOOT's gv-b: the outline | feed gutter
 const midDown = { grows: grows(), legacy: window.__rompGrowLegacy() };
 STORE['romp-pane-grow'] = JSON.stringify(PEER2); winFire('storage', { key: 'romp-pane-grow' });   // …lands mid-drag
-const midHeld = { grows: grows(), legacy: window.__rompGrowLegacy() };
+const midNoted = { grows: grows(), legacy: window.__rompGrowLegacy() };
 winFire('mousemove', { clientX: 350 }); winFire('mouseup', {});
-out.peerFirst.midDrag = { down: midDown, held: midHeld, grows: grows(), store: store_() };
+out.peerFirst.midDrag = { down: midDown, mid: midNoted, grows: grows(), store: store_() };
+// 17) ONE TRANSACTION per drag (the sixth review pass). The outline | feed | files panes shown at 300 / 400 / 300 px, the chat pane
+//     hidden and this dashboard pending. (1) the outline | feed divider dragged +50 while a peer's upgrade sets files to 900: nothing
+//     moves under the hand, and at the release the divider lands within a pixel of the line while the store carries the peer's 900
+//     and chat1 (the pair rebased against the ingested sibling); (2) the same with no peer: the plain write, 350 / 350, 4e3c6215's
+//     result; (3) a drag abandoned — the window's blur, a pointercancel, the document going hidden — puts the press-time weights
+//     back and writes nothing, and the peer's upgrade after it is taken in whole, the pair included, so a later fair grow's write
+//     carries the PEER's pair; (4) a new press while one stands cancels the prior (its 350 never written), and a stale release is
+//     a no-op; (5) the row gutter shares the path: abandoned by blur it reports nothing and hides its line, and its stale release
+//     never commits a pane gutter's drag
+const PEER3 = { chat: 669, chat1: 331, chat2: 331, fleet: 34, feed: 331, files: 900 };
+const THREE = { chat: 640, fleet: 150, feed: 200, files: 150 };   // proportional to the 300 / 400 / 300 px on screen, so the press's px normalisation is visible on the vars
+function pendingThree() { fresh(THREE, false, [true, true, true]); EL['files-pane'].offsetWidth = 300; BODY.add('po-files'); BOOT(); restore(['chat2']); window.__rompSeedAreaWeight(); }
+function outerPx(g) { const px = flex(1000, [g['--g-fleet'], g['--g-feed'], g['--g-files']]); return { fleet: px[0], feed: px[1], files: px[2], divider: px[0] }; }   // the outer row's three shown panes over their 1000 px
+function ghostLeft() { return EL['gv-ghost'].style.left; }
+function listeners() { return { move: (WL['mousemove'] || []).length, up: (WL['mouseup'] || []).length }; }
+out.tx = {};
+pendingThree();
+EL['gv-b'].fire('mousedown', { preventDefault() {}, clientX: 300 });
+const t1down = grows();
+winFire('mousemove', { clientX: 350 });
+STORE['romp-pane-grow'] = JSON.stringify(PEER3); winFire('storage', { key: 'romp-pane-grow' });
+out.tx.peerMid = { during: { grows: grows(), legacy: window.__rompGrowLegacy(), ghost: ghostLeft(), sameAsDown: JSON.stringify(grows()) === JSON.stringify(t1down) } };
+winFire('mousemove', { clientX: 350 }); winFire('mouseup', {});
+out.tx.peerMid.after = { grows: grows(), px: outerPx(grows()), store: store_(), legacy: window.__rompGrowLegacy(), listeners: listeners(), drag: BODY.has('drag') };
+pendingThree();
+const t2 = drag('gv-b', 300, 350);
+out.tx.noPeer = { grows: grows(), px: outerPx(grows()), store: store_(), afterUp: t2.afterUp };
+const abandon = (how) => {
+  pendingThree(); const before = { grows: grows(), bytes: STORE['romp-pane-grow'] };
+  EL['gv-b'].fire('mousedown', { preventDefault() {}, clientX: 300 }); const pressed = grows();
+  winFire('mousemove', { clientX: 350 });
+  if (how === 'blur') winFire('blur', {}); else if (how === 'pointercancel') winFire('pointercancel', {}); else { document.visibilityState = 'hidden'; docFire('visibilitychange', {}); }
+  const cancelled = { grows: grows(), bytes: STORE['romp-pane-grow'], listeners: listeners(), drag: BODY.has('drag') || BODY.has('dragv'), ghost: EL['gv-ghost'].style.display };
+  STORE['romp-pane-grow'] = JSON.stringify(PEER3); winFire('storage', { key: 'romp-pane-grow' });
+  const ingested = { grows: grows(), legacy: window.__rompGrowLegacy() };
+  window.__rompGrowFair('chat');   // a later fair grow (the rail's Chat on a current dashboard): its write carries the pair the PEER holds
+  return { before, pressed, cancelled, ingested, later: { store: store_() } };
+};
+out.tx.abandoned = { blur: abandon('blur'), pointercancel: abandon('pointercancel'), hidden: abandon('hidden') };
+pendingThree();
+EL['gv-b'].fire('mousedown', { preventDefault() {}, clientX: 300 }); winFire('mousemove', { clientX: 350 });
+const staleUp = WL['mouseup'][0];
+EL['gv-c'].fire('mousedown', { preventDefault() {}, clientX: 700 });   // a second press while the first stands: the first is cancelled
+const secondPress = { grows: grows(), bytes: STORE['romp-pane-grow'], listeners: listeners() };
+winFire('mousemove', { clientX: 720 }); winFire('mouseup', {});
+const committed = { grows: grows(), store: store_() };
+staleUp();
+out.tx.replaced = { secondPress, committed, afterStale: { grows: grows(), store: store_() } };
+pendingThree();
+window.__rompRowGutter('gv-rows', 'chat-row-1', 'chat-row-2', function (s) { APPLIED.push(s); });
+EL['gv-rows'].fire('mousedown', { preventDefault() {}, clientY: 400 }); winFire('mousemove', { clientY: 500 });
+const rowMid = { ghost: ghostH().display, dragh: BODY.has('dragh') };
+winFire('blur', {});
+out.tx.row = { mid: rowMid, cancelled: { ghost: ghostH().display, dragh: BODY.has('dragh'), applied: APPLIED.slice(), listeners: listeners(), bytes: STORE['romp-pane-grow'], grows: grows() } };
+EL['gv-rows'].fire('mousedown', { preventDefault() {}, clientY: 400 }); winFire('mousemove', { clientY: 500 });
+const rowStaleUp = WL['mouseup'][0];
+EL['gv-b'].fire('mousedown', { preventDefault() {}, clientX: 300 });   // a pane gutter's press cancels the row drag
+winFire('mousemove', { clientX: 350 });
+rowStaleUp();
+out.tx.row.crossed = { applied: APPLIED.slice(), grows: grows(), bytes: STORE['romp-pane-grow'], listeners: listeners() };
+winFire('mouseup', {});
+out.tx.row.crossed.committed = { grows: grows(), store: store_(), applied: APPLIED.slice() };
 console.log(JSON.stringify(out));
 """
 
@@ -736,11 +804,47 @@ class PaneGuttersExecute(unittest.TestCase):
         self.assertEqual(i["store"], peer, "…and writes nothing"); self.assertFalse(i["seed"])
         m = self.out["peerFirst"]["midDrag"]
         self.assertTrue(m["down"]["legacy"]); self.assertEqual((m["down"]["grows"]["--g-fleet"], m["down"]["grows"]["--g-feed"]), (300, 300 + 100), "the press normalised the pair to px")
-        self.assertFalse(m["held"]["legacy"], "the peer's write mid-drag was ingested…")
-        self.assertEqual((m["held"]["grows"]["--g-fleet"], m["held"]["grows"]["--g-feed"]), (300, 400), "…but for the pair under the pointer")
-        self.assertEqual(m["held"]["grows"]["--g-chat1"], 331)
-        self.assertEqual((m["grows"]["--g-fleet"], m["grows"]["--g-feed"]), (350, 350), "on release the dragged pair stands")
-        self.assertEqual(m["store"], dict(peer, fleet=350, feed=350), "…and the write carries the merged view")
+        self.assertTrue(m["mid"]["legacy"], "the peer's write mid-drag is only NOTED: nothing moves under the hand (the sixth pass)…")
+        self.assertEqual(m["mid"]["grows"], m["down"]["grows"], "…no weight changes during the drag")
+        self.assertEqual((m["grows"]["--g-fleet"], m["grows"]["--g-feed"]), (350, 350), "on release the dragged pair stands (no other pane in the container: the plain write)")
+        self.assertEqual(m["store"], dict(peer, fleet=350, feed=350), "…and the write carries the merged view: the peer's store ingested at the release, the pair replaced")
+
+    def test_17_a_drag_is_one_transaction_a_peer_s_write_waits_for_its_end_and_an_abandoned_drag_writes_nothing(self):
+        peer3 = {"chat": 669, "chat1": 331, "chat2": 331, "fleet": 34, "feed": 331, "files": 900}
+        p = self.out["tx"]["peerMid"]
+        self.assertTrue(p["during"]["legacy"], "the peer's write mid-drag is noted, not applied"); self.assertTrue(p["during"]["sameAsDown"], "nothing moves under the hand")
+        self.assertEqual(p["during"]["ghost"], "350px", "the line stands where the pointer put it")
+        a = p["after"]
+        self.assertFalse(a["legacy"], "the release ingested the peer's store…")
+        self.assertLessEqual(abs(a["px"]["divider"] - 350), 1, "…and the divider lands where the line was: the pair rebased against the ingested files: %r" % a["px"])
+        self.assertLessEqual(abs(a["px"]["feed"] - 350), 1); self.assertLessEqual(abs(a["px"]["files"] - 300), 1, "the files pane keeps its pixels: only the divider moved")
+        self.assertEqual(a["store"]["files"], 900, "the store carries the peer's files weight"); self.assertEqual(a["store"]["chat1"], 331); self.assertEqual(a["store"]["chat"], 669)
+        self.assertAlmostEqual(a["store"]["fleet"], 1050, places=6, msg="the pair: 900 · 700 / 300 = 2100, split 350 : 350"); self.assertAlmostEqual(a["store"]["feed"], 1050, places=6)
+        self.assertEqual(a["listeners"], {"move": 0, "up": 0}); self.assertFalse(a["drag"])
+        n = self.out["tx"]["noPeer"]
+        self.assertEqual((n["grows"]["--g-fleet"], n["grows"]["--g-feed"], n["grows"]["--g-files"]), (350, 350, 300), "no peer: the plain write of the pair's pixels, 4e3c6215's result (the rebase is the identity)")
+        self.assertEqual((n["store"]["fleet"], n["store"]["feed"]), (350, 350)); self.assertNotIn("chat1", n["store"], "still pending")
+        for how, ab in self.out["tx"]["abandoned"].items():
+            self.assertEqual((ab["pressed"]["--g-fleet"], ab["pressed"]["--g-feed"], ab["pressed"]["--g-files"]), (300, 400, 300), how + ": the press normalised the container to px")
+            self.assertEqual(ab["cancelled"]["grows"], ab["before"]["grows"], how + ": the cancel put the press-time weights back (150 / 200 / 150)")
+            self.assertEqual(ab["cancelled"]["bytes"], ab["before"]["bytes"], how + ": …and wrote nothing")
+            self.assertEqual(ab["cancelled"]["listeners"], {"move": 0, "up": 0}, how + ": the gesture's listeners are gone"); self.assertFalse(ab["cancelled"]["drag"]); self.assertEqual(ab["cancelled"]["ghost"], "none")
+            self.assertFalse(ab["ingested"]["legacy"], how + ": the peer's upgrade after it is taken in…")
+            self.assertEqual((ab["ingested"]["grows"]["--g-fleet"], ab["ingested"]["grows"]["--g-feed"]), (34, 331), how + ": …the pair included")
+            self.assertEqual((ab["later"]["store"]["fleet"], ab["later"]["store"]["feed"]), (34, 331), how + ": a later fair grow's write carries the PEER's pair, not the abandoned drag's")
+        r = self.out["tx"]["replaced"]
+        self.assertEqual(r["secondPress"]["grows"]["--g-fleet"], 300, "the second press cancelled the first (its 150 restored, then normalised again to 300): the 350 never landed")
+        self.assertNotIn("chat1", r["secondPress"]["bytes"]); self.assertEqual(r["secondPress"]["listeners"], {"move": 1, "up": 1}, "one gesture's listeners, the second's")
+        self.assertEqual((r["committed"]["store"]["fleet"], r["committed"]["store"]["feed"], r["committed"]["store"]["files"]), (300, 420, 280), "the second drag committed; the first never wrote")
+        self.assertEqual(r["afterStale"], {"grows": r["committed"]["grows"], "store": r["committed"]["store"]}, "the first gesture's stale release is a no-op")
+        rw = self.out["tx"]["row"]
+        self.assertEqual(rw["mid"], {"ghost": "block", "dragh": True})
+        self.assertEqual(rw["cancelled"]["ghost"], "none"); self.assertFalse(rw["cancelled"]["dragh"]); self.assertEqual(rw["cancelled"]["applied"], [], "abandoned by blur: no share reported")
+        self.assertEqual(rw["cancelled"]["listeners"], {"move": 0, "up": 0}); self.assertNotIn("chat1", rw["cancelled"]["bytes"])
+        c = rw["crossed"]
+        self.assertEqual(c["applied"], [], "the row gutter's stale release reports nothing…"); self.assertEqual((c["grows"]["--g-fleet"], c["grows"]["--g-feed"]), (300, 400), "…and commits no pane gutter's drag")
+        self.assertEqual(c["listeners"], {"move": 1, "up": 1})
+        self.assertEqual((c["committed"]["store"]["fleet"], c["committed"]["store"]["feed"]), (350, 350), "the pane gutter's own release commits"); self.assertEqual(c["committed"]["applied"], [])
 
     def test_11_a_store_from_before_the_rows_seeds_the_first_pane_s_inner_weight_from_the_chat_weight(self):
         a = self.out["legacy"]

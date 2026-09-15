@@ -131,7 +131,8 @@ class PaneRailTest(unittest.TestCase):
         # chat|chat grab inside a row never writes the outer row's weights, nor an outer grab a row's
         self.assertIn("function normalise(ids){var px={};ids.forEach(function(id){px[id]=document.getElementById(id).offsetWidth;});Object.keys(px).forEach(function(id){setGrow(key(id),px[id]);});return px;}", self.html)
         self.assertIn("function sibs(id){var el=document.getElementById(id),par=el?el.parentElement:null;return PANES.filter(function(p){var e=document.getElementById(p);return !!e&&shown(p)&&e.parentElement===par;});}", self.html)
-        self.assertIn("ingest();if(!vert){held=[key(L.id),key(R.id)];normalise(sibs(L.id));}", self.html)   # a peer's upgrade first, the pair held against one mid-drag (2026-09-15)
+        self.assertIn("if(!vert){var ids=sibs(L.id),px=normalise(ids);ids.forEach(function(id){W+=px[id];if(id!==L.id&&id!==R.id)others.push(key(id));});}", self.html)   # the press: the container to px, its width and the pair's siblings kept for the release (2026-09-15)
+        self.assertIn("function endGesture(commit){var g=gesture;if(!g)return;gesture=null;", self.html)   # one exit for every gutter drag
         # the one write of the store (persist): the pre-rows shape — no chat1 — while a pre-rows store's upgrade waits for the chat pane
         # to show; a peer's upgrade is ingested at its storage event and first in every entry point, never here
         self.assertIn("function persist(){var o=grow;if(legacy){o=Object.assign({},grow);delete o.chat1;}try{localStorage.setItem(GK,JSON.stringify(o));}catch(e){}}", self.html)

@@ -40,7 +40,10 @@ the REAL page: a hermetic kernel serves the dashboard with FIVE synthetic sessio
      outline revealed from the rail before the chat pane shows lays out as four equal panes, the restored column closed from
      the palette before the chat pane shows leaves two halves and no weight for it in the store; and a PEER's upgrade (the fifth
      pass: a second page of the same browser, sharing the store) is ingested at its storage event, so this page's first action
-     after it — the rail's Outline — fair-grows as a fresh current page does, and the palette's close leaves no chat2;
+     after it — the rail's Outline — fair-grows as a fresh current page does, and the palette's close leaves no chat2; and a
+     gutter DRAG is one transaction (the sixth pass): a peer's upgrade landing mid-drag moves nothing under the hand, the
+     release lands the divider where the line was and carries the peer's weights, and a drag abandoned to the window's blur
+     writes nothing;
   9. the whole story runs in under two and a half minutes (the driver waits on conditions, never on fixed sleeps).
 Screenshots of the 1 + 1 stack and the 2 x 2, dark and light, land in the directory ROMP_ROWS_SHOTS names (default
 /tmp/chat-rows-shots) for a human look. Skips LOUDLY when the extension deps or a playwright browser are absent (CI
@@ -444,6 +447,50 @@ await waitGone("chat-pane-2");
 out.s8d = { upgraded, ingested, fleetB, fleetC, afterClose: await widthsNow(), legacyAfter: await legacyOf(page) };
 await page.click(".rail-btn[data-pane=fleet]");
 await waitFn(() => !document.body.classList.contains("po-fleet"), null, "the rail never hid the outline again (peer case)");
+// ---- 8e. a DRAG is one transaction (the sixth pass): the outline, the feed and the files pane shown with the chat pane off, this
+//      page pending; the outline | feed gutter dragged; a peer page writes an upgraded store with the files weight changed between two
+//      pointer moves — nothing moves under the hand — and the release lands the divider within a pixel of the line while the store
+//      carries the peer's files weight; then a drag abandoned to the window's blur puts everything back and writes nothing
+const boxOf = (id) => page.evaluate((id) => { const e = document.getElementById(id); if (!e) return null; const r = e.getBoundingClientRect(); return { left: r.left, right: r.right, width: r.width, top: r.top, height: r.height }; }, id);
+const boxes = async () => ({ fleet: await boxOf("fleet-pane"), feed: await boxOf("feed-pane"), files: await boxOf("files-pane"), gvb: await boxOf("gv-b") });
+await page.evaluate(([grow, cols]) => {
+  localStorage.setItem("romp-pane-grow", JSON.stringify(grow)); localStorage.setItem("romp-chat-cols", JSON.stringify({ v: 2, cols }));
+  const st = JSON.parse(localStorage.getItem("romp:settings") || "{}"); st.showFilesControl = true; localStorage.setItem("romp:settings", JSON.stringify(st));
+  localStorage.setItem("romp-panes", JSON.stringify({ chat: false, fleet: true, feed: true, timeline: true, files: true }));
+}, [{ chat: 640, fleet: 300, feed: 400, files: 300 }, [{ n: 2, ids: [cfg.b] }]]);
+await page.reload();
+await waitBootGone();
+await waitFn(() => !document.body.classList.contains("po-chat") && document.body.classList.contains("po-fleet") && document.body.classList.contains("po-files") && !!window.__rompGrowLegacy && window.__rompGrowLegacy() === true && window.__rompChatFrameIds().length === 2, null, "this page never came up pending with the outline, the feed and the files pane shown");
+const pageP = await context.newPage();   // the peer: booted first, so its own boot writes land before the drag
+const dieP = async (why) => { try { await pageP.close(); } catch (e) { /* */ } await die(why); };
+await pageP.goto(cfg.url);
+await pageP.waitForFunction(() => !document.getElementById("romp-boot") && !!window.__rompGrowLegacy, null, { timeout: T }).catch(async (e) => { await dieP("the peer page never booted: " + String(e).split("\n")[0]); });
+const pre = await boxes();
+const g8 = pre.gvb;
+await page.mouse.move(g8.left + g8.width / 2, g8.top + g8.height / 2);
+await page.mouse.down();
+await page.mouse.move(g8.left + g8.width / 2 + 50, g8.top + g8.height / 2, { steps: 5 });
+const midBoxes = await boxes();
+await pageP.evaluate(() => localStorage.setItem("romp-pane-grow", JSON.stringify({ chat: 669, chat1: 331, chat2: 331, fleet: 34, feed: 331, files: 900 })));   // the peer's upgrade, mid-drag
+await page.mouse.move(g8.left + g8.width / 2 + 50, g8.top + g8.height / 2 + 1, { steps: 3 });   // another move after the write: still nothing under the hand
+const afterWrite = { boxes: await boxes(), legacy: await legacyOf(page), ghostLeft: await page.evaluate(() => parseFloat(document.getElementById("gv-ghost").style.left)), drag: await page.evaluate(() => document.body.classList.contains("drag")) };
+await page.mouse.up();
+await waitFn(() => { const s = JSON.parse(localStorage.getItem("romp-pane-grow") || "{}"); return "chat1" in s && s.files === 900; }, null, "the release never wrote the merged store");
+const released = { boxes: await boxes(), store: await page.evaluate(() => JSON.parse(localStorage.getItem("romp-pane-grow"))), legacy: await legacyOf(page), drag: await page.evaluate(() => document.body.classList.contains("drag")) };
+// …and a drag abandoned to the window's blur
+const beforeAbandon = { boxes: await boxes(), bytes: await page.evaluate(() => localStorage.getItem("romp-pane-grow")) };
+const g9 = beforeAbandon.boxes.gvb;
+await page.mouse.move(g9.left + g9.width / 2, g9.top + g9.height / 2);
+await page.mouse.down();
+await page.mouse.move(g9.left + g9.width / 2 + 40, g9.top + g9.height / 2, { steps: 4 });
+const abandonMid = { drag: await page.evaluate(() => document.body.classList.contains("drag")), ghost: await page.evaluate(() => getComputedStyle(document.getElementById("gv-ghost")).display) };
+await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+await waitFn(() => !document.body.classList.contains("drag"), null, "the blur never ended the drag");
+const abandoned = { boxes: await boxes(), bytes: await page.evaluate(() => localStorage.getItem("romp-pane-grow")), ghost: await page.evaluate(() => getComputedStyle(document.getElementById("gv-ghost")).display) };
+await page.mouse.up();   // the stale release
+const afterStale = { boxes: await boxes(), bytes: await page.evaluate(() => localStorage.getItem("romp-pane-grow")) };
+await pageP.close();
+out.s8e = { pre, midBoxes, afterWrite, released, beforeAbandon, abandonMid, abandoned, afterStale };
 out.ms = Date.now() - out.t0;
 fs.writeSync(1, "RESULT:" + JSON.stringify(out) + "\n");
 await browser.close();
@@ -876,6 +923,28 @@ class ServedChatRows(unittest.TestCase):
         self.assertEqual(a["frames"], ["f-chat"], "the palette's Close this column closed the restored column")
         self.assertNotIn("chat2", a["grow"], "…and the store has no chat2: the write carried the deletion over the peer's store")
         self.assertIn("chat1", a["grow"], "…in its current shape"); self.assertFalse(s["legacyAfter"])
+
+    def test_8e_a_drag_is_one_transaction_a_peer_s_write_mid_drag_waits_for_the_release_and_an_abandoned_drag_writes_nothing(self):
+        r = self._r()
+        s = r["s8e"]
+        aw = s["afterWrite"]
+        self.assertTrue(aw["drag"]); self.assertTrue(aw["legacy"], "the peer's write mid-drag is only noted: this page is still pending under the hand")
+        for k in ("fleet", "feed", "files"):
+            self.assertLessEqual(abs(aw["boxes"][k]["left"] - s["midBoxes"][k]["left"]), 0.5, "%s did not move under the hand: %r vs %r" % (k, aw["boxes"][k], s["midBoxes"][k]))
+            self.assertLessEqual(abs(aw["boxes"][k]["width"] - s["midBoxes"][k]["width"]), 0.5)
+        rl = s["released"]
+        self.assertFalse(rl["legacy"], "the release ingested the peer's store"); self.assertFalse(rl["drag"])
+        self.assertLessEqual(abs(rl["boxes"]["gvb"]["left"] - aw["ghostLeft"]), 1, "the divider landed where the line was: %r vs %r" % (rl["boxes"]["gvb"], aw["ghostLeft"]))
+        self.assertLessEqual(abs(rl["boxes"]["fleet"]["width"] - (s["pre"]["fleet"]["width"] + 50)), SLACK_PX, "about the drag: %r -> %r" % (s["pre"]["fleet"], rl["boxes"]["fleet"]))
+        self.assertLessEqual(abs(rl["boxes"]["files"]["width"] - s["pre"]["files"]["width"]), 1, "the files pane keeps its pixels: only the dragged divider moved")
+        self.assertEqual(rl["store"]["files"], 900, "the store carries the peer's files weight"); self.assertIn("chat1", rl["store"])
+        self.assertEqual(rl["store"]["chat1"], 331)
+        ab = s["abandoned"]
+        self.assertTrue(s["abandonMid"]["drag"]); self.assertEqual(s["abandonMid"]["ghost"], "block")
+        self.assertEqual(ab["bytes"], s["beforeAbandon"]["bytes"], "a drag abandoned to the window's blur writes nothing"); self.assertEqual(ab["ghost"], "none")
+        for k in ("fleet", "feed", "files", "gvb"):
+            self.assertLessEqual(abs(ab["boxes"][k]["left"] - s["beforeAbandon"]["boxes"][k]["left"]), 0.5, "%s is back where it was: %r vs %r" % (k, ab["boxes"][k], s["beforeAbandon"]["boxes"][k]))
+        self.assertEqual(s["afterStale"]["bytes"], ab["bytes"], "the stale release writes nothing"); self.assertLessEqual(abs(s["afterStale"]["boxes"]["gvb"]["left"] - ab["boxes"]["gvb"]["left"]), 0.5)
 
     def test_9_the_whole_story_runs_in_under_two_and_a_half_minutes_and_left_its_screenshots(self):
         r = self._r()

@@ -54808,12 +54808,11 @@ function finite(v){return typeof v==='number'&&isFinite(v);}
 // every entry point that reads or changes a weight — the rail's fair grow, a gutter's press and release, a column's
 // unregister, the split's halving and hand-back, the upgrade — never from persist, which writes what its caller produced
 // (review find 2026-09-15, fifth pass: adopting at the final write threw away the very action that wrote — a drag snapped
-// back, a reveal kept the peer's weight, a closed column's weight came back). A peer's write landing MID-DRAG is ingested
-// but for the two panes under the pointer (`held`): the gesture's result stands for those, and the release writes the
-// merged view.
-var held=null;   // the two keys under a gutter drag, from its press to its release
-function ingest(){if(!legacy)return false;var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}
-if(!cur||!finite(cur.chat1))return false;legacy=false;for(var k in cur){if(finite(cur[k])&&!(held&&held.indexOf(k)>=0))setGrow(k,cur[k]);}return true;}
+// back, a reveal kept the peer's weight, a closed column's weight came back). While a gutter DRAG stands (`gesture`, below)
+// a peer's write is only NOTED (ingestDue): nothing moves under the hand, and the drag's end ingests it (sixth pass).
+var gesture=null,ingestDue=false;   // the gutter drag in flight — one transaction — and a peer's write heard during it
+function ingest(){if(!legacy)return false;if(gesture){ingestDue=true;return false;}var cur=null;try{cur=JSON.parse(localStorage.getItem(GK)||'null');}catch(e){}
+if(!cur||!finite(cur.chat1))return false;legacy=false;for(var k in cur){if(finite(cur[k]))setGrow(k,cur[k]);}return true;}
 window.addEventListener('storage',function(e){if(e&&e.key===GK)ingest();});   // the peer's write IS the event; a peer's column-store write reaching the split's reconcile first is covered by the ingest at that path's entry
 window.__rompGrowLegacy=function(){return legacy;};   // whether the store is still pre-rows-shaped here (the served tests read it)
 // while legacy the store keeps its pre-rows SHAPE — no chat1 — so a reload before the upgrade finds it legacy again, the
@@ -54876,19 +54875,46 @@ setGrow(key(leftId),px[leftId]+px[goneId]+7);persist();return true;};
 // pane's SHARE (0–1) to `apply` instead of writing grows — the rows' split is the split script's, kept as a ratio in
 // its own store, never a pixel weight here.
 var ghost=document.getElementById('gv-ghost'),ghostH=document.getElementById('gv-ghost-h');
+// ONE TRANSACTION per drag (review find 2026-09-15, sixth pass: holding the dragged pair alone let a peer's write move every
+// OTHER pane under the hand, so the landing line lied by some 130 px, and a hold nobody cleared outlived an abandoned drag).
+// `gesture` is the press: the pair, the container's weights before anything was written (w0), its shown siblings and its
+// pixel width less its gutters (W), the pair's extent (sum) and the divider's place (nL). While it stands a peer's write is
+// only noted (ingest above). endGesture is the ONE exit for every gutter, the pane gutters and the row gutter alike: commit on
+// the gutter's own release; cancel on pointercancel, the window's blur, the document going hidden, or a new press while one
+// stands. A cancel puts the press-time weights back on the vars and writes nothing. A commit writes the pair — and with a
+// peer's store noted mid-drag, ingests that store whole first (the pair's values too: they are about to be replaced) and
+// REBASES the pair against the ingested siblings so the divider lands exactly where the line was: with a and b the pair's
+// pixels at release, Σo the other shown siblings' ingested weights and W the container's pixels, w_L + w_R = Σo·(a+b)/(W−a−b)
+// and w_L = (w_L+w_R)·a/(a+b); with nothing noted, or nothing else in the container, this is the plain write of a and b.
+// Either exit runs the deferred ingest last and removes the gesture's listeners: a stale release is a no-op.
+function endGesture(commit){var g=gesture;if(!g)return;gesture=null;
+window.removeEventListener('mousemove',g.mv);window.removeEventListener('mouseup',g.up);
+document.body.classList.remove('drag',g.vert?'dragh':'dragv');if(g.gh)g.gh.style.display='none';
+var due=ingestDue;ingestDue=false;
+if(g.vert){if(commit&&g.apply)g.apply(g.nL/g.sum);if(due)ingest();return;}
+if(!commit){for(var k in g.w0)setGrow(k,g.w0[k]);if(due)ingest();return;}   // cancelled: the press-time weights back, nothing written, then the peer's store
+var a=g.nL,b=g.sum-g.nL,lk=key(g.L.id),rk=key(g.R.id),so=0;
+if(due&&ingest()&&a+b<g.W)g.others.forEach(function(k){if(finite(grow[k]))so+=grow[k];});
+if(so>0){var pair=so*(a+b)/(g.W-a-b);setGrow(lk,pair*a/(a+b));setGrow(rk,pair*b/(a+b));}else{setGrow(lk,a);setGrow(rk,b);}
+persist();}
+window.addEventListener('pointercancel',function(){endGesture(false);});
+window.addEventListener('blur',function(){endGesture(false);});
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='hidden')endGesture(false);});
 function gutter(gid,leftPick,rightId,vert,apply){var h=document.getElementById(gid);if(!h)return;
 h.addEventListener('mousedown',function(e){e.preventDefault();
 var L=document.getElementById(leftPick()),R=document.getElementById(rightId);if(!L||!R)return;
+if(gesture)endGesture(false);   // a new press while one stands: the prior is cancelled, never committed
+ingest();   // a peer's upgrade first, before the press is measured
+var w0=Object.assign({},grow),others=[],W=0;
+if(!vert){var ids=sibs(L.id),px=normalise(ids);ids.forEach(function(id){W+=px[id];if(id!==L.id&&id!==R.id)others.push(key(id));});}   // the pair's container to px (a row pair is a ratio, never px): its width less its gutters, and the pair's shown siblings
 document.body.classList.add('drag',vert?'dragh':'dragv');
-ingest();if(!vert){held=[key(L.id),key(R.id)];normalise(sibs(L.id));}   // a peer's upgrade first; then the pair is held against one landing mid-drag, and the pair's container goes to px (a row pair is a ratio, never px)
 var sz=vert?'offsetHeight':'offsetWidth',ax=vert?'clientY':'clientX',gh=vert?ghostH:ghost;
-var wL=L[sz],wR=R[sz],sum=wL+wR,s0=e[ax],mn=Math.min(120,sum*0.25),nL=wL,lr=L.getBoundingClientRect(),l0=vert?lr.top:lr.left,rr=(L.parentElement||row).getBoundingClientRect();
-function show(){if(!gh)return;if(vert){gh.style.left=rr.left+'px';gh.style.width=rr.width+'px';gh.style.top=(l0+nL)+'px';}else{gh.style.top=rr.top+'px';gh.style.height=rr.height+'px';gh.style.left=(l0+nL)+'px';}gh.style.display='block';}
-function mv(ev){nL=Math.max(mn,Math.min(sum-mn,wL+(ev[ax]-s0)));show();}
-function up(){document.body.classList.remove('drag',vert?'dragh':'dragv');if(gh)gh.style.display='none';
-ingest();   // a peer's upgrade that landed mid-drag, the held pair excepted: the gesture's result stands for those two, and the write below carries both
-if(vert){if(apply)apply(nL/sum);}else{setGrow(key(L.id),nL);setGrow(key(R.id),sum-nL);held=null;persist();}
-window.removeEventListener('mousemove',mv);window.removeEventListener('mouseup',up);}
+var wL=L[sz],wR=R[sz],sum=wL+wR,s0=e[ax],mn=Math.min(120,sum*0.25),lr=L.getBoundingClientRect(),l0=vert?lr.top:lr.left,rr=(L.parentElement||row).getBoundingClientRect();
+var g={gid:gid,L:L,R:R,vert:vert,apply:apply,gh:gh,w0:w0,others:others,W:W,sum:sum,nL:wL,l0:l0};
+function show(){if(!gh)return;if(vert){gh.style.left=rr.left+'px';gh.style.width=rr.width+'px';gh.style.top=(l0+g.nL)+'px';}else{gh.style.top=rr.top+'px';gh.style.height=rr.height+'px';gh.style.left=(l0+g.nL)+'px';}gh.style.display='block';}
+function mv(ev){if(gesture!==g)return;g.nL=Math.max(mn,Math.min(sum-mn,wL+(ev[ax]-s0)));show();}
+function up(){if(gesture!==g)return;endGesture(true);}
+g.mv=mv;g.up=up;gesture=g;
 show();window.addEventListener('mousemove',mv);window.addEventListener('mouseup',up);});}
 window.__rompGutter=gutter;   // the split's chat|chat gutters are wired through the same code
 window.__rompRowGutter=function(gid,topId,botId,apply){gutter(gid,function(){return topId;},botId,true,apply);};   // …and the gutter between the two chat rows: the release reports the top row's share
