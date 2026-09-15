@@ -54793,8 +54793,9 @@ var GK='romp-pane-grow',grow={chat:60,chat1:60,fleet:34,feed:40,files:40};
 // column keeps its proportion against it (60 against a stored 400 px would have opened the first pane as a sliver) —
 // and the store is marked legacy, for __rompSeedAreaWeight below to set the outer weight once the split has restored
 // its columns (the old chat weight was ONE column's; the area's is every top-row column's together)
-var legacy=false;
+var legacy=false,legacyGrow=null;
 try{var g=JSON.parse(localStorage.getItem(GK)||'null');if(g){if(typeof g.chat1!=='number'){g.chat1=typeof g.chat==='number'?g.chat:grow.chat;legacy=true;}grow=Object.assign(grow,g);}}catch(e){}
+if(legacy)legacyGrow=Object.assign({},grow);   // the pre-rows weights as stored, snapshotted BEFORE any restored column takes a fair grow of the rows' rule (review find 2026-09-15: a column with no stored weight took its row-siblings' average ahead of the upgrade, and the upgrade froze that)
 function setGrow(k,v){grow[k]=v;row.style.setProperty('--g-'+k,v);}
 for(var k in grow)setGrow(k,grow[k]);
 function persist(){try{localStorage.setItem(GK,JSON.stringify(grow));}catch(e){}}
@@ -54876,12 +54877,17 @@ window.__rompRowGutter=function(gid,topId,botId,apply){gutter(gid,function(){ret
 // those PIXELS as their weights: the chat columns inside the area, the outer panes beside it, and the area itself the
 // chat columns' pixels plus the gutters between them. Weights in px sum to the space each container distributes, so the
 // render matches the pre-rows one pixel for pixel; persisted, so the store carries chat1 from then on and this never runs again.
+// A restored column with NO stored weight (a supported restore) is given the weight the PRE-ROWS shell gave it — its fair
+// grow then: the average of the finite weights of the panes on screen as it was made, the first pane, the columns restored
+// before it and the shown outer panes — in restoration order, each resolved weight counting for the next; read from the
+// boot snapshot, never from the rows' sibling average make() has since applied (which the pixels below overwrite).
+function finite(v){return typeof v==='number'&&isFinite(v);}
 window.__rompSeedAreaWeight=function(colKeys){if(!legacy)return false;legacy=false;
-var chatKeys=['chat1'].concat((colKeys||[]).filter(function(k){return typeof grow[k]==='number'&&isFinite(grow[k]);}));
-var outer=['fleet','feed','files'].filter(function(k){return shown(idOf(k));});
-var items=chatKeys.concat(outer),T=0,W=row.offsetWidth;items.forEach(function(k){T+=grow[k];});
+var lg=legacyGrow||{},outer=['fleet','feed','files'].filter(function(k){return shown(idOf(k));}),chatKeys=['chat1'];
+(colKeys||[]).forEach(function(k){if(!finite(lg[k])){var v=chatKeys.concat(outer).map(function(j){return lg[j];}).filter(finite);lg[k]=v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;}chatKeys.push(k);});
+var items=chatKeys.concat(outer),T=0,W=row.offsetWidth;items.forEach(function(k){T+=lg[k];});
 if(!(W>0)||!(T>0)){persist();return false;}
-var avail=W-7*(items.length-1),px={},sum=0;items.forEach(function(k){px[k]=avail*grow[k]/T;});
+var avail=W-7*(items.length-1),px={},sum=0;items.forEach(function(k){px[k]=avail*lg[k]/T;});
 items.forEach(function(k){setGrow(k,px[k]);});chatKeys.forEach(function(k){sum+=px[k];});
 setGrow('chat',sum+7*(chatKeys.length-1));persist();return true;};
 gutter('gv-a',function(){return lastChat();},'fleet-pane');
@@ -58294,7 +58300,7 @@ var drag=null,zones=[],ghost=document.getElementById('col-ghost');   // drag: {s
 function edgeWidth(w){return Math.max(72,Math.min(180,0.2*w));}   // the edge zone's width for a pane w px wide (and the bottom zone's height for a row that tall)
 function ghostRect(pane,rowRect){return {top:rowRect.top,height:rowRect.height,left:pane.left+pane.width/2,width:pane.width/2};}   // the right half of a row's rightmost pane, the row's height: what the drop produces
 function bottomRect(){if(hasRow2()){var lp=document.getElementById(lastPaneIn(2));return ghostRect(lp.getBoundingClientRect(),ROWS[2].getBoundingClientRect());}
-var a=area.getBoundingClientRect();return {top:a.top+a.height/2,height:a.height/2,left:a.left,width:a.width};}   // the bottom zone's promise: a column at the bottom row's right, else the row itself across the area's bottom half
+var a=area.getBoundingClientRect(),h=(a.height-7)/2;return {top:a.top+a.height-h,height:h,left:a.left,width:a.width};}   // the bottom zone's promise: a column at the bottom row's right, else the row itself — the area's bottom half less the 7 px row gutter's share, exactly the box the half split opens (review polish 2026-09-15)
 function zoneRect(z){if(z.classList.contains('col-drop-bottom'))return bottomRect();var r=Number(z.getAttribute('data-row'))===2?2:1;return ghostRect(z.parentElement.getBoundingClientRect(),ROWS[r].getBoundingClientRect());}
 function showGhost(z){if(!ghost)return;if(!z||!drag){ghost.classList.remove('on','refused');ghost.textContent='';return;}
 var r=zoneRect(z),refused=!!z.getAttribute('data-refused');

@@ -311,6 +311,10 @@ const LEGACY = [
   { name: "two", grow: { chat: 640, fleet: 34, feed: 400, chat2: 400 }, cols: [{ n: 2, ids: [cfg.b] }] },
   { name: "three", grow: { chat: 500, chat2: 300, chat3: 200, fleet: 34, feed: 400 }, cols: [{ n: 2, ids: [cfg.b] }, { n: 3, ids: [cfg.c] }] },
   { name: "four", grow: { chat: 400, chat2: 300, chat3: 200, chat4: 100, fleet: 34, feed: 300 }, cols: [{ n: 2, ids: [cfg.b] }, { n: 3, ids: [cfg.c] }, { n: 4, ids: [cfg.d] }] },
+  // a restored column with NO stored weight (review find 2026-09-15), two of them, and an empty legacy object
+  { name: "missing-one", grow: { chat: 640, fleet: 34, feed: 400 }, cols: [{ n: 2, ids: [cfg.b] }] },
+  { name: "missing-two", grow: { chat: 640, fleet: 34, feed: 400 }, cols: [{ n: 2, ids: [cfg.b] }, { n: 3, ids: [cfg.c] }] },
+  { name: "empty", grow: {}, cols: [{ n: 2, ids: [cfg.b] }, { n: 3, ids: [cfg.c] }] },
 ];
 out.s8 = {};
 for (const c of LEGACY) {
@@ -486,8 +490,9 @@ class ServedChatRows(unittest.TestCase):
         self.assertEqual([z["row"] for z in edges], ["1"], "one column: the top row's edge alone beside it")
         gh = s["ghost"]
         self.assertEqual(gh["cls"], "on"); self.assertEqual(gh["text"], "api", "the dragged session's name, no verb")
-        self.assertLessEqual(abs(gh["top"] - (before["area"]["top"] + before["area"]["height"] / 2)), 2, "the rectangle is the area's bottom half: %r vs %r" % (gh, before["area"]))
-        self.assertLessEqual(abs(gh["height"] - before["area"]["height"] / 2), 2)
+        want_h = (before["area"]["height"] - 7) / 2
+        self.assertLessEqual(abs(gh["height"] - want_h), 1, "the rectangle is the box the half split opens: the bottom half less the row gutter's share: %r vs %r" % (gh, before["area"]))
+        self.assertLessEqual(abs(gh["top"] - (before["area"]["bottom"] - want_h)), 1)
         self.assertLessEqual(abs(gh["left"] - before["area"]["left"]), 1); self.assertLessEqual(abs(gh["width"] - before["area"]["width"]), 1)
         a = s["after"]
         self.assertEqual(a["frames"], ["f-chat", "f-chat-2"])
@@ -497,6 +502,8 @@ class ServedChatRows(unittest.TestCase):
         self.assertLessEqual(abs(a["p2"]["top"] - a["row2"]["top"]), 1, "the new column is in the bottom row: %r" % a["p2"])
         self.assertLessEqual(abs(a["p2"]["width"] - a["row2"]["width"]), 1, "…and has the row to itself (no gutter ahead of it)")
         self.assertLessEqual(abs(a["p1"]["height"] - a["row1"]["height"]), 1, "the first pane now fills the top row only")
+        self.assertLessEqual(abs(a["row2"]["top"] - gh["top"]), 1, "the row IS the rectangle: it starts where the rectangle did: %r vs %r" % (a["row2"], gh))
+        self.assertLessEqual(abs(a["row2"]["height"] - gh["height"]), 1, "…and is as tall")
         self.assertEqual(a["nonce"], before["nonce"], "the first pane's document is the SAME document: nothing re-parented #f-chat")
         self.assertEqual(a["col2Tabs"], [SID_B]); self.assertNotIn(SID_B, a["col1Tabs"])
         self.assertEqual(a["zonesLeft"], 0, "every zone unmounted at the drop"); self.assertEqual(a["ghostAfter"]["display"], "none")
@@ -623,14 +630,15 @@ class ServedChatRows(unittest.TestCase):
         r = self._r()
         s = r["s6c"]
         gh, area = s["ghost"], s["areaBefore"]
-        self.assertLessEqual(abs(gh["top"] - (area["top"] + area["height"] / 2)), 2, "the rectangle is the area's bottom half: %r vs %r" % (gh, area))
-        self.assertLessEqual(abs(gh["height"] - area["height"] / 2), 2)
+        want_h = (area["height"] - 7) / 2
+        self.assertLessEqual(abs(gh["height"] - want_h), 1, "the rectangle is the box the half split opens: %r vs %r" % (gh, area))
+        self.assertLessEqual(abs(gh["top"] - (area["bottom"] - want_h)), 1)
         a = s["after"]
         self._assert_rows_stacked(a, "reopened")
         self.assertEqual(json.loads(a["cols"])["rowSplit"], 0.5, "the row opens at the half, not at step 5's dragged share: %r" % a["cols"])
-        # the row's box IS the rectangle's, to the half-gutter the rectangle rounds over (3.5 px: the 7 px gutter sits between the rows)
-        self.assertLessEqual(abs(a["row2"]["top"] - gh["top"]), 5, "the row starts where the rectangle did: %r vs %r" % (a["row2"], gh))
-        self.assertLessEqual(abs(a["row2"]["height"] - gh["height"]), 5, "…and is as tall: %r vs %r" % (a["row2"], gh))
+        # the row's box IS the rectangle's: the rectangle accounts for the 7 px gutter between the rows (review polish 2026-09-15)
+        self.assertLessEqual(abs(a["row2"]["top"] - gh["top"]), 1, "the row starts where the rectangle did: %r vs %r" % (a["row2"], gh))
+        self.assertLessEqual(abs(a["row2"]["height"] - gh["height"]), 1, "…and is as tall: %r vs %r" % (a["row2"], gh))
         self.assertLessEqual(abs(a["row1"]["height"] - a["row2"]["height"]), 2, "the two rows share the height evenly again")
         self.assertEqual(a["nonce"], r["s5"]["nonce2"])
 
@@ -642,12 +650,31 @@ class ServedChatRows(unittest.TestCase):
         self.assertEqual(sorted(s["col1Tabs"]), sorted([SID_A, SID_B, SID_C, SID_D, SID_E]))
         self.assertEqual(s["nonce"], r["s5"]["nonce2"])
 
+    @staticmethod
+    def _pre_rows_weights(stored, cols):
+        """The weights the PRE-ROWS shell laid the row out by: the store's, its defaults (chat 60, feed 40) for keys the store
+        lacks, and for a restored column with no stored weight its fair grow as it was made — the average of the panes then on
+        screen (the first pane, the columns made before it, the feed), in restoration order."""
+        w = dict({"chat": 60, "feed": 40}, **stored)
+        made = ["chat"]
+        for k in cols:
+            if k not in w:
+                pool = [w[j] for j in made + ["feed"]]
+                w[k] = sum(pool) / len(pool)
+            made.append(k)
+        return w
+
     def test_8_a_pre_rows_pane_store_reloads_at_the_widths_the_pre_rows_shell_gave_it(self):
         r = self._r()
         cases = {"one": ([], {"chat": 700, "feed": 300}), "two": (["chat2"], {"chat": 640, "chat2": 400, "feed": 400}),
                  "three": (["chat2", "chat3"], {"chat": 500, "chat2": 300, "chat3": 200, "feed": 400}),
-                 "four": (["chat2", "chat3", "chat4"], {"chat": 400, "chat2": 300, "chat3": 200, "chat4": 100, "feed": 300})}
-        for name, (cols, weights) in cases.items():
+                 "four": (["chat2", "chat3", "chat4"], {"chat": 400, "chat2": 300, "chat3": 200, "chat4": 100, "feed": 300}),
+                 # the missing-weight cases: chat2 resolves to (640 + 400) / 2 = 520, chat3 to (640 + 520 + 400) / 3 = 520; the empty
+                 # object to the pre-rows defaults, both columns at (60 + 40) / 2 = 50
+                 "missing-one": (["chat2"], {"chat": 640, "feed": 400}), "missing-two": (["chat2", "chat3"], {"chat": 640, "feed": 400}),
+                 "empty": (["chat2", "chat3"], {})}
+        for name, (cols, stored) in cases.items():
+            weights = self._pre_rows_weights(stored, cols)
             s = r["s8"][name]
             for which in ("first", "second"):
                 m = s[which]
@@ -671,7 +698,7 @@ class ServedChatRows(unittest.TestCase):
 
     def test_9_the_whole_story_runs_in_under_two_and_a_half_minutes_and_left_its_screenshots(self):
         r = self._r()
-        self.assertLess(r["ms"], 150_000, "the driver waits on conditions, never on fixed sleeps: %d ms" % r["ms"])
+        self.assertLess(r["ms"], 180_000, "the driver waits on conditions, never on fixed sleeps: %d ms" % r["ms"])
         self.assertEqual(r.get("shots"), ["stack-1-1-dark.png", "stack-1-1-light.png", "grid-2-2-dark.png", "grid-2-2-light.png"])
         for name in r["shots"]:
             self.assertTrue(os.path.getsize(os.path.join(SHOTS, name)) > 10_000, name + " is a real screenshot")

@@ -175,6 +175,7 @@ class SplitSourcePins(unittest.TestCase):
         self.assertIn(".col-drop.col-drop-bottom{top:auto;z-index:9}", self.html)
         self.assertIn("#chat-area{flex:var(--g-chat,60) 1 0;display:flex;flex-direction:column;position:relative;", self.html, "position:relative: the bottom zone's box")
         for needle in ["function bottomRect(){", "function zoneRect(z){if(z.classList.contains('col-drop-bottom'))return bottomRect();",
+                       "var a=area.getBoundingClientRect(),h=(a.height-7)/2;return {top:a.top+a.height-h,height:h,left:a.left,width:a.width};",   # the new row's rectangle is the box the half split opens, gutter and all (review polish 2026-09-15)
                        "function making(z){return z.classList.contains('col-drop-edge')||z.classList.contains('col-drop-bottom');}",
                        "var b=zone(area,'col-drop-bottom',null,function(sid){if(b.getAttribute('data-refused'))refuse();else moveTab(sid,'below');});"]:
             self.assertIn(needle, split, needle)
@@ -249,6 +250,12 @@ class SplitSourcePins(unittest.TestCase):
         # a pre-rows pane store (no chat1): the area's weight is set once from the top-row columns the split restored, in the
         # pixels of the pre-rows layout (review find 2026-09-15; tests/test_pane_gutters.py runs it)
         self.assertIn("window.__rompSeedAreaWeight=function(colKeys){if(!legacy)return false;legacy=false;", gut)
+        # …from a snapshot of the pre-rows weights taken at boot, a restored column with no stored weight given the pre-rows fair
+        # grow (the panes on screen as it was made, in restoration order), never the rows' sibling average make() applied since
+        self.assertIn("if(legacy)legacyGrow=Object.assign({},grow);", gut)
+        self.assertLess(gut.index("if(legacy)legacyGrow=Object.assign({},grow);"), gut.index("for(var k in grow)setGrow(k,grow[k]);"), "snapshotted before the first write")
+        self.assertIn("var lg=legacyGrow||{},outer=['fleet','feed','files'].filter(function(k){return shown(idOf(k));}),chatKeys=['chat1'];", gut)
+        self.assertIn("(colKeys||[]).forEach(function(k){if(!finite(lg[k])){var v=chatKeys.concat(outer).map(function(j){return lg[j];}).filter(finite);lg[k]=v.length?v.reduce(function(a,b){return a+b;},0)/v.length:50;}chatKeys.push(k);});", gut)
         self.assertIn("if(window.__rompSeedAreaWeight)window.__rompSeedAreaWeight(rowCols(1).map(function(c){return 'chat'+c.n;}));", km._LANDING_SPLIT_JS, "called at the split's boot with the TOP row's restored columns")
         boot = km._LANDING_SPLIT_JS[km._LANDING_SPLIT_JS.index("try{if(!mobile()){var r0=read();"):]
         self.assertLess(boot.index("cols.forEach(function(c){make(c.n,seedFor(c),null);});"), boot.index("__rompSeedAreaWeight(rowCols(1)"), "…after they are made (their stored weights applied)")
@@ -1489,8 +1496,8 @@ class RowsExecute(unittest.TestCase):
         o = self.out["one"]
         self.assertEqual(o["zones"], {"chat-pane": [self._edge("38px", "1")], "chat-area": [self._bottom("160px")]},
                          "one column: the top row's edge under the source strip, and the bottom zone a fifth of the area's 800 px")
-        self.assertEqual(o["ghost"], {"cls": "on", "text": "api", "top": "430px", "height": "400px", "left": "0px", "width": "1400px"},
-                         "the rectangle is the chat area's bottom half: what the drop produces")
+        self.assertEqual(o["ghost"], {"cls": "on", "text": "api", "top": "433.5px", "height": "396.5px", "left": "0px", "width": "1400px"},
+                         "the rectangle is the box the half split opens: the area's bottom half less the 7 px row gutter's share (800 - 7) / 2 from 30 + 800 - 396.5")
         self.assertEqual(o["afterLeave"]["cls"], "")
         d = o["dropped"]
         self.assertTrue(d["prevented"])
@@ -1678,7 +1685,7 @@ class RowsExecute(unittest.TestCase):
         f = r["folded"]
         self.assertEqual(f["area"], {"cls": "", "rs1": 50, "rs2": 50}, "the fold forgets the share in memory too, not only in the store")
         self.assertEqual(f["stored"], {"v": 2, "cols": []}); self.assertEqual(f["bytes"], json.dumps({"v": 2, "cols": []}, separators=(",", ":")))
-        self.assertEqual(r["ghost"], {"cls": "on", "text": "tests", "top": "430px", "height": "400px", "left": "0px", "width": "1400px"}, "the rectangle: the area's bottom half")
+        self.assertEqual(r["ghost"], {"cls": "on", "text": "tests", "top": "433.5px", "height": "396.5px", "left": "0px", "width": "1400px"}, "the rectangle: the box the half split opens")
         o = r["reopened"]
         self.assertEqual(o["area"], {"cls": "rows", "rs1": 50, "rs2": 50}, "…and the row opens at the half, not the 0.7 of the folded row")
         self.assertEqual(o["stored"], {"v": 2, "cols": [{"n": 2, "ids": [TESTS], "row": 2}], "rowSplit": 0.5}); self.assertEqual(o["bottom"], ["chat-pane-2"])

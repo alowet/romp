@@ -124,9 +124,19 @@ function flex(avail, ws) { const T = ws.reduce((a, b) => a + b, 0); return ws.ma
 // the widths a PRE-ROWS shell rendered from a pane store: every chat column and every shown outer pane in ONE row, a 7 px
 // gutter between each pair — and the widths the rows shell renders from the weights the upgrade hook leaves: the outer
 // row (the area, then the shown outer panes), then the chat columns inside the area behind their own gutters
+// …a column the pre-rows store held NO weight for took the pre-rows fair grow as it was made: the average of the finite
+// weights of the panes then on screen (the first pane, the columns made before it, the shown outer panes), in
+// restoration order; the pre-rows defaults stand in for keys the store lacks (chat 60, feed 40, fleet 34, files 40)
+const OLD_DEFAULTS = { chat: 60, fleet: 34, feed: 40, files: 40 };
+function legacyResolved(store, colKeys, outerShown) {
+  const w = Object.assign({}, OLD_DEFAULTS, store); const made = ['chat'];
+  colKeys.forEach((k) => { if (typeof w[k] !== 'number') { const v = made.concat(outerShown).map((j) => w[j]); w[k] = v.reduce((a, b) => a + b, 0) / v.length; } made.push(k); });
+  return w;
+}
 function legacyWidths(store, colKeys, outerShown) {
+  const w = legacyResolved(store, colKeys, outerShown);
   const chat = ['chat'].concat(colKeys), items = chat.concat(outerShown);
-  const px = flex(1007 - 7 * (items.length - 1), items.map((k) => store[k]));
+  const px = flex(1007 - 7 * (items.length - 1), items.map((k) => w[k]));
   const o = {}; items.forEach((k, i) => { o[k === 'chat' ? 'chat1' : k] = px[i]; }); return o;
 }
 function rowsWidths(g, colKeys, outerShown) {
@@ -263,6 +273,13 @@ const LEGACY = [
   { name: 'three', store: { chat: 500, chat2: 300, chat3: 200, fleet: 34, feed: 400 }, cols: ['chat2', 'chat3'], fleet: false },
   { name: 'four', store: { chat: 400, chat2: 300, chat3: 200, chat4: 100, fleet: 200, feed: 300, files: 40 }, cols: ['chat2', 'chat3', 'chat4'], fleet: true },
   { name: 'stale', store: { chat: 640, chat2: 400, chat3: 999, fleet: 34, feed: 400 }, cols: ['chat2'], fleet: false },
+  // a restored column with NO stored weight (review find 2026-09-15): the pre-rows shell gave it the average of chat 640 and
+  // feed 400, 520 — where make()'s rows' rule, run before the upgrade, gave it its row sibling's 640 and the upgrade froze that
+  { name: 'missingOne', store: { chat: 640, fleet: 34, feed: 400 }, cols: ['chat2'], fleet: false },
+  // two missing: the second averages the first's resolved 520 in — (640 + 520 + 400) / 3 = 520 again
+  { name: 'missingTwo', store: { chat: 640, fleet: 34, feed: 400 }, cols: ['chat2', 'chat3'], fleet: false },
+  // an EMPTY legacy object: the pre-rows defaults (chat 60, feed 40), both columns at their average 50
+  { name: 'empty', store: {}, cols: ['chat2', 'chat3'], fleet: false },
 ];
 out.upgrade = {};
 LEGACY.forEach((c) => {
@@ -431,7 +448,7 @@ class PaneGuttersExecute(unittest.TestCase):
 
     def test_12_the_upgrade_of_a_pre_rows_store_renders_the_widths_the_pre_rows_shell_did(self):
         u = self.out["upgrade"]
-        for name in ("one", "two", "three", "four", "stale"):
+        for name in ("one", "two", "three", "four", "stale", "missingOne", "missingTwo", "empty"):
             c = u[name]
             self.assertTrue(c["wrote"], name + ": a pre-rows store (no chat1) is upgraded")
             self.assertEqual(sorted(c["after"]), sorted(c["before"]), name + ": every pane the pre-rows row held is laid out")
@@ -452,6 +469,19 @@ class PaneGuttersExecute(unittest.TestCase):
         self.assertAlmostEqual(one["grows"]["--g-chat"], 1000 * 700 / 1000, places=6); self.assertAlmostEqual(one["grows"]["--g-chat1"], 700, places=6, msg="one column: the area is the pane")
         four = u["four"]
         self.assertAlmostEqual(four["grows"]["--g-fleet"], (1007 - 7 * 5) * 200 / 1500, places=6, msg="the outline shown: in the pre-rows row and normalised with it")
+        # the missing-weight rule in the hook's own numbers (the reviewer's case at a 1007 px row): chat2 resolves to 520, so
+        # 993 shared 640 : 520 : 400 — not the 640 : 640 : 400 make()'s sibling average had written before the upgrade
+        m1 = u["missingOne"]
+        self.assertAlmostEqual(m1["grows"]["--g-chat1"], 993 * 640 / 1560, places=6); self.assertAlmostEqual(m1["grows"]["--g-chat2"], 993 * 520 / 1560, places=6)
+        self.assertAlmostEqual(m1["grows"]["--g-feed"], 993 * 400 / 1560, places=6)
+        self.assertAlmostEqual(m1["grows"]["--g-chat"], 993 * 1160 / 1560 + 7, places=6)
+        m2 = u["missingTwo"]
+        self.assertAlmostEqual(m2["grows"]["--g-chat3"], (1007 - 21) * 520 / 2080, places=6, msg="the second missing weight averages the first's resolved 520 in: 520 again")
+        self.assertAlmostEqual(m2["grows"]["--g-chat2"], m2["grows"]["--g-chat3"], places=6)
+        em = u["empty"]
+        self.assertAlmostEqual(em["grows"]["--g-chat1"], 986 * 60 / 200, places=6, msg="an empty legacy object: the pre-rows defaults, chat 60 and feed 40")
+        self.assertAlmostEqual(em["grows"]["--g-chat2"], 986 * 50 / 200, places=6); self.assertAlmostEqual(em["grows"]["--g-chat3"], 986 * 50 / 200, places=6)
+        self.assertAlmostEqual(em["grows"]["--g-feed"], 986 * 40 / 200, places=6)
         cur = u["current"]
         self.assertFalse(cur["wrote"], "a store that already carries chat1 is not a pre-rows store: untouched")
         self.assertEqual(cur["grows"]["--g-chat"], 900); self.assertEqual(cur["grows"]["--g-chat1"], 640)
