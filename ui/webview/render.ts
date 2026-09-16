@@ -5051,10 +5051,15 @@ function rescindQueued(el: HTMLElement, toComposer: boolean): void {
     const known = ownPaths || ((el as any)._qpaths as string[] | undefined) || ((el as any)._qimgs as string[] | undefined) || null;
     const back = rescindedComposerState(qmd, known);
     const goal = (el as any)._qgoal as { itemId: string; title: string } | null | undefined;
-    const armedCites: string[] = [], armedFiles: string[] = [];   // what THIS press puts into the box, by identity: the refusal takes exactly these back
+    const armedCites: string[] = [], armedFiles: string[] = [];   // what THIS press puts into the box, by identity (a chip's key, a file entry's id): the refusal takes exactly these back
     if (goal && goal.itemId) { setCitation(sidQ, { itemId: goal.itemId, title: goal.title }); armedCites.push("g:" + goal.itemId); }
     else if (back.cites.length) { composerCitations.set(sidQ, back.cites.map((c) => ({ title: c.quote.split("\n")[0].slice(0, 80), quote: c.quote, src: c.src }))); persistDrafts(); renderComposerChips(sidQ); for (const c of back.cites) armedCites.push("q:" + c.quote + "\n" + (c.src || "")); }
-    for (const f of back.files) { addComposerFile(sidQ, f); armedFiles.push(f); }
+    for (const f of back.files) {
+      const had = new Set((composerFiles.get(sidQ) || []).map((e) => e.id));
+      addComposerFile(sidQ, f);
+      const added = (composerFiles.get(sidQ) || []).find((e) => !had.has(e.id));   // the entry this press created — none when the path was already on the strip (round twenty-three: by id, never by path)
+      if (added) armedFiles.push(added.id);
+    }
     restoreToComposer(back.text);
     // a provisional rescind gets no cancelResult (nothing was posted) — no stash to consume, none kept
     if (!provisional) pendingCancelRestores.set(activeId + " " + qmd, { before, after: ta ? ta.value : "", cites: citesBefore, files: filesBefore, armedCites, armedFiles });
@@ -16276,17 +16281,35 @@ let fireStage: () => void = () => { /* assigned by the composer closure */ };
 // move, the ✕ by index, the refused rescind's rollback, persistence — and the two can never diverge (a path held twice, marked once, was
 // how one legacy copy came back unmarked). It leaves only by the user's own act: the ✕ on the last such chip, or a send that empties
 // the strip. One reader, isUnverified; one door to a hold, armHold. An older persisted store's bare paths load as verified entries.
-interface ComposerFile { path: string; legacy: boolean }
-const composerFiles = new Map<string, ComposerFile[]>();   // sid -> attachments, in drop order, each with its provenance
+// `id` (round twenty-three): a stable per-entry identity, minted at creation and carried through the hand-off, the provisional move and
+// the store, so two entries of one path never collapse — the refused rescind's rollback reconciles the strip as a MULTISET of entries by
+// id, never by path (by path, a legacy copy ✕'d in the cancel window was "already present" through its verified twin and stayed gone,
+// its mark with it). ON THE WIRE and IN THE STORE the files stay the OLD shape — `files: string[]` — with the provenance and the ids in
+// aligned sibling lists (`filesLegacy: boolean[]`, `filesIds: string[]`) a reader may lack: the frames of one dashboard are not
+// guaranteed one bundle (a rebuild in place; a later column loads the new render.js while a pane holding the reload runs the old),
+// and the old reader keeps only strings — a new sender's objects were every attachment dropped on a move.
+interface ComposerFile { id: string; path: string; legacy: boolean }
+const composerFiles = new Map<string, ComposerFile[]>();   // sid -> attachments, in drop order, each with its identity and provenance
+let fileSeq = 0;
+function mintFileId(): string { return "f" + Date.now().toString(36) + "." + (++fileSeq) + "." + Math.random().toString(36).slice(2, 8); }
 function filePaths(sid: string | null): string[] { return sid ? (composerFiles.get(sid) || []).map((e) => e.path) : []; }
+// The wire / store view of a list (round twenty-three): the old `files` strings plus the aligned sibling lists.
+function fileWire(list: readonly ComposerFile[]): { files: string[]; filesLegacy: boolean[]; filesIds: string[] } {
+  return { files: list.map((e) => e.path), filesLegacy: list.map((e) => e.legacy), filesIds: list.map((e) => e.id) };
+}
 function isUnverified(sid: string | null): boolean { return !!sid && (composerFiles.get(sid) || []).some((e) => e.legacy); }
-// The entries a persisted store or a hand-off carries: today's `{ path, legacy }` objects, or an older page's bare paths — verified,
-// the accepted upgrade residual (a legacy file attached before round twenty-two loads without its mark).
-function fileEntriesOf(v: unknown): ComposerFile[] {
+// The entries a persisted store or a hand-off carries (round twenty-three): `files` as bare paths — the old shape, and the only one
+// an older reader keeps — with the provenance and the ids in aligned sibling lists when the writer had them (a writer without them:
+// every file verified, ids minted here); or round twenty-two's `{ path, legacy }` objects, one interim store's shape (ids minted).
+function fileEntriesOf(v: unknown, legacy?: unknown, ids?: unknown): ComposerFile[] {
   const out: ComposerFile[] = [];
+  const L = Array.isArray(legacy) ? legacy : [], I = Array.isArray(ids) ? ids : [];
+  let i = 0;
   for (const x of (Array.isArray(v) ? v : [])) {
-    if (typeof x === "string" && x) out.push({ path: x, legacy: false });
-    else if (x && typeof x === "object" && typeof (x as { path?: unknown }).path === "string" && (x as { path: string }).path) out.push({ path: (x as { path: string }).path, legacy: (x as { legacy?: unknown }).legacy === true });
+    const at = i++;
+    if (typeof x === "string" && x) out.push({ id: typeof I[at] === "string" && I[at] ? I[at] : mintFileId(), path: x, legacy: L[at] === true });
+    else if (x && typeof x === "object" && typeof (x as { path?: unknown }).path === "string" && (x as { path: string }).path)
+      out.push({ id: typeof (x as { id?: unknown }).id === "string" && (x as { id: string }).id ? (x as { id: string }).id : mintFileId(), path: (x as { path: string }).path, legacy: (x as { legacy?: unknown }).legacy === true });
   }
   return out;
 }
@@ -16299,9 +16322,9 @@ function restoreComposerAfterRefusedRescind(sid: string, stash: { cites: Citatio
   const cites = (composerCitations.get(sid) || []).filter((c) => !(armedC.has(citeKey(c)) && !beforeC.has(citeKey(c))));
   for (const c of stash.cites) if (!cites.some((x) => citeKey(x) === citeKey(c))) cites.push(c);
   if (cites.length) composerCitations.set(sid, cites); else composerCitations.delete(sid);
-  const beforeF = new Set(stash.files.map((e) => e.path)), armedF = new Set(stash.armedFiles);
-  const files = (composerFiles.get(sid) || []).filter((e) => !(armedF.has(e.path) && !beforeF.has(e.path)));
-  for (const e of stash.files) if (!files.some((x) => x.path === e.path)) files.push({ ...e });
+  const armedF = new Set(stash.armedFiles);   // the ids of the entries the press created
+  const files = (composerFiles.get(sid) || []).filter((e) => !armedF.has(e.id));   // a MULTISET by id (round twenty-three): two entries of one path never collapse, and a ✕'d legacy copy comes back as itself
+  for (const e of stash.files) if (!files.some((x) => x.id === e.id)) files.push({ ...e });
   if (files.length) composerFiles.set(sid, files); else composerFiles.delete(sid);
   persistDrafts(); renderComposerChips(sid); renderComposerFiles(sid);
 }
@@ -16671,7 +16694,11 @@ function persistDrafts(): void {
   try {
     vscodeApi?.setState?.({ ...(vscodeApi.getState?.() || {}), drafts: Object.fromEntries(drafts),
                             citations: Object.fromEntries(composerCitations),
-                            files: Object.fromEntries(composerFiles),   // entries, provenance included (round twenty-two): a reload does not forget which are unverified
+                            // the files in the OLD shape — paths — with the provenance and the ids beside them (round twenty-three): an older page of
+                            // the same dashboard reads `files` as it always did; this page rebuilds the entries from the three lists
+                            files: Object.fromEntries([...composerFiles].map(([k, v]) => [k, fileWire(v).files])),
+                            filesLegacy: Object.fromEntries([...composerFiles].map(([k, v]) => [k, fileWire(v).filesLegacy])),
+                            filesIds: Object.fromEntries([...composerFiles].map(([k, v]) => [k, fileWire(v).filesIds])),
                             staged: stagedMsgs.entries(),
                             // the FAILED creates, by their tab's id (round six): the tab comes back after a reload with its
                             // reason and its draft, and its ✕ — the one discard — takes this record with the draft
@@ -16696,10 +16723,10 @@ function bootComposerState(): void {
   try {
   const saved = ((vscodeApi?.getState?.() || {}) as any).drafts;
   if (saved && typeof saved === "object") for (const [k, v] of Object.entries(saved)) if (typeof v === "string") drafts.set(k, v);
-  const savedFiles = ((vscodeApi?.getState?.() || {}) as any).files;
+  const savedFiles = ((vscodeApi?.getState?.() || {}) as any).files, savedLegacy = ((vscodeApi?.getState?.() || {}) as any).filesLegacy, savedIds = ((vscodeApi?.getState?.() || {}) as any).filesIds;
   if (savedFiles && typeof savedFiles === "object")
     for (const [k, v] of Object.entries(savedFiles)) {
-      const entries = fileEntriesOf(v);   // entries with their provenance; an older store's bare paths load as verified (round twenty-two)
+      const entries = fileEntriesOf(v, savedLegacy && typeof savedLegacy === "object" ? (savedLegacy as any)[k] : undefined, savedIds && typeof savedIds === "object" ? (savedIds as any)[k] : undefined);   // paths + siblings (round twenty-three); an older store's bare paths, or round twenty-two's objects, load too
       if (entries.length) composerFiles.set(k, entries);
     }
   const savedCites = ((vscodeApi?.getState?.() || {}) as any).citations;
@@ -17197,7 +17224,7 @@ function addComposerFile(id: string | null, path: string, legacy = false): void 
   const list = composerFiles.get(id) || [];
   const hit = list.find((e) => e.path === path);
   if (hit) hit.legacy = hit.legacy || legacy;       // the same file dropped twice attaches once; a guess over a known path leaves it unverified (round twenty-two)
-  else list.push({ path, legacy });                // an older kernel's guess (round twenty-one): this composer is unverified until the user acts
+  else list.push({ id: mintFileId(), path, legacy });   // its own identity (round twenty-three); an older kernel's guess (round twenty-one) makes the composer unverified until the user acts
   composerFiles.set(id, list);
   persistDrafts();
   if (id === activeId) renderComposerFiles(id);
@@ -17474,13 +17501,13 @@ const sessionMru: string[] = [];
 // they are current), not this page's snapshot from its last render: a held column's kernel frames may not have landed since
 // the hold, and its snapshot would still call the member the peer moved away "shown here" — and drop its draft.
 (window as any).__rompOrphanStateSids = (): string[] => { colSets = readColSets(); if (activeId) stashActiveDraft(activeId); return orphanStateSids(); };   // the box's live text counts: stashed first, so an active tab this column no longer lists is in the list
-(window as any).__rompTakeSessionState = (sid: string): { draft: string; citations: Citation[]; files: ComposerFile[]; staged: StagedMsg[] } | null => {
+(window as any).__rompTakeSessionState = (sid: string): { draft: string; citations: Citation[]; files: string[]; staged: StagedMsg[]; filesLegacy: boolean[]; filesIds: string[] } | null => {
   if (typeof sid !== "string" || !sid) return null;
   const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
   const boxHeld = sid === activeId && !!ta && !!ta.value.trim();   // the box holds words: the reload core's `typing` hold stands on it (editing())
   if (sid === activeId && ta) { if (ta.value) drafts.set(sid, ta.value); else drafts.delete(sid); }
-  const draft = drafts.get(sid) ?? "", citations = composerCitations.get(sid) ?? [], files = composerFiles.get(sid) ?? [], staged = stagedMsgs.takeAll(sid);
-  drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid);   // the files travel as entries, provenance included (round twenty-two)
+  const draft = drafts.get(sid) ?? "", citations = composerCitations.get(sid) ?? [], wire = fileWire(composerFiles.get(sid) ?? []), files = wire.files, staged = stagedMsgs.takeAll(sid);   // the files in the OLD shape, their provenance and ids beside them (round twenty-three)
+  drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid);   // the files travel as paths with their provenance and ids in sibling lists (round twenty-three)
   if (draft || staged.length) handedOff.add(sid);   // the words left with the tab (round twelve): a held send here would be the bare path — sendHeldFor's belt
   if (sid === activeId) { if (ta) { ta.value = ""; growComposer(ta); } renderComposerChips(sid); renderComposerFiles(sid); renderStagedStrip(sid); }
   // the typing hold's ENDING event (round eleven, 2026-09-16): the core hears a draft cleared by typing ('input') or a blur, never a
@@ -17490,7 +17517,7 @@ const sessionMru: string[] = [];
   if (boxHeld) { try { (window as any).__rompReload?.ended?.(); } catch { /* no core (the VS Code webview) */ } }
   persistDrafts();
   if (!draft && !citations.length && !files.length && !staged.length) return null;
-  return { draft, citations, files, staged };
+  return { draft, citations, files, staged, filesLegacy: wire.filesLegacy, filesIds: wire.filesIds };
 };
 // …and the TARGET page's half: what the source held, into the maps (joined onto anything already here, never over
 // it), persisted, and into the box when the tab is active. The shell posts it on a new column's load or at once.
@@ -17504,10 +17531,10 @@ function reclaimHandedOff(): void { for (const sid of [...handedOff]) if (heldHe
 function adoptSessionState(sid: unknown, state: unknown): void {
   if (typeof sid !== "string" || !sid || !state || typeof state !== "object") return;
   handedOff.delete(sid);   // the words are here again
-  const st = state as { draft?: unknown; citations?: unknown; files?: unknown; staged?: unknown };
+  const st = state as { draft?: unknown; citations?: unknown; files?: unknown; staged?: unknown; filesLegacy?: unknown; filesIds?: unknown };
   if (typeof st.draft === "string" && st.draft) drafts.set(sid, [drafts.get(sid) ?? "", st.draft].filter(Boolean).join("\n\n"));
   if (Array.isArray(st.files) && st.files.length) {
-    const entries = fileEntriesOf(st.files);   // entries with their provenance (an older page's bare paths: verified), appended — a path held twice is held twice, each with its own mark (round twenty-two)
+    const entries = fileEntriesOf(st.files, st.filesLegacy, st.filesIds);   // the old shape's paths with their provenance and ids beside them (an older page sends paths alone: verified), appended — a path held twice is held twice, each with its own mark and identity (rounds twenty-two, twenty-three)
     if (entries.length) composerFiles.set(sid, [...(composerFiles.get(sid) ?? []), ...entries]);
   }
   if (isUnverified(sid)) disarmUnverified(sid);   // an unverified attachment arrived: a hold this session held is cancelled, said — no automatic send with a guessed file

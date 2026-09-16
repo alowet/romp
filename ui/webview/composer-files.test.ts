@@ -65,7 +65,7 @@ test("an image thumbnail renders per surface; other files wear an ext + name chi
   assert.match(fn, /openPath\(p, id \|\| null, e\);/);   // with its click: a modified click on a PDF takes a browser tab
   assert.match(fn, /if \(id\) removeComposerFile\(id, i\);/);
   // the same file dropped twice attaches once
-  assert.match(RENDER, /const hit = list\.find\(\(e\) => e\.path === path\);\n  if \(hit\) hit\.legacy = hit\.legacy \|\| legacy;[^\n]*\n  else list\.push\(\{ path, legacy \}\);/);
+  assert.match(RENDER, /const hit = list\.find\(\(e\) => e\.path === path\);\n  if \(hit\) hit\.legacy = hit\.legacy \|\| legacy;[^\n]*\n  else list\.push\(\{ id: mintFileId\(\), path, legacy \}\);/);
 });
 
 test("attachments ride the send as a trailing line of paths, quoted when they hold spaces", () => {
@@ -81,8 +81,8 @@ test("attachments ride the send as a trailing line of paths, quoted when they ho
 
 test("attachments live the DRAFT lifecycle: switch, reload, close", () => {
   // persisted beside drafts/citations/staged, restored as a list of strings
-  assert.match(RENDER, /files: Object\.fromEntries\(composerFiles\),/);
-  assert.match(RENDER, /const savedFiles = \(\(vscodeApi\?\.getState\?\.\(\) \|\| \{\}\) as any\)\.files;/);
+  assert.match(RENDER, /files: Object\.fromEntries\(\[\.\.\.composerFiles\]\.map\(\(\[k, v\]\) => \[k, fileWire\(v\)\.files\]\)\),/, "the store's `files` are paths — the old shape (round twenty-three)");
+  assert.match(RENDER, /const savedFiles = \(\(vscodeApi\?\.getState\?\.\(\) \|\| \{\}\) as any\)\.files, savedLegacy = \(\(vscodeApi\?\.getState\?\.\(\) \|\| \{\}\) as any\)\.filesLegacy, savedIds = /);
   // a tab switch REPAINTS the strip (unlike citations, which the switch abandons); the staged
   // strip (2026-08-15) repaints in the same breath, between the chips and the files
   assert.match(RENDER, /renderComposerChips\(id\);   \/\/ the entering tab's own citation chip \(if any\)\s*\n\s*renderStagedStrip\(id\);[^\n]*\n\s*renderComposerFiles\(id\);/);
