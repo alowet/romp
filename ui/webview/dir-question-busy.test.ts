@@ -59,10 +59,11 @@ type Api = {
   setSets: (sets: Record<string, string[]>) => void; reclaim: () => void;   // round thirteen: the shell's sets as they stand, and renderTabs's reclaim of the handed-off marker
   heading: (sid: string) => string;   // round fourteen: the held strip's heading, its count
   unverified: (sid: string) => boolean; removeFile: (id: string, idx: number) => void;   // round twenty-one
+  rollback: (sid: string, stash: Record<string, unknown>) => void;   // round twenty-two
   legacyFor: (name: string) => string | undefined;   // round sixteen: the ship a legacy (untagged) answer names, by the saved name
   shipUnposted: (id: string, name: string, shipId: string, b64?: string, kind?: "composer" | "comment") => void; post: (id: string, shipId: string) => void;   // round eighteen: the post boundary
   draft: (sid: string, text: string) => void;   // round fifteen: a session's draft, written as the box's stash would
-  held: { stage: (id: string, text: string, cites?: unknown[]) => void; cite: (id: string, chips?: unknown[]) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown>; drafts: () => Record<string, string> };
+  held: { stage: (id: string, text: string, cites?: unknown[]) => void; cite: (id: string, chips?: unknown[]) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown>; entries: () => Record<string, unknown>; drafts: () => Record<string, string> };
   busy: () => boolean; answer: (v: string | null) => void; confirm: () => { title: string; buttons: string[]; key: string | null } | null;
   overlays: () => number; clickButton: (label: string) => boolean; rid: () => string | null;
   type: (t: string) => void; composer: () => string; picker: () => { open: boolean; search: string; dir: string }; state: () => State;
@@ -93,7 +94,8 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
      fnOpt("shipFailed"), fnOpt("sendHeldFor"), fn("flushStaged"), fn("routeUserMessage"), fn("noteOrphanState"),
      fnOpt("shipRecord"), fnOpt("retainShipBytes"), fnOpt("failShipsOfHost"), fnOpt("columnBusyWhy"), fnOpt("askCloseUpload"), fnOpt("abandonPendingUploads"), fn("reshipPendingUploads"), fn("noteColumnEmptiness"),
      fnOpt("composerShips"), lineOpt("reclaimHandedOff"), fnOpt("legacyShipFor"), lineOpt("legacyNameOf"), fnOpt("uploadingHeading"), fnOpt("postShipFrame"), fnOpt("noteAmbiguity"),
-     lineOpt("isUnverified"), lineOpt("markLegacyFile"), lineOpt("unmarkLegacyFile"), lineOpt("dropLegacyMarks"), lineOpt("moveLegacyMarks"), fnOpt("armHold"), fnOpt("disarmUnverified"), fn("removeComposerFile"),   /* noteAmbiguity: gone since round nineteen; lifted when an older render.ts (780e439e) still has it, so the fail-before run reads clean */
+     lineOpt("isUnverified"), lineOpt("markLegacyFile"), lineOpt("unmarkLegacyFile"), lineOpt("dropLegacyMarks"), lineOpt("moveLegacyMarks"), fnOpt("armHold"), fnOpt("disarmUnverified"), fn("removeComposerFile"),
+     lineOpt("filePaths"), fnOpt("fileEntriesOf"), fnOpt("restoreComposerAfterRefusedRescind"), fnOpt("citeKey"),   /* noteAmbiguity: gone since round nineteen; lifted when an older render.ts (780e439e) still has it, so the fail-before run reads clean */
      winLine("__rompSessionBusy"), winLine("__rompColumnBusyWhy")].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
@@ -187,12 +189,13 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       setSets: (s) => { colSets = s; }, reclaim: () => reclaimHandedOff(),   // what renderTabs does first: reads the sets, reclaims the marker for a sid shown here again
       heading: (sid) => uploadingHeading(sid),
       unverified: (sid) => (typeof isUnverified === "function" ? isUnverified(sid) : false), removeFile: (id, idx) => removeComposerFile(id, idx),   // round twenty-one: the mark, and the user's ✕ on a chip
+      rollback: (sid, stash) => restoreComposerAfterRefusedRescind(sid, stash),   // round twenty-two: the refused rescind's restore, with the stash as the press left it
       legacyFor: (name) => { const p = legacyShipFor(name, ""); const q = p && p.ship ? p.ship : p; return q ? q.shipId : undefined; },   // what the nack branch does with an untagged local name (rounds sixteen, seventeen, nineteen; an older render.ts answered { ship, matches })
       draft: (sid, text) => { drafts.set(sid, text); persistDrafts(); },
       route: (m) => (typeof routeCreateReply === "function" ? routeCreateReply(m).kind : "?"),
       // (each persists, as the page's own staging / citing / attaching does)
-      held: { stage: (id, text, cites) => { stagedMsgs.push(id, { text, cites: cites || [] }); persistDrafts(); }, cite: (id, chips) => { composerCitations.set(id, chips || [{ title: "a card", itemId: "g1" }]); persistDrafts(); }, attach: (id) => { composerFiles.set(id, ["/tmp/a.png"]); persistDrafts(); },
-              staged: () => stagedMsgs.entries(), citations: () => Object.fromEntries(composerCitations), files: () => Object.fromEntries(composerFiles), drafts: () => Object.fromEntries(drafts) },
+      held: { stage: (id, text, cites) => { stagedMsgs.push(id, { text, cites: cites || [] }); persistDrafts(); }, cite: (id, chips) => { composerCitations.set(id, chips || [{ title: "a card", itemId: "g1" }]); persistDrafts(); }, attach: (id) => { composerFiles.set(id, typeof filePaths === "function" ? [{ path: "/tmp/a.png", legacy: false }] : ["/tmp/a.png"]); persistDrafts(); },
+              staged: () => stagedMsgs.entries(), citations: () => Object.fromEntries(composerCitations), files: () => Object.fromEntries([...composerFiles].map(([k, v]) => [k, v.map((e) => (typeof e === "string" ? e : e.path))])), entries: () => Object.fromEntries(composerFiles), drafts: () => Object.fromEntries(drafts) },
       fireTimers: () => { const t = HOOKS.timers.splice(0); for (const f of t) f(); return t.length; },
       type: (t) => { EL["composer-input"].value = t; }, composer: () => EL["composer-input"].value,
       picker: () => ({ open: EL.picker.style.display !== "none", search: EL["picker-search"].value, dir: EL["picker-dir"].value }),
@@ -556,7 +559,7 @@ test("round nine: adoption carries the staged message (with its citation), the u
   assert.deepEqual(w.api.held.citations()[X], [CARD], "the unsent chip");
   assert.deepEqual(w.api.held.files()[X], ["/tmp/a.png"], "the attached file"); assert.equal(w.api.held.drafts()[X], TYPED, "the plain draft, as before");
   nothingUnder(w, id);
-  assert.deepEqual((w.store.staged as any)[X], [{ text: "staged while opening", cites: [CARD] }], "on disk under the real sid"); assert.deepEqual((w.store.files as any)[X], ["/tmp/a.png"]);
+  assert.deepEqual((w.store.staged as any)[X], [{ text: "staged while opening", cites: [CARD] }], "on disk under the real sid"); assert.deepEqual((w.store.files as any)[X], [{ path: "/tmp/a.png", legacy: false }]);
   assert.deepEqual(w.HOOKS.claims, [X]); assert.equal(w.api.busy(), false);
 });
 
@@ -636,7 +639,7 @@ test("round eleven: an upload never crosses documents — a create resolved to a
   assert.ok(w.HOOKS.seq.lastIndexOf("persist") < w.HOOKS.seq.lastIndexOf("flip:false"), "persisted before the flip");
   assert.ok(w.HOOKS.posts.some((p) => p.romp === "orphanState" && (p.sids as string[]).includes(A)), "the completed file under an unshown session is offered to the pane that shows it");
   const st = w.api.take(A);
-  assert.deepEqual(st, { draft: TYPED, citations: [], files: ["drops/1700000000000-photo.png"], staged: [], legacy: [] }, "the hand-off's exact fields: no upload, no held send — and which files are unverified (none here, round twenty-one)");
+  assert.deepEqual(st, { draft: TYPED, citations: [], files: [{ path: "drops/1700000000000-photo.png", legacy: false }], staged: [] }, "the hand-off's exact fields: no upload, no held send; each file with its provenance (round twenty-two)");
   assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "dropFile").map((m) => m.shipId), ["s1"], "one frame per upload — its creation post (the unread one never posted) — and no re-send, ever");
   // the receiving pane ignores an upload or a held-send field an older page might still send: never a chip, never a hold, never a re-ship
   const r = receiving(); r.api.adoptState(A, { ...st, ships: [{ name: "x.png", shipId: "s9", b64: "QUJD" }], heldSend: true });
@@ -1002,7 +1005,7 @@ test("round twenty-one: an older kernel's guessed attachment makes the composer 
   const w = world({ activeId: A, mru: [A], order: [A], nextActive: A, store: {}, sets: { "": [A] } });   // A active; a dismissal falls back to A
   w.api.ship(A, "a.png", "a1", "QUJD"); w.api.type(TYPED); assert.equal(w.api.holdSend(A), true);
   w.api.ack({ type: "droppedPath", path: "drops/9-foreign.png", host: "TESTHOST" });   // an unmatched legacy answer: attached to A by the fallback
-  assert.equal(w.api.unverified(A), true, "A is unverified"); assert.deepEqual(w.api.heldSend(), [], "A's hold gone"); assert.deepEqual((w.store.legacy as any)[A], ["drops/9-foreign.png"], "…and the mark is on disk");
+  assert.equal(w.api.unverified(A), true, "A is unverified"); assert.deepEqual(w.api.heldSend(), [], "A's hold gone"); assert.deepEqual((w.store.files as any)[A], [{ path: "drops/9-foreign.png", legacy: true }], "…and the mark is on disk, on the entry");
   assert.equal(w.api.holdSend(A), false, "no hold may be armed on it"); assert.ok(w.HOOKS.toasts.some((t) => /can't be sent automatically/.test(t)));
   const r = world({ activeId: null, mru: [], order: [A], nextActive: null, store: w.store, sets: { "": [A] } });   // a reload over the same store
   assert.equal(r.api.unverified(A), true, "the reload remembers");
@@ -1014,7 +1017,7 @@ test("round twenty-one: an older kernel's guessed attachment makes the composer 
   w.api.ack({ type: "droppedPath", path: "drops/1-a.png", shipId: "a1" }); w.api.ack({ type: "droppedPath", path: "drops/2-p.png", shipId: "p1" });
   assert.deepEqual(w.api.held.files()[A], ["drops/9-foreign.png", "drops/1-a.png", "drops/2-p.png"]); assert.equal(w.HOOKS.fired, 0, "nothing sent"); assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage"), []);
   w.api.removeFile(A, 0);   // the user's ✕ on the legacy chip
-  assert.equal(w.api.unverified(A), false, "verified again"); assert.equal((w.store.legacy as any)[A], undefined, "…on disk too");
+  assert.equal(w.api.unverified(A), false, "verified again"); assert.ok(!((w.store.files as any)[A] || []).some((e: any) => e.legacy), "…on disk too");
   w.api.ship(A, "z.png", "z1", "QUJD"); assert.equal(w.api.holdSend(A), true, "a NEW hold may be armed");
   w.api.ack({ type: "droppedPath", path: "drops/3-z.png", shipId: "z1" });
   assert.equal(w.HOOKS.fired, 1, "…and fires normally");
@@ -1026,9 +1029,53 @@ test("round twenty-one: the mark travels with the file across the hand-off — t
   w.api.ack({ type: "droppedPath", path: "drops/1-a.png" });   // a legacy answer matched to A's own ship: attached, A unverified
   assert.equal(w.api.unverified(A), true);
   const st = w.api.take(A);
-  assert.deepEqual(st.legacy, ["drops/1-a.png"], "the mark rides the state"); assert.equal(w.api.unverified(A), false, "…and leaves the source with the file");
+  assert.deepEqual(st.files, [{ path: "drops/1-a.png", legacy: true }], "the file rides the state with its provenance (round twenty-two)"); assert.equal(w.api.unverified(A), false, "…and leaves the source with the file");
   const v = receiving(); v.api.ship(A, "v.png", "v1", "QUJD"); assert.equal(v.api.holdSend(A), true);
   v.api.adoptState(A, st);
   assert.equal(v.api.unverified(A), true, "the receiving pane is unverified"); assert.deepEqual(v.api.heldSend(), [], "its hold cancelled"); assert.ok(v.HOOKS.toasts.some((t) => /can't be sent automatically/.test(t)));
   assert.deepEqual(v.api.held.files()[A], ["drops/1-a.png"]);
+});
+
+// ---- round twenty-two ----
+test("round twenty-two: the mark lives on the entry — a path held twice is unverified twice: one ✕ leaves it unverified, no hold arms, a tagged answer sends nothing; the second ✕ verifies it and a new hold fires with the verified files only", () => {
+  const w = world({ activeId: A, mru: [A], order: [A], nextActive: A, store: {}, sets: { "": [A] } });
+  w.api.ack({ type: "droppedPath", path: "drops/9-L.png", host: "TESTHOST" });   // an unmatched legacy answer: L attached to the active A, unverified
+  w.api.adoptState(A, { files: [{ path: "drops/9-L.png", legacy: true }] });      // a hand-off brings another L, marked
+  assert.deepEqual(w.api.held.entries()[A], [{ path: "drops/9-L.png", legacy: true }, { path: "drops/9-L.png", legacy: true }], "held twice, marked twice");
+  w.api.removeFile(A, 0);   // the user ✕'s one
+  assert.equal(w.api.unverified(A), true, "one L remains — still unverified"); assert.equal(w.api.holdSend(A), false, "no hold may be armed");
+  w.api.ship(A, "v.png", "v1", "QUJD"); w.api.type(TYPED);
+  w.api.ack({ type: "droppedPath", path: "drops/1-v.png", shipId: "v1" });
+  assert.equal(w.HOOKS.fired, 0, "a tagged answer sends nothing"); assert.deepEqual(w.api.held.files()[A], ["drops/9-L.png", "drops/1-v.png"]);
+  w.api.removeFile(A, 0);   // the second L
+  assert.equal(w.api.unverified(A), false, "verified"); assert.deepEqual(w.api.held.files()[A], ["drops/1-v.png"]);
+  w.api.ship(A, "z.png", "z1", "QUJD"); assert.equal(w.api.holdSend(A), true, "a new hold arms");
+  w.api.ack({ type: "droppedPath", path: "drops/2-z.png", shipId: "z1" });
+  assert.equal(w.HOOKS.fired, 1, "…and fires with the verified files only");
+});
+
+test("round twenty-two: the refused rescind's rollback restores a legacy file WITH its mark — the ✕ in the cancel window is overridden as before, never its provenance", () => {
+  const w = receiving();
+  w.api.ack({ type: "droppedPath", path: "drops/9-L.png", host: "TESTHOST" });   // L attached after the message was queued: unverified
+  const stash = { before: "", after: "", cites: [], files: JSON.parse(JSON.stringify(w.api.held.entries()[A])), armedCites: [], armedFiles: ["drops/5-armed.png"] };   // the press stashed the strip as it stood, then armed its own file
+  w.api.ack({ type: "droppedPath", path: "drops/5-armed.png", shipId: "none" });   // (the armed file arrives by any road: here a tagged frame for no ship is dropped, so attach it as the press would)
+  w.api.rollback(A, { ...stash, files: [] }); w.api.removeFile(A, 0);   // (clear the way: nothing before, L gone) — now the real sequence:
+  w.api.ack({ type: "droppedPath", path: "drops/9-L.png", host: "TESTHOST" });
+  const armedStash = { before: "", after: "", cites: [], files: JSON.parse(JSON.stringify(w.api.held.entries()[A])), armedCites: [], armedFiles: ["drops/5-armed.png"] };
+  w.api.adoptState(A, { files: ["drops/5-armed.png"] });   // the press's own file, verified
+  w.api.removeFile(A, 0);   // the user ✕'s L inside the cancel window
+  assert.equal(w.api.unverified(A), false);
+  w.api.rollback(A, armedStash);   // cancelResult ok:false
+  assert.deepEqual(w.api.held.entries()[A], [{ path: "drops/9-L.png", legacy: true }], "the armed file goes, L comes back WITH its mark"); assert.equal(w.api.unverified(A), true, "unverified again");
+});
+
+test("round twenty-two: entries round-trip through the store with their provenance; an older store's bare paths load as verified entries", () => {
+  const store: Record<string, unknown> = {};
+  const w = world({ activeId: A, mru: [A], order: [A], nextActive: A, store, sets: { "": [A] } });
+  w.api.ack({ type: "droppedPath", path: "drops/9-L.png", host: "TESTHOST" }); w.api.adoptState(A, { files: ["drops/1-ok.png"] });
+  assert.deepEqual((store.files as any)[A], [{ path: "drops/9-L.png", legacy: true }, { path: "drops/1-ok.png", legacy: false }], "persisted as entries");
+  const r = world({ activeId: null, mru: [], order: [A], nextActive: null, store, sets: { "": [A] } });
+  assert.deepEqual(r.api.held.entries()[A], [{ path: "drops/9-L.png", legacy: true }, { path: "drops/1-ok.png", legacy: false }], "back with their marks"); assert.equal(r.api.unverified(A), true);
+  const o = world({ activeId: null, mru: [], order: [A], nextActive: null, store: { files: { [A]: ["drops/old-1.png", "drops/old-2.png"] } }, sets: { "": [A] } });   // a store from before the entries
+  assert.deepEqual(o.api.held.entries()[A], [{ path: "drops/old-1.png", legacy: false }, { path: "drops/old-2.png", legacy: false }], "bare paths load as verified entries"); assert.equal(o.api.unverified(A), false);
 });

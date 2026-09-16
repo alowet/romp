@@ -5047,7 +5047,7 @@ function rescindQueued(el: HTMLElement, toComposer: boolean): void {
     // refused rescind must not leave a goal or attachments the user never asked for on their next message).
     const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
     const before = ta ? ta.value : "";
-    const citesBefore = (composerCitations.get(sidQ) || []).slice(), filesBefore = (composerFiles.get(sidQ) || []).slice();
+    const citesBefore = (composerCitations.get(sidQ) || []).slice(), filesBefore = (composerFiles.get(sidQ) || []).map((e) => ({ ...e }));   // the entries as they stood, provenance included (round twenty-two)
     const known = ownPaths || ((el as any)._qpaths as string[] | undefined) || ((el as any)._qimgs as string[] | undefined) || null;
     const back = rescindedComposerState(qmd, known);
     const goal = (el as any)._qgoal as { itemId: string; title: string } | null | undefined;
@@ -5078,7 +5078,7 @@ function rescindQueued(el: HTMLElement, toComposer: boolean): void {
 // composer back exactly as it was IF the user hasn't touched it since (the user 2026-07-20: the
 // restored copy of an un-recallable message is a double-send waiting to happen). An edited draft is
 // never touched — the toast alone covers it.
-const pendingCancelRestores = new Map<string, { before: string; after: string; cites: Citation[]; files: string[]; armedCites: string[]; armedFiles: string[] }>();   // + the chips as they stood and what the press armed, by identity (T373 fold, medium 2; round two, low 1)
+const pendingCancelRestores = new Map<string, { before: string; after: string; cites: Citation[]; files: ComposerFile[]; armedCites: string[]; armedFiles: string[] }>();   // + the chips as they stood and what the press armed, by identity (T373 fold, medium 2; round two, low 1)
 /** A citation's identity for the refusal's bookkeeping: a goal by its item, a quote by its words and source. */
 function citeKey(c: Citation): string { return c.itemId ? "g:" + c.itemId : "q:" + (c.quote || "") + "\n" + (c.src || ""); }
 
@@ -8333,8 +8333,7 @@ function mergeCitations(sid: string, incoming: readonly Citation[]): void {
 
 function moveProvisionalState(fromId: string, toId: string): void {
   const files = composerFiles.get(fromId);
-  if (files && files.length) { composerFiles.set(toId, [...(composerFiles.get(toId) ?? []), ...files]); composerFiles.delete(fromId); }
-  moveLegacyMarks(fromId, toId);   // an unverified attachment travels with its file (round twenty-one): the real session is unverified now
+  if (files && files.length) { composerFiles.set(toId, [...(composerFiles.get(toId) ?? []), ...files]); composerFiles.delete(fromId); }   // each entry carries its provenance (round twenty-two): an unverified attachment makes the real session unverified
   const staged = stagedMsgs.takeAll(fromId);
   if (staged.length) stagedMsgs.appendAll(toId, staged);   // every item the stack accepted — a context-only one (quotes, no words) included, which restore()'s load filter dropped (round ten)
   const cites = composerCitations.get(fromId);
@@ -16270,18 +16269,42 @@ let fireStage: () => void = () => { /* assigned by the composer closure */ };
 // on send), unlike citations (a "reply right now" intent that a tab switch abandons). On send the paths
 // ride the outgoing text as a trailing line, quoted when they contain spaces — the same thing the old
 // insert-at-cursor produced, now legible while you compose.
-const composerFiles = new Map<string, string[]>();   // sid -> attachment paths, in drop order
-// UNVERIFIED attachments (round twenty-one, 2026-09-16): the paths an untagged, un-picked answer — a kernel before v0.15.0, which names no
-// upload — attached to a composer by a best guess (its own ship's owner by name, or the active session as on main). While a composer
-// holds one, NO automatic send may be armed on it, transferred to it or released for it: the guessed file would ride the message. The
-// mark is durable — persisted with the drafts, so a reload does not forget — and leaves only by the user's own act on that composer:
-// the ✕ on the last such chip, or a send or a clear that empties the strip. One reader, isUnverified; one door to a hold, armHold.
-const legacyFiles = new Map<string, Set<string>>();   // sid -> the legacy-attached paths still on its strip
-function isUnverified(sid: string | null): boolean { return !!sid && (legacyFiles.get(sid)?.size ?? 0) > 0; }
-function markLegacyFile(sid: string, path: string): void { const s = legacyFiles.get(sid) || new Set<string>(); s.add(path); legacyFiles.set(sid, s); }
-function unmarkLegacyFile(sid: string, path: string): void { const s = legacyFiles.get(sid); if (!s) return; s.delete(path); if (!s.size) legacyFiles.delete(sid); }
-function dropLegacyMarks(sid: string): void { legacyFiles.delete(sid); }
-function moveLegacyMarks(fromId: string, toId: string): void { const s = legacyFiles.get(fromId); if (!s) return; for (const p of s) markLegacyFile(toId, p); legacyFiles.delete(fromId); }
+// Each attachment carries its PROVENANCE on the entry (round twenty-two, 2026-09-16): `legacy` — an untagged, un-picked answer (a kernel
+// before v0.15.0, which names no upload) attached it by a best guess (its own ship's owner by name, or the active session as on main).
+// While a composer holds one, NO automatic send may be armed on it, transferred to it or released for it: the guessed file would ride
+// the message. The mark lives ON the entry, so every operation on the list carries it for free — the hand-off's append, the provisional
+// move, the ✕ by index, the refused rescind's rollback, persistence — and the two can never diverge (a path held twice, marked once, was
+// how one legacy copy came back unmarked). It leaves only by the user's own act: the ✕ on the last such chip, or a send that empties
+// the strip. One reader, isUnverified; one door to a hold, armHold. An older persisted store's bare paths load as verified entries.
+interface ComposerFile { path: string; legacy: boolean }
+const composerFiles = new Map<string, ComposerFile[]>();   // sid -> attachments, in drop order, each with its provenance
+function filePaths(sid: string | null): string[] { return sid ? (composerFiles.get(sid) || []).map((e) => e.path) : []; }
+function isUnverified(sid: string | null): boolean { return !!sid && (composerFiles.get(sid) || []).some((e) => e.legacy); }
+// The entries a persisted store or a hand-off carries: today's `{ path, legacy }` objects, or an older page's bare paths — verified,
+// the accepted upgrade residual (a legacy file attached before round twenty-two loads without its mark).
+function fileEntriesOf(v: unknown): ComposerFile[] {
+  const out: ComposerFile[] = [];
+  for (const x of (Array.isArray(v) ? v : [])) {
+    if (typeof x === "string" && x) out.push({ path: x, legacy: false });
+    else if (x && typeof x === "object" && typeof (x as { path?: unknown }).path === "string" && (x as { path: string }).path) out.push({ path: (x as { path: string }).path, legacy: (x as { legacy?: unknown }).legacy === true });
+  }
+  return out;
+}
+// A rescind the kernel REFUSED (cancelResult ok:false — the message had already reached the session): the chips the press armed go,
+// typed or not, and the chips as they stood come back — each attachment WITH its provenance (round twenty-two: the stash holds entries,
+// so a legacy file the user ✕'d in the window comes back marked, never as a verified file). Only what the press put in, and only if it
+// was not already there before it: a file or chip the user added since the pencil stays. Persisted with the draft.
+function restoreComposerAfterRefusedRescind(sid: string, stash: { cites: Citation[]; files: ComposerFile[]; armedCites: string[]; armedFiles: string[] }): void {
+  const beforeC = new Set(stash.cites.map(citeKey)), armedC = new Set(stash.armedCites);
+  const cites = (composerCitations.get(sid) || []).filter((c) => !(armedC.has(citeKey(c)) && !beforeC.has(citeKey(c))));
+  for (const c of stash.cites) if (!cites.some((x) => citeKey(x) === citeKey(c))) cites.push(c);
+  if (cites.length) composerCitations.set(sid, cites); else composerCitations.delete(sid);
+  const beforeF = new Set(stash.files.map((e) => e.path)), armedF = new Set(stash.armedFiles);
+  const files = (composerFiles.get(sid) || []).filter((e) => !(armedF.has(e.path) && !beforeF.has(e.path)));
+  for (const e of stash.files) if (!files.some((x) => x.path === e.path)) files.push({ ...e });
+  if (files.length) composerFiles.set(sid, files); else composerFiles.delete(sid);
+  persistDrafts(); renderComposerChips(sid); renderComposerFiles(sid);
+}
 const UNVERIFIED_NOTICE = "An attachment from an older kernel is on this message, so it can't be sent automatically — check it and send it yourself.";
 // THE one door to a held send (round twenty-one): refused, and said, for a composer holding an unverified attachment; every place that
 // arms a hold — the gate's "Wait for the upload", a provisional's hold moving to the session it became — comes through here.
@@ -16640,7 +16663,7 @@ function restoreFailedProvisionals(): void {
   for (const k of [...drafts.keys()]) if (isProvisionalId(k) && !failedProvisionals.has(k)) { drafts.delete(k); dropped = true; }
   for (const k of Object.keys(stagedMsgs.entries())) if (isProvisionalId(k) && !failedProvisionals.has(k)) { stagedMsgs.takeAll(k); dropped = true; }   // staged text under an id no record names (round eight)
   for (const k of [...composerCitations.keys()]) if (isProvisionalId(k) && !failedProvisionals.has(k)) { composerCitations.delete(k); dropped = true; }
-  for (const k of [...composerFiles.keys()]) if (isProvisionalId(k) && !failedProvisionals.has(k)) { composerFiles.delete(k); dropLegacyMarks(k); dropped = true; }
+  for (const k of [...composerFiles.keys()]) if (isProvisionalId(k) && !failedProvisionals.has(k)) { composerFiles.delete(k); dropped = true; }
   if (dropped) persistDrafts();
   if (wantActiveGone && failedProvisionals.has(wantActiveGone)) { const failedTab = wantActiveGone; wantActiveGone = null; setTimeout(() => { if (!activeId) setActive(failedTab); }, 0); }   // the failed tab the page was on, back in front once booted
 }
@@ -16648,8 +16671,7 @@ function persistDrafts(): void {
   try {
     vscodeApi?.setState?.({ ...(vscodeApi.getState?.() || {}), drafts: Object.fromEntries(drafts),
                             citations: Object.fromEntries(composerCitations),
-                            files: Object.fromEntries(composerFiles),
-                            legacy: Object.fromEntries([...legacyFiles].map(([k, v]) => [k, [...v]])),   // the unverified attachments (round twenty-one): a reload does not forget
+                            files: Object.fromEntries(composerFiles),   // entries, provenance included (round twenty-two): a reload does not forget which are unverified
                             staged: stagedMsgs.entries(),
                             // the FAILED creates, by their tab's id (round six): the tab comes back after a reload with its
                             // reason and its draft, and its ✕ — the one discard — takes this record with the draft
@@ -16677,12 +16699,9 @@ function bootComposerState(): void {
   const savedFiles = ((vscodeApi?.getState?.() || {}) as any).files;
   if (savedFiles && typeof savedFiles === "object")
     for (const [k, v] of Object.entries(savedFiles)) {
-      const paths = (Array.isArray(v) ? v : []).filter((x): x is string => typeof x === "string" && !!x);
-      if (paths.length) composerFiles.set(k, paths);
+      const entries = fileEntriesOf(v);   // entries with their provenance; an older store's bare paths load as verified (round twenty-two)
+      if (entries.length) composerFiles.set(k, entries);
     }
-  const savedLegacy = ((vscodeApi?.getState?.() || {}) as any).legacy;   // the unverified marks, back with the files they mark (round twenty-one)
-  if (savedLegacy && typeof savedLegacy === "object")
-    for (const [k, v] of Object.entries(savedLegacy)) for (const p of (Array.isArray(v) ? v : [])) if (typeof p === "string" && p && (composerFiles.get(k) || []).includes(p)) markLegacyFile(k, p);
   const savedCites = ((vscodeApi?.getState?.() || {}) as any).citations;
   if (savedCites && typeof savedCites === "object")
     for (const [k, v] of Object.entries(savedCites)) {
@@ -16817,7 +16836,7 @@ function sendHeldFor(sid: string): void {
   if (!vscodeApi) return;
   if (isUnverified(sid)) { warnToast(UNVERIFIED_NOTICE); return; }   // the belt (round twenty-one): never a guessed file on an automatic send
   const typed = (drafts.get(sid) ?? "").trim();
-  const attached = composerFiles.get(sid) || [];
+  const attached = filePaths(sid);
   // the BELT (round twelve): the words went to another column with their tab (the take ran, handedOff) and nothing of the message is
   // here — a send from here would be the bare path. Refused: the hold is already off (the caller deleted it), the file stays under the
   // sid and the orphan offer carries it to the pane that shows the session. The shell's move refusal (__rompSessionBusy) is the belt's braces.
@@ -16833,7 +16852,7 @@ function sendHeldFor(sid: string): void {
   if (text) lastSent.set(sid, text);
   flushStaged(sid, text ? { text, cites, imgPaths: attached.filter((p) => previewKind(p) === "img"), paths: attached } : undefined);
   if (cites) composerCitations.delete(sid);
-  if (attached.length) { composerFiles.delete(sid); dropLegacyMarks(sid); }
+  if (attached.length) composerFiles.delete(sid);
   drafts.delete(sid); draftStartedAt.delete(sid);
   persistDrafts();
 }
@@ -17067,7 +17086,8 @@ function renderComposerFilesInner(id: string | null): void {
     setTip(sendBtn, held ? "Send (Enter)\nsends when the upload finishes" : "Send (Enter)");
   }
   strip.replaceChildren();
-  const paths = (id ? composerFiles.get(id) : undefined) || [];
+  const entries = (id ? composerFiles.get(id) : undefined) || [];
+  const paths = entries.map((e) => e.path);
   const pending = (id ? pendingShips.get(id) : undefined) || [];
   if (!paths.length && !pending.length) { strip.style.display = "none"; return; }
   strip.style.display = "flex";
@@ -17090,7 +17110,7 @@ function renderComposerFilesInner(id: string | null): void {
   }
   paths.forEach((p, i) => {
     const box = el("span", "composer-file");
-    box.title = p + " — click opens it · ✕ removes";
+    box.title = p + " — click opens it · ✕ removes" + (entries[i].legacy ? "\nattached by an older kernel's guess — check it before sending" : "");   // its provenance, where the chip is (round twenty-two)
     if (previewKind(p) === "img") {
       if (canPreview()) {
         // Name first, pixels when ready (the user 2026-08-04): the ext + name chip goes up IMMEDIATELY
@@ -17175,9 +17195,10 @@ function composerFileDoc(p: string): HTMLElement {
 function addComposerFile(id: string | null, path: string, legacy = false): void {
   if (!id || !path) return;
   const list = composerFiles.get(id) || [];
-  if (!list.includes(path)) list.push(path);       // the same file dropped twice attaches once
+  const hit = list.find((e) => e.path === path);
+  if (hit) hit.legacy = hit.legacy || legacy;       // the same file dropped twice attaches once; a guess over a known path leaves it unverified (round twenty-two)
+  else list.push({ path, legacy });                // an older kernel's guess (round twenty-one): this composer is unverified until the user acts
   composerFiles.set(id, list);
-  if (legacy) markLegacyFile(id, path);            // an older kernel's guess (round twenty-one): this composer is unverified until the user acts
   persistDrafts();
   if (id === activeId) renderComposerFiles(id);
 }
@@ -17185,8 +17206,7 @@ function addComposerFile(id: string | null, path: string, legacy = false): void 
 function removeComposerFile(id: string, idx: number): void {
   const list = composerFiles.get(id);
   if (!list || idx < 0 || idx >= list.length) return;
-  unmarkLegacyFile(id, list[idx]);   // the user's ✕: the last legacy chip gone, the composer is verified again (round twenty-one)
-  list.splice(idx, 1);
+  list.splice(idx, 1);   // the user's ✕: the entry goes with its provenance — the last legacy chip gone, the composer is verified again (rounds twenty-one, twenty-two)
   if (!list.length) composerFiles.delete(id);
   persistDrafts();
   if (id === activeId) renderComposerFiles(id);
@@ -17454,14 +17474,13 @@ const sessionMru: string[] = [];
 // they are current), not this page's snapshot from its last render: a held column's kernel frames may not have landed since
 // the hold, and its snapshot would still call the member the peer moved away "shown here" — and drop its draft.
 (window as any).__rompOrphanStateSids = (): string[] => { colSets = readColSets(); if (activeId) stashActiveDraft(activeId); return orphanStateSids(); };   // the box's live text counts: stashed first, so an active tab this column no longer lists is in the list
-(window as any).__rompTakeSessionState = (sid: string): { draft: string; citations: Citation[]; files: string[]; staged: StagedMsg[]; legacy: string[] } | null => {
+(window as any).__rompTakeSessionState = (sid: string): { draft: string; citations: Citation[]; files: ComposerFile[]; staged: StagedMsg[] } | null => {
   if (typeof sid !== "string" || !sid) return null;
   const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
   const boxHeld = sid === activeId && !!ta && !!ta.value.trim();   // the box holds words: the reload core's `typing` hold stands on it (editing())
   if (sid === activeId && ta) { if (ta.value) drafts.set(sid, ta.value); else drafts.delete(sid); }
   const draft = drafts.get(sid) ?? "", citations = composerCitations.get(sid) ?? [], files = composerFiles.get(sid) ?? [], staged = stagedMsgs.takeAll(sid);
-  const legacy = [...(legacyFiles.get(sid) ?? [])];   // which of the files an older kernel attached by a guess (round twenty-one): the mark travels
-  drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid); legacyFiles.delete(sid);
+  drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid);   // the files travel as entries, provenance included (round twenty-two)
   if (draft || staged.length) handedOff.add(sid);   // the words left with the tab (round twelve): a held send here would be the bare path — sendHeldFor's belt
   if (sid === activeId) { if (ta) { ta.value = ""; growComposer(ta); } renderComposerChips(sid); renderComposerFiles(sid); renderStagedStrip(sid); }
   // the typing hold's ENDING event (round eleven, 2026-09-16): the core hears a draft cleared by typing ('input') or a blur, never a
@@ -17471,7 +17490,7 @@ const sessionMru: string[] = [];
   if (boxHeld) { try { (window as any).__rompReload?.ended?.(); } catch { /* no core (the VS Code webview) */ } }
   persistDrafts();
   if (!draft && !citations.length && !files.length && !staged.length) return null;
-  return { draft, citations, files, staged, legacy };
+  return { draft, citations, files, staged };
 };
 // …and the TARGET page's half: what the source held, into the maps (joined onto anything already here, never over
 // it), persisted, and into the box when the tab is active. The shell posts it on a new column's load or at once.
@@ -17485,14 +17504,13 @@ function reclaimHandedOff(): void { for (const sid of [...handedOff]) if (heldHe
 function adoptSessionState(sid: unknown, state: unknown): void {
   if (typeof sid !== "string" || !sid || !state || typeof state !== "object") return;
   handedOff.delete(sid);   // the words are here again
-  const st = state as { draft?: unknown; citations?: unknown; files?: unknown; staged?: unknown; legacy?: unknown };
+  const st = state as { draft?: unknown; citations?: unknown; files?: unknown; staged?: unknown };
   if (typeof st.draft === "string" && st.draft) drafts.set(sid, [drafts.get(sid) ?? "", st.draft].filter(Boolean).join("\n\n"));
   if (Array.isArray(st.files) && st.files.length) {
-    const paths = (st.files as unknown[]).filter((p): p is string => typeof p === "string" && !!p);
-    if (paths.length) composerFiles.set(sid, [...(composerFiles.get(sid) ?? []), ...paths]);
-    if (Array.isArray(st.legacy)) for (const p of st.legacy) if (typeof p === "string" && paths.includes(p)) markLegacyFile(sid, p);   // the unverified marks arrive with their files (round twenty-one)…
+    const entries = fileEntriesOf(st.files);   // entries with their provenance (an older page's bare paths: verified), appended — a path held twice is held twice, each with its own mark (round twenty-two)
+    if (entries.length) composerFiles.set(sid, [...(composerFiles.get(sid) ?? []), ...entries]);
   }
-  if (isUnverified(sid)) disarmUnverified(sid);   // …and a hold this session held is cancelled, said: no automatic send with a guessed file
+  if (isUnverified(sid)) disarmUnverified(sid);   // an unverified attachment arrived: a hold this session held is cancelled, said — no automatic send with a guessed file
   if (Array.isArray(st.staged) && st.staged.length) stagedMsgs.appendAll(sid, st.staged);   // every item the source's stack held, a context-only one included (round ten; restore() dropped those)
   if (Array.isArray(st.citations) && st.citations.length) mergeCitations(sid, st.citations as Citation[]);   // after the stack: the flavour rule (round ten), never a mixed list
   // NO upload arrives here, and no held send is ever armed here (round eleven, 2026-09-16): an upload's ack rides the socket of the
@@ -18734,7 +18752,7 @@ function dismissSession(id: string, why: DismissWhy, doomed?: ReadonlySet<string
     // closed session was ACTIVE: the shared chip strip above the composer still shows its chip until
     // someone repaints it, and that stale chip's ✕ targets the dead id (whose map entry is gone), so the
     // click early-returns and the chip can't even be dismissed — hence the repaint below.
-    drafts.delete(id); composerCitations.delete(id); composerEdits.delete(id); composerFiles.delete(id); dropLegacyMarks(id); persistDrafts();
+    drafts.delete(id); composerCitations.delete(id); composerEdits.delete(id); composerFiles.delete(id); persistDrafts();
   } else {
     persistDrafts();   // a host drop / omission KEEPS it all (see DismissWhy) — the stash above may have updated the copy
   }
@@ -19073,17 +19091,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
         // ride their next message (the T373 fold's medium 2). Only what the PRESS put in, and only if it was not already there
         // before it: a file or chip the user added since the pencil stays, as their typed words do (round two's low 1); a
         // chip the press displaced (a goal chip replaces the strip) comes back. Persisted with the draft.
-        if (stash.armedCites.length || stash.armedFiles.length) {
-          const beforeC = new Set(stash.cites.map(citeKey)), armedC = new Set(stash.armedCites);
-          const cites = (composerCitations.get(m.id) || []).filter((c) => !(armedC.has(citeKey(c)) && !beforeC.has(citeKey(c))));
-          for (const c of stash.cites) if (!cites.some((x) => citeKey(x) === citeKey(c))) cites.push(c);
-          if (cites.length) composerCitations.set(m.id, cites); else composerCitations.delete(m.id);
-          const beforeF = new Set(stash.files), armedF = new Set(stash.armedFiles);
-          const files = (composerFiles.get(m.id) || []).filter((f) => !(armedF.has(f) && !beforeF.has(f)));
-          for (const f of stash.files) if (!files.includes(f)) files.push(f);
-          if (files.length) composerFiles.set(m.id, files); else composerFiles.delete(m.id);
-          persistDrafts(); renderComposerChips(m.id); renderComposerFiles(m.id);
-        }
+        if (stash.armedCites.length || stash.armedFiles.length) restoreComposerAfterRefusedRescind(m.id, stash);
       }
       // …and put the BUBBLE back (the user 2026-07-24). The ✕ deletes it optimistically, but a miss means the
       // message is still going through — and the kernel's build never changed, so its next delta carries no
@@ -19692,7 +19700,7 @@ function setupComposer() {
       flushStaged(activeId);
       return;
     }
-    const attached = composerFiles.get(activeId) || [];
+    const attached = filePaths(activeId);
     // SHIP GATE (the user 2026-08-16): an upload still in flight is NOT in `attached` (the send reads
     // only acked paths), so sending now silently drops it — the exact report. Intercept with the same
     // pane-local confirm the /clear guard uses: send WITHOUT it explicitly, or hold the send and let
@@ -19800,7 +19808,7 @@ function setupComposer() {
         registerOptimistic(sid, text, attached.filter((p) => previewKind(p) === "img"), undefined, attached);
         sendOnShip.delete(sid);                       // a send happened — any held one is superseded
         histWalk.delete(sid);                         // …and the history walk starts fresh
-        if (attached.length) { composerFiles.delete(sid); dropLegacyMarks(sid); if (sid === activeId) renderComposerFiles(sid); }
+        if (attached.length) { composerFiles.delete(sid); if (sid === activeId) renderComposerFiles(sid); }
         drafts.delete(sid); draftStartedAt.delete(sid); persistDrafts();
         clearBox();
         return;
@@ -19830,7 +19838,7 @@ function setupComposer() {
       if (cites) { composerCitations.delete(activeId); renderComposerChips(activeId); }   // consumed on send
       sendOnShip.delete(sid);                       // a send happened — any held one is superseded
       histWalk.delete(sid);                         // …and the history walk starts fresh
-      if (attached.length) { composerFiles.delete(sid); dropLegacyMarks(sid); if (sid === activeId) renderComposerFiles(sid); }   // the strip emptied into this message — the user's own send verifies it (round twenty-one)
+      if (attached.length) { composerFiles.delete(sid); if (sid === activeId) renderComposerFiles(sid); }   // the strip emptied into this message — the user's own send verifies it (round twenty-one)
       drafts.delete(activeId); draftStartedAt.delete(activeId); persistDrafts();   // sent — no draft to restore on a later switch-back
       clearBox();   // a drag-expanded box snaps back to one line after a send (the user 2026-07-07)
       // The box is empty again, so a live picker re-takes it: send your pre-question draft, then just type the

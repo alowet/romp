@@ -49,7 +49,7 @@ type Api = {
   heldHere: (id: string) => boolean;
   state: () => { activeId: string | null; wantActive: string | null; colSets: ColSets | null; colEmptyPosted: boolean; tabOrderSeen: boolean };
   set: (p: { activeId?: string | null; wantActive?: string | null; provisionalId?: string | null; tabOrderSeen?: boolean; failed?: string[]; hostsSeen?: string[] }) => void;
-  maps: { drafts: Map<string, string>; composerCitations: Map<string, unknown[]>; composerFiles: Map<string, string[]>; stagedMsgs: StagedStack };
+  maps: { drafts: Map<string, string>; composerCitations: Map<string, unknown[]>; composerFiles: Map<string, { path: string; legacy: boolean }[]>; stagedMsgs: StagedStack };
 };
 type World = { api: Api; HOOKS: Hooks; W: { sets: ColSets | null; owner: ((sid: string) => unknown) | null }; me: { id: string }; other: { id: string; contentWindow: unknown } };
 
@@ -69,7 +69,7 @@ function world(o: { col?: string; sets?: ColSets | null; tabOrderSeen?: boolean;
   const win = { parent: PARENT, frameElement: me };
   const js = requireCjs("esbuild").transformSync(
     [line("heldHere"), line("tabInView"), line("columnBusy"), fn("forwardToOwner"), fn("claimSession"), fn("noteColumnEmptiness"),
-     fn("orphanStateSids"), fn("noteOrphanState"), fn("staleActiveFallback"), fn("adoptSessionState"), fn("mergeCitations"), fn("shipOwner"), line("isUnverified"), line("markLegacyFile"), fn("disarmUnverified")].join("\n"), { loader: "ts" }).code;
+     fn("orphanStateSids"), fn("noteOrphanState"), fn("staleActiveFallback"), fn("adoptSessionState"), fn("mergeCitations"), fn("shipOwner"), line("isUnverified"), fn("fileEntriesOf"), fn("disarmUnverified")].join("\n"), { loader: "ts" }).code;
   const prelude = `
     const { columnHolds, columnEmptiness, isProvisionalId, isSubId, StagedStack, HOOKS } = W;
     const COL = W.col;
@@ -86,7 +86,7 @@ function world(o: { col?: string; sets?: ColSets | null; tabOrderSeen?: boolean;
     const drafts = new Map(), composerCitations = new Map(), composerFiles = new Map(); const stagedMsgs = new StagedStack();
     const persistDrafts = () => { HOOKS.persisted++; }; const loadComposerFor = (sid) => { HOOKS.loaded.push(sid); };
     const pendingShips = new Map(), sendOnShip = new Set(); const warnToast = () => {}; const vscodeApi = { postMessage() {} }; const renderComposerFiles = () => {};   // the carry's upload half (round ten): idle in these worlds
-    const legacyFiles = new Map(); let shipGateSid = null; const closeConfirm = () => {}; const endReloadHoldIfIdle = () => {}; const UNVERIFIED_NOTICE = "";   // the unverified mark's stores (round twenty-one): none marked in these worlds
+    let shipGateSid = null; const closeConfirm = () => {}; const endReloadHoldIfIdle = () => {}; const UNVERIFIED_NOTICE = "";   // the unverified mark's neighbours (rounds twenty-one, twenty-two): the mark lives on the file entries; none marked in these worlds
     const handedOff = new Set();   // the held send's belt (round twelve): an adopt clears the sid
   `;
   const epilogue = `
@@ -303,11 +303,11 @@ test("orphaned state: sids held for sessions this column does not show are offer
 
 test("adoptSessionState joins every slice onto what is already here, persists once, and fills the box only for the active tab; junk is ignored", () => {
   const w = world({ col: "2", sets: { "2": [API] }, activeId: API });
-  w.api.maps.drafts.set(API, "already here"); w.api.maps.composerFiles.set(API, ["/tmp/a.png"]); w.api.maps.stagedMsgs.push(API, { text: "first", cites: [] });
+  w.api.maps.drafts.set(API, "already here"); w.api.maps.composerFiles.set(API, [{ path: "/tmp/a.png", legacy: false }]); w.api.maps.stagedMsgs.push(API, { text: "first", cites: [] });
   w.api.adoptSessionState(API, { draft: "moved in", citations: [{ title: "a card" }], files: ["/tmp/b.png", 7, ""], staged: [{ text: "second", cites: [] }] });
   assert.equal(w.api.maps.drafts.get(API), "already here\n\nmoved in", "joined, never over");
   assert.deepEqual(w.api.maps.composerCitations.get(API), [{ title: "a card" }]);
-  assert.deepEqual(w.api.maps.composerFiles.get(API), ["/tmp/a.png", "/tmp/b.png"], "strings only");
+  assert.deepEqual(w.api.maps.composerFiles.get(API), [{ path: "/tmp/a.png", legacy: false }, { path: "/tmp/b.png", legacy: false }], "strings only, as verified entries (round twenty-two)");
   assert.deepEqual(w.api.maps.stagedMsgs.list(API), [{ text: "first", cites: [] }, { text: "second", cites: [] }], "in order: what was here, then what arrived");
   assert.equal(w.HOOKS.persisted, 1);
   assert.deepEqual(w.HOOKS.loaded, [API], "the active tab's box is refilled");

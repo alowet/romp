@@ -110,15 +110,15 @@ test("a queued bubble with no ✕ says where the message actually is", () => {
 });
 
 test("the qx click stashes the composer before/after so a failed cancel can undo the restore", () => {
-  assert.match(RENDER, /const pendingCancelRestores = new Map<string, \{ before: string; after: string; cites: Citation\[\]; files: string\[\]; armedCites: string\[\]; armedFiles: string\[\] \}>\(\);/);
+  assert.match(RENDER, /const pendingCancelRestores = new Map<string, \{ before: string; after: string; cites: Citation\[\]; files: ComposerFile\[\]; armedCites: string\[\]; armedFiles: string\[\] \}>\(\);/);
   // the refusal looks the stash up under the very key the rescind stored: one separator, spelled the same on both sides
   // (a literal NUL byte sat in the handler's key from 2026-07-20 to the T373 fold, invisible in every text view, so no
   // refusal ever found its stash; the served lab caught it, and the file is held free of control bytes here)
   assert.match(RENDER, /const key = m\.id \+ " " \+ \(typeof m\.md === "string" \? m\.md : ""\);/, "the handler's key is the store's key");
   // the refusal takes back only what the press armed and was not there before; the user's additions since stay (round two, low 1)
-  assert.match(RENDER, /const cites = \(composerCitations\.get\(m\.id\) \|\| \[\]\)\.filter\(\(c\) => !\(armedC\.has\(citeKey\(c\)\) && !beforeC\.has\(citeKey\(c\)\)\)\);/);
-  assert.match(RENDER, /const files = \(composerFiles\.get\(m\.id\) \|\| \[\]\)\.filter\(\(f\) => !\(armedF\.has\(f\) && !beforeF\.has\(f\)\)\);/);
-  assert.match(RENDER, /for \(const f of stash\.files\) if \(!files\.includes\(f\)\) files\.push\(f\);/, "what stood before and went comes back");
+  assert.match(RENDER, /const cites = \(composerCitations\.get\(sid\) \|\| \[\]\)\.filter\(\(c\) => !\(armedC\.has\(citeKey\(c\)\) && !beforeC\.has\(citeKey\(c\)\)\)\);/);
+  assert.match(RENDER, /const files = \(composerFiles\.get\(sid\) \|\| \[\]\)\.filter\(\(e\) => !\(armedF\.has\(e\.path\) && !beforeF\.has\(e\.path\)\)\);/);
+  assert.match(RENDER, /for \(const e of stash\.files\) if \(!files\.some\(\(x\) => x\.path === e\.path\)\) files\.push\(\{ \.\.\.e \}\);/, "what stood before and went comes back");
   assert.doesNotMatch(RENDER, /[\x00-\x08\x0b\x0c\x0e-\x1f]/, "no control byte in render.ts: a separator is spelled as an escape");
   assert.match(RENDER, /pendingCancelRestores\.set\(activeId \+ " " \+ qmd, \{ before, after: ta \? ta\.value : "", cites: citesBefore, files: filesBefore, armedCites, armedFiles \}\);/);
 });

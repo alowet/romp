@@ -39,5 +39,5 @@ test("every draft mutation keeps the persisted copy in sync (switch / send / clo
   // sending clears the draft (and ends its start-stamp) → persist
   assert.match(RENDER, /drafts\.delete\(activeId\); draftStartedAt\.delete\(activeId\); persistDrafts\(\);\s*\/\/ sent/);
   // closing a tab drops its draft AND its citation AND its edit pill → persist (the user 2026-08-04)
-  assert.match(RENDER, /drafts\.delete\(id\); composerCitations\.delete\(id\); composerEdits\.delete\(id\); composerFiles\.delete\(id\); dropLegacyMarks\(id\); persistDrafts\(\);/);
+  assert.match(RENDER, /drafts\.delete\(id\); composerCitations\.delete\(id\); composerEdits\.delete\(id\); composerFiles\.delete\(id\); persistDrafts\(\);/);
 });

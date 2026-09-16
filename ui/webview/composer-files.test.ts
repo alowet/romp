@@ -32,7 +32,7 @@ test("the composer has an attachment strip, its own row above the chips — on B
 });
 
 test("every file arrival becomes an attachment, never raw path text in the box", () => {
-  assert.match(RENDER, /const composerFiles = new Map<string, string\[\]>\(\);/);
+  assert.match(RENDER, /const composerFiles = new Map<string, ComposerFile\[\]>\(\);/);
   // the drop handler's three path sources all land in addComposerFile
   assert.match(RENDER, /const fromUri = \(u: string\) => addComposerFile\(activeId, decodeURIComponent\(u\.replace\(\/\^file:\\\/\\\/\/, ""\)\)\);/);
   assert.match(RENDER, /if \(p\) \{ addComposerFile\(activeId, p\); return; \}/);
@@ -65,15 +65,15 @@ test("an image thumbnail renders per surface; other files wear an ext + name chi
   assert.match(fn, /openPath\(p, id \|\| null, e\);/);   // with its click: a modified click on a PDF takes a browser tab
   assert.match(fn, /if \(id\) removeComposerFile\(id, i\);/);
   // the same file dropped twice attaches once
-  assert.match(RENDER, /if \(!list\.includes\(path\)\) list\.push\(path\);/);
+  assert.match(RENDER, /const hit = list\.find\(\(e\) => e\.path === path\);\n  if \(hit\) hit\.legacy = hit\.legacy \|\| legacy;[^\n]*\n  else list\.push\(\{ path, legacy \}\);/);
 });
 
 test("attachments ride the send as a trailing line of paths, quoted when they hold spaces", () => {
-  assert.match(RENDER, /const attached = composerFiles\.get\(activeId\) \|\| \[\];/);
+  assert.match(RENDER, /const attached = filePaths\(activeId\);/);
   assert.match(RENDER, /if \(!typed && !attached\.length\) return;/);   // attachment-only sends are real sends
   assert.match(RENDER, /\(typed \? typed \+ "\\n" : ""\) \+ attached\.map\(\(p\) => \(\/\\s\/\.test\(p\) \? '"' \+ p \+ '"' : p\)\)\.join\(" "\)/);
   // consumed on delivery (the provisional queue path included) — the strip emptied into this message
-  assert.match(RENDER, /if \(attached\.length\) \{ composerFiles\.delete\(sid\); dropLegacyMarks\(sid\); if \(sid === activeId\) renderComposerFiles\(sid\); \}/);
+  assert.match(RENDER, /if \(attached\.length\) \{ composerFiles\.delete\(sid\); if \(sid === activeId\) renderComposerFiles\(sid\); \}/);
   // a picker answer and an edit send only the TYPED words — attachments wait for the next normal send
   assert.match(RENDER, /const askRoute = typed \? composerAnswersAsk\(\) : null;/);
   assert.match(RENDER, /if \(!typed\) return;\s*\/\/ an edit sends the typed words/);
@@ -89,7 +89,7 @@ test("attachments live the DRAFT lifecycle: switch, reload, close", () => {
   // the post-reload restore paints it once the active tab is known
   assert.match(RENDER, /renderComposerFiles\(activeId\);   \/\/ attachments persisted across the reload/);
   // closing a session drops its attachments with its draft, and repaints for the new active tab
-  assert.match(RENDER, /drafts\.delete\(id\); composerCitations\.delete\(id\); composerEdits\.delete\(id\); composerFiles\.delete\(id\); dropLegacyMarks\(id\); persistDrafts\(\);/);
+  assert.match(RENDER, /drafts\.delete\(id\); composerCitations\.delete\(id\); composerEdits\.delete\(id\); composerFiles\.delete\(id\); persistDrafts\(\);/);
   // …through the shared loader (T236): loadComposerFor paints thumbnails with the chips, staged stack and draft
   assert.match(RENDER, /loadComposerFor\(activeId\);   \/\/ the strip was showing the CLOSED session/);
   assert.match(RENDER, /function loadComposerFor\(id: string \| null, keepTyped = false\): void \{[\s\S]*?renderComposerFiles\(id\);/);
