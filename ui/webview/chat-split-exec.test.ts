@@ -68,7 +68,7 @@ function world(o: { col?: string; sets?: ColSets | null; tabOrderSeen?: boolean;
   };
   const win = { parent: PARENT, frameElement: me };
   const js = requireCjs("esbuild").transformSync(
-    [line("heldHere"), line("tabInView"), fn("forwardToOwner"), fn("claimSession"), fn("noteColumnEmptiness"),
+    [line("heldHere"), line("tabInView"), line("columnBusy"), fn("forwardToOwner"), fn("claimSession"), fn("noteColumnEmptiness"),
      fn("orphanStateSids"), fn("noteOrphanState"), fn("staleActiveFallback"), fn("adoptSessionState")].join("\n"), { loader: "ts" }).code;
   const prelude = `
     const { columnHolds, columnEmptiness, isProvisionalId, isSubId, StagedStack, HOOKS } = W;
@@ -341,7 +341,7 @@ function stripWorld(o: { col: string; sets: ColSets | null; wantActive?: string 
   const PARENT = { postMessage(m: Record<string, unknown>) { HOOKS.posts.push(m); }, __rompChatSets: () => W.sets };
   const win = { parent: PARENT, frameElement: { id: "f-chat-" + o.col } };
   const js = requireCjs("esbuild").transformSync(
-    [line("heldHere"), line("tabInView"), fn("stripLists"), fn("ackClosingTabs"), fn("applyTabOrder"), fn("noteColumnEmptiness")].join("\n"), { loader: "ts" }).code;
+    [line("heldHere"), line("tabInView"), line("columnBusy"), fn("stripLists"), fn("ackClosingTabs"), fn("applyTabOrder"), fn("noteColumnEmptiness")].join("\n"), { loader: "ts" }).code;
   const prelude = `
     const { columnHolds, columnEmptiness, isProvisionalId, isSubId, syncSessionsFromTabMeta, reconcileTabOrder, retainLiveOmitted, hostOf, localStrip, stripHost, HOOKS } = W;
     const COL = W.col;

@@ -79,7 +79,7 @@ test("a pick of a session another column holds is shown where it lives: the setA
   // closing map and the hosts whose own strip has landed — `held` resets the latch, `unknown` says nothing and leaves it, `empty` is
   // said once. A member whose host has not reported is unknown, never gone (the user 2026-09-14: a host-prefixed tab dragged into a new
   // column, folded ~250 ms later on the local kernel's first strip, before its own host's strip had landed)
-  assert.match(RENDER, /function noteColumnEmptiness\(ids: readonly string\[\]\): void \{\n\s*if \(!COL \|\| !colSets \|\| !tabOrderSeen\) return;\n(?:\s*\/\/[^\n]*\n)*\s*if \(provisionalId \|\| failedProvisionals\.size\) return;\n\s*const mine = colSets\[COL\] \|\| \[\];\n(?:\s*\/\/[^\n]*\n)*\s*const verdict = columnEmptiness\(mine, ids, boardLive, closingTabs, hostsSeen\);\n\s*if \(verdict === "held"\) \{ colEmptyPosted = false; return; \}\n\s*if \(verdict === "unknown" \|\| colEmptyPosted\) return;\n\s*colEmptyPosted = true;[\s\S]*?const crossed = mine\.filter\(\(id\) => closingTabs\.has\(id\)\);\n\s*try \{ window\.parent\.postMessage\(\{ romp: "colEmpty", gone: mine\.slice\(\), crossed \}, "\*"\);/);
+  assert.match(RENDER, /function noteColumnEmptiness\(ids: readonly string\[\]\): void \{\n\s*if \(!COL \|\| !colSets \|\| !tabOrderSeen\) return;\n(?:\s*\/\/[^\n]*\n)*\s*if \(columnBusy\(\)\) return;[^\n]*\n\s*const mine = colSets\[COL\] \|\| \[\];\n(?:\s*\/\/[^\n]*\n)*\s*const verdict = columnEmptiness\(mine, ids, boardLive, closingTabs, hostsSeen\);\n\s*if \(verdict === "held"\) \{ colEmptyPosted = false; return; \}\n\s*if \(verdict === "unknown" \|\| colEmptyPosted\) return;\n\s*colEmptyPosted = true;[\s\S]*?const crossed = mine\.filter\(\(id\) => closingTabs\.has\(id\)\);\n\s*try \{ window\.parent\.postMessage\(\{ romp: "colEmpty", gone: mine\.slice\(\), crossed \}, "\*"\);/);
   assert.match(RENDER, /import \{ colFromSearch, columnHolds, columnEmptiness, type ColSets \} from "\.\/chat-columns";/);
   assert.match(RENDER, /boardLive = liveSet;/, "applyTabOrder keeps the frame's live set for the emptiness post");
   // the hosts-seen set: filled in applyTabOrder from the frame's provenance (tab-order.ts stripHost — "" for the local kernel's own
@@ -98,9 +98,13 @@ test("a pick of a session another column holds is shown where it lives: the setA
   // the shell's two questions before it moves a tab or closes a column (kernel.py moveTab / close; tests/test_chat_split.py
   // runs the refusals): an id a column can hold, and a create in flight here
   assert.match(RENDER, /\(window as any\)\.__rompMovableSession = \(sid: unknown\): boolean => typeof sid === "string" && !!sid && !isProvisionalId\(sid\) && !isSubId\(sid\) && !settings\.tabsLocked;/);   // …and no while the tabs are locked (T395)
-  // …three facts since round three (2026-09-15): a pending folder question (dirQuestion) keeps the column busy too, through
-  // its prompt and the picker "Edit the path" reopens — one reader for the shell's question and the flip
-  assert.match(RENDER, /function columnBusy\(\): boolean \{ return !!provisionalId \|\| failedProvisionals\.size > 0 \|\| dirQuestion; \}\n\(window as any\)\.__rompColumnBusy = \(\): boolean => columnBusy\(\);/);
+  // ONE reader for the two facts (round four, 2026-09-15): the shell's question, the flip and the emptiness report read
+  // columnBusy(); a folder question keeps the provisional TAB, so it is busy by provisionalId alone — no third fact
+  assert.match(RENDER, /function columnBusy\(\): boolean \{ return !!provisionalId \|\| failedProvisionals\.size > 0; \}\n\(window as any\)\.__rompColumnBusy = \(\): boolean => columnBusy\(\);/);
+  assert.match(RENDER, /function noteColumnEmptiness\(ids: readonly string\[\]\): void \{\n\s*if \(!COL \|\| !colSets \|\| !tabOrderSeen\) return;\n(?:\s*\/\/[^\n]*\n)*\s*if \(columnBusy\(\)\) return;/, "the emptiness report reads the one reader");
+  assert.ok(!/\b(pendingCarry|dirQuestion|abandonDirQuestion)\b/.test(RENDER), "no document-local carry keyed to no session");
+  // …and the state a closing page hands over never names a synthetic id (a create in flight, a sub-agent viewer)
+  assert.match(RENDER, /function orphanStateSids\(\): string\[\] \{[\s\S]*?if \(!isProvisionalId\(id\) && !isSubId\(id\) && !heldHere\(id\)\) out\.add\(id\);/);
   assert.match(KERNEL, /function movable\(f,sid\)\{[^\n]*__rompMovableSession/);
   assert.match(KERNEL, /function busy\(f\)\{[^\n]*__rompColumnBusy/);
   // …and the shell hears the busy answer CHANGE (2026-09-15): a column another dashboard's write dropped is HELD while its page
@@ -115,14 +119,21 @@ test("a pick of a session another column holds is shown where it lives: the setA
   assert.match(RENDER, /if \(draft\) \{ persistDrafts\(\);[^\n]*\n  syncColumnBusy\(\);[^\n]*\n\}/, "adoptProvisional: after the claim and the drafts");
   assert.match(RENDER, /if \(activeId === realId && ta\) \{ ta\.value = drafts\.get\(realId\) \?\? ""; growComposer\(ta\); \}\n  \}\n(?:\s*\/\/[^\n]*\n)*\s*syncColumnBusy\(\);\n\}/, "resolveProvisionalToExisting: after the text is on the running session's draft");
   assert.match(RENDER, /postMessage\(\{ type: "cancelCreate", name \}\);\n  syncColumnBusy\(\);/, "cancelProvisional: last");
-  // the folder question (round three): the carry is written, the question marked pending — NO flip (busy before, busy now); the
-  // flip comes from the retry's settlement or from the abandonment, whose last act it is; startCreate's picker close is the
-  // one that does not abandon (dir-question-busy.test.ts runs the whole flow)
-  assert.match(RENDER, /pendingCarry = \[\.\.\.held\.queued, held\.draft\]\.filter\(Boolean\)\.join\("\\n\\n"\);\n  dirQuestion = true;[^\n]*\n  syncColumnBusy\(\);/, "the folder question: pending, said for the invariant");
-  assert.match(RENDER, /function abandonDirQuestion\(\): void \{[\s\S]*?dirQuestion = false;\n  syncColumnBusy\(\);[^\n]*\n\}/, "the abandonment flips last");
-  assert.match(RENDER, /closePicker\(false\);   \/\/ a create from the picker is the folder question's RETRY/);
-  assert.match(RENDER, /if \(abandonCreate && dirQuestion\) abandonDirQuestion\(\);/);
-  assert.match(RENDER, /pendingCarry = "";\n  dirQuestion = false;/, "a new create ends the question");
+  // the folder question keeps the provisional TAB (round four; dir-question-busy.test.ts runs the whole flow): no drop, the
+  // backstop stood down, the prompt keyed to the create; the retry keeps the tab; a dismissal makes it a failed create; the
+  // picker opened over the prompt dismisses it first, as its own create's
+  const dirq = RENDER.slice(RENDER.indexOf("function onCreateDirMissing("), RENDER.indexOf("function dirWhy("));
+  assert.ok(!dirq.includes("dropProvisional("), "the tab stays");
+  assert.match(dirq, /const id = provisionalId;\n  if \(!id\) return;[^\n]*\n  if \(provisionalTimer\) \{ clearTimeout\(provisionalTimer\); provisionalTimer = undefined; \}\n  dirQuestionFor = id;/);
+  assert.match(dirq, /if \(provisionalId !== id \|\| dirQuestionFor !== id\) return;/, "an answer to an older prompt never settles a newer create");
+  assert.match(dirq, /failProvisional\(dirWhy\(missing\), v === "picker"\);\n    \}, "dir:" \+ id\);/, "dismissed: a failed create, keyed prompt");
+  assert.match(RENDER, /if \(provisionalId && dirQuestionFor === provisionalId && pendingNewSession === provisionalName\(req\.host, req\.name\)\) \{/, "startCreate: the retry keeps the tab");
+  assert.match(RENDER, /if \(abandonCreate && dirQuestionFor && dirQuestionFor === provisionalId\) failProvisional\(dirWhy\(lastCreate\?\.dir \?\? ""\)\);/);
+  assert.match(RENDER, /function openPicker\(pick = false, prompt\?: string, allowNew = false\) \{\n  dismissDirPromptForPicker\(\);/);
+  assert.match(RENDER, /function dismissDirPromptForPicker\(\): void \{\n  if \(confirmKey && confirmKey\.indexOf\("dir:"\) === 0\) closeConfirm\("picker"\);\n\}/);
+  assert.match(RENDER, /confirmCb = null;\n  confirmKey = null;[^\n]*\n  if \(cb\) cb\(value\);/);
+  // …and the shell HOLDS a busy column an emptiness report would close, as reconcile does, instead of refusing it (P2-b)
+  assert.ok(KERNEL.includes("if(busy(frameOfCol(en.n))){held[en.n]=true;save();return;}\nclose(en.n);return;}"));
   assert.match(RENDER, /discards both \*\/ \}\);\n  syncColumnBusy\(\);[^\n]*\n\}/, "failProvisional: still busy, said for the invariant, last");
   assert.match(RENDER, /else \{ failedProvisionals\.delete\(id\); dismissSession\(id, "close"\); syncColumnBusy\(\); \}/, "a failed tab's discard: the text went with it");
   // …and the shell's close() takes the state the page holds for sessions it does not show, judged against the shell's current sets

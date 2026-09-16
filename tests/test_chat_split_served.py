@@ -48,11 +48,12 @@ driver run walks the whole story in order, each step landing in its own assertio
      of column 2 lands as a storage event, so the busy column is held; the create resolves to the existing "web" via the
      focus the shell hops into a column, and the text typed into the provisional tab ends up in A's composer in column 1,
      which shows A, and column 2 is closed, its blob holding no draft for A;
- 15. the FOLDER QUESTION (round three): a real create in column 2 naming a folder under the lab's project dir that is not
-     there yet; the kernel's real createDirMissing puts "That folder isn't there" up; a peer's removal lands as a storage
-     event — the column is busy (the question is the create in flight) and stands, prompt and all; "Edit the path" keeps
-     it standing with the picker; the picker closed with no create abandons the question: the typed text lands in the
-     draft of the tab the column showed (C), the flip closes the held column, and the text is in C's box in column 1.
+ 15. the FOLDER QUESTION (round four): a real create in column 2 naming a folder under the lab's project dir that is not
+     there yet; the kernel's real createDirMissing puts "That folder isn't there" up OVER the provisional tab, which stays
+     with the typed text in its box; a peer's removal lands as a storage event — the column is busy by that tab and stands,
+     prompt and tab; "Edit the path" keeps both and prefills the picker; the picker closed with no create dismisses the
+     question: the tab is a failed create (its text in its box, the column still busy and standing); the tab's ✕ discards
+     it, and the flip closes the held column — the text in no other session's draft.
 Skips LOUDLY when the extension deps or a playwright browser are absent (CI installs none). Synthetic only:
 placeholder sids, invented notes-api prompt text, no real session data."""
 import json
@@ -767,21 +768,22 @@ await clickTab("f-chat", cfg.sidA); await waitActive("f-chat", cfg.sidA);
 out.s14.composer1 = await composerIn("f-chat");
 out.s14.after = await shell();
 out.s14.blob2Drafts = await page.evaluate(() => { try { return JSON.parse(localStorage.getItem("romp-vscode-state-chat:2") || "{}").drafts || {}; } catch (e) { return null; } });
-// ---- step 15 (round three, 2026-09-15): the FOLDER QUESTION in a held column keeps it busy; abandoning it keeps the text ----
+// ---- step 15 (round four, 2026-09-15): the FOLDER QUESTION keeps the provisional TAB; a held column stands under it; dismissed → a failed tab; its ✕ → the close ----
 // A real create in column 2 naming a folder under the lab's project dir that is not there yet: the kernel's REAL answer is
-// createDirMissing (a filesystem check, which the lab kernel makes like any other), and the page puts "That folder isn't
-// there" up. The peer's removal (its storage event) lands while the question is up: the column is busy — the question is the
-// create in flight — so it is held, prompt and all. "Edit the path" keeps it standing with the picker (the carry waits for the
-// create from there); closing the picker with no create abandons the question: the typed text goes to the draft of the tab the
-// column showed (C), then the flip; the shell closes the held column and hands that draft to C's owner, column 1. Before the
-// fix the flip fired the moment the provisional dropped for the prompt, and the column closed with the carry and the prompt.
+// createDirMissing (a filesystem check the lab kernel makes like any other) and the page puts "That folder isn't there" up —
+// over the provisional TAB, which stays with the typed text in its box. The peer's removal (its storage event) lands while the
+// question is up: the column is busy by that tab, so it is held, prompt and tab. "Edit the path" keeps both and prefills the
+// picker; the picker closed with no create dismisses the question — the tab is a FAILED create now (the "Couldn't start"
+// dialog, the text still in its box), the column still busy and standing; the tab's ✕ is the one discard, and the flip
+// closes the held column. Before this the shell closed the column the moment the peer's write landed, prompt and text with it.
 holdCol2 = false;   // step 14 parked column 2's frames; this step wants the kernel's real answer
 const TYPED15 = "notes for a session whose folder is not there yet";
 const f15 = await page.evaluate((sid) => { const f = window.__rompMoveTab(sid, "new"); return f ? f.id : null; }, cfg.sidC);
 await waitTabs("f-chat-2", [cfg.sidC]);
 const busy2 = () => page.evaluate(() => { try { return !!document.getElementById("f-chat-2").contentWindow.__rompColumnBusy(); } catch (e) { return null; } });
-const promptIn2 = () => page.evaluate(() => { const f = document.getElementById("f-chat-2"); const d = f && f.contentDocument; const c = d && d.getElementById("confirm"); return !!c && /folder isn't there/.test(c.textContent || ""); });   // false for a column already gone
+const promptIn2 = (src) => page.evaluate((src) => { const f = document.getElementById("f-chat-2"); const d = f && f.contentDocument; const c = d && d.getElementById("confirm"); return !!c && new RegExp(src).test(c.textContent || ""); }, src);   // false for a column already gone
 const pickerIn2 = () => page.evaluate(() => { const f = document.getElementById("f-chat-2"); const d = f && f.contentDocument; const p = d && d.getElementById("picker"); return !!p && p.style.display !== "none"; });
+const provIn2 = () => page.evaluate(() => { const f = document.getElementById("f-chat-2"); const d = f && f.contentDocument; if (!d) return null; const t = Array.from(d.querySelectorAll("#tabs .tab[data-id]")).map((x) => x.dataset.id).find((id) => id.indexOf("new-") === 0); return t || null; });   // the provisional tab on column 2's strip
 const fr15 = await (await page.$("#f-chat-2")).contentFrame();
 await page.evaluate(() => document.getElementById("f-chat-2").contentWindow.postMessage({ type: "openPicker" }, "*"));
 await waitFn(() => { const d = document.getElementById("f-chat-2").contentDocument; const p = d && d.getElementById("picker"); return !!p && p.style.display !== "none"; }, null, "step 15: column 2's picker never opened");
@@ -789,32 +791,40 @@ await fr15.evaluate((dir) => { const sb = document.getElementById("picker-search
   const d = document.getElementById("picker-dir"); d.value = dir; d.dispatchEvent(new Event("input", { bubbles: true })); document.getElementById("picker-new-btn").click(); }, cfg.cwd + "/not-there-yet");
 await waitFn(() => { const f = document.getElementById("f-chat-2"); try { return !!f.contentWindow.__rompColumnBusy(); } catch (e) { return false; } }, null, "step 15: no create in flight in column 2");
 await fr15.evaluate((text) => { const ta = document.getElementById("composer-input"); ta.value = text; ta.dispatchEvent(new Event("input", { bubbles: true })); }, TYPED15);
-// the kernel's real answer: the folder question is up in column 2
+// the kernel's real answer: the folder question is up in column 2 — over the provisional tab, which stays
 await waitFn(() => { const d = document.getElementById("f-chat-2").contentDocument; const c = d && d.getElementById("confirm"); return !!c && /folder isn't there/.test(c.textContent || ""); }, null, "step 15: the folder question never showed in column 2");
-out.s15 = { frame: f15, typed: TYPED15, busyAtQuestion: await busy2() };
-// the peer removes column 2 while the question is up: busy → held, prompt and all
+out.s15 = { frame: f15, typed: TYPED15, busyAtQuestion: await busy2(), provAtQuestion: await provIn2(), composerAtQuestion: await composerIn("f-chat-2") };
+// the peer removes column 2 while the question is up: busy → held, prompt and tab
 await page.evaluate(() => { const v = JSON.stringify({ v: 2, cols: [] }); localStorage.setItem("romp-chat-cols", v); window.dispatchEvent(new StorageEvent("storage", { key: "romp-chat-cols", newValue: v })); });
 await page.evaluate(() => new Promise((r) => setTimeout(r, 150)));
-out.s15.held = await shell(); out.s15.heldBusy = await busy2(); out.s15.promptStill = await promptIn2();
-// "Edit the path": the question continues in the picker — the column stands, still busy. (Only while the column stands: before
-// the fix the peer's write closed it, prompt and all, and the test reads that from `held` rather than the driver dying here.)
-out.s15.editing = { frames: await page.evaluate(() => window.__rompChatFrameIds()), busy: null, picker: false, dir: "" };
+out.s15.held = await shell(); out.s15.heldBusy = await busy2(); out.s15.promptStill = await promptIn2("folder isn't there"); out.s15.provStill = await provIn2();
+// (the gestures below only while the column stands: before the fix the peer's write closed it, and the test reads that from `held`)
+out.s15.editing = { frames: await page.evaluate(() => window.__rompChatFrameIds()), busy: null, picker: false, prov: null, dir: "" };
+out.s15.dismissed = null;
 if (out.s15.editing.frames.includes("f-chat-2")) {
+  // "Edit the path": the question continues in the picker, prefilled — the tab stays, the column stands, still busy
   await fr15.evaluate(() => { const b = Array.from(document.querySelectorAll("#confirm button")).find((x) => /Edit the path/.test(x.textContent || "")); if (b) b.click(); });
   await waitFn(() => { const f = document.getElementById("f-chat-2"); const d = f && f.contentDocument; const p = d && d.getElementById("picker"); return !!p && p.style.display !== "none" && !d.getElementById("confirm"); }, null, "step 15: Edit the path never reopened the picker");
-  out.s15.editing = { frames: await page.evaluate(() => window.__rompChatFrameIds()), busy: await busy2(), picker: await pickerIn2(),
+  out.s15.editing = { frames: await page.evaluate(() => window.__rompChatFrameIds()), busy: await busy2(), picker: await pickerIn2(), prov: await provIn2(),
                       dir: await fr15.evaluate(() => document.getElementById("picker-dir").value) };
-  // the picker closed with no create (the toggle, as step 5 closes it): the question is abandoned — the text to C's draft, then
-  // the flip; the shell closes the held column and hands the draft to C's owner
+  // the picker closed with no create (the toggle, as step 5 closes it): the question is dismissed — the tab is a FAILED create,
+  // its text in its box, said as for any failed create; the column stands, still busy
   await page.evaluate(() => document.getElementById("f-chat-2").contentWindow.postMessage({ type: "openPicker", toggle: true }, "*"));
+  // (recorded, never died on: before the fix the column closed here instead, and test_15 reads that from `dismissed`)
+  const failedShown = await page.waitForFunction(() => { const f = document.getElementById("f-chat-2"); const d = f && f.contentDocument; const c = d && d.getElementById("confirm"); return !!c && /Couldn't start/.test(c.textContent || ""); }, null, { timeout: T }).then(() => true).catch(() => false);
+  out.s15.dismissed = { failedShown, frames: await page.evaluate(() => window.__rompChatFrameIds()), busy: await busy2(), prov: await provIn2(), store: await page.evaluate(() => localStorage.getItem("romp-chat-cols")),
+                        composer: (await page.evaluate(() => !!document.getElementById("f-chat-2"))) ? await composerIn("f-chat-2") : null };
+  if (failedShown) {
+    await fr15.evaluate(() => { const b = document.querySelector("#confirm button"); if (b) b.click(); });   // OK
+    await page.waitForFunction(() => { const f = document.getElementById("f-chat-2"); const d = f && f.contentDocument; return !!d && !d.getElementById("confirm"); }, null, { timeout: T }).catch(() => {});
+    // the failed tab's ✕: the one discard — the column is not busy any more, and the held close completes on the flip
+    await fr15.evaluate((id) => { const x = document.querySelector('#tabs .tab[data-id="' + id + '"] .tab-close'); if (x) x.click(); }, out.s15.dismissed.prov);
+  }
 }
 out.s15.colGone = await page.waitForFunction(() => !document.getElementById("chat-pane-2") && !document.getElementById("gv-chat-2"), null, { timeout: T }).then(() => true).catch(() => false);
-const drafts1 = await page.evaluate(() => { try { return JSON.parse(localStorage.getItem("romp-vscode-state-chat") || "{}").drafts || {}; } catch (e) { return {}; } });
-out.s15.keyed = Object.keys(drafts1).filter((k) => (drafts1[k] || "").includes(TYPED15));
-if (out.s15.keyed.length) { await clickTab("f-chat", out.s15.keyed[0]); await waitActive("f-chat", out.s15.keyed[0]); }
-out.s15.composer1 = await composerIn("f-chat");
 out.s15.after = await shell();
-out.s15.blob2Drafts = await page.evaluate(() => { try { return JSON.parse(localStorage.getItem("romp-vscode-state-chat:2") || "{}").drafts || {}; } catch (e) { return null; } });
+const drafts1 = await page.evaluate(() => { try { return JSON.parse(localStorage.getItem("romp-vscode-state-chat") || "{}").drafts || {}; } catch (e) { return {}; } });
+out.s15.leaked = Object.keys(drafts1).filter((k) => (drafts1[k] || "").includes(TYPED15));   // the discarded text must be in no other session's draft
 } catch (e) { out.lateError = String((e && e.stack) || e); }
 out.ms = Date.now() - out.t0;
 fs.writeSync(1, "RESULT:" + JSON.stringify(out) + "\n");
@@ -1277,29 +1287,33 @@ class ServedChatSplit(unittest.TestCase):
         self.assertIn(s["typed"], s["composer1"] or "", "the typed text is in A's composer in column 1, the pane that shows A: %r" % s["composer1"])
         self.assertFalse((s["blob2Drafts"] or {}).get(SID_A), "…and not stranded in column 2's blob: %r" % s["blob2Drafts"])
 
-    def test_15_the_folder_question_keeps_a_held_column_busy_and_abandoning_it_keeps_the_typed_text(self):
-        """Round three (2026-09-15). The kernel's createDirMissing dropped the provisional and the page flipped at once, so a
-        column another dashboard had dropped closed there, the "That folder isn't there" prompt and the carried text with it
-        (the carry was in no session's draft the close hand-off enumerates). The question is the create in flight now: busy
-        through its prompt and the picker "Edit the path" reopens; abandoning it (the picker closed with no create) lands the
-        text in the draft of the tab the column showed, then flips, and the close hands that draft to the tab's owner. The
-        create, the kernel's answer (a filesystem check) and every gesture are real; the peer's removal is its storage event."""
+    def test_15_the_folder_question_keeps_the_provisional_tab_and_a_held_column_stands_under_it_until_the_tab_is_discarded(self):
+        """Round four (2026-09-15). The folder question keeps the provisional TAB: the create still in flight, its text in its
+        box, the column busy by that tab for every reader — so a column another dashboard dropped stands under the prompt
+        and the picker. A dismissal turns the tab into a failed create (text kept, still busy); the user's ✕ is the one
+        discard, and the flip then closes the held column. Rounds one to three carried the text in a variable keyed to no
+        session, and a dismissal could put it in another session's draft or lose it with the document. The create, the
+        kernel's answer (a filesystem check) and every gesture are real; the peer's removal is its storage event."""
         r = self._r()
         self.assertNotIn("lateError", r, "step 15 raised: %s" % r.get("lateError"))
         s = r["s15"]
         self.assertEqual(s["frame"], "f-chat-2")
-        self.assertTrue(s["busyAtQuestion"], "the question up: the column is busy")
+        self.assertTrue(s["busyAtQuestion"], "the question up: the column is busy"); self.assertTrue(s["provAtQuestion"], "…by the provisional tab, which stays: %r" % s["provAtQuestion"])
+        self.assertEqual(s["composerAtQuestion"], s["typed"], "its text where it was typed")
         h = s["held"]
         self.assertEqual(h["frameIds"], ["f-chat", "f-chat-2"], "held under the peer's write: %r" % h); self.assertEqual(h["sets"], {"2": []})
-        self.assertEqual(json.loads(h["cols"]), {"v": 2, "cols": []}); self.assertTrue(s["heldBusy"]); self.assertTrue(s["promptStill"], "the prompt is still up in the held column")
+        self.assertEqual(json.loads(h["cols"]), {"v": 2, "cols": []}); self.assertTrue(s["heldBusy"]); self.assertTrue(s["promptStill"], "the prompt is still up"); self.assertEqual(s["provStill"], s["provAtQuestion"], "…and the tab")
         e = s["editing"]
-        self.assertEqual(e["frames"], ["f-chat", "f-chat-2"], "Edit the path: the column stands, with the picker"); self.assertTrue(e["busy"]); self.assertTrue(e["picker"])
+        self.assertEqual(e["frames"], ["f-chat", "f-chat-2"], "Edit the path: the column stands, with the picker"); self.assertTrue(e["busy"]); self.assertTrue(e["picker"]); self.assertEqual(e["prov"], s["provAtQuestion"], "the tab stays")
         self.assertTrue(e["dir"].endswith("/not-there-yet"), "prefilled to retry this create: %r" % e["dir"])
-        self.assertTrue(s["colGone"], "the picker closed with no create: abandoned, flipped, the held column closed: %r" % s)
-        self.assertEqual(s["keyed"], [SID_C], "the text is the draft of the tab the column showed (C), handed to column 1")
-        self.assertIn(s["typed"], s["composer1"] or "", "…and in C's box there: %r" % s["composer1"])
+        d = s["dismissed"]
+        self.assertIsNotNone(d, "the picker closed with no create dismissed the question")
+        self.assertTrue(d["failedShown"], "dismissed: the tab is a failed create, said as for any (before the fix the column closed here instead): %r" % d)
+        self.assertEqual(d["frames"], ["f-chat", "f-chat-2"], "a failed create now: the column still stands"); self.assertTrue(d["busy"], "…and is still busy (the failed tab holds the text)")
+        self.assertEqual(d["prov"], s["provAtQuestion"], "the same tab, failed"); self.assertEqual(d["composer"], s["typed"], "its text still in its box"); self.assertEqual(json.loads(d["store"]), {"v": 2, "cols": []}, "the peer's write, untouched")
+        self.assertTrue(s["colGone"], "the tab's ✕ discarded it: not busy, the held column closed on the flip: %r" % s)
         self.assertEqual(s["after"]["frameIds"], ["f-chat"]); self.assertEqual(json.loads(s["after"]["cols"]), {"v": 2, "cols": []})
-        self.assertFalse(any(TYPED in (v or "") for v in (s["blob2Drafts"] or {}).values()) if (TYPED := s["typed"]) else False, "not stranded in column 2's blob: %r" % s["blob2Drafts"])
+        self.assertEqual(s["leaked"], [], "the discarded text is in no other session's draft")
 
     def test_per_tab_hot_keys_switch_to_the_column_holding_the_session_and_the_split_cycles(self):
         # the user 2026-09-10: a hot key per tab (set from its menu; the keycap on the tab is the T379 widget, reading the same

@@ -154,8 +154,10 @@ test("a missing directory raises the create-or-edit choice, and Create re-sends 
   // (2026-07-30: the cue became a provisional TAB, so the folder question retires it and holds what was
   // typed for the retry — "Create it and start" re-sends the same create, so the text is still that
   // session's, not the fallback tab's.)
-  assert.match(RENDER, /const held = dropProvisional\(\);/);
-  assert.match(RENDER, /pendingCarry = \[\.\.\.held\.queued, held\.draft\]\.filter\(Boolean\)/);
+  // (round four, 2026-09-15: the folder question keeps the provisional TAB — its box holds the text; the retry re-sends the
+  // create on that same tab, so nothing is carried anywhere)
+  assert.match(RENDER, /const id = provisionalId;\n  if \(!id\) return;/);
+  assert.match(RENDER, /if \(provisionalId && dirQuestionFor === provisionalId && pendingNewSession === provisionalName\(req\.host, req\.name\)\) \{/);
   assert.match(RENDER, /\{ label: "Create it and start", value: "create" \}, \{ label: "Edit the path", value: "edit" \}/);
   assert.match(RENDER, /if \(v === "create" && req\) \{ startCreate\(req, true\); return; \}/);   // …and with no request to retry the question is abandoned (dir-question-busy.test.ts)
   assert.match(RENDER, /\.\.\.\(mkdir \? \{ mkdir: true \} : \{\}\)/, "mkdir rides the same message");

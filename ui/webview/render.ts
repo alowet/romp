@@ -8109,15 +8109,16 @@ function forgetProvisionalSend(text: string): boolean {
   return true;
 }
 let provisionalTimer: ReturnType<typeof setTimeout> | undefined;
-// Text typed into a provisional tab whose create had to ask something first, waiting for the retry's tab.
-let pendingCarry = "";
-// …and the FOLDER QUESTION it belongs to is still the create in flight (round three, 2026-09-15): from the kernel's
-// createDirMissing until the user retries ("Create it and start", or a create from the picker "Edit the path" reopened) or
-// abandons it (the prompt dismissed, the picker closed with no create). True for that whole span — a third busy fact the
-// shell reads (__rompColumnBusy), so a column another dashboard dropped stays held under the prompt and the picker, and
-// the column's ✕ refuses, exactly as over a provisional tab. Before this the flip fired the moment the provisional dropped,
-// the shell closed the held column, and the carry — in no session's draft — died with the document, prompt and all.
-let dirQuestion = false;
+// THE FOLDER QUESTION keeps the provisional TAB (round four, 2026-09-15). A create the kernel answers with createDirMissing
+// is not going to land as asked, but its tab stays — the box holding what was typed — and the tab IS the create still in
+// flight: busy for every reader by provisionalId alone, nothing to relocate, so a column another dashboard dropped stays
+// held under the prompt and the column's ✕ refuses, as over any pending create. This names the provisional whose question
+// is up (its prompt, or the picker "Edit the path" reopened) — not a busy fact: WHICH pending create is waiting on the user.
+// The retry re-sends the create on that same tab (startCreate); a dismissal — Escape, the backdrop, the picker closed with
+// no create, the picker opened over the prompt — turns the tab into a FAILED provisional: text kept in its box, busy, the
+// user's ✕ the one discard, exactly a failed create. (Rounds one to three carried the text in a document-local variable
+// keyed to no session: a held column's close could not hand it anywhere, and its fallbacks put it in other sessions' drafts.)
+let dirQuestionFor: string | null = null;
 // Provisional tabs whose create FAILED (the user 2026-08-08): the tab — and whatever was typed into
 // it — STAYS, foregrounded, with the failure dialog on top. It used to be torn down and the held text
 // dumped into whichever tab happened to be active, polluting an unrelated thread's draft. The set keys
@@ -8137,10 +8138,11 @@ const PROVISIONAL_WAIT_MS = 90_000;
 // the REASON behind the answer above (T395 round one): the shell's refusal toast names the padlock for a lock, and says
 // "only an open session" for the rest, instead of one line for both
 (window as any).__rompMoveRefusal = (sid: unknown): string => typeof sid !== "string" || !sid || isProvisionalId(sid) || isSubId(sid) ? "not-open" : settings.tabsLocked ? "locked" : "";
-// THE THREE FACTS "a create is in flight here" reads: a provisional tab, a failed one still holding its text, and a pending
-// folder question (its prompt up, or the path being edited in the picker it reopened) — see dirQuestion. One reader for
-// the shell's question and for the flip below, so they can never disagree.
-function columnBusy(): boolean { return !!provisionalId || failedProvisionals.size > 0 || dirQuestion; }
+// THE TWO FACTS "a create is in flight here" reads: a provisional tab (a folder question keeps it, see dirQuestionFor) and a
+// failed one still holding its text. ONE reader — the shell's question, the flip below and the emptiness report
+// (noteColumnEmptiness) all read this, so they can never disagree (round four: the emptiness report read the facts on its
+// own and posted colEmpty from under a folder question).
+function columnBusy(): boolean { return !!provisionalId || failedProvisionals.size > 0; }
 (window as any).__rompColumnBusy = (): boolean => columnBusy();
 // …and the shell hears the answer CHANGE (2026-09-15): a column another dashboard's write dropped is HELD by the shell
 // while this page is busy — closing it would kill the create's queued text and draft with the document — and closed the
@@ -8159,7 +8161,7 @@ function syncColumnBusy(): void {
 }
 
 function openProvisional(req: CreateReq): void {
-  dropProvisional();                       // never two at once: a second create supersedes the first
+  const prev = dropProvisional();          // never two at once: a second create supersedes the first — and takes its text (below)
   const display = provisionalName(req.host, req.name);
   pendingNewSession = display;
   const id = mintProvisionalId(Date.now().toString(36) + Math.random().toString(36).slice(2));
@@ -8177,12 +8179,11 @@ function openProvisional(req: CreateReq): void {
   renderTabs();
   setActive(id);
   const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
-  // text carried over from a create that had to ask something first (the folder question): it was typed
-  // for THIS session, so it comes back into the box the retry opens rather than being stranded on
-  // whichever tab happened to be underneath.
-  if (ta && pendingCarry) { ta.value = pendingCarry; growComposer(ta); }
-  pendingCarry = "";
-  dirQuestion = false;                     // the retry is under way: the question is answered (busy stays, by this provisional)
+  // the superseded create's text comes along: it was typed for a new session, and this is the new session now — a create
+  // retried from the picker under another name (the folder question's "Edit the path", renamed) above all. Never another
+  // session's draft; and the same name retried is not this path at all (startCreate keeps that tab)
+  const carry = [...prev.queued, prev.draft].filter(Boolean).join("\n\n");
+  if (ta && carry) { ta.value = carry; growComposer(ta); }
   ta?.focus();                             // the whole point: you can start typing NOW
   provisionalTimer = setTimeout(
     () => failProvisional("romp asked to start it, but nothing came back."), PROVISIONAL_WAIT_MS);
@@ -8192,6 +8193,7 @@ function openProvisional(req: CreateReq): void {
 function dropProvisional(): { queued: string[]; draft: string } {
   const id = provisionalId;
   provisionalId = null;
+  dirQuestionFor = null;                   // whatever question that create had is over with it
   provisionalTags = [];
   pendingNewSession = null;
   if (provisionalTimer) { clearTimeout(provisionalTimer); provisionalTimer = undefined; }
@@ -8255,9 +8257,10 @@ function resolveProvisionalToExisting(realId: string): void {
 // foregrounded first, with whatever was typed back in ITS box (the user 2026-08-08): tearing it down
 // restored the text into whichever tab happened to be active, so a failure that landed while you were
 // reading another thread silently rewrote that thread's draft.
-function failProvisional(why: string): void {
+function failProvisional(why: string, quiet = false): void {
   if (!provisionalId) return;
   const id = provisionalId;
+  dirQuestionFor = null;             // whatever question it had is over: the tab is a failed create now
   const name = pendingNewSession || "that session";
   // retire the create MACHINERY only — dropProvisional() would dismiss the tab too
   provisionalId = null;
@@ -8281,7 +8284,7 @@ function failProvisional(why: string): void {
     if (ta) { ta.value = held; growComposer(ta); }
   }
   renderTabs();
-  showConfirm("Couldn't start " + name,
+  if (!quiet) showConfirm("Couldn't start " + name,   // quiet: the picker the user opened over a folder question is the foreground (dismissDirPromptForPicker)
     why + (held ? "\n\nWhat you typed is in this tab's message box." : ""),
     [{ label: "OK", value: "ok" }], () => { /* the tab keeps the text until its ✕ discards both */ });
   syncColumnBusy();                  // still busy (the failed tab holds the text): no flip, said for the invariant — every write of the two facts
@@ -8372,7 +8375,7 @@ function noteColumnEmptiness(ids: readonly string[]): void {
   // a create in flight, or a failed one still holding its text, is this column's own tab and in no entry: the column
   // stays until it resolves (adoptProvisional claims the real id) or its ✕ discards it — closed under it, the queued
   // text and the draft died with the document (review find 2026-09-11)
-  if (provisionalId || failedProvisionals.size) return;
+  if (columnBusy()) return;   // ONE reader with the shell's question and the flip (round four): never from under a folder question either
   const mine = colSets[COL] || [];
   // held: a member is listed, or live and not crossed → the latch resets. unknown: none is present but a member's host has
   // not reported on this socket (chat-columns.ts columnEmptiness) → nothing is said and the latch stands as it was, the
@@ -8866,29 +8869,42 @@ function startCreate(req: CreateReq, mkdir = false): void {
   lastCreate = req;
   rememberDir(req.host, req.dir);   // what you used on that machine is the right prefill for it next time
   if (vscodeApi) vscodeApi.postMessage({ type: "createSession", ...req, ...(mkdir ? { mkdir: true } : {}) });
-  closePicker(false);   // a create from the picker is the folder question's RETRY, never its abandonment: openProvisional below takes the carry
+  closePicker(false);   // a create from the picker RETRIES a pending folder question, never dismisses it (closePicker)
+  // the folder question's retry — "Create it and start", or the same name created again from the picker "Edit the path"
+  // reopened: ONE tab, one create. The pending tab stays, its box untouched; the kernel's answer lands on it as on any
+  // create (adoptsProvisional matches the name), and the backstop is armed again
+  if (provisionalId && dirQuestionFor === provisionalId && pendingNewSession === provisionalName(req.host, req.name)) {
+    dirQuestionFor = null;
+    provisionalTags = req.tags?.slice() ?? [];
+    if (provisionalTimer) clearTimeout(provisionalTimer);
+    provisionalTimer = setTimeout(() => failProvisional("romp asked to start it, but nothing came back."), PROVISIONAL_WAIT_MS);
+    syncColumnBusy();   // busy before, busy now: said for the invariant
+    return;
+  }
   // …and the tab is THERE, with a live composer, before the kernel has answered. A remote session's tab
   // arrives host-prefixed, so that is the name the provisional one is matched against on arrival.
   openProvisional(req);
 }
 
 function onCreateDirMissing(m: any): void {
-  // The folder question supersedes the provisional tab: this create is not going to land as asked. Keep
-  // what was typed — "Create it and start" re-sends the very same create, so the text belongs to the
-  // session that is about to exist, not to whatever tab we happen to fall back to.
-  const held = dropProvisional();
-  pendingCarry = [...held.queued, held.draft].filter(Boolean).join("\n\n");
-  dirQuestion = true;   // the create is still in flight, as its folder question: busy for the shell, so a held column stands under the prompt
-  syncColumnBusy();     // no flip (busy before, busy now): said for the invariant — every write of the facts the answer reads
-  const req = lastCreate;
+  // The folder question: this create is not going to land as asked, and the provisional TAB STAYS — its box holds what was
+  // typed, and the tab is the create still in flight (see dirQuestionFor). The kernel has answered, so the backstop stands
+  // down: the wait is the user's now. The prompt is bound to THIS create (its key names the tab), so an answer to an older
+  // prompt can never settle a newer create, and the picker opened over it dismisses it as its own create's (openPicker).
+  const id = provisionalId;
+  if (!id) return;   // no create pending here: answered elsewhere, or settled already
+  if (provisionalTimer) { clearTimeout(provisionalTimer); provisionalTimer = undefined; }
+  dirQuestionFor = id;
+  const req = lastCreate, missing = String(m.dir || "");
   showConfirm("That folder isn't there",
-    createDirPrompt(String(m.name), (m.status || null) as DirStatus | null, String(m.dir || "")),
+    createDirPrompt(String(m.name), (m.status || null) as DirStatus | null, missing),
     [{ label: "Create it and start", value: "create" }, { label: "Edit the path", value: "edit" }],
     (v) => {
-      if (v === "create" && req) { startCreate(req, true); return; }   // the retry: openProvisional takes the carry and ends the question — busy stays, by the new provisional
+      if (provisionalId !== id || dirQuestionFor !== id) return;   // not this create's question any more: settled, retried or dismissed meanwhile
+      if (v === "create" && req) { startCreate(req, true); return; }   // the retry: the same create, mkdir set, on this same tab (startCreate)
       if (v === "edit" && req) {
-        // the question continues in the picker, prefilled to retry THIS create: the carry waits for the create from there
-        // (busy stays), and the picker closing with no create abandons it (closePicker → abandonDirQuestion)
+        // the question continues in the picker, prefilled to retry THIS create; the tab stays, its box untouched. A create from
+        // the picker is the retry (startCreate); the picker closing with no create dismisses the question (closePicker)
         openPicker();                    // reopen with the same name and path, cursor in the dir field
         const search = document.getElementById("picker-search") as HTMLInputElement | null;
         if (search) search.value = req.name;
@@ -8896,33 +8912,25 @@ function onCreateDirMissing(m: any): void {
         if (dir) { dir.value = req.dir; dir.focus(); dir.select(); askDirComplete(dir.value); }
         return;
       }
-      abandonDirQuestion();   // dismissed (Escape, the backdrop, a newer dialog), or nothing to retry: the text goes where the user can see it, then the flip
-    });
+      // dismissed — Escape, the backdrop, a newer dialog (null), the picker opened over it ("picker"), or nothing to retry: a
+      // failed create, its text kept in its box until the user's ✕; quietly when the picker is what the user asked for
+      failProvisional(dirWhy(missing), v === "picker");
+    }, "dir:" + id);
 }
-
-// The folder question ABANDONED: the carried text has no session to go to — the requested one will not exist — so it goes
-// where the user can see it: the draft of the tab this column shows, else the one it showed last, else the board's first
-// (appended, never over what is there; the way a failed create's text stays in its tab's box). Then the flip, LAST: a
-// column another dashboard dropped closes on it, and close() hands that draft to the tab's owner (__rompOrphanStateSids),
-// so the text is in the box of the pane that shows the tab. With no tab anywhere the carry waits for the next create, as
-// it always did.
-function abandonDirQuestion(): void {
-  const text = pendingCarry;
-  const sid = activeId || mru[0] || order[0] || null;
-  if (sid) {
-    pendingCarry = "";
-    if (text) {
-      stashActiveDraft(sid);   // the box's live text first, so nothing typed since is dropped by the read below
-      drafts.set(sid, [drafts.get(sid) ?? "", text].filter(Boolean).join("\n\n"));
-      persistDrafts();
-      if (activeId === sid) loadComposerFor(sid);
-    }
-  }
-  dirQuestion = false;
-  syncColumnBusy();   // LAST: the text has a home (or no home exists to lose it to)
+// the reason a dismissed folder question leaves on its failed tab (the dialog adds where the text is, as for any failed create)
+function dirWhy(dir: string): string {
+  return "That folder isn't there" + (dir ? ": " + dir : "") + ". Start it again from the session picker with a folder that exists, or discard this tab with its ✕.";
+}
+// The picker opened over a folder question (the palette, Mod+Shift+O — the dialog does not block it): that question is
+// dismissed FIRST, as a dismissal of ITS OWN create — the pending tab becomes a failed one, text kept, quietly (the picker
+// the user asked for is the foreground) — so an older prompt is never left up for a newer create's dialog to cancel, and
+// its callback to settle that newer create (round four, 2026-09-15). Only a folder question: other dialogs stand.
+function dismissDirPromptForPicker(): void {
+  if (confirmKey && confirmKey.indexOf("dir:") === 0) closeConfirm("picker");
 }
 
 function openPicker(pick = false, prompt?: string, allowNew = false) {
+  dismissDirPromptForPicker();   // a folder question up: dismissed first, as its own create's (a failed tab, text kept), never left for a newer dialog to cancel
   pickMode = pick;
   pickAllowNew = pick && allowNew;
   let overlay = document.getElementById("picker");
@@ -9331,9 +9339,11 @@ function reviveFailedLocal(id: string, name: string, text: string) {
 // One overlay at a time; Esc / backdrop click cancels (cb(null)). Buttons carry
 // a value handed to cb. Reuses the picker overlay's backdrop styling.
 let confirmCb: ((v: string | null) => void) | null = null;
-function showConfirm(title: string, detail: string, buttons: Array<{ label: string; value: string; danger?: boolean }>, cb: (v: string | null) => void) {
-  closeConfirm(null);   // a newer dialog replaces (and cancels) an older one
+let confirmKey: string | null = null;   // what the dialog up is about, for a caller that must know (the folder question: "dir:<provisional id>"); null for the rest
+function showConfirm(title: string, detail: string, buttons: Array<{ label: string; value: string; danger?: boolean }>, cb: (v: string | null) => void, key?: string) {
+  closeConfirm(null);   // a newer dialog replaces (and cancels) an older one — whose callback checks the cancel is still about its own create (onCreateDirMissing)
   confirmCb = cb;
+  confirmKey = key ?? null;
   const overlay = el("div", "picker-overlay confirm-overlay"); overlay.id = "confirm";
   const box = el("div", "picker-box confirm-box");
   const h = el("div", "confirm-title"); h.textContent = title;
@@ -11133,6 +11143,7 @@ function closeConfirm(value: string | null) {
   }
   const cb = confirmCb;
   confirmCb = null;
+  confirmKey = null;   // before the callback: a dialog it opens (a failed create's) is a new one
   if (cb) cb(value);
 }
 
@@ -11159,8 +11170,9 @@ function closePicker(abandonCreate = true) {
     pickMode = false;
   }
   // the picker "Edit the path" reopened closing with no create (Escape, the backdrop, the toggle, an existing session picked
-  // instead): the folder question is abandoned — startCreate alone passes false, its create being the question's retry
-  if (abandonCreate && dirQuestion) abandonDirQuestion();
+  // instead) dismisses the folder question: the pending tab becomes a failed one, its text kept — startCreate alone passes
+  // false, its create being the question's retry
+  if (abandonCreate && dirQuestionFor && dirQuestionFor === provisionalId) failProvisional(dirWhy(lastCreate?.dir ?? ""));
 }
 
 function pickerRows(): HTMLElement[] {

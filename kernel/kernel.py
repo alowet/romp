@@ -58394,6 +58394,12 @@ if(en.ids.length){save();return;}
 // and toasted a close nobody asked for (the vanishing tab, the user 2026-09-12)
 var crossed=Array.isArray(m.crossed)?gone.filter(function(id){return m.crossed.indexOf(id)>=0;}):[];
 var home=document.getElementById('f-chat');try{if(home&&crossed.length)home.contentWindow.postMessage({romp:'closing',ids:crossed},'*');}catch(e){}
+// …but never from under a create in flight (round four, 2026-09-15): a page reports no emptiness while busy (render.ts
+// noteColumnEmptiness), yet a report may cross the create in flight — so a busy document is HELD here the way reconcile
+// holds one, never refused: the store is written without the column (its members are gone) and the page's colBusy flip
+// completes the close. Before this close() refused with the toast nobody asked for, the entry stood emptied in memory while
+// the store still listed the vanished member, and the flip found nothing held.
+if(busy(frameOfCol(en.n))){held[en.n]=true;save();return;}
 close(en.n);return;}
 // ORPHANED STATE (review find 2026-09-11): a page holds a draft, citations, attachments or staged messages for a session
 // it does not show — a column blob written before the partition (a v1 column was a whole chat page, so its blob may name

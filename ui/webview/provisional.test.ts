@@ -165,10 +165,14 @@ test("closing a provisional tab aborts the pending spawn; a FAILED one is a plai
   assert.match(RENDER, /if \(!isProvisionalId\(id\)\) vscodeApi\.postMessage\(\{ type: "closeTab", id \}\);/);
 });
 
-test("the folder question retires the tab and holds what was typed for the retry", () => {
-  assert.match(RENDER, /const held = dropProvisional\(\);/);
-  assert.match(RENDER, /pendingCarry = \[\.\.\.held\.queued, held\.draft\]\.filter\(Boolean\)/);
-  assert.match(RENDER, /if \(ta && pendingCarry\) \{ ta\.value = pendingCarry; growComposer\(ta\); \}/);
+test("the folder question keeps the provisional tab; a superseded create's text comes along into the new tab", () => {
+  const dirq = RENDER.slice(RENDER.indexOf("function onCreateDirMissing("), RENDER.indexOf("function dirWhy("));
+  assert.ok(!dirq.includes("dropProvisional("), "round four (2026-09-15): the tab stays through the question — the create still in flight, its text in its box");
+  assert.match(dirq, /const id = provisionalId;\n  if \(!id\) return;/);
+  // round four (2026-09-15): the folder question keeps the tab, so nothing is carried between creates; what a SUPERSEDED
+  // create held (a second create while one is pending — the question's "Edit the path" renamed, above all) comes along
+  // into the new tab's box instead of being dropped
+  assert.match(RENDER, /const carry = \[\.\.\.prev\.queued, prev\.draft\]\.filter\(Boolean\)\.join\("\\n\\n"\);\n  if \(ta && carry\) \{ ta\.value = carry; growComposer\(ta\); \}/);
 });
 
 test("a starting tab shows the romp loader, not the 'No messages yet' placeholder", () => {

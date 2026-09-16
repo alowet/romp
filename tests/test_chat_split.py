@@ -284,6 +284,9 @@ class SplitSourcePins(unittest.TestCase):
         self.assertIn("activeIn(focused())", split)
         # the emptiness message, the drafts hand-off and the other dashboard tab's write
         self.assertIn("m.romp==='colEmpty'&&Array.isArray(m.gone)", split)
+        # …and an emptiness report that would close a BUSY column holds it as reconcile does, never refuses it (round four,
+        # 2026-09-15): the store written without the column, the flip completing the close
+        self.assertIn("if(busy(frameOfCol(en.n))){held[en.n]=true;save();return;}\nclose(en.n);return;}", split)
         self.assertIn("f.contentWindow.postMessage({romp:'adopt',sid:sid,state:state},'*');", split)
         self.assertIn("__rompTakeSessionState", split)
         # the page's two answers the shell asks for before it moves a tab or closes a column (review finds 2026-09-11), and
@@ -746,6 +749,18 @@ TAKE['f-chat-2'] = { [API]: { draft: 'a', citations: [], files: [], staged: [] }
 CALLS.posted = [];
 crossOf('f-chat-2').fire('click', { stopPropagation() {} });
 out.orphanClose.older = CALLS.posted.filter((p) => p.m && p.m.romp === 'adopt');
+// T) EMPTINESS FROM UNDER A CREATE IN FLIGHT (round four, 2026-09-15): a page reports no emptiness while busy, but a report
+//    may cross the create; the shell then HOLDS the column as reconcile does — the store written without it, the crossed ids
+//    still held back home, no toast — and the page's flip completes the close
+boot({}, false);
+window.__rompMoveTab(API, 'new');
+BUSY['f-chat-2'] = true; CALLS.notify = []; CALLS.sets = []; CALLS.unregister = []; CALLS.posted = [];
+msg({ romp: 'colEmpty', gone: [API], crossed: [API] }, 'f-chat-2');
+out.busyEmpty = { ids: ids(), stored: cols(), sets: window.__rompChatSets(), notify: CALLS.notify.slice(), saves: saves(), unregister: CALLS.unregister.slice(),
+                  closing: CALLS.posted.filter((p) => p.m && p.m.romp === 'closing') };
+BUSY['f-chat-2'] = false; CALLS.sets = [];
+msg({ romp: 'colBusy', busy: false }, 'f-chat-2');
+out.busyEmpty.after = { ids: ids(), stored: cols(), saves: saves(), unregister: CALLS.unregister.slice(), notify: CALLS.notify.slice() };
 // O) a closing column's width goes to the column on its left, measured before its key is dropped
 boot({}, false);
 window.__rompMoveTab(API, 'new'); window.__rompMoveTab(TESTS, 'new');
@@ -1085,6 +1100,20 @@ class SplitExecutes(unittest.TestCase):
         x = h["cross"]
         self.assertEqual(x["ids"], ["f-chat", "f-chat-2"]); self.assertEqual(x["notify"], [["warn", "A session is still being created in this column."]], "the user's own cross is refused with the line")
         self.assertEqual(x["then"], {"ids": ["f-chat"], "notify": 1}, "…and the flip closes it, saying nothing more")
+
+    def test_an_emptiness_report_from_under_a_create_in_flight_holds_the_column_instead_of_refusing_it(self):
+        # round four (2026-09-15): a colEmpty for a busy column met close()'s refusal — the toast nobody asked for, the entry
+        # emptied in memory while the store still listed the vanished member, and nothing held for the flip to complete: a
+        # stale mounted column until a reload. Held now, as reconcile holds: the store written without the column, the flip
+        # closing it
+        b = self.out["busyEmpty"]
+        self.assertEqual(b["ids"], ["f-chat", "f-chat-2"], "the busy column stands"); self.assertEqual(b["sets"], {"2": []}, "unlisted")
+        self.assertEqual(b["stored"], {"v": 2, "cols": []}, "the store: the column's members are gone, so is the column"); self.assertEqual(b["saves"], 1)
+        self.assertEqual(b["notify"], [], "no toast: the page's report is not the user's act"); self.assertEqual(b["unregister"], [])
+        self.assertEqual(b["closing"], [{"id": "f-chat", "m": {"romp": "closing", "ids": [API]}}], "the crossed id is still held back on the first column's strip")
+        a = b["after"]
+        self.assertEqual(a["ids"], ["f-chat"], "the flip completes the close"); self.assertEqual(a["stored"], {"v": 2, "cols": []}); self.assertEqual(a["saves"], 0, "nothing written again")
+        self.assertEqual(a["unregister"], ["chat-pane-2"]); self.assertEqual(a["notify"], [])
 
     def test_the_store_s_bytes_are_the_split_s_own_write_for_write_less_only_a_held_column(self):
         # round two (2026-09-15): the first fix filtered EMPTY entries out of every write, which changed ordinary bytes — a move
