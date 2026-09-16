@@ -17,7 +17,7 @@ const STYLES = ui("webview", "styles.css");
 test("render handles kernel warn messages with a toast", () => {
   // (2026-07-30: a warn arriving while a create is in flight IS that create's verdict, so it takes the
   // dialog and retires the provisional tab. Every other warn still gets the toast.)
-  assert.match(RENDER, /if \(provisionalId\) \{ failProvisional\(m\.text\); return; \}[\s\S]*?warnToast\(m\.text\);\n\}/);
+  assert.match(RENDER, /case "current": if \(provisionalId\) failProvisional\(m\.text\); else warnToast\(m\.text\); return;/);
   assert.match(RENDER, /function warnToast\(msg: string\)/);
 });
 

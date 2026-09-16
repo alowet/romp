@@ -111,7 +111,7 @@ test("a pick of a session another column holds is shown where it lives: the setA
   // is busy (closing it would kill the create's queued text) and closed on the page's colBusy flip, posted from every write of
   // the two facts the answer reads, only when it flipped (tests/test_chat_split.py runs the hold and both of its ends)
   assert.match(RENDER, /let columnBusyTold = false;\n(?:\/\/[^\n]*\n)*function announceColumnBusy\(\): void \{[\s\S]*?\}\nfunction syncColumnBusy\(\): void \{\n\s*const busy = columnBusy\(\);\n\s*if \(busy === columnBusyTold\) return;\n\s*columnBusyTold = busy;\n\s*try \{ if \(window\.parent && window\.parent !== window\) window\.parent\.postMessage\(\{ romp: "colBusy", busy \}, "\*"\); \}/);   // the baseline's announcer sits between them (round seven)
-  assert.match(RENDER, /\n  provisionalId = id;\n  provisionalRid = rid;[^\n]*\n  syncColumnBusy\(\);/, "openProvisional: busy now (waiting on this request, round five)");
+  assert.match(RENDER, /\n  provisionalId = id;\n  provisionalRid = rid;[^\n]*\n  pendingCreate = \{ id, name: display, dir: req\.dir, rid \};[^\n]*\n  persistDrafts\(\);\n  syncColumnBusy\(\);/, "openProvisional: busy now, waiting on this request, the pending create on disk (rounds five and eight)");
   // the flip is the LAST act of every settling path, after that path's last write of the text (round two, 2026-09-15: from
   // inside dropProvisional it ran ahead of resolveProvisionalToExisting's drafts.set and the text died with the document)
   const drop = RENDER.slice(RENDER.indexOf("function dropProvisional("), RENDER.indexOf("function adoptProvisional("));
@@ -148,18 +148,26 @@ test("a pick of a session another column holds is shown where it lives: the setA
   const fail = RENDER.slice(RENDER.indexOf("function failProvisional("), RENDER.indexOf("function cancelProvisional("));
   assert.ok(!/if \(held\) \{[^}]*persistDrafts\(\)/.test(fail) && /\n  persistDrafts\(\);   \/\/ ALWAYS/.test(fail), "failProvisional persists unconditionally");
   assert.match(RENDER, /function bootComposerState\(\): void \{\n  try \{[\s\S]*?restoreFailedProvisionals\(\);[\s\S]*?\} catch \(e\) \{ console\.error\(/);
-  assert.match(RENDER, /try \{ stagedMsgs\.restore\([^\n]*\n(?:[^\n]*\n)?bootComposerState\(\);[^\n]*\nannounceColumnBusy\(\);/, "the boot: staged restored, then the composer state, then the baseline");
+  assert.match(RENDER, /try \{ stagedMsgs\.restore\([^\n]*\n(?:\/\/[^\n]*\n)*function finishBoot\(\): void \{\n\s*bootComposerState\(\);[^\n]*\n\s*announceColumnBusy\(\);/, "the boot: staged restored, then the composer state, then the baseline (finishBoot, round eight)");
+  // round eight: replies are routed by their request, never by the pending create; the pending create is persisted; staged text
+  // under an id no record names is swept
+  assert.match(RENDER, /function routeCreateReply\(m: \{ rid\?: unknown \}\): CreateReplyRoute \{\n  if \(typeof m\.rid !== "string"\) return \{ kind: "current" \};\n  if \(provisionalRid !== null && m\.rid === provisionalRid\) return \{ kind: "pending" \};/);
+  assert.match(RENDER, /function onCreateWarn\(m: \{ text: string; rid\?: unknown \}\): void \{\n  const route = routeCreateReply\(m\);/);
+  assert.match(dirq, /const route = routeCreateReply\(m\);/); assert.match(dirq, /if \(route\.kind !== "current" && route\.kind !== "pending"\) return;/);
+  assert.match(RENDER, /rememberSettled\(provisionalRid, realId\);[\s\S]*?rememberSettled\(provisionalRid, realId\);/, "both settlements remember the request");
+  assert.match(RENDER, /pendingCreate = \{ id, name: display, dir: req\.dir, rid \};/); assert.match(RENDER, /pending: pendingCreate,/);
+  assert.match(RENDER, /for \(const k of Object\.keys\(stagedMsgs\.entries\(\)\)\) if \(isProvisionalId\(k\) && !failedProvisionals\.has\(k\)\) \{ stagedMsgs\.takeAll\(k\); dropped = true; \}/);
   assert.match(RENDER, /function announceColumnBusy\(\): void \{\n  columnBusyTold = columnBusy\(\);/);
   assert.match(RENDER, /else if \(m\.type === "focus" && createReplyIsStale\(m\)\) \{/, "a replaced create's success focus is nobody's (round six)");
   assert.ok(RENDER.indexOf('else if (m.type === "focus" && createReplyIsStale(m))') < RENDER.indexOf('else if (m.type === "focus" && !focusIsOurs(m.id))'), "…judged before either focus branch");
   // the failed tabs are persisted with the drafts and rebuilt at boot (round six); a rid reply with none pending refines a failed tab's reason
   assert.match(RENDER, /failed: Object\.fromEntries\(\[\.\.\.failedProvisionals\]\.map\(\(id\) => \[id, \{ name: failedInfo\.get\(id\)\?\.name/);
   assert.match(RENDER, /^  restoreFailedProvisionals\(\);/m); assert.match(RENDER, /function restoreFailedProvisionals\(\): void \{/);
-  assert.match(RENDER, /for \(const \[id, info\] of failedInfo\) if \(info\.rid === m\.rid && failedProvisionals\.has\(id\)\) \{ failedWhy\.set\(id, m\.text\); persistDrafts\(\); \}/);
+  assert.match(RENDER, /case "failed": failedWhy\.set\(route\.id, m\.text\); persistDrafts\(\); warnToast\(m\.text\); return;/, "a failed tab's late reason refines THAT tab (routed by request, round eight)");
   assert.ok(KERNEL.includes('_reveal_chat_for(client, {**({"rid": rid} if rid else {}), "type": "focus", "id": sid})'), "the spawn path's focus names the request");
   assert.ok(KERNEL.includes('tags=ctags, rid=_rid.get("rid"))'), "…threaded from the create op"); assert.ok(KERNEL.includes('_refuse_ws_flag(client, msg["type"], ferr, "mkdir", msg.get("mkdir"), extra=_rid)'));
-  assert.match(dirq, /if \(createReplyIsStale\(m\)\) return;/); assert.match(dirq, /key = "dir:" \+ \(typeof m\.rid === "string" \? m\.rid : id\)/);
-  assert.match(RENDER, /function onCreateWarn\(m: \{ text: string; rid\?: unknown \}\): void \{\n  if \(createReplyIsStale\(m\)\) return;\n  if \(provisionalId\) \{ failProvisional\(m\.text\); return; \}/);
+  assert.ok(!dirq.includes("createReplyIsStale("), "the folder question routes by request (routeCreateReply, round eight), not by the superseded set alone"); assert.match(dirq, /key = "dir:" \+ \(typeof m\.rid === "string" \? m\.rid : id\)/);
+  assert.match(RENDER, /function onCreateWarn\(m: \{ text: string; rid\?: unknown \}\): void \{\n  const route = routeCreateReply\(m\);[^\n]*\n  switch \(route\.kind\) \{\n    case "current": if \(provisionalId\) failProvisional\(m\.text\); else warnToast\(m\.text\); return;/, "a warning is routed by its request (round eight); none → the pending create's, as ever");
   assert.match(RENDER, /else if \(m\.type === "warn" && typeof m\.text === "string" && m\.text\) onCreateWarn\(m\);/);
   // …a dialog replacing a folder question says so, and that question fails its create quietly (no second #confirm); never two
   assert.match(RENDER, /closeConfirm\(confirmKey !== null && confirmKey\.indexOf\("dir:"\) === 0 \? "replaced" : null\);/);
@@ -170,7 +178,7 @@ test("a pick of a session another column holds is shown where it lives: the setA
   // …and the shell HOLDS a busy column an emptiness report would close, as reconcile does, instead of refusing it (P2-b)
   assert.ok(KERNEL.includes("if(busy(frameOfCol(en.n))){held[en.n]=true;save();return;}\nclose(en.n);return;}"));
   assert.match(RENDER, /discards both \*\/ \}\);\n  syncColumnBusy\(\);[^\n]*\n\}/, "failProvisional: still busy, said for the invariant, last");
-  assert.match(RENDER, /else \{ failedProvisionals\.delete\(id\); failedWhy\.delete\(id\); failedInfo\.delete\(id\); dismissSession\(id, "close"\); syncColumnBusy\(\); \}/, "a failed tab's discard: the text went with it (and its reason, round five)");
+  assert.match(RENDER, /else \{ failedProvisionals\.delete\(id\); failedWhy\.delete\(id\); failedInfo\.delete\(id\); stagedMsgs\.takeAll\(id\); dismissSession\(id, "close"\); syncColumnBusy\(\); \}/, "a failed tab's discard: the text went with it (and its reason, round five)");
   // …and the shell's close() takes the state the page holds for sessions it does not show, judged against the shell's current sets
   assert.match(RENDER, /\(window as any\)\.__rompOrphanStateSids = \(\): string\[\] => \{ colSets = readColSets\(\); if \(activeId\) stashActiveDraft\(activeId\); return orphanStateSids\(\); \};/);   // round three: the box's live text for an active tab the column no longer lists counts too
   assert.ok(KERNEL.includes("orphans(f).forEach(function(sid){if(cols[i].ids.indexOf(sid)>=0)return;var t=frameOfCol(ownerOf(sid));adopt(t&&t!==f&&loaded(t)?t:home,sid,take(f,sid));});"));

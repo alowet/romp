@@ -332,7 +332,8 @@ test("render.ts keeps the notices on the core's hook alone, pagehide keeps the s
   const scroll = RENDER.match(/^function persistScrollForReload\(\): void \{([\s\S]*?)\n\}/m);
   assert.ok(scroll && !scroll[1].includes("Notices"), "the scroll record is untouched");
   // the replay follows the loss toast's block directly: the loss first, then what the last page was saying
-  assert.match(RENDER, /shipsInFlight: \[\] \}\);\n\s*\}\n\s*\}\n\s*\} catch \(e\) \{ console\.error\([^\n]*\n\}\n(\/\/[^\n]*\n)*try \{ for \(const text of takeReloadNotices\(sessionStorage\)\) warnToast\(text\); \} catch \{ \/\* ignore \*\/ \}/);
+  // …executed as one sequence (finishBoot, round eight: the loss toast first, then the replay — dir-question-busy.test.ts runs it)
+  assert.match(RENDER, /function finishBoot\(\): void \{\n\s*bootComposerState\(\);[^\n]*\n\s*announceColumnBusy\(\);[^\n]*\n\s*try \{ for \(const text of takeReloadNotices\(sessionStorage\)\) warnToast\(text\); \} catch \{ \/\* ignore \*\/ \}[^\n]*\n\}\nfinishBoot\(\);/);
   assert.equal((RENDER.match(/takeReloadNotices\(/g) || []).length, 1, "consumed once, at load");
   assert.equal((RENDER.match(/keepReloadNotices\(/g) || []).length, 1, "written from one place");
 });

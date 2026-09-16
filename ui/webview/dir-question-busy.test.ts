@@ -22,6 +22,7 @@ import * as path from "node:path";
 import { createRequire } from "node:module";
 import { provisionalName, mintProvisionalId, isProvisionalId } from "./provisional";
 import { StagedStack } from "./staged-messages";
+import { takeReloadNotices, keepReloadNotices } from "./reload-notices";
 
 const requireCjs = createRequire(__filename);
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
@@ -44,15 +45,16 @@ type Api = {
   startCreate: (req: typeof REQ, mkdir?: boolean) => void; onCreateDirMissing: (m: Record<string, unknown>) => void; closePicker: (abandon?: boolean) => void;
   openPicker: () => void; cancelProvisional: () => void; closeTabLocally: (id: string) => void;
   onCreateWarn: (m: { text: string; rid?: unknown }) => void; showConfirm: (title: string, detail: string, buttons: { label: string; value: string }[], cb: (v: string | null) => void) => void;
-  stale: (m: { rid?: unknown }) => boolean; fireTimers: () => number; settle: () => void;
+  stale: (m: { rid?: unknown }) => boolean; fireTimers: () => number; settle: () => void; resolveTo: (sid: string) => void; route: (m: { rid?: unknown }) => string;
   held: { stage: (id: string, text: string) => void; cite: (id: string) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown> };
   busy: () => boolean; answer: (v: string | null) => void; confirm: () => { title: string; buttons: string[]; key: string | null } | null;
   overlays: () => number; clickButton: (label: string) => boolean; rid: () => string | null;
   type: (t: string) => void; composer: () => string; picker: () => { open: boolean; search: string; dir: string }; state: () => State;
 };
 
-function world(o: { activeId: string | null; mru: string[]; order: string[]; nextActive: string | null; store?: Record<string, unknown> }): { api: Api; HOOKS: Hooks; store: Record<string, unknown> } {
+function world(o: { activeId: string | null; mru: string[]; order: string[]; nextActive: string | null; store?: Record<string, unknown>; session?: Record<string, string> }): { api: Api; HOOKS: Hooks; store: Record<string, unknown>; session: Record<string, string> } {
   const store: Record<string, unknown> = o.store ?? {};
+  const session: Record<string, string> = o.session ?? {};   // the page's sessionStorage (the reload notices ride it)
   const HOOKS: Hooks = { posts: [], boot: [], sent: [], seq: [], confirms: [], pickers: 0, persisted: 0, timers: [], cleared: 0, toasts: [], answered: [] };
   const win = { parent: { postMessage(m: Record<string, unknown>) { HOOKS.posts.push(m); if (m.romp === "colBusy") HOOKS.seq.push("flip:" + m.busy); } } };
   const js = requireCjs("esbuild").transformSync(
@@ -60,13 +62,15 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
      fn("onCreateDirMissing"), fnOpt("dirWhy"), fnOpt("dismissDirPromptForPicker"), fn("closePicker"), fn("startCreate"), fn("closeConfirm"), fn("closeTabLocally"),
      fn("showConfirm"), fnOpt("onCreateWarn"), lineOpt("createReplyIsStale"), lineOpt("mintRid"),
      fn("persistDrafts").replace("function persistDrafts(", "function persistDraftsReal("), fnOpt("restoreFailedProvisionals"),
-     fnOpt("bootComposerState"), fnOpt("announceColumnBusy"), lineOpt("retireRid")].join("\n"),
+     fnOpt("bootComposerState"), fnOpt("announceColumnBusy"), lineOpt("retireRid"), fnOpt("finishBoot"), fnOpt("routeCreateReply"), lineOpt("rememberSettled"), fn("resolveProvisionalToExisting")].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
-    const { provisionalName, mintProvisionalId, isProvisionalId, StagedStack, HOOKS, STORE } = W;
+    const { provisionalName, mintProvisionalId, isProvisionalId, StagedStack, HOOKS, STORE, takeReloadNotices } = W;
+    const sessionStorage = { getItem: (k) => (k in W.SESSION ? W.SESSION[k] : null), setItem: (k, v) => { W.SESSION[k] = String(v); }, removeItem: (k) => { delete W.SESSION[k]; } };
     let provisionalId = null, provisionalTags = [], pendingNewSession = null, provisionalTimer = undefined, dirQuestionFor = null, pendingCarry = "", dirQuestion = false;
     let columnBusyTold = false, lastCreate = null, pickMode = false, activeId = W.activeId, confirmCb = null, confirmKey = null, provisionalRid = null;
-    const failedWhy = new Map(); const failedInfo = new Map(); let wantActiveGone = W.wantActiveGone; const supersededRids = [];
+    const failedWhy = new Map(); const failedInfo = new Map(); let wantActiveGone = W.wantActiveGone; const supersededRids = []; const settledRids = new Map(); let pendingCreate = null;
+    const RELOADED_WHY = "The page reloaded while this session was being created. Start it again from the session picker, or discard this tab with its ✕.";
     const pendingShips = new Map(); let stagedMsgs; const composerCitations = new Map(), composerFiles = new Map();   // stagedMsgs: created in the epilogue, in PRODUCTION order relative to the boot
     const provisionalQueue = []; const failedProvisionals = new Set(); const pendingSent = new Map(); const sessions = new Map(); const closingTabs = new Map();
     // the per-column state store the real page reads at boot (vscodeApi.getState) and writes on every draft change (setState replaces it)
@@ -103,7 +107,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
     // the failed creates with their orphan sweep, the lost ships), then the busy baseline — the real functions. On a render.ts
     // from before round seven (the fail-before run) the failed-create restore ran BEFORE stagedMsgs existed: that order is
     // reproduced here, and its store rewrite fails exactly as production's did
-    if (typeof bootComposerState === "function") { stagedMsgs = new StagedStack(); try { stagedMsgs.restore(STORE.staged); } catch (e) { /* */ } bootComposerState(); announceColumnBusy(); }
+    if (typeof bootComposerState === "function") { stagedMsgs = new StagedStack(); try { stagedMsgs.restore(STORE.staged); } catch (e) { /* */ } if (typeof finishBoot === "function") finishBoot(); else { bootComposerState(); announceColumnBusy(); } }
     else { for (const [k, v] of Object.entries((STORE.drafts && typeof STORE.drafts === "object") ? STORE.drafts : {})) drafts.set(k, v); if (typeof restoreFailedProvisionals === "function") restoreFailedProvisionals(); stagedMsgs = new StagedStack(); try { stagedMsgs.restore(STORE.staged); } catch (e) { /* */ } }
     HOOKS.boot = HOOKS.posts.splice(0); HOOKS.seq.length = 0;   // what the boot said (the busy baseline) is read apart from what the page says afterwards
     const overlay = () => findId(body, "confirm");
@@ -119,7 +123,10 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       rid: () => provisionalRid,
       stale: (m) => (typeof createReplyIsStale === "function" ? createReplyIsStale(m) : false),
       settle: () => { dropProvisional(); syncColumnBusy(); },   // a settlement that is not a cancel (the focus / the session's frame adopting): the request is NOT superseded
-      held: { stage: (id, text) => stagedMsgs.push(id, { text, cites: [] }), cite: (id) => composerCitations.set(id, [{ title: "a card", itemId: "g1" }]), attach: (id) => composerFiles.set(id, ["/tmp/a.png"]),
+      resolveTo: (sid) => resolveProvisionalToExisting(sid),     // the real settlement onto a running session (remembers the request as settled)
+      route: (m) => (typeof routeCreateReply === "function" ? routeCreateReply(m).kind : "?"),
+      // (each persists, as the page's own staging / citing / attaching does)
+      held: { stage: (id, text) => { stagedMsgs.push(id, { text, cites: [] }); persistDrafts(); }, cite: (id) => { composerCitations.set(id, [{ title: "a card", itemId: "g1" }]); persistDrafts(); }, attach: (id) => { composerFiles.set(id, ["/tmp/a.png"]); persistDrafts(); },
               staged: () => stagedMsgs.entries(), citations: () => Object.fromEntries(composerCitations), files: () => Object.fromEntries(composerFiles) },
       fireTimers: () => { const t = HOOKS.timers.splice(0); for (const f of t) f(); return t.length; },
       type: (t) => { EL["composer-input"].value = t; }, composer: () => EL["composer-input"].value,
@@ -128,8 +135,8 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
     };
   `;
   const make = new Function("W", "window", prelude + js + epilogue) as (w: unknown, win: unknown) => Api;
-  const api = make({ provisionalName, mintProvisionalId, isProvisionalId, StagedStack, HOOKS, STORE: store, activeId: o.activeId, mru: o.mru, order: o.order, nextActive: o.nextActive, wantActiveGone: null }, win);
-  return { api, HOOKS, store };
+  const api = make({ provisionalName, mintProvisionalId, isProvisionalId, StagedStack, HOOKS, STORE: store, SESSION: session, takeReloadNotices, activeId: o.activeId, mru: o.mru, order: o.order, nextActive: o.nextActive, wantActiveGone: null }, win);
+  return { api, HOOKS, store, session };
 }
 const flips = (h: Hooks, busy: boolean) => h.posts.filter((p) => p.romp === "colBusy" && p.busy === busy).length;
 const last = (h: Hooks) => h.posts[h.posts.length - 1];
@@ -403,4 +410,62 @@ test("round seven: a restored failed tab sets the busy baseline — one colBusy:
   assert.equal(r.api.busy(), true); assert.deepEqual(r.HOOKS.boot.filter((p) => p.romp === "colBusy"), [{ romp: "colBusy", busy: true }], "the baseline, said once at boot");
   r.api.closeTabLocally(id);
   assert.deepEqual(r.HOOKS.posts.filter((p) => p.romp === "colBusy"), [{ romp: "colBusy", busy: false }], "the ✕: exactly one colBusy:false — the shell completes the held close");
+});
+
+// ---- round eight ----
+test("round eight: a reply is routed by its request, never by the pending create — with B pending, A's follow-ups reach A's tab or a toast, and B stands", () => {
+  // A settled on a running session, B pending: A's follow-up warning is a toast; B is untouched
+  const a = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: C });
+  a.api.startCreate(REQ); const ridA = a.api.rid()!; a.api.resolveTo(A);
+  a.api.openPicker(); a.api.startCreate({ ...REQ, name: "notes-b" }); const idB = a.api.state().provisionalId!;
+  assert.equal(a.api.route({ rid: ridA }), "settled");
+  a.api.onCreateWarn({ text: '"notes" is already running; its tags were not changed', rid: ridA });
+  assert.deepEqual(a.HOOKS.toasts, ['"notes" is already running; its tags were not changed']); assert.equal(a.api.state().provisionalId, idB, "B still pending"); assert.deepEqual(a.api.state().failed, [], "B not failed");
+  // A backstopped, B pending: A's late authoritative reason refines A's tab; B is untouched
+  const b = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: C });
+  b.api.startCreate(REQ); const ridA2 = b.api.rid()!; const idA2 = b.api.state().provisionalId!; b.api.fireTimers(); b.api.answer("ok");   // the backstop's own "Couldn't start" dialog, dismissed
+  b.api.openPicker(); b.api.startCreate({ ...REQ, name: "notes-b" }); const idB2 = b.api.state().provisionalId!;
+  assert.equal(b.api.route({ rid: ridA2 }), "failed");
+  b.api.onCreateWarn({ text: "late authoritative detail for A", rid: ridA2 });
+  assert.equal(b.api.state().why[idA2], "late authoritative detail for A", "A's tab, refined"); assert.equal(b.api.state().provisionalId, idB2, "B still pending"); assert.deepEqual(b.api.state().failed, [idA2], "B not failed");
+  // A failed, B pending: A's late folder question refines A's reason and asks nothing of B
+  b.api.onCreateDirMissing({ name: REQ.name, dir: REQ.dir, status: { canCreate: true }, rid: ridA2 });
+  assert.equal(b.api.overlays(), 0, "no prompt over B"); assert.equal(b.api.state().dirQuestionFor, null); assert.match(b.api.state().why[idA2], /^That folder isn't there/); assert.equal(b.api.state().provisionalId, idB2);
+  // a request no tab remembers (a create from before a reload), B pending: a warning is said, a folder question is dropped
+  assert.equal(b.api.route({ rid: "c-from-before-the-reload" }), "unknown");
+  b.api.onCreateWarn({ text: "an old create's word", rid: "c-from-before-the-reload" }); assert.ok(b.HOOKS.toasts.includes("an old create's word")); assert.equal(b.api.state().provisionalId, idB2);
+  b.api.onCreateDirMissing({ name: "old", dir: "/old", status: { canCreate: true }, rid: "c-from-before-the-reload" }); assert.equal(b.api.overlays(), 0); assert.equal(b.api.state().dirQuestionFor, null);
+  // no request id (an older kernel): the pending create's, as ever
+  assert.equal(b.api.route({}), "current"); assert.equal(b.api.route({ rid: b.api.rid()! }), "pending");
+  b.api.onCreateWarn({ text: "B's own verdict" }); assert.deepEqual(b.api.state().failed.sort(), [idA2, idB2].sort(), "no id: the pending create's verdict, as today");
+});
+
+test("round eight: a create still pending at reload comes back as a failed tab holding its staged text, busy until its ✕; staged text under no record is swept", () => {
+  const store: Record<string, unknown> = {};
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store });
+  w.api.startCreate(REQ); const id = w.api.state().provisionalId!; const rid = w.api.rid()!;
+  assert.deepEqual(store.pending, { id, name: "notes", dir: REQ.dir, rid }, "the pending create is on disk from the start");
+  w.api.held.stage(id, "staged before the reload");   // staging moved the text out of the plain draft
+  (store.staged as any)["new-orphan-staged"] = [{ text: "nobody's", cites: [] }];
+  const r = world({ activeId: null, mru: [], order: [A, B, C], nextActive: null, store });   // the page reloads mid-create
+  const st = r.api.state();
+  assert.deepEqual(st.failed, [id], "back as a failed create"); assert.equal(st.why[id], "The page reloaded while this session was being created. Start it again from the session picker, or discard this tab with its ✕.");
+  assert.deepEqual((r.api.held.staged()[id] || []).map((m: any) => m.text), ["staged before the reload"], "its staged text is with it");
+  assert.equal(r.api.busy(), true, "busy: a held column stays"); assert.equal(store.pending, null, "the failed record replaced the pending one"); assert.ok((store.failed as any)[id]);
+  assert.equal((store.staged as any)["new-orphan-staged"], undefined, "staged text under no record: swept, and the store rewritten");
+  r.api.closeTabLocally(id);
+  assert.equal((store.failed as any)[id], undefined); assert.equal((store.staged as any)[id], undefined, "the ✕ took the staged text too"); assert.equal(r.api.busy(), false);
+  // a failure clears the pending record (the failed record replaces it); the same-tab retry updates it
+  const v = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: C, store: {} });
+  v.api.startCreate(REQ); v.api.onCreateDirMissing({ name: REQ.name, dir: REQ.dir, status: { canCreate: true } }); const rid1 = v.api.rid()!;
+  v.api.answer("create"); assert.equal((v.store.pending as any).rid, v.api.rid(), "the retry's request"); assert.notEqual((v.store.pending as any).rid, rid1);
+  v.api.fireTimers(); assert.equal(v.store.pending, null, "failed: the failed record replaces it"); assert.ok((v.store.failed as any)[v.api.state().failed[0]]);
+});
+
+test("round eight: at boot the lost-upload notice comes before the replay of the last page's notices — executed, not read off the file", () => {
+  const session: Record<string, string> = {}; keepReloadNotices({ getItem: (k) => session[k] ?? null, setItem: (k, v) => { session[k] = v; }, removeItem: (k) => { delete session[k]; } }, ["what the last page was saying"]);
+  const w = world({ activeId: null, mru: [], order: [A, B, C], nextActive: null, store: { shipsInFlight: ["a.png"] }, session });
+  assert.equal(w.HOOKS.toasts.length, 2, "both said: " + JSON.stringify(w.HOOKS.toasts));
+  assert.match(w.HOOKS.toasts[0], /was still uploading when this page reloaded/, "the loss first"); assert.equal(w.HOOKS.toasts[1], "what the last page was saying", "…then the replay");
+  assert.equal(session["romp:reloadNotices"], undefined, "consumed once");
 });
