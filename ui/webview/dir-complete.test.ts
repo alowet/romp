@@ -157,12 +157,12 @@ test("a missing directory raises the create-or-edit choice, and Create re-sends 
   assert.match(RENDER, /const held = dropProvisional\(\);/);
   assert.match(RENDER, /pendingCarry = \[\.\.\.held\.queued, held\.draft\]\.filter\(Boolean\)/);
   assert.match(RENDER, /\{ label: "Create it and start", value: "create" \}, \{ label: "Edit the path", value: "edit" \}/);
-  assert.match(RENDER, /if \(v === "create"\) \{ startCreate\(req, true\); return; \}/);
+  assert.match(RENDER, /if \(v === "create" && req\) \{ startCreate\(req, true\); return; \}/);   // …and with no request to retry the question is abandoned (dir-question-busy.test.ts)
   assert.match(RENDER, /\.\.\.\(mkdir \? \{ mkdir: true \} : \{\}\)/, "mkdir rides the same message");
 });
 
 test("Edit reopens the picker with what was typed, cursor in the path", () => {
-  const edit = RENDER.slice(RENDER.indexOf('if (v === "edit")'), RENDER.indexOf("function openPicker"));
+  const edit = RENDER.slice(RENDER.indexOf('if (v === "edit" && req)'), RENDER.indexOf("function openPicker"));
   assert.match(edit, /search\.value = req\.name/);
   assert.match(edit, /dir\.value = req\.dir; dir\.focus\(\); dir\.select\(\); askDirComplete\(dir\.value\)/);
 });
