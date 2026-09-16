@@ -39,17 +39,19 @@ test("the strip renders pending chips (name + pulsing dots) and shows even with 
 });
 
 test("the droppedPath ack retires the chip it answers, then attaches the thumbnail", () => {
-  assert.match(RENDER, /const owner = retirePendingShip\(m\.path, ackShip\) \|\| activeId;/);
+  assert.match(RENDER, /const retired = retirePendingShip\(m\.path, ackShip\);[^\n]*\n    const owner = retired \|\| activeId;/);
   assert.match(RENDER, /retirePendingShip\(m\.path, ackShip\)[\s\S]{0,300}addComposerFile\(owner, m\.path\)/,
     "the ack attaches to the composer that SHIPPED the file (the 2026-08-16 wrong-tab attach)");
 });
 
-test("ack↔chip matching mirrors the kernel's saved-name sanitizer, FIFO as the fallback", () => {
+test("ack↔chip matching is by the echoed shipId alone: an untagged answer retires nothing (round fifteen); the saved-name sanitizer mirror stays for the chip's name", () => {
   // drops/<ms>-<safe name>: the JS sanitizer mirrors _save_dropped_file's regex …
   assert.match(RENDER, /name\.replace\(\/\[\^\\w.-\]\+\/g, "_"\)\.slice\(-80\)/);
   assert.match(KERNEL, /re\.sub\(r"\[\^\\w.-\]\+", "_", name\)\[-80:\]/);
-  // … and an unmatched ack still retires the OLDEST entry (the kernel answers in order)
-  assert.match(RENDER, /list\.splice\(i >= 0 \? i : 0, 1\);/);
+  // … but the name match and the oldest-first fallback are GONE: an answer with no shipId (the VS Code picker, an older kernel) retired a
+  // record it was not about — another session's upload, whose held send then went with the picked path
+  assert.match(RENDER, /function retirePendingShip\(key: string, shipId\?: string\): string \| null \{\n(?:\s*\/\/[^\n]*\n)*\s*if \(!shipId\) return null;/);
+  assert.ok(!RENDER.includes("list.splice(i >= 0 ? i : 0, 1);") && !RENDER.includes('k.endsWith("-" + shipSafeName(p.name))'), "no fallback of any kind");
 });
 
 test("a failed kernel save is NACKED and surfaces loudly — never a silent stuck chip", () => {
@@ -58,7 +60,7 @@ test("a failed kernel save is NACKED and surfaces loudly — never a silent stuc
   // client: the nack retires the chip and says so in a toast
   assert.match(RENDER, /m\.type === "dropSaveFailed" && typeof m\.name === "string"/);
   assert.match(RENDER, /shipFailed\(m\.name, nackShip, m\.name \+ " couldn't be saved on the kernel, so it was not attached — try again\."\);/);   // one failure path for every ship that fails (round eleven)
-  assert.match(RENDER, /\n  const owner = retirePendingShip\(key, shipId\) \|\| activeId;\n  const held = [\s\S]{0,500}endReloadHoldIfIdle\(\);\n  warnToast\(why \+/);   // the nack also ends the reload hold (T272), then says so
+  assert.match(RENDER, /\n  const owner = retirePendingShip\(key, failedId\) \|\| activeId;\n  const held = [\s\S]{0,500}endReloadHoldIfIdle\(\);\n  warnToast\(why \+/);   // the nack also ends the reload hold (T272), then says so
   // a FileReader failure retires it too — an unreadable file must not pulse forever, nor let a held send fire without it (round eleven)
   assert.match(RENDER, /reader\.onerror = \(\) => shipFailed\(name, shipId, name \+ " could not be read, so it was not attached — try again\."\);/);
 });
@@ -105,7 +107,7 @@ test("duplicate acks from a re-ship race are DROPPED, never attached to the acti
   assert.match(RENDER, /if \(ackShip && !shipOwner\(ackShip\)\) return;/);
   assert.match(RENDER, /if \(nackShip && !shipOwner\(nackShip\)\) return;/);
   // and an id-carrying ack retires ONLY its own entry — never a FIFO guess across sessions
-  assert.match(RENDER, /if \(shipId && i < 0\) continue;/);
+  assert.match(RENDER, /if \(i < 0\) continue;   \/\/ an id-carrying ack retires ONLY its own entry, wherever it lives/);   // untagged answers left at the top (round fifteen)
 });
 
 test("the chip wears the accent loader-dots motif from styles.css", () => {

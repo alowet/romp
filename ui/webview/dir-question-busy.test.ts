@@ -58,6 +58,7 @@ type Api = {
   strip: (ids: string[]) => void; detach: (host: string) => void; wsdown: () => void; wsup: () => void;
   setSets: (sets: Record<string, string[]>) => void; reclaim: () => void;   // round thirteen: the shell's sets as they stand, and renderTabs's reclaim of the handed-off marker
   heading: (sid: string) => string;   // round fourteen: the held strip's heading, its count
+  draft: (sid: string, text: string) => void;   // round fifteen: a session's draft, written as the box's stash would
   held: { stage: (id: string, text: string, cites?: unknown[]) => void; cite: (id: string, chips?: unknown[]) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown>; drafts: () => Record<string, string> };
   busy: () => boolean; answer: (v: string | null) => void; confirm: () => { title: string; buttons: string[]; key: string | null } | null;
   overlays: () => number; clickButton: (label: string) => boolean; rid: () => string | null;
@@ -178,6 +179,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       wsdown: () => { wsIsUp = false; }, wsup: () => { wsIsUp = true; reshipPendingUploads(); },   // the shim's edges, as the page's listeners read them
       setSets: (s) => { colSets = s; }, reclaim: () => reclaimHandedOff(),   // what renderTabs does first: reads the sets, reclaims the marker for a sid shown here again
       heading: (sid) => uploadingHeading(sid),
+      draft: (sid, text) => { drafts.set(sid, text); persistDrafts(); },
       route: (m) => (typeof routeCreateReply === "function" ? routeCreateReply(m).kind : "?"),
       // (each persists, as the page's own staging / citing / attaching does)
       held: { stage: (id, text, cites) => { stagedMsgs.push(id, { text, cites: cites || [] }); persistDrafts(); }, cite: (id, chips) => { composerCitations.set(id, chips || [{ title: "a card", itemId: "g1" }]); persistDrafts(); }, attach: (id) => { composerFiles.set(id, ["/tmp/a.png"]); persistDrafts(); },
@@ -849,4 +851,51 @@ test("round fourteen: the held strip's heading counts the COMPOSER's uploads —
   w.api.ship(A, "two.png", "c2", "QUJD");
   assert.equal(w.api.heading(A), "staged — sends when the upload finishes (2 still uploading)", "two composer uploads");
   assert.equal(w.api.heading(B), "staged — sends when the upload finishes");
+});
+
+// ---- round fifteen ----
+test("round fifteen: an UNTAGGED droppedPath (the VS Code picker) for the active session lands on ITS composer and is inert beyond it — another session's sole pending upload and held send stand; that session's own tagged ack then sends its words with its file alone", () => {
+  const w = receiving();   // A is the active session
+  w.api.draft(B, "B words waiting"); w.api.ship(B, "b.png", "b1", "QUJD"); w.api.holdSend(B);   // B owns the document's only pending upload, and a send held on it
+  w.api.ack({ type: "droppedPath", path: "/synthetic/picked-for-A.txt" });   // the picker's answer for A: no shipId, no ship
+  assert.deepEqual(w.api.held.files()[A], ["/synthetic/picked-for-A.txt"], "A's composer gets the picked file");
+  assert.equal(w.api.held.files()[B], undefined, "nothing on B's strip");
+  assert.deepEqual(w.api.ships()[B].map((p) => p.shipId), ["b1"], "B's record intact"); assert.deepEqual(w.api.heldSend(), [B], "B's hold intact");
+  assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage"), [], "nothing sent"); assert.equal(w.HOOKS.fired, 0);
+  w.api.ack({ type: "droppedPath", path: "drops/1-b.png", shipId: "b1" });   // B's own tagged ack
+  const sent = w.HOOKS.sent.filter((m) => m.type === "sendMessage");
+  assert.deepEqual(sent.map((m) => ({ id: m.id, text: m.text, paths: m.paths })), [{ id: B, text: "B words waiting\ndrops/1-b.png", paths: ["drops/1-b.png"] }], "B's held send fires with B's file alone");
+  assert.deepEqual(w.api.held.files()[A], ["/synthetic/picked-for-A.txt"], "A's strip untouched by B's release"); assert.deepEqual(w.api.heldSend(), []);
+});
+
+test("round fifteen: an untagged ack is routed by the ACTIVE session's own sole ship's kind, and retires nothing — a sole composer ship: the composer, the box untouched; a sole comment ship with the box open: the box; none or several: main's box-open reading", () => {
+  const w = receiving(); w.api.openComment("note ");
+  w.api.ship(A, "a.png", "a1", "QUJD");
+  w.api.ack({ type: "droppedPath", path: "drops/1-a.png" });
+  assert.deepEqual(w.api.held.files()[A], ["drops/1-a.png"], "the sole ship is the composer's: the composer"); assert.equal(w.api.comment(), "note ", "the box untouched");
+  assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["a1"], "untagged: nothing retired — the chip waits for its own tagged ack");
+  w.api.ack({ type: "droppedPath", path: "drops/1-a.png", shipId: "a1" });
+  assert.equal(w.api.ships()[A], undefined, "the tagged ack retires it"); assert.deepEqual(w.api.held.files()[A], ["drops/1-a.png"], "the same file attaches once");
+  w.api.ship(A, "c.png", "c1", "QUJD", "comment");
+  w.api.ack({ type: "droppedPath", path: "drops/2-c.png" });
+  assert.equal(w.api.comment(), "note drops/2-c.png ", "the sole ship is the comment's: the box");
+  w.api.ship(A, "d.png", "d1", "QUJD");   // two pending now
+  w.api.ack({ type: "droppedPath", path: "drops/3-x.png" });
+  assert.equal(w.api.comment(), "note drops/2-c.png drops/3-x.png ", "several pending: main's reading, the open box is the comment's");
+  assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["c1", "d1"], "and still nothing retired by an untagged answer");
+  w.api.closeComment();
+  const v = receiving(); v.api.ship(B, "b.png", "b1", "QUJD");   // B's ship, A active: an untagged ack is never B's
+  v.api.ack({ type: "droppedPath", path: "drops/9-picked.png" });
+  assert.deepEqual(v.api.held.files()[A], ["drops/9-picked.png"]); assert.deepEqual(v.api.ships()[B].map((p) => p.shipId), ["b1"]);
+});
+
+test("round fifteen: an UNTAGGED failure fails only the active session's sole ship; with none, it is said and nothing is touched — another session's hold stands", () => {
+  const w = receiving();
+  w.api.ship(B, "b.png", "b1", "QUJD"); w.api.holdSend(B);
+  w.api.shipFail("whatever.png", undefined as unknown as string);   // an older kernel's nack: no shipId; A has no ship
+  assert.ok(w.HOOKS.toasts.some((t) => /whatever\.png could not be read/.test(t)), "said"); assert.deepEqual(w.api.ships()[B].map((p) => p.shipId), ["b1"], "B's record stands"); assert.deepEqual(w.api.heldSend(), [B], "B's hold stands");
+  w.api.ship(A, "a.png", "a1", "QUJD"); w.api.holdSend(A);
+  w.api.shipFail("a.png", undefined as unknown as string);   // A's sole ship: the untagged failure is its
+  assert.equal(w.api.ships()[A], undefined, "A's ship failed"); assert.deepEqual(w.api.heldSend(), [B], "A's hold cancelled, B's stands");
+  assert.ok(w.HOOKS.toasts.some((t) => /a\.png could not be read.*NOT sent/.test(t)));
 });

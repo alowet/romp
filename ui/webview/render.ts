@@ -16321,13 +16321,14 @@ function shipRecord(shipId: string): PendingShip | null {
   for (const list of pendingShips.values()) { const p = list.find((x) => x.shipId === shipId); if (p) return p; }
   return null;
 }
-// The one pending ship of this document, when exactly one is pending (round fourteen): an UNTAGGED ack or nack — an older kernel
-// echoes no shipId — is unambiguous then, and is routed by that ship's kind; with none or several, the untagged reading stays
-// main's (an open comment box is the comment's ack, else the composer's).
+// The ACTIVE session's one pending ship, when it has exactly one (round fourteen, scoped in round fifteen): an UNTAGGED ack or nack —
+// an older kernel echoes no shipId; the VS Code composer picker's droppedPath carries none and made no ship — can only be about the
+// active session's own upload, so only that ship's kind routes it; with none or several, the untagged reading stays main's (an open
+// comment box is the comment's ack, else the composer's). Never another session's record: read document-wide, the picker's answer
+// for A retired B's upload and sent B's held message with A's path.
 function soleShip(): PendingShip | null {
-  let found: PendingShip | null = null;
-  for (const list of pendingShips.values()) for (const p of list) { if (found) return null; found = p; }
-  return found;
+  const list = activeId ? pendingShips.get(activeId) : undefined;
+  return list && list.length === 1 ? list[0] : null;
 }
 // The COMPOSER's pending ships for a session (round thirteen): what its send gate counts, what a send held on its uploads waits
 // for, what the ✕ on its last chip settles. A comment's upload for the same session is none of the composer's business — counted
@@ -16374,15 +16375,17 @@ window.addEventListener("romp:hostDetached", (e) => {
 // strip after a mid-flight tab switch (the user 2026-08-16, the send-while-uploading report's
 // second face).
 function retirePendingShip(key: string, shipId?: string): string | null {
-  const k = "-" + shipSafeName(key.split("/").pop() || key);
-  const ids = activeId ? [activeId, ...pendingShips.keys()] : [...pendingShips.keys()];
-  for (const id of ids) {
+  // UNTAGGED (round fifteen): no shipId, nothing retired — the name match and the oldest-first fallback that stood here removed a
+  // record the answer was not about (the picker's untagged droppedPath for the active session retired another session's upload,
+  // whose held send then went with the picked path). A tagged ack retires exactly its own record, wherever it lives.
+  if (!shipId) return null;
+  void key;
+  for (const id of [...pendingShips.keys()]) {
     const list = pendingShips.get(id);
     if (!list || !list.length) continue;
-    let i = shipId ? list.findIndex((p) => p.shipId === shipId) : -1;
-    if (shipId && i < 0) continue;   // an id-carrying ack retires ONLY its own entry, wherever it lives
-    if (i < 0) i = list.findIndex((p) => k.endsWith("-" + shipSafeName(p.name)));
-    list.splice(i >= 0 ? i : 0, 1);
+    const i = list.findIndex((p) => p.shipId === shipId);
+    if (i < 0) continue;   // an id-carrying ack retires ONLY its own entry, wherever it lives
+    list.splice(i, 1);
     if (!list.length) pendingShips.delete(id);
     persistDrafts();
     if (id === activeId) renderComposerFiles(id);
@@ -16403,15 +16406,17 @@ function shipFailed(key: string, shipId: string | undefined, why: string): void 
   // so a comment's late failure left the composer's message unsent when its own file landed). An untagged failure (an older
   // kernel's nack, no shipId) reads the sole pending ship when there is exactly one, else it is the composer's, as on main.
   const rec = shipId ? shipRecord(shipId) : soleShip();
+  if (!shipId && !rec) { warnToast(why); return; }   // untagged, and the active session has no sole ship: said, nothing touched (round fifteen)
+  const failedId = shipId || rec!.shipId;              // untagged: the active session's sole ship is the one that failed
   if (rec && rec.kind === "comment") {
-    const cOwner = retirePendingShip(key, shipId) || activeId;
+    const cOwner = retirePendingShip(key, failedId) || activeId;
     endReloadHoldIfIdle();
     warnToast(why);
     if (cOwner && cOwner === activeId) renderComposerFiles(cOwner);   // its pending chip leaves the strip
     syncColumnBusy();
     return;
   }
-  const owner = retirePendingShip(key, shipId) || activeId;
+  const owner = retirePendingShip(key, failedId) || activeId;
   const held = !!owner && sendOnShip.delete(owner);    // a held send must not fire without the file it waited for: any COMPOSER ship's failure cancels it (the message would be incomplete)
   const gateWasOpen = shipGateSid === owner;
   if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }   // the question is moot — but a failed save never auto-sends
@@ -19178,18 +19183,21 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       syncColumnBusy();   // LAST (round eleven): the upload's hold on the column ends with its chip
       return;
     }
-    const owner = retirePendingShip(m.path, ackShip) || activeId;      // the chip this ack answers names the OWNING composer (no-op for pickFile, which never ships)
+    const retired = retirePendingShip(m.path, ackShip);   // the chip this TAGGED ack answers names the OWNING composer; an untagged answer (the picker, an older kernel) retires nothing (round fifteen)
+    const owner = retired || activeId;                    // …and lands on the ACTIVE session's composer, as the picker always did
     addComposerFile(owner, m.path);
     // an OPEN ship-gate dialog counts as a held send (the user 2026-08-19): the upload finishing is
-    // the answer to the question it asks, so it closes itself and the send fires — no click needed
-    const gateOpen = shipGateSid === owner;
-    if (owner && (sendOnShip.has(owner) || gateOpen) && !composerShips(owner).length) {   // the composer's own ships (round thirteen): a comment's never gate it
+    // the answer to the question it asks, so it closes itself and the send fires — no click needed.
+    // ONLY a tagged ack that retired one of the owner's own composer ships may release a held send (round fifteen): an untagged
+    // answer never calls sendHeldFor, never touches sendOnShip or shipGateSid — read as B's, the picker's answer for A sent B's words
+    const gateOpen = !!retired && shipGateSid === retired;
+    if (retired && (sendOnShip.has(retired) || gateOpen) && !composerShips(retired).length) {   // the composer's own ships (round thirteen): a comment's never gate it
       // the LAST ship landed — the event the held send was waiting for (the user 2026-08-16), and every ship it waited on
       // completed (a failure cancels the hold the moment it happens, shipFailed)
-      sendOnShip.delete(owner);
+      sendOnShip.delete(retired);
       if (gateOpen) { shipGateSid = null; closeConfirm(null); }
-      if (owner === activeId) fireHeldSend();
-      else sendHeldFor(owner);   // BY SID (round eleven): the tab need not be shown here — a held column whose create resolved to a session shown elsewhere
+      if (retired === activeId) fireHeldSend();
+      else sendHeldFor(retired);   // BY SID (round eleven): the tab need not be shown here — a held column whose create resolved to a session shown elsewhere
       endReloadHoldIfIdle();   // the ending event follows the release: the held send has been posted
     }
     if (owner && !heldHere(owner)) noteOrphanState();   // the file landed under a session this column does not show (a moved tab, a resolved create): offered to the pane that does, now (round eleven)

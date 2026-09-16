@@ -26,10 +26,10 @@ test("a send with ships in flight is gated by the confirm: send-without is expli
 });
 
 test("the held send fires on the LAST ack — event-based — and a nack cancels it loudly", () => {
-  assert.match(RENDER, /if \(owner && \(sendOnShip\.has\(owner\) \|\| gateOpen\) && !composerShips\(owner\)\.length\) \{/,
+  assert.match(RENDER, /if \(retired && \(sendOnShip\.has\(retired\) \|\| gateOpen\) && !composerShips\(retired\)\.length\) \{/,
     "the deciding event is the last of the COMPOSER's pending ships retiring — for a held send AND an open gate dialog (a comment's upload is none of it, round thirteen)");
-  assert.match(RENDER, /if \(owner === activeId\) fireHeldSend\(\);/);
-  assert.match(RENDER, /if \(owner === activeId\) fireHeldSend\(\);\n\s*else sendHeldFor\(owner\);/,
+  assert.match(RENDER, /if \(retired === activeId\) fireHeldSend\(\);/);
+  assert.match(RENDER, /if \(retired === activeId\) fireHeldSend\(\);\n\s*else sendHeldFor\(retired\);/,
     "a held send whose tab is not shown here goes BY SID from this document (round eleven): the ack rides this socket, so a held column whose create resolved to a session shown elsewhere sends from here");
   assert.match(RENDER, /function sendHeldFor\(sid: string\): void \{[\s\S]{0,1600}flushStaged\(sid, text \? \{ text, cites, imgPaths: attached\.filter\(\(p\) => previewKind\(p\) === "img"\), paths: attached \} : undefined\);/,
     "…built from the stores the way deliver builds from the box, through the one routing owner");
@@ -43,7 +43,7 @@ test("the OPEN gate dialog resolves itself on the last ack: closes and sends, no
   // dialog just sat there. The upload finishing IS the answer to the question the dialog asks.
   assert.match(RENDER, /let shipGateSid: string \| null = null;/);
   assert.match(RENDER, /shipGateSid = sid;\s*\/\/ the last-ship ack resolves the open dialog itself/);
-  assert.match(RENDER, /const gateOpen = shipGateSid === owner;/);
+  assert.match(RENDER, /const gateOpen = !!retired && shipGateSid === retired;/);
   assert.match(RENDER, /if \(gateOpen\) \{ shipGateSid = null; closeConfirm\(null\); \}/,
     "the dialog dismisses itself the moment the last ship lands, then the send fires");
   assert.match(RENDER, /shipGateSid = null; endReloadHoldIfIdle\(\);\n\s*if \(v === "now"\)/,
@@ -74,7 +74,7 @@ test("any successful send supersedes a hold, so a spent hold can never double-se
 
 test("the ack attaches to the composer that SHIPPED the file, not whatever tab is active", () => {
   assert.match(RENDER, /function retirePendingShip\(key: string, shipId\?: string\): string \| null \{/);
-  assert.match(RENDER, /const owner = retirePendingShip\(m\.path, ackShip\) \|\| activeId;/);
+  assert.match(RENDER, /const retired = retirePendingShip\(m\.path, ackShip\);[^\n]*\n    const owner = retired \|\| activeId;/);
   assert.match(RENDER, /addComposerFile\(owner, m\.path\);/);
 });
 
