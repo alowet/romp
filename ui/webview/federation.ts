@@ -1809,6 +1809,10 @@ export class FederationManager {
     } catch (e) {}
     this.conns.delete(host);
     this.hostSeq = this.hostSeq.filter((h) => h !== host);
+    // …and the page hears the DETACH as an event (round twelve, 2026-09-16): an upload shipped to this host has no ack coming —
+    // its kernel is out of this dashboard for good, unlike a relay drop — so the pane fails those ships (render.ts) instead of
+    // holding its column on them forever
+    try { window.dispatchEvent(new CustomEvent("romp:hostDetached", { detail: { host } })); } catch (e) { /* no window */ }
     // drop that host's tabs from the panes (else they linger stale), then re-emit the merged order.
     for (const sid of this.perHostSids[host] || []) {
       // Stamped `hostDrop`: this is NOT the session's end — its kernel is simply out of reach — so the pane

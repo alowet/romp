@@ -23,7 +23,7 @@ import { createRequire } from "node:module";
 import { provisionalName, mintProvisionalId, isProvisionalId } from "./provisional";
 import { StagedStack, quoteReplyBody, stagedPosts, isCitationShape } from "./staged-messages";
 import { takeReloadNotices, keepReloadNotices } from "./reload-notices";
-import { columnHolds } from "./chat-columns";
+import { columnHolds, columnEmptiness } from "./chat-columns";
 import { isSubId } from "./subagent-view";
 
 const requireCjs = createRequire(__filename);
@@ -41,7 +41,7 @@ const VIEWER = C + "/agent/a1";
 const REQ = { name: "notes", backend: "sdk", dir: "/proj/not-there-yet", host: "" };
 const TYPED = "notes for a session whose folder is not there yet";
 
-type Hooks = { posts: Record<string, unknown>[]; boot: Record<string, unknown>[]; sent: Record<string, unknown>[]; seq: string[]; confirms: string[]; pickers: number; persisted: number; timers: (() => void)[]; cleared: number; toasts: string[]; answered: (string | null)[]; claims: string[]; fired: number; reloadEnded: number };
+type Hooks = { posts: Record<string, unknown>[]; boot: Record<string, unknown>[]; sent: Record<string, unknown>[]; seq: string[]; confirms: string[]; pickers: number; persisted: number; timers: (() => void)[]; cleared: number; toasts: string[]; answered: (string | null)[]; claims: string[]; fired: number; reloadEnded: number; closeSplit: number[] };
 type Ship = { name: string; shipId: string; b64?: string };
 type State = { provisionalId: string | null; dirQuestionFor: string | null; failed: string[]; activeId: string | null; drafts: Record<string, string>; sessions: string[]; timer: boolean; why: Record<string, string> };
 type Api = {
@@ -51,8 +51,11 @@ type Api = {
   stale: (m: { rid?: unknown }) => boolean; fireTimers: () => number; settle: () => void; resolveTo: (sid: string) => void; route: (m: { rid?: unknown }) => string;
   adopt: (sid: string) => void; orphans: () => string[];
   // round ten: the hand-off's two halves (the real take arrow and adoptSessionState), an upload in flight and its held send, the kernel's ack (the real droppedPath branch)
-  take: (sid: string) => any; adoptState: (sid: string, st: unknown) => void; ship: (id: string, name: string, shipId: string, b64?: string) => void; holdSend: (id: string) => void;
+  take: (sid: string) => any; adoptState: (sid: string, st: unknown) => void; ship: (id: string, name: string, shipId: string, b64?: string, kind?: "composer" | "comment") => void; holdSend: (id: string) => void;
   ships: () => Record<string, Ship[]>; heldSend: () => string[]; ack: (m: Record<string, unknown>) => void; shipFail: (name: string, shipId: string) => void;   // shipFail: the FileReader failed on it (round eleven)
+  // round twelve: the shell's session question and the column's reason, the close question, a mini comment box, the strip as last seen, a host detach, the local socket's edges
+  sessionBusy: (sid: string) => boolean; busyWhy: () => string; askClose: () => void; openComment: (text: string) => void; comment: () => string | null; closeComment: () => void;
+  strip: (ids: string[]) => void; detach: (host: string) => void; wsdown: () => void; wsup: () => void;
   held: { stage: (id: string, text: string, cites?: unknown[]) => void; cite: (id: string, chips?: unknown[]) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown>; drafts: () => Record<string, string> };
   busy: () => boolean; answer: (v: string | null) => void; confirm: () => { title: string; buttons: string[]; key: string | null } | null;
   overlays: () => number; clickButton: (label: string) => boolean; rid: () => string | null;
@@ -62,13 +65,16 @@ type Api = {
 // the source pane's half of the hand-off is an arrow on window, not a function: sliced whole (assigned onto the harness's window)
 const TAKE = (() => { const i = RENDER.indexOf("(window as any).__rompTakeSessionState = "); assert.ok(i >= 0, "the take arrow"); return RENDER.slice(i, RENDER.indexOf("\n};\n", i) + 4); })();
 // the kernel's upload ack is a branch of the message switch: sliced and wrapped, so the test runs the real attach + held-send release
+// a one-line arrow assigned on window (the shell's questions): sliced whole, "" on an older render.ts
+const winLine = (name: string): string => { const i = RENDER.indexOf(`(window as any).${name} = `); return i >= 0 ? RENDER.slice(i, RENDER.indexOf("\n", i) + 1) : ""; };
 const ON_DROPPED = (() => { const i = RENDER.indexOf('if (m.type === "droppedPath" && typeof m.path === "string")'); const j = RENDER.indexOf('} else if (m.type === "dropSaveFailed"', i); assert.ok(i >= 0 && j > i, "the droppedPath branch"); return "function onDroppedPath(m: any): void {\n" + RENDER.slice(i, j + 1) + "\n}\n"; })();
 
 function world(o: { activeId: string | null; mru: string[]; order: string[]; nextActive: string | null; store?: Record<string, unknown>; session?: Record<string, string>; sets?: Record<string, string[]> | null }): { api: Api; HOOKS: Hooks; store: Record<string, unknown>; session: Record<string, string> } {
   const store: Record<string, unknown> = o.store ?? {};
   const session: Record<string, string> = o.session ?? {};   // the page's sessionStorage (the reload notices ride it)
-  const HOOKS: Hooks = { posts: [], boot: [], sent: [], seq: [], confirms: [], pickers: 0, persisted: 0, timers: [], cleared: 0, toasts: [], answered: [], claims: [], fired: 0, reloadEnded: 0 };
-  const win = { parent: { postMessage(m: Record<string, unknown>) { HOOKS.posts.push(m); if (m.romp === "colBusy") HOOKS.seq.push("flip:" + m.busy); } },
+  const HOOKS: Hooks = { posts: [], boot: [], sent: [], seq: [], confirms: [], pickers: 0, persisted: 0, timers: [], cleared: 0, toasts: [], answered: [], claims: [], fired: 0, reloadEnded: 0, closeSplit: [] };
+  const win = { parent: { postMessage(m: Record<string, unknown>) { HOOKS.posts.push(m); if (m.romp === "colBusy") HOOKS.seq.push("flip:" + m.busy); if (m.romp === "colEmpty") HOOKS.seq.push("empty"); },
+                          __rompCloseSplit(n: number) { HOOKS.closeSplit.push(n); } },
                 __rompReload: { ended() { HOOKS.reloadEnded++; } } };   // the reload core's ending-event door, counted (round eleven)
   const js = requireCjs("esbuild").transformSync(
     [lineOpt("columnBusy"), fn("syncColumnBusy"), fn("dropProvisional"), fn("openProvisional"), fn("cancelProvisional"), fn("failProvisional"),
@@ -78,11 +84,16 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
      fnOpt("bootComposerState"), fnOpt("announceColumnBusy"), lineOpt("retireRid"), fnOpt("finishBoot"), fnOpt("routeCreateReply"), lineOpt("rememberSettled"), fn("resolveProvisionalToExisting"),
      fn("adoptProvisional"), fnOpt("moveProvisionalState"), fn("orphanStateSids"), lineOpt("heldHere"),
      fnOpt("mergeCitations"), fn("addPendingShip"), fn("shipSafeName"), fn("shipOwner"), fn("retirePendingShip"), fn("endReloadHoldIfIdle"), fn("addComposerFile"), fn("adoptSessionState"), TAKE, ON_DROPPED,
-     fnOpt("shipFailed"), fnOpt("sendHeldFor"), fn("flushStaged"), fn("routeUserMessage"), fn("noteOrphanState")].join("\n"),
+     fnOpt("shipFailed"), fnOpt("sendHeldFor"), fn("flushStaged"), fn("routeUserMessage"), fn("noteOrphanState"),
+     fnOpt("shipRecord"), fnOpt("retainShipBytes"), fnOpt("failShipsOfHost"), fnOpt("columnBusyWhy"), fnOpt("askCloseUpload"), fnOpt("abandonPendingUploads"), fn("reshipPendingUploads"), fn("noteColumnEmptiness"),
+     winLine("__rompSessionBusy"), winLine("__rompColumnBusyWhy")].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
-    const { provisionalName, mintProvisionalId, isProvisionalId, isSubId, columnHolds, StagedStack, HOOKS, STORE, takeReloadNotices, quoteReplyBody, stagedPosts, isCitationShape } = W;
+    const { provisionalName, mintProvisionalId, isProvisionalId, isSubId, columnHolds, columnEmptiness, StagedStack, HOOKS, STORE, takeReloadNotices, quoteReplyBody, stagedPosts, isCitationShape } = W;
     let tabOrderSeen = true;   // the board has been heard: the orphan offer speaks (round eleven)
+    let lastStripIds = W.order.slice(); let boardLive = new Set(); const hostsSeen = new Set([""]); let colEmptyPosted = false;   // the strip as last judged (round twelve): the world's order, every member listed, the local host heard
+    const handedOff = new Set(); let wsIsUp = true; const hostOf = (sid) => { const i = String(sid).indexOf(":"); return i > 0 ? String(sid).slice(0, i) : ""; };
+    let CMTBOX = null; const cmtShippedImgs = [];   // the mini comment box: #cmt-pop answers querySelector with it while open; the echo's thumbnail list
     const lastSent = new Map(), draftStartedAt = new Map(); const hostIsDown = () => false; const previewKind = (p) => (/\.(png|jpe?g|gif|webp)$/i.test(String(p)) ? "img" : "file");
     const ephemeralWarnToast = (t) => { HOOKS.toasts.push(t); };
     const COL = "2"; let colSets = W.sets;   // this page: a later column, whose set the shell answers (round nine: the orphan enumeration reads it)
@@ -109,7 +120,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       addEventListener(t, f) { (n.handlers[t] = n.handlers[t] || []).push(f); }, click() { (n.handlers.click || []).forEach((f) => f({ target: n })); },
       get firstElementChild() { return n.children[0] || null; }, focus() {} }; return n; };
     const body = mk("body", ""); const findId = (node, id) => { if (node.id === id) return node; for (const c of node.children) { const r = findId(c, id); if (r) return r; } return null; };
-    const document = { body, getElementById: (id) => EL[id] || findId(body, id), addEventListener() {}, removeEventListener() {} };
+    const document = { body, getElementById: (id) => (id === "cmt-pop" ? (CMTBOX ? { querySelector: () => CMTBOX } : null) : (EL[id] || findId(body, id))), addEventListener() {}, removeEventListener() {} };
     const el = (tag, cls) => mk(tag, cls);
     const warnToast = (t) => { HOOKS.toasts.push(t); };
     const vscodeApi = { postMessage: (m) => { HOOKS.sent.push(m); }, ...vscodeApiState };
@@ -151,12 +162,17 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       orphans: () => orphanStateSids(),                          // what this page would hand the shell at a close (the sids it holds state for and does not show)
       take: (sid) => window.__rompTakeSessionState(sid),         // the shell's close(): this page's state for a session, taken whole (round ten: the real arrow)
       adoptState: (sid, st) => adoptSessionState(sid, st),       // the receiving pane's half
-      ship: (id, name, shipId, b64) => { addPendingShip(id, name, shipId); const e = pendingShips.get(id).find((p) => p.shipId === shipId); if (b64) e.b64 = b64; },   // a file picked: the chip is up, the bytes retained
+      ship: (id, name, shipId, b64, kind) => { addPendingShip(id, name, shipId, kind || "composer"); if (b64) { if (typeof retainShipBytes === "function") retainShipBytes(id, shipId, b64); else pendingShips.get(id).find((p) => p.shipId === shipId).b64 = b64; } },   // a file picked: the chip is up, the bytes retained (through the real retention when it exists)
       holdSend: (id) => { sendOnShip.add(id); },                 // "Wait for the upload"
       ships: () => Object.fromEntries([...pendingShips].map(([k, v]) => [k, v.map((p) => ({ name: p.name, shipId: p.shipId, ...(p.b64 ? { b64: p.b64 } : {}) }))])),
       heldSend: () => [...sendOnShip],
       ack: (m) => onDroppedPath(m),                              // the kernel's droppedPath, through the real branch
       shipFail: (name, shipId) => shipFailed(name, shipId, name + " could not be read, so it was not attached — try again."),   // the reader's failure path (round eleven)
+      sessionBusy: (sid) => window.__rompSessionBusy(sid), busyWhy: () => columnBusyWhy(), askClose: () => askCloseUpload(),
+      openComment: (text) => { CMTBOX = { value: text, dispatchEvent() {}, focus() {} }; }, comment: () => (CMTBOX ? CMTBOX.value : null), closeComment: () => { CMTBOX = null; },
+      strip: (ids) => { lastStripIds = ids.slice(); noteColumnEmptiness(ids); },   // renderTabs's judgement of the kernel's strip
+      detach: (host) => failShipsOfHost(host, "was still uploading when " + host + " was detached, so it was not attached — attach it again once the host is back."),   // what the romp:hostDetached listener does (pinned in chat-split.test.ts)
+      wsdown: () => { wsIsUp = false; }, wsup: () => { wsIsUp = true; reshipPendingUploads(); },   // the shim's edges, as the page's listeners read them
       route: (m) => (typeof routeCreateReply === "function" ? routeCreateReply(m).kind : "?"),
       // (each persists, as the page's own staging / citing / attaching does)
       held: { stage: (id, text, cites) => { stagedMsgs.push(id, { text, cites: cites || [] }); persistDrafts(); }, cite: (id, chips) => { composerCitations.set(id, chips || [{ title: "a card", itemId: "g1" }]); persistDrafts(); }, attach: (id) => { composerFiles.set(id, ["/tmp/a.png"]); persistDrafts(); },
@@ -168,7 +184,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
     };
   `;
   const make = new Function("W", "window", prelude + js + epilogue) as (w: unknown, win: unknown) => Api;
-  const api = make({ provisionalName, mintProvisionalId, isProvisionalId, isSubId, columnHolds, StagedStack, HOOKS, STORE: store, SESSION: session, takeReloadNotices, quoteReplyBody, stagedPosts, isCitationShape, sets: o.sets === undefined ? { "2": [C] } : o.sets, activeId: o.activeId, mru: o.mru, order: o.order, nextActive: o.nextActive, wantActiveGone: null }, win);
+  const api = make({ provisionalName, mintProvisionalId, isProvisionalId, isSubId, columnHolds, columnEmptiness, StagedStack, HOOKS, STORE: store, SESSION: session, takeReloadNotices, quoteReplyBody, stagedPosts, isCitationShape, sets: o.sets === undefined ? { "2": [C] } : o.sets, activeId: o.activeId, mru: o.mru, order: o.order, nextActive: o.nextActive, wantActiveGone: null }, win);
   return { api, HOOKS, store, session };
 }
 const flips = (h: Hooks, busy: boolean) => h.posts.filter((p) => p.romp === "colBusy" && p.busy === busy).length;
@@ -674,4 +690,98 @@ test("round ten: flavours never mix in a carry — a goal chip keeps the list an
   // the receiving pane's adopt: the same rule, the same order
   const r = receiving(); r.api.held.cite(A, [CARD]); r.api.adoptState(A, { citations: [QUOTE], staged: [{ text: "arrived staged", cites: [] }] });
   assert.deepEqual(r.api.held.citations()[A], [CARD]); assert.deepEqual(r.api.held.staged()[A], [{ text: "arrived staged", cites: [] }, { text: "", cites: [QUOTE] }]);
+});
+
+// ---- round twelve ----
+const RA = "TESTHOST:11111111-2222-3333-4444-555555555521";   // a session on an attached remote host
+
+test("round twelve: a session with an upload in flight, or a send held on one, is BUSY for the shell's move question until the ack; a moved-away message's held send is refused here (the belt) and the file is offered on", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {}, sets: { "2": [] } });
+  w.api.startCreate(REQ); const id = w.api.state().provisionalId!;
+  w.api.ship(id, SHIP.name, SHIP.shipId, SHIP.b64); w.api.holdSend(id); w.api.type(TYPED);
+  w.api.resolveTo(A);
+  assert.equal(w.api.sessionBusy(A), true, "an upload in flight: the session cannot move"); assert.equal(w.api.sessionBusy(B), false);
+  const st = w.api.take(A);   // the shell moved the tab anyway (an older shell): the words left with it
+  assert.equal(st.draft, TYPED);
+  w.api.ack({ type: "droppedPath", path: "drops/1700000000000-photo.png", shipId: "s1" });
+  assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage"), [], "the belt: nothing of the message is here — no bare path is sent");
+  assert.ok(w.HOOKS.toasts.some((t) => /moved to another column/.test(t)), "said: " + JSON.stringify(w.HOOKS.toasts));
+  assert.deepEqual(w.api.held.files()[A], ["drops/1700000000000-photo.png"], "the file, under the session"); assert.deepEqual(w.api.heldSend(), []);
+  assert.ok(w.HOOKS.posts.some((p) => p.romp === "orphanState" && (p.sids as string[]).includes(A)), "…offered to the pane that shows it");
+  assert.equal(w.api.sessionBusy(A), false, "released"); assert.equal(w.api.busy(), false);
+  const v = receiving(); v.api.holdSend(A);
+  assert.equal(v.api.sessionBusy(A), true, "a held send alone pins the session too");
+});
+
+test("round twelve: the ack is routed by the SHIP — a composer upload lands on the composer though a comment box is open (the held send fires), a comment's upload lands in the box, a legacy ack with no ship id keeps the old reading", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {} });
+  w.api.startCreate(REQ); const id = w.api.state().provisionalId!;
+  w.api.ship(id, "photo.png", "s1", "QUJD"); w.api.holdSend(id); w.api.type(TYPED);
+  w.api.adopt(X);
+  w.api.openComment("a note ");
+  w.api.ack({ type: "droppedPath", path: "drops/1-photo.png", shipId: "s1" });
+  assert.deepEqual(w.api.held.files()[X], ["drops/1-photo.png"], "the composer's upload, on the composer's strip"); assert.equal(w.HOOKS.fired, 1, "the held send fired");
+  assert.equal(w.api.comment(), "a note ", "the comment box untouched"); assert.equal(w.api.busy(), false);
+  w.api.ship(X, "shot.png", "s2", "QUJD", "comment");
+  w.api.ack({ type: "droppedPath", path: "drops/2-shot.png", shipId: "s2" });
+  assert.equal(w.api.comment(), "a note drops/2-shot.png ", "a comment's upload lands in the box"); assert.deepEqual(w.api.held.files()[X], ["drops/1-photo.png"]);
+  w.api.ship(X, "old.png", "s3", "QUJD");
+  w.api.ack({ type: "droppedPath", path: "drops/3-old.png" });   // an older kernel: no ship id echoed
+  assert.equal(w.api.comment(), "a note drops/2-shot.png drops/3-old.png ", "no ship to read: an open box is the comment's, as before");
+  w.api.closeComment();
+});
+
+test("round twelve: a host DETACHED fails every upload shipped to it — loudly, the held send cancelled — and touches no other host's", () => {
+  const w = receiving();
+  w.api.ship(RA, "remote.png", "r1", "QUJD"); w.api.holdSend(RA); w.api.ship(A, "local.png", "l1", "QUJD");
+  assert.equal(w.api.busy(), true);
+  w.api.detach("TESTHOST");
+  assert.deepEqual(Object.keys(w.api.ships()), [A], "the remote ship is gone, the local one stands"); assert.deepEqual(w.api.heldSend(), []);
+  assert.ok(w.HOOKS.toasts.some((t) => /remote\.png .*TESTHOST was detached/.test(t) && /NOT sent/.test(t)), "said: " + JSON.stringify(w.HOOKS.toasts));
+  assert.equal(w.api.busy(), true, "the local upload still holds");
+  w.api.ack({ type: "droppedPath", path: "drops/1-local.png", shipId: "l1" });
+  assert.equal(w.api.busy(), false);
+});
+
+test("round twelve: what holds the column, by name; a column held only by an upload for a session shown elsewhere asks the user on this user's close — keep waiting, or close anyway and lose it", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {}, sets: { "2": [] } });
+  assert.equal(w.api.busyWhy(), "");
+  w.api.startCreate(REQ); const id = w.api.state().provisionalId!;
+  assert.equal(w.api.busyWhy(), "create");
+  w.api.ship(id, SHIP.name, SHIP.shipId, SHIP.b64); w.api.holdSend(id); w.api.type(TYPED);
+  w.api.resolveTo(A);
+  assert.equal(w.api.busyWhy(), "upload-unshown", "the only hold: an upload for A, which this column does not show");
+  w.api.askClose();
+  assert.deepEqual(w.api.confirm(), { title: "An upload is still on its way", buttons: ["Keep waiting", "Close anyway"], key: "close-upload:2" });
+  assert.equal(w.api.clickButton("Keep waiting"), true);
+  assert.equal(Object.keys(w.api.ships()).length, 1, "kept"); assert.deepEqual(w.HOOKS.closeSplit, []); assert.equal(w.api.busy(), true);
+  w.api.askClose(); assert.equal(w.api.clickButton("Close anyway"), true);
+  assert.deepEqual(w.api.ships(), {}, "abandoned"); assert.deepEqual(w.api.heldSend(), [], "the held send never fires short of it");
+  assert.equal(w.api.held.drafts()[A], TYPED, "the words stay the session's draft, to travel with the close");
+  assert.equal(w.api.busy(), false); assert.equal(flips(w.HOOKS, false), 1); assert.deepEqual(w.HOOKS.closeSplit, [2], "…and the shell is asked to close again");
+  const v = world({ activeId: A, mru: [A], order: [A], nextActive: null, store: {}, sets: { "2": [A] } });   // the session IS shown here: its chip's ✕ can release the hold
+  v.api.ship(A, "a.png", "a1", "QUJD");
+  assert.equal(v.api.busyWhy(), "upload");
+});
+
+test("round twelve: a frame the shim's own queue flushes on the reconnect is not re-shipped by that reconnect's romp:wsup — one frame per upload; a ship made before the drop is re-shipped once", () => {
+  const w = receiving();
+  w.api.ship(A, "before.png", "p1", "QUJD");   // shipped on the live socket, unacked at the drop
+  w.api.wsdown();
+  w.api.ship(A, "during.png", "q1", "QUJD");   // posted while down: the shim queues it and flushes it on the open
+  w.api.wsup();
+  const frames = () => w.HOOKS.sent.filter((m) => m.type === "dropFile").map((m) => m.shipId);
+  assert.deepEqual(frames(), ["p1"], "the queued frame rides the shim's flush; only the earlier ship is re-sent");
+  w.api.wsdown(); w.api.wsup();
+  assert.deepEqual(frames(), ["p1", "p1", "q1"], "a second drop before the acks: both re-ship (the kernel answers one path per ship id)");
+});
+
+test("round twelve: the strip's last member gone while an upload was in flight — the emptiness is reported on the release, before the flip", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {}, sets: { "2": [C] } });
+  w.api.ship(C, "c.png", "c1", "QUJD");
+  w.api.strip([A, B]);   // the kernel's strip no longer lists C
+  assert.equal(w.HOOKS.posts.filter((p) => p.romp === "colEmpty").length, 0, "not from under a hold");
+  w.api.ack({ type: "droppedPath", path: "drops/1-c.png", shipId: "c1" });
+  assert.deepEqual(w.HOOKS.posts.filter((p) => p.romp === "colEmpty"), [{ romp: "colEmpty", gone: [C], crossed: [] }], "said on the release");
+  assert.deepEqual(last(w.HOOKS), { romp: "colBusy", busy: false }, "the flip, last"); assert.ok(w.HOOKS.seq.indexOf("empty") < w.HOOKS.seq.lastIndexOf("flip:false"));
 });

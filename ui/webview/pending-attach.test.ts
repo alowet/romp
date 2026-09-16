@@ -25,7 +25,7 @@ test("the pending chip goes up BEFORE the encode starts — pick-to-feedback is 
   assert.match(RENDER, /const pendingShips = new Map<string, PendingShip\[\]>\(\);/);   // entries retain shipId + payload (T215)
   // registered at the TOP of shipFileToHost (before new FileReader), with the sid captured once —
   // at call time via the sidAt default (a pasted-path caller passes the sid it verified against)
-  assert.match(RENDER, /const name = f\.name \|\| "pasted\.png";\s*\n\s*const sid = sidAt;.*\n\s*const shipId = "s".*\n\s*addPendingShip\(sid, name, shipId\);.*\n\s*const reader = new FileReader\(\);/);
+  assert.match(RENDER, /const name = f\.name \|\| "pasted\.png";\s*\n\s*const sid = sidAt;.*\n\s*const shipId = "s".*\n\s*addPendingShip\(sid, name, shipId, kind\);.*\n\s*const reader = new FileReader\(\);/);
 });
 
 test("the strip renders pending chips (name + pulsing dots) and shows even with no real attachments", () => {
@@ -86,10 +86,10 @@ test("a kernel restart between ship and ack RE-SHIPS the retained bytes on recon
   // The ack rides the socket the dropFile went out on, so a restart in that window means it can
   // never arrive: the chip pulsed forever and a held send never fired. The payload is retained on
   // the entry and re-shipped on romp:wsup — the exact kernel-is-back event, never a timer.
-  assert.match(RENDER, /interface PendingShip \{ name: string; shipId: string; b64\?: string \}/);
-  assert.match(RENDER, /if \(entry\) entry\.b64 = b64;/);
+  assert.match(RENDER, /interface PendingShip \{ name: string; shipId: string; b64\?: string; kind: "composer" \| "comment"; queued\?: boolean \}/);
+  assert.match(RENDER, /function retainShipBytes\(sid: string \| null, shipId: string, b64: string\): void \{[\s\S]{0,300}entry\.b64 = b64;\n  entry\.queued = !hostOf\(sid \|\| ""\) && !wsIsUp;/);
   assert.match(RENDER, /function reshipPendingUploads\(hosts\?: readonly string\[\]\): void \{/);
-  assert.match(RENDER, /window\.addEventListener\("romp:wsup", \(\) => \{\n  reshipPendingUploads\(\);/);   // the listener grew a body (T246: the local active-tab re-arm rides it too)
+  assert.match(RENDER, /window\.addEventListener\("romp:wsup", \(\) => \{\n  wsIsUp = true;\n  reshipPendingUploads\(\);/);   // up is noted first (round twelve); the listener grew a body (T246: the local active-tab re-arm rides it too)
   // an entry still ENCODING has no payload — its own onload ships on the fresh socket, never doubled
   assert.match(RENDER, /if \(!p\.b64\) continue;/);
   // the re-ship rides the same dropFile shape, same shipId, routed to the owning session

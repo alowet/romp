@@ -563,3 +563,53 @@ class HeadlessParity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DropFileIdempotence(_Wire):
+    """A dropFile with a ship id saves ONCE per kernel life (round twelve, 2026-09-16): the page re-ships retained bytes on a
+    reconnect (T215) and the standalone shim flushes a queued frame on its open, so the same upload can arrive twice — the
+    repeat answers the same path and writes nothing. Synthetic bytes; the hermetic state dir's drops/."""
+    def setUp(self):
+        super().setUp()
+        km._DROP_SAVED.clear()
+        self.drops = Path(km.jd.STATE) / "drops"
+
+    def _files(self):
+        return sorted(p.name for p in self.drops.glob("*-photo.png")) if self.drops.is_dir() else []
+
+    def _gap(self):
+        # _save_dropped_file names a file by the millisecond (pre-existing): two DIFFERENT uploads inside one millisecond land on one
+        # name and the second overwrites the first. Distinct uploads here are spaced past that, so the test reads the map, not the clock.
+        import time as _t
+        _t.sleep(0.002)
+
+    def test_a_repeat_ship_id_answers_the_same_path_and_writes_nothing(self):
+        before = set(self._files())
+        a = self.send({"type": "dropFile", "name": "photo.png", "b64": "QUJD", "shipId": "s1", "id": "11111111-2222-3333-4444-555555555501"})
+        b = self.send({"type": "dropFile", "name": "photo.png", "b64": "QUJD", "shipId": "s1", "id": "11111111-2222-3333-4444-555555555501"})
+        self.assertEqual(a["type"], "droppedPath"); self.assertEqual(a["shipId"], "s1")
+        self.assertEqual(b, a, "the second frame: the same ack, byte for byte")
+        self.assertEqual(len(set(self._files()) - before), 1, "one file for the two frames")
+        self.assertEqual(Path(a["path"]).read_bytes(), b"ABC")
+
+    def test_another_ship_id_or_no_ship_id_saves_anew(self):
+        before = set(self._files())
+        a = self.send({"type": "dropFile", "name": "photo.png", "b64": "QUJD", "shipId": "s1", "id": "11111111-2222-3333-4444-555555555501"})
+        self._gap()
+        c = self.send({"type": "dropFile", "name": "photo.png", "b64": "QUJD", "shipId": "s2", "id": "11111111-2222-3333-4444-555555555501"})
+        self.assertNotEqual(a["path"], c["path"], "a different ship is a different upload")
+        self._gap()
+        d = self.send({"type": "dropFile", "name": "photo.png", "b64": "QUJD"})   # an older page: no ship id — saved as before, never through the map
+        self.assertNotIn("shipId", d); self.assertEqual(d["type"], "droppedPath"); self.assertNotIn(d["path"], (a["path"], c["path"]))
+        self.assertEqual(len(set(self._files()) - before), 3)
+        self.assertEqual([k for k in km._DROP_SAVED], [("11111111-2222-3333-4444-555555555501", "s1"), ("11111111-2222-3333-4444-555555555501", "s2")], "only ships with an id are remembered")
+
+    def test_the_key_is_the_session_and_the_ship(self):
+        a = self.send({"type": "dropFile", "name": "photo.png", "b64": "QUJD", "shipId": "s1", "id": "11111111-2222-3333-4444-555555555501"})
+        self._gap()
+        b = self.send({"type": "dropFile", "name": "photo.png", "b64": "QUJD", "shipId": "s1", "id": "11111111-2222-3333-4444-555555555502"})
+        self.assertNotEqual(a["path"], b["path"], "another session's page minted the same page-local id: not the same upload")
+        os.unlink(a["path"]); self._gap()
+        c = self.send({"type": "dropFile", "name": "photo.png", "b64": "QUJD", "shipId": "s1", "id": "11111111-2222-3333-4444-555555555501"})
+        self.assertNotEqual(c["path"], a["path"], "the saved file gone (a sweep): saved anew, never a path to nothing")
+        self.assertTrue(Path(c["path"]).is_file())

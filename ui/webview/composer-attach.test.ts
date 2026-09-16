@@ -63,7 +63,7 @@ test("shipFileToHost stamps the session id so federation routes the bytes to the
   // must not reroute the bytes away from the session the user attached them to. Callers
   // that already verified against a session (the pasted-path flow) pass THEIR captured
   // sid; the default keeps ship-time capture for everyone else.
-  assert.match(RENDER, /function shipFileToHost\(f: File, sidAt: string \| null = activeId\)/);
+  assert.match(RENDER, /function shipFileToHost\(f: File, sidAt: string \| null = activeId, kind: PendingShip\["kind"\] = "composer"\)/);
   assert.match(RENDER, /const sid = sidAt;/);
   assert.match(RENDER, /if \(sid\) msg\.id = sid;\s*\/\/ the owning session → the owning kernel/);
 });

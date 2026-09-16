@@ -6589,6 +6589,7 @@ function renderTabs() {
   for (const id of order) { if (!seen.has(id) && stripLists(id)) { seen.add(id); ids.push(id); } }
   for (const id of tabMeta.keys()) { if (!seen.has(id) && stripLists(id)) { seen.add(id); ids.push(id); } }   // any pushed tab not yet in `order` (placeholder); stripLists is the one membership rule the restores read too
   auditTabOrder(ids);
+  lastStripIds = ids;         // the strip as last seen: the emptiness check re-runs on it when a hold ends (syncColumnBusy, round twelve)
   noteColumnEmptiness(ids);   // a later column none of whose members the kernel lists any more tells the shell (the chat split)
   noteOrphanState();          // …and state held for a session another column shows is offered to the shell (the chat split)
   // demo/recording view filter (the user 2026-07-14): `#only=<tag>` shows only matching-name tabs; the
@@ -8198,6 +8199,22 @@ const PROVISIONAL_WAIT_MS = 90_000;
 // the facts on its own and posted colEmpty from under a folder question).
 function columnBusy(): boolean { return !!provisionalId || failedProvisionals.size > 0 || pendingShips.size > 0; }
 (window as any).__rompColumnBusy = (): boolean => columnBusy();
+// …and the SESSION-level question (round twelve, 2026-09-16): a session with an upload in flight, or a send held on one, cannot
+// MOVE to another column — the ack rides this document's socket and the held send fires here, so a move would split the send
+// from its words (the words went with the tab; the ack here sent the bare path). The shell asks before every move (moveTab:
+// the palette, the drag zones, a new column) and refuses with a line; the ack releases it.
+(window as any).__rompSessionBusy = (sid: unknown): boolean => typeof sid === "string" && !!sid && (pendingShips.has(sid) || sendOnShip.has(sid));
+// WHICH fact holds the column (round twelve): the shell's own close asks, and for a column whose ONLY hold is an upload for a
+// session it does not show — no chip is rendered here, so no ✕ can release it — it puts the question to the user instead of the
+// refusal (askCloseUpload): close anyway and lose the upload, the one acceptable loss, by an explicit choice.
+function columnBusyWhy(): "" | "create" | "failed" | "upload" | "upload-unshown" {
+  if (provisionalId) return "create";
+  if (failedProvisionals.size) return "failed";
+  if (!pendingShips.size) return "";
+  for (const sid of pendingShips.keys()) if (heldHere(sid)) return "upload";
+  return "upload-unshown";
+}
+(window as any).__rompColumnBusyWhy = (): string => columnBusyWhy();
 // …and the shell hears the answer CHANGE (2026-09-15): a column another dashboard's write dropped is HELD by the shell
 // while this page is busy — closing it would kill the create's queued text and draft with the document — and closed the
 // moment the create lands, is cancelled, resolves to a running session, or a failed one's tab is discarded
@@ -8219,6 +8236,10 @@ function syncColumnBusy(): void {
   const busy = columnBusy();
   if (busy === columnBusyTold) return;
   columnBusyTold = busy;
+  // the emptiness a busy column could not report (noteColumnEmptiness returns while busy) is reported on the release (round
+  // twelve): the strip's last member gone while an upload was in flight left the column mounted, and its store entry stale,
+  // until the kernel's next strip — with a quiet kernel, for good. Said before the flip, so the flip stays the last word.
+  if (!busy) noteColumnEmptiness(lastStripIds);
   try { if (window.parent && window.parent !== window) window.parent.postMessage({ romp: "colBusy", busy }, "*"); } catch (e) { /* no shell */ }
 }
 
@@ -8501,6 +8522,7 @@ function claimSession(id: string): void {
 // tab, the user 2026-09-12: a hold over a session the kernel still listed hid it for the backstop and toasted a close
 // nobody asked for).
 let colEmptyPosted = false;
+let lastStripIds: string[] = [];   // the ids the last renderTabs judged (round twelve: the release of a hold re-judges them)
 function noteColumnEmptiness(ids: readonly string[]): void {
   if (!COL || !colSets || !tabOrderSeen) return;
   // a create in flight, or a failed one still holding its text, is this column's own tab and in no entry: the column
@@ -9816,7 +9838,7 @@ cmtFilePicker.multiple = true;
 cmtFilePicker.style.display = "none";
 cmtFilePicker.addEventListener("change", () => {
   const sid = pendingCommentAnchor?.sid || openCommentKey?.sid || activeId;
-  Array.from(cmtFilePicker.files || []).forEach((f) => shipFileToHost(f, sid));
+  Array.from(cmtFilePicker.files || []).forEach((f) => shipFileToHost(f, sid, "comment"));   // a COMMENT's ship: the ack is routed to the box by the ship's kind (round twelve)
   cmtFilePicker.value = "";
 });
 document.body.appendChild(cmtFilePicker);
@@ -16258,7 +16280,12 @@ const composerFiles = new Map<string, string[]>();   // sid -> attachment paths,
 // race is dropped instead of attached to whatever tab is active. Names of ships lost to a full page
 // RELOAD persist beside the drafts and surface as a loud re-attach toast at startup (the VS Code pipe
 // reloads its webview on reconnect, so the wedge there is a vanished chip, not an eternal one).
-interface PendingShip { name: string; shipId: string; b64?: string }
+// `kind` (round twelve): whose upload — the composer's or a comment's — so the ack is routed by the SHIP, never by whichever box
+// happens to be open. `queued`: the frame was posted while the local socket was down, so the shim's own queue flushes it on the
+// next open — the reconnect re-ship must not post it again (the kernel saved two files, one per frame).
+interface PendingShip { name: string; shipId: string; b64?: string; kind: "composer" | "comment"; queued?: boolean }
+let wsIsUp = true;   // the local socket, as the shim's events say (romp:wsdown / romp:wsup); the first connect fires no wsup, so up until told otherwise
+window.addEventListener("romp:wsdown", () => { wsIsUp = false; });
 let shipSeq = 0;   // per-page mint — a shipId only ever meets acks for this page's own ships
 const pendingShips = new Map<string, PendingShip[]>();   // sid -> ships awaiting droppedPath
 
@@ -16270,10 +16297,10 @@ function shipSafeName(name: string): string {
   return (name.replace(/[^\w.-]+/g, "_").slice(-80)) || "drop";
 }
 
-function addPendingShip(id: string | null, name: string, shipId: string): void {
+function addPendingShip(id: string | null, name: string, shipId: string, kind: PendingShip["kind"] = "composer"): void {
   if (!id) return;
   const list = pendingShips.get(id) || [];
-  list.push({ name, shipId });
+  list.push({ name, shipId, kind });
   pendingShips.set(id, list);
   persistDrafts();   // the NAMES ride the draft store so a reload can say what it lost (T215)
   if (id === activeId) renderComposerFiles(id);
@@ -16287,6 +16314,33 @@ function shipOwner(shipId: string): string | null {
   for (const [id, list] of pendingShips) if (list.some((p) => p.shipId === shipId)) return id;
   return null;
 }
+// …and the entry itself (round twelve): the ack reads the ship's kind off it
+function shipRecord(shipId: string): PendingShip | null {
+  for (const list of pendingShips.values()) { const p = list.find((x) => x.shipId === shipId); if (p) return p; }
+  return null;
+}
+// The bytes, retained on the entry until the ack (the reconnect re-ship needs them, T215), and whether the frame that carries them
+// is riding the shim's OWN queue: posted while the local socket is down, the shim holds it and flushes it on the next open — so the
+// re-ship that open's romp:wsup runs must skip it, or the kernel saves the file twice (round twelve).
+function retainShipBytes(sid: string | null, shipId: string, b64: string): void {
+  const entry = sid ? (pendingShips.get(sid) || []).find((p) => p.shipId === shipId) : undefined;
+  if (!entry) return;
+  entry.b64 = b64;
+  entry.queued = !hostOf(sid || "") && !wsIsUp;
+}
+// Every ship to `host` fails (round twelve): the host was DETACHED from this dashboard (federation.ts closeRemote → romp:hostDetached),
+// so no ack is coming for any of them — unlike a relay drop, whose reopen re-ships. Each through the one failure path: the chip goes,
+// a held send is cancelled loudly, the column's hold ends.
+function failShipsOfHost(host: string, why: string): void {
+  for (const [sid, list] of [...pendingShips]) {
+    if (hostOf(sid) !== host) continue;
+    for (const p of list.slice()) shipFailed(p.name, p.shipId, p.name + " " + why);
+  }
+}
+window.addEventListener("romp:hostDetached", (e) => {
+  const h = String((((e as CustomEvent).detail || {}) as any).host || "");
+  if (h) failShipsOfHost(h, "was still uploading when " + h + " was detached, so it was not attached — attach it again once the host is back.");
+});
 
 // An ack (or nack) retires ONE pending chip: the entry whose shipId the ack echoes (exact — new
 // kernels echo it); else the entry whose sanitized name `key` ends with — `key` is the saved path on
@@ -16332,6 +16386,31 @@ function shipFailed(key: string, shipId: string | undefined, why: string): void 
   syncColumnBusy();
 }
 
+// The user's own ✕ on a column whose ONLY hold is an upload for a session it does not show (round twelve, 2026-09-16): no chip
+// is drawn here, so nothing but the ack could release it, and a socket that never comes back would hold it for good. The shell
+// asks (close → askCloseUpload) and the user decides — the composer's own confirm shape. "Close anyway" abandons every pending
+// upload of this document (the one acceptable loss, by an explicit choice): the chips go, a send held on one is cancelled, the
+// words stay the session's draft and travel with the close; then the shell is asked to close again, and it can.
+function askCloseUpload(): void {
+  if (!pendingShips.size) { try { (window.parent as any)?.__rompCloseSplit?.(Number(COL)); } catch (e) { /* no shell */ } return; }   // the ack landed meanwhile: nothing to lose
+  const n = [...pendingShips.values()].reduce((a, l) => a + l.length, 0);
+  showConfirm(n === 1 ? "An upload is still on its way" : n + " uploads are still on their way",
+    "A file for a session shown in another column is still uploading from this one. Close anyway and the attachment is lost; "
+    + "a message waiting on it stays that session's draft.",
+    [{ label: "Keep waiting", value: "wait" }, { label: "Close anyway", value: "close", danger: true }],
+    (v) => { if (v === "close") { abandonPendingUploads(); try { (window.parent as any)?.__rompCloseSplit?.(Number(COL)); } catch (e) { /* no shell */ } } },
+    "close-upload:" + COL);
+}
+function abandonPendingUploads(): void {
+  const sids = [...pendingShips.keys()];
+  pendingShips.clear();
+  for (const sid of sids) sendOnShip.delete(sid);   // a held send never fires short of its attachment
+  if (shipGateSid !== null) shipGateSid = null;
+  persistDrafts();   // the ships' names leave the store: no loss toast for a choice already made
+  endReloadHoldIfIdle();
+  syncColumnBusy();   // the column's hold ends: the shell's close can proceed
+}
+
 // Re-ship the retained payloads whose ack socket just came back. That socket died with the acks
 // still owed, so re-sending the bytes is the ONLY way the chip's retiring event can still arrive;
 // the kernel just saves a fresh copy (a duplicate file in drops/ is an orphan, never attached — the
@@ -16351,6 +16430,7 @@ function reshipPendingUploads(hosts?: readonly string[]): void {
     if (hosts ? hosts.indexOf(h) < 0 : h) continue;   // no scope → the local kernel's own entries
     for (const p of list) {
       if (!p.b64) continue;
+      if (!hosts && p.queued) { p.queued = false; continue; }   // the shim's own queue flushed this frame on the open that fired this wsup (round twelve): posting it again saved the file twice
       const msg: { type: string; name: string; b64: string; shipId: string; id?: string } =
         { type: "dropFile", name: p.name, b64: p.b64, shipId: p.shipId };
       if (id) msg.id = id;
@@ -16359,6 +16439,7 @@ function reshipPendingUploads(hosts?: readonly string[]): void {
   }
 }
 window.addEventListener("romp:wsup", () => {
+  wsIsUp = true;
   reshipPendingUploads();
   // …and the LOCAL kernel's active tab (the twin of the relay re-arm below; review fold, T246): the shim's
   // redial carries ?active= from the PERSISTED activeId, which a dismissal's fallback and a sole-tab adoption
@@ -16640,6 +16721,14 @@ function sendHeldFor(sid: string): void {
   if (!vscodeApi) return;
   const typed = (drafts.get(sid) ?? "").trim();
   const attached = composerFiles.get(sid) || [];
+  // the BELT (round twelve): the words went to another column with their tab (the take ran, handedOff) and nothing of the message is
+  // here — a send from here would be the bare path. Refused: the hold is already off (the caller deleted it), the file stays under the
+  // sid and the orphan offer carries it to the pane that shows the session. The shell's move refusal (__rompSessionBusy) is the belt's braces.
+  if (!typed && !stagedMsgs.count(sid) && handedOff.has(sid)) {
+    warnToast("The message waiting on this upload moved to another column with its session, so it was not sent from here — the attachment is on that session's strip there.");
+    noteOrphanState();
+    return;
+  }
   const text = attached.length ? (typed ? typed + "\n" : "") + attached.map((p) => (/\s/.test(p) ? '"' + p + '"' : p)).join(" ") : typed;
   if (!text && !stagedMsgs.count(sid)) return;
   if (hostIsDown(sid) || isProvisionalId(sid)) { ephemeralWarnToast("The message held for the upload was not sent — the session isn't reachable. It stays as that session's draft."); return; }
@@ -17274,6 +17363,7 @@ const sessionMru: string[] = [];
   if (sid === activeId && ta) { if (ta.value) drafts.set(sid, ta.value); else drafts.delete(sid); }
   const draft = drafts.get(sid) ?? "", citations = composerCitations.get(sid) ?? [], files = composerFiles.get(sid) ?? [], staged = stagedMsgs.takeAll(sid);
   drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid);
+  if (draft || staged.length) handedOff.add(sid);   // the words left with the tab (round twelve): a held send here would be the bare path — sendHeldFor's belt
   if (sid === activeId) { if (ta) { ta.value = ""; growComposer(ta); } renderComposerChips(sid); renderComposerFiles(sid); renderStagedStrip(sid); }
   // the typing hold's ENDING event (round eleven, 2026-09-16): the core hears a draft cleared by typing ('input') or a blur, never a
   // box emptied from here — an owed reload then waited for the minute's backstop. Told exactly when the take emptied a box that
@@ -17286,8 +17376,12 @@ const sessionMru: string[] = [];
 };
 // …and the TARGET page's half: what the source held, into the maps (joined onto anything already here, never over
 // it), persisted, and into the box when the tab is active. The shell posts it on a new column's load or at once.
+// The sids whose WORDS this page handed to another column (the take) and has not had back (an adopt): sendHeldFor refuses to
+// send for one of them with nothing of the message here (round twelve).
+const handedOff = new Set<string>();
 function adoptSessionState(sid: unknown, state: unknown): void {
   if (typeof sid !== "string" || !sid || !state || typeof state !== "object") return;
+  handedOff.delete(sid);   // the words are here again
   const st = state as { draft?: unknown; citations?: unknown; files?: unknown; staged?: unknown };
   if (typeof st.draft === "string" && st.draft) drafts.set(sid, [drafts.get(sid) ?? "", st.draft].filter(Boolean).join("\n\n"));
   if (Array.isArray(st.files) && st.files.length) {
@@ -18658,6 +18752,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
   // a moved tab's drafts (the chat split): the shell took them from the source page (__rompTakeSessionState) and
   // hands them to this page, the session's column now — into the maps, persisted, and into the box when it is active
   if (m.romp === "adopt") { adoptSessionState(m.sid, m.state); return; }
+  if (m.romp === "askCloseUpload") { askCloseUpload(); return; }   // the shell's close met a column held only by an upload for a session shown elsewhere (round twelve)
   // the shell closed a later column whose members the kernel's strip no longer lists (colEmpty): they return to this,
   // the first column, but the kernel may still list one closed from its own cross for a push or two — held back here
   // (closingTabs, retired by the kernel's next strip as any ✕ is) so no tab flashes into this strip on its way out. The
@@ -19023,13 +19118,18 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     const s = sessions.get(m.id);
     if (s && s.name !== m.name) { s.name = m.name; renderTabs(); syncTabKeysWithStrip(); if (m.id === activeId) { syncComposerPh(); updateStatusline(); } }   // the box, the badge and a hot key's title name the session as it is now called
   }
+  // The upload's ack is ROUTED BY THE SHIP (round twelve, 2026-09-16): a comment's upload lands in the open comment box, a composer's
+  // never does, box open or not — before this any open box took the composer's ack (the path into the box, the chip retired, the held
+  // send left armed, the column's hold released), so a held column closed with the message unsent and unsaid. A legacy ack with no
+  // shipId (an older kernel) keeps the old reading: an open box is the comment's.
   else if (m.type === "droppedPath" && typeof m.path === "string") {   // host-saved drop/paste/pick → a thumbnail, not path text (the user 2026-08-04)
     const ackShip = typeof m.shipId === "string" && m.shipId ? m.shipId : undefined;
     if (ackShip && !shipOwner(ackShip)) return;   // a duplicate of a ship already retired (a reconnect
     //                                               re-ship raced the original ack) — attaching it again
     //                                               would double the file on whatever tab is active (T215)
+    const ship = ackShip ? shipRecord(ackShip) : null;   // the ack's route (see above)
     const cbox = document.getElementById("cmt-pop")?.querySelector(".cmt-input") as HTMLTextAreaElement | null;
-    if (cbox) {
+    if (cbox && (ship ? ship.kind === "comment" : true)) {
       // a comment popover is open — its own clip shipped this file, so the path lands in ITS box
       retirePendingShip(m.path, ackShip);
       cbox.value = (cbox.value ? cbox.value.trimEnd() + " " : "") + m.path + " ";
@@ -20369,7 +20469,7 @@ function acceptDroppedTransfer(dt: DataTransfer): void {
   });
 }
 
-function shipFileToHost(f: File, sidAt: string | null = activeId) {
+function shipFileToHost(f: File, sidAt: string | null = activeId, kind: PendingShip["kind"] = "composer") {
   if (f.size > SHIP_MAX_BYTES) {
     // an oversize file must be REFUSED VISIBLY, never dropped silently — name the
     // file, its size and the cap, on the same loud surface a failed federation
@@ -20384,13 +20484,12 @@ function shipFileToHost(f: File, sidAt: string | null = activeId) {
   const name = f.name || "pasted.png";
   const sid = sidAt;   // captured at CALL (= ship) time via the default param — a tab switch
   const shipId = "s" + Date.now().toString(36) + "." + (++shipSeq);   // page-local; the ack echoes it
-  addPendingShip(sid, name, shipId);   // mid-encode (or mid-verify, for a pasted path) must not reroute
+  addPendingShip(sid, name, shipId, kind);   // mid-encode (or mid-verify, for a pasted path) must not reroute
   const reader = new FileReader();
   reader.onload = () => {
     const b64 = String(reader.result || "").split(",")[1] || "";
     if (!b64 || !vscodeApi) { shipFailed(name, shipId, name + " could not be read, so it was not attached — try again."); return; }   // a held send must not fire short of it (round eleven)
-    const entry = sid ? (pendingShips.get(sid) || []).find((p) => p.shipId === shipId) : undefined;
-    if (entry) entry.b64 = b64;   // retained until the ack — the reconnect re-ship needs the bytes (T215)
+    retainShipBytes(sid, shipId, b64);   // retained until the ack — the reconnect re-ship needs the bytes (T215); marked if the shim's queue carries the frame (round twelve)
     const msg: { type: string; name: string; b64: string; shipId: string; id?: string } =
       { type: "dropFile", name, b64, shipId };
     if (sid) msg.id = sid;   // the owning session → the owning kernel

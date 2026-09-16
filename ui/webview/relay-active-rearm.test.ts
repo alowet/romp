@@ -64,7 +64,7 @@ test("render.ts re-sends activeTab on romp:hostRelayUp for that host's active ta
 
 test("render.ts re-sends a LOCAL active tab on romp:wsup, the shim's reconnect event, beside the local re-ship", () => {
   // anchored on the re-ship call: render.ts has other romp:wsup listeners (preview heals, awaitingFull), this is the one
-  const m = RENDER.match(/window\.addEventListener\("romp:wsup", \(\) => \{\n  reshipPendingUploads\(\);([\s\S]*?)\n\}\);/);
+  const m = RENDER.match(/window\.addEventListener\("romp:wsup", \(\) => \{\n  wsIsUp = true;\n  reshipPendingUploads\(\);([\s\S]*?)\n\}\);/);
   assert.ok(m, "the romp:wsup re-ship listener, now with a body");
   assert.match(m![1], /if \(activeTabToReannounce\(activeId, ""\)\) notifyActive\(\);/, "the local tab is re-announced with the LOCAL host marker");
 });

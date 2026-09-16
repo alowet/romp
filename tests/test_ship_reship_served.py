@@ -74,11 +74,12 @@ PNG = base64.b64decode(
 
 class SourcePins(unittest.TestCase):
     def test_payload_retained_and_reshipped_on_the_reconnect_event(self):
-        self.assertIn("interface PendingShip { name: string; shipId: string; b64?: string }", RENDER)
-        self.assertIn("if (entry) entry.b64 = b64;", RENDER)
+        self.assertIn('interface PendingShip { name: string; shipId: string; b64?: string; kind: "composer" | "comment"; queued?: boolean }', RENDER)   # + the ship's kind and the shim-queue mark (round twelve)
+        self.assertIn("  entry.b64 = b64;\n  entry.queued = !hostOf(sid || \"\") && !wsIsUp;", RENDER)   # retained in retainShipBytes, marked when the shim's queue carries the frame (round twelve)
+        self.assertIn("retainShipBytes(sid, shipId, b64);", RENDER)
         # the listener grew a body (T246: the local active-tab re-arm rides the same open event); the re-ship
         # is still its first statement
-        self.assertIn('window.addEventListener("romp:wsup", () => {\n  reshipPendingUploads();', RENDER)
+        self.assertIn('window.addEventListener("romp:wsup", () => {\n  wsIsUp = true;\n  reshipPendingUploads();', RENDER)   # up is noted first (round twelve), then the re-ship
         # …and the federated twin (review finding 2026-09-01): the relay's own (re)open re-ships THAT
         # host's entries — scoped by ack socket. The kernel-reported hostUp does NOT: it fires in the
         # tick federation re-dials the relay, before the socket is open (second review, same day)
