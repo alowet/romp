@@ -8125,10 +8125,16 @@ let dirQuestionFor: string | null = null;
 // of being read against whatever tab is current. A reply WITHOUT one (an older kernel) is read as today: the current create's.
 let provisionalRid: string | null = null;
 function mintRid(): string { return "c-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
-// Stale ONLY while a DIFFERENT create is pending (round six): with none pending, a reply that names a request takes main's
-// path — a namesake's "tags were not changed" after the focus settled the tab, a tagError after the session's own frame
-// adopted it, a host's late authoritative reason after the backstop failed the tab (onCreateWarn refines that tab's reason).
-function createReplyIsStale(m: { rid?: unknown }): boolean { return typeof m.rid === "string" && provisionalRid !== null && m.rid !== provisionalRid; }
+// A reply is stale iff its request was SUPERSEDED (round seven): the rid enters supersededRids at the exact events that make it
+// nobody's — a second create opening over a pending one (openProvisional), a same-tab retry minting a new request
+// (startCreate), the user's ✕ on a pending tab (cancelProvisional) — and stays there (the last 64), so a late focus or
+// warning for it is dropped even after the replacing create has settled. A rid never superseded is never stale, whatever
+// is pending: a namesake's "tags were not changed" after the focus settled the tab, a tagError after the session's own
+// frame adopted it, a host's late authoritative reason after the backstop all still reach the user (onCreateWarn). A reload
+// empties the set: a stale focus arriving after one takes the ordinary path, as any focus does.
+const supersededRids: string[] = [];
+function retireRid(rid: string | null): void { if (!rid || supersededRids.includes(rid)) return; supersededRids.push(rid); while (supersededRids.length > 64) supersededRids.shift(); }
+function createReplyIsStale(m: { rid?: unknown }): boolean { return typeof m.rid === "string" && supersededRids.includes(m.rid); }
 // the reason a create failed, by its failed tab (failProvisional): the tab's own placeholder shows it, so a failure said
 // quietly (the picker opened over its prompt, an unrelated dialog replacing it) is still explained where the text is
 const failedWhy = new Map<string, string>();
@@ -8172,6 +8178,14 @@ function columnBusy(): boolean { return !!provisionalId || failedProvisionals.si
 // path, after that path's last write of the text (round two, 2026-09-15: posted from inside dropProvisional it ran ahead of
 // resolveProvisionalToExisting's drafts.set, and the typed text died with the document).
 let columnBusyTold = false;
+// …said once, unconditionally, at the end of boot (round seven): a page that restored a failed tab is busy from its first
+// moment, and the flip's edge detection needs that baseline — else the tab's ✕ flipped busy to false against a false
+// baseline, said nothing, and a column the shell had held for this page was never closed. One message; the shell ignores
+// a `true`, and a `false` for a column it is not holding.
+function announceColumnBusy(): void {
+  columnBusyTold = columnBusy();
+  try { if (window.parent && window.parent !== window) window.parent.postMessage({ romp: "colBusy", busy: columnBusyTold }, "*"); } catch (e) { /* no shell */ }
+}
 function syncColumnBusy(): void {
   const busy = columnBusy();
   if (busy === columnBusyTold) return;
@@ -8180,6 +8194,7 @@ function syncColumnBusy(): void {
 }
 
 function openProvisional(req: CreateReq, rid: string | null = null): void {
+  retireRid(provisionalRid);               // the create this one supersedes: its late replies are nobody's from here on
   const prev = dropProvisional();          // never two at once: a second create supersedes the first — and takes its text (below)
   const display = provisionalName(req.host, req.name);
   pendingNewSession = display;
@@ -8303,10 +8318,11 @@ function failProvisional(why: string, quiet = false): void {
   if (s) s.status = { state: "closed", sinceEpoch: Date.now() };   // ms, like every kernel payload
   setActive(id);                     // jump back to the failed thread BEFORE saying anything
   if (held) {
-    drafts.set(id, held); persistDrafts();
+    drafts.set(id, held);
     const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
     if (ta) { ta.value = held; growComposer(ta); }
   }
+  persistDrafts();   // ALWAYS (round seven): the failed record rides with whatever the tab holds — a staged message, a citation, an attachment, or nothing but the reason — so the tab comes back after a reload in every case
   renderTabs();
   if (!quiet) showConfirm("Couldn't start " + name,   // quiet: the picker the user opened over a folder question is the foreground (dismissDirPromptForPicker)
     why + (held ? "\n\nWhat you typed is in this tab's message box." : ""),
@@ -8318,6 +8334,7 @@ function failProvisional(why: string, quiet = false): void {
 // create doesn't leave behind an orphan session the user meant to cancel.
 function cancelProvisional(): void {
   const name = pendingNewSession;
+  retireRid(provisionalRid);               // "never mind": the request's late replies are nobody's (a folder question for it must not land on a later create)
   dropProvisional();
   if (name && vscodeApi) vscodeApi.postMessage({ type: "cancelCreate", name });
   syncColumnBusy();                        // LAST: nothing to hand anywhere — the ✕ discarded the text with the tab
@@ -8900,6 +8917,7 @@ function startCreate(req: CreateReq, mkdir = false): void {
   // create (adoptsProvisional matches the name), and the backstop is armed again
   if (provisionalId && dirQuestionFor === provisionalId && pendingNewSession === provisionalName(req.host, req.name)) {
     dirQuestionFor = null;
+    retireRid(provisionalRid);
     provisionalRid = rid;   // the tab waits on the retry now: the first attempt's late replies are stale
     provisionalTags = req.tags?.slice() ?? [];
     if (provisionalTimer) clearTimeout(provisionalTimer);
@@ -16347,7 +16365,14 @@ function persistDrafts(): void {
                             shipsInFlight: [...pendingShips.values()].flat().map((p) => p.name) });
   } catch { /* ignore */ }
 }
-try {
+// THE COMPOSER'S PERSISTED STATE, restored at boot — ONE sequence, in this order: the drafts, the attachments, the citations,
+// then the failed creates (which may drop orphan new-* entries and REWRITE the store), then the ships lost to the reload.
+// Called below, after stagedMsgs exists and has restored its own entries (round seven, 2026-09-15): the rewrite reads every
+// store persistDrafts writes, stagedMsgs among them, and before this the failed-create restore ran ahead of stagedMsgs's
+// declaration — a ReferenceError in its temporal dead zone, swallowed by the catch, so the maps were pruned in memory while
+// the disk kept the orphans, on every reload. A failure here is logged, never silent.
+function bootComposerState(): void {
+  try {
   const saved = ((vscodeApi?.getState?.() || {}) as any).drafts;
   if (saved && typeof saved === "object") for (const [k, v] of Object.entries(saved)) if (typeof v === "string") drafts.set(k, v);
   const savedFiles = ((vscodeApi?.getState?.() || {}) as any).files;
@@ -16389,7 +16414,8 @@ try {
       vscodeApi?.setState?.({ ...(vscodeApi.getState?.() || {}), shipsInFlight: [] });
     }
   }
-} catch { /* ignore */ }
+  } catch (e) { console.error("romp: the composer's persisted state did not restore", e); }   // logged, never swallowed
+}
 // The notices the last page was showing when the reload core took it (persistNoticesForReload): shown again once, after
 // the loss toast above, and the record taken out of sessionStorage in the same call so a later load says nothing (one
 // reload, one replay: the scroll record's idiom).
@@ -16423,6 +16449,8 @@ const stagedCollapsed = new Set<string>();
 // entering tab's list on a switch and hide that tab's first items.
 const stagedScroll = new Map<string, number>();
 try { stagedMsgs.restore(((vscodeApi?.getState?.() || {}) as any).staged); } catch { /* ignore */ }
+bootComposerState();    // every store the rewrite touches exists now (drafts, citations, files, staged): the failed creates come back, orphans go
+announceColumnBusy();   // the busy baseline, said once: a restored failed tab makes this page busy from its first moment
 
 // One routing owner for a user message (deliver speaks it through flushStaged, once per post of the
 // release): a goal chip rides askFollowUp, quote chips wrap client-side, a bare message is a plain send

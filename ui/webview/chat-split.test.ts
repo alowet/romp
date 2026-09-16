@@ -110,7 +110,7 @@ test("a pick of a session another column holds is shown where it lives: the setA
   // …and the shell hears the busy answer CHANGE (2026-09-15): a column another dashboard's write dropped is HELD while its page
   // is busy (closing it would kill the create's queued text) and closed on the page's colBusy flip, posted from every write of
   // the two facts the answer reads, only when it flipped (tests/test_chat_split.py runs the hold and both of its ends)
-  assert.match(RENDER, /let columnBusyTold = false;\nfunction syncColumnBusy\(\): void \{\n\s*const busy = columnBusy\(\);\n\s*if \(busy === columnBusyTold\) return;\n\s*columnBusyTold = busy;\n\s*try \{ if \(window\.parent && window\.parent !== window\) window\.parent\.postMessage\(\{ romp: "colBusy", busy \}, "\*"\); \}/);
+  assert.match(RENDER, /let columnBusyTold = false;\n(?:\/\/[^\n]*\n)*function announceColumnBusy\(\): void \{[\s\S]*?\}\nfunction syncColumnBusy\(\): void \{\n\s*const busy = columnBusy\(\);\n\s*if \(busy === columnBusyTold\) return;\n\s*columnBusyTold = busy;\n\s*try \{ if \(window\.parent && window\.parent !== window\) window\.parent\.postMessage\(\{ romp: "colBusy", busy \}, "\*"\); \}/);   // the baseline's announcer sits between them (round seven)
   assert.match(RENDER, /\n  provisionalId = id;\n  provisionalRid = rid;[^\n]*\n  syncColumnBusy\(\);/, "openProvisional: busy now (waiting on this request, round five)");
   // the flip is the LAST act of every settling path, after that path's last write of the text (round two, 2026-09-15: from
   // inside dropProvisional it ran ahead of resolveProvisionalToExisting's drafts.set and the text died with the document)
@@ -137,7 +137,19 @@ test("a pick of a session another column holds is shown where it lives: the setA
   assert.match(RENDER, /const rid = mintRid\(\);[^\n]*\n  if \(vscodeApi\) vscodeApi\.postMessage\(\{ type: "createSession", \.\.\.req, rid, /);
   // …stale ONLY while a DIFFERENT create is pending (round six): with none pending a rid reply takes main's path (a namesake's
   // tags warning after the settling focus, a tagError after adoption, a host's late reason after the backstop)
-  assert.match(RENDER, /function createReplyIsStale\(m: \{ rid\?: unknown \}\): boolean \{ return typeof m\.rid === "string" && provisionalRid !== null && m\.rid !== provisionalRid; \}/);
+  // …stale iff SUPERSEDED (round seven): the rid retired at the events that make it nobody's, kept (the last 64) past the
+  // replacing create's settlement; never superseded → never stale
+  assert.match(RENDER, /function createReplyIsStale\(m: \{ rid\?: unknown \}\): boolean \{ return typeof m\.rid === "string" && supersededRids\.includes\(m\.rid\); \}/);
+  assert.match(RENDER, /function openProvisional\(req: CreateReq, rid: string \| null = null\): void \{\n  retireRid\(provisionalRid\);/);
+  assert.match(RENDER, /dirQuestionFor = null;\n    retireRid\(provisionalRid\);\n    provisionalRid = rid;/);
+  assert.match(RENDER, /function cancelProvisional\(\): void \{\n  const name = pendingNewSession;\n  retireRid\(provisionalRid\);/);
+  // the failed record is persisted whatever the tab holds; the boot restores in ONE real sequence after stagedMsgs exists, and
+  // says the busy baseline once (round seven)
+  const fail = RENDER.slice(RENDER.indexOf("function failProvisional("), RENDER.indexOf("function cancelProvisional("));
+  assert.ok(!/if \(held\) \{[^}]*persistDrafts\(\)/.test(fail) && /\n  persistDrafts\(\);   \/\/ ALWAYS/.test(fail), "failProvisional persists unconditionally");
+  assert.match(RENDER, /function bootComposerState\(\): void \{\n  try \{[\s\S]*?restoreFailedProvisionals\(\);[\s\S]*?\} catch \(e\) \{ console\.error\(/);
+  assert.match(RENDER, /try \{ stagedMsgs\.restore\([^\n]*\n(?:[^\n]*\n)?bootComposerState\(\);[^\n]*\nannounceColumnBusy\(\);/, "the boot: staged restored, then the composer state, then the baseline");
+  assert.match(RENDER, /function announceColumnBusy\(\): void \{\n  columnBusyTold = columnBusy\(\);/);
   assert.match(RENDER, /else if \(m\.type === "focus" && createReplyIsStale\(m\)\) \{/, "a replaced create's success focus is nobody's (round six)");
   assert.ok(RENDER.indexOf('else if (m.type === "focus" && createReplyIsStale(m))') < RENDER.indexOf('else if (m.type === "focus" && !focusIsOurs(m.id))'), "…judged before either focus branch");
   // the failed tabs are persisted with the drafts and rebuilt at boot (round six); a rid reply with none pending refines a failed tab's reason

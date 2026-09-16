@@ -38,13 +38,14 @@ const VIEWER = C + "/agent/a1";
 const REQ = { name: "notes", backend: "sdk", dir: "/proj/not-there-yet", host: "" };
 const TYPED = "notes for a session whose folder is not there yet";
 
-type Hooks = { posts: Record<string, unknown>[]; sent: Record<string, unknown>[]; seq: string[]; confirms: string[]; pickers: number; persisted: number; timers: (() => void)[]; cleared: number; toasts: string[]; answered: (string | null)[] };
+type Hooks = { posts: Record<string, unknown>[]; boot: Record<string, unknown>[]; sent: Record<string, unknown>[]; seq: string[]; confirms: string[]; pickers: number; persisted: number; timers: (() => void)[]; cleared: number; toasts: string[]; answered: (string | null)[] };
 type State = { provisionalId: string | null; dirQuestionFor: string | null; failed: string[]; activeId: string | null; drafts: Record<string, string>; sessions: string[]; timer: boolean; why: Record<string, string> };
 type Api = {
   startCreate: (req: typeof REQ, mkdir?: boolean) => void; onCreateDirMissing: (m: Record<string, unknown>) => void; closePicker: (abandon?: boolean) => void;
   openPicker: () => void; cancelProvisional: () => void; closeTabLocally: (id: string) => void;
   onCreateWarn: (m: { text: string; rid?: unknown }) => void; showConfirm: (title: string, detail: string, buttons: { label: string; value: string }[], cb: (v: string | null) => void) => void;
-  stale: (m: { rid?: unknown }) => boolean; fireTimers: () => number;
+  stale: (m: { rid?: unknown }) => boolean; fireTimers: () => number; settle: () => void;
+  held: { stage: (id: string, text: string) => void; cite: (id: string) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown> };
   busy: () => boolean; answer: (v: string | null) => void; confirm: () => { title: string; buttons: string[]; key: string | null } | null;
   overlays: () => number; clickButton: (label: string) => boolean; rid: () => string | null;
   type: (t: string) => void; composer: () => string; picker: () => { open: boolean; search: string; dir: string }; state: () => State;
@@ -52,24 +53,25 @@ type Api = {
 
 function world(o: { activeId: string | null; mru: string[]; order: string[]; nextActive: string | null; store?: Record<string, unknown> }): { api: Api; HOOKS: Hooks; store: Record<string, unknown> } {
   const store: Record<string, unknown> = o.store ?? {};
-  const HOOKS: Hooks = { posts: [], sent: [], seq: [], confirms: [], pickers: 0, persisted: 0, timers: [], cleared: 0, toasts: [], answered: [] };
+  const HOOKS: Hooks = { posts: [], boot: [], sent: [], seq: [], confirms: [], pickers: 0, persisted: 0, timers: [], cleared: 0, toasts: [], answered: [] };
   const win = { parent: { postMessage(m: Record<string, unknown>) { HOOKS.posts.push(m); if (m.romp === "colBusy") HOOKS.seq.push("flip:" + m.busy); } } };
   const js = requireCjs("esbuild").transformSync(
     [lineOpt("columnBusy"), fn("syncColumnBusy"), fn("dropProvisional"), fn("openProvisional"), fn("cancelProvisional"), fn("failProvisional"),
      fn("onCreateDirMissing"), fnOpt("dirWhy"), fnOpt("dismissDirPromptForPicker"), fn("closePicker"), fn("startCreate"), fn("closeConfirm"), fn("closeTabLocally"),
      fn("showConfirm"), fnOpt("onCreateWarn"), lineOpt("createReplyIsStale"), lineOpt("mintRid"),
-     fn("persistDrafts").replace("function persistDrafts(", "function persistDraftsReal("), fnOpt("restoreFailedProvisionals")].join("\n"),
+     fn("persistDrafts").replace("function persistDrafts(", "function persistDraftsReal("), fnOpt("restoreFailedProvisionals"),
+     fnOpt("bootComposerState"), fnOpt("announceColumnBusy"), lineOpt("retireRid")].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
     const { provisionalName, mintProvisionalId, isProvisionalId, StagedStack, HOOKS, STORE } = W;
     let provisionalId = null, provisionalTags = [], pendingNewSession = null, provisionalTimer = undefined, dirQuestionFor = null, pendingCarry = "", dirQuestion = false;
     let columnBusyTold = false, lastCreate = null, pickMode = false, activeId = W.activeId, confirmCb = null, confirmKey = null, provisionalRid = null;
-    const failedWhy = new Map(); const failedInfo = new Map(); let wantActiveGone = W.wantActiveGone;
-    const pendingShips = new Map(); const stagedMsgs = new StagedStack(); const composerCitations = new Map(), composerFiles = new Map();
+    const failedWhy = new Map(); const failedInfo = new Map(); let wantActiveGone = W.wantActiveGone; const supersededRids = [];
+    const pendingShips = new Map(); let stagedMsgs; const composerCitations = new Map(), composerFiles = new Map();   // stagedMsgs: created in the epilogue, in PRODUCTION order relative to the boot
     const provisionalQueue = []; const failedProvisionals = new Set(); const pendingSent = new Map(); const sessions = new Map(); const closingTabs = new Map();
     // the per-column state store the real page reads at boot (vscodeApi.getState) and writes on every draft change (setState replaces it)
     const vscodeApiState = { getState: () => STORE, setState: (s) => { for (const k of Object.keys(STORE)) delete STORE[k]; Object.assign(STORE, s); } };
-    const drafts = new Map(Object.entries((STORE.drafts && typeof STORE.drafts === "object") ? STORE.drafts : {}));   // the boot's drafts restore
+    const drafts = new Map();   // filled by the REAL boot (bootComposerState), below
     const order = W.order.slice(); const mru = W.mru.slice();
     const PROVISIONAL_WAIT_MS = 90000;
     const EL = { "composer-input": { value: "", focus() {} }, picker: { style: { display: "none" } }, "picker-search": { value: "" }, "picker-dir": { value: "", focus() {}, select() {} } };
@@ -97,7 +99,13 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
     const setTimeout = (f) => { HOOKS.timers.push(f); return HOOKS.timers.length; }; const clearTimeout = () => { HOOKS.cleared++; };
   `;
   const epilogue = `
-    if (typeof restoreFailedProvisionals === "function") restoreFailedProvisionals();   // the boot's rebuild of the failed tabs, over this store
+    // THE BOOT, in production's order: stagedMsgs is created and restored, then the composer's state (drafts, files, citations,
+    // the failed creates with their orphan sweep, the lost ships), then the busy baseline — the real functions. On a render.ts
+    // from before round seven (the fail-before run) the failed-create restore ran BEFORE stagedMsgs existed: that order is
+    // reproduced here, and its store rewrite fails exactly as production's did
+    if (typeof bootComposerState === "function") { stagedMsgs = new StagedStack(); try { stagedMsgs.restore(STORE.staged); } catch (e) { /* */ } bootComposerState(); announceColumnBusy(); }
+    else { for (const [k, v] of Object.entries((STORE.drafts && typeof STORE.drafts === "object") ? STORE.drafts : {})) drafts.set(k, v); if (typeof restoreFailedProvisionals === "function") restoreFailedProvisionals(); stagedMsgs = new StagedStack(); try { stagedMsgs.restore(STORE.staged); } catch (e) { /* */ } }
+    HOOKS.boot = HOOKS.posts.splice(0); HOOKS.seq.length = 0;   // what the boot said (the busy baseline) is read apart from what the page says afterwards
     const overlay = () => findId(body, "confirm");
     return {
       startCreate, onCreateDirMissing, closePicker, openPicker, cancelProvisional, closeTabLocally, showConfirm,
@@ -110,6 +118,9 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       clickButton: (label) => { const o = overlay(); const b = o && o.children[0].children[2].children.find((x) => x.textContent === label); if (b) b.click(); return !!b; },
       rid: () => provisionalRid,
       stale: (m) => (typeof createReplyIsStale === "function" ? createReplyIsStale(m) : false),
+      settle: () => { dropProvisional(); syncColumnBusy(); },   // a settlement that is not a cancel (the focus / the session's frame adopting): the request is NOT superseded
+      held: { stage: (id, text) => stagedMsgs.push(id, { text, cites: [] }), cite: (id) => composerCitations.set(id, [{ title: "a card", itemId: "g1" }]), attach: (id) => composerFiles.set(id, ["/tmp/a.png"]),
+              staged: () => stagedMsgs.entries(), citations: () => Object.fromEntries(composerCitations), files: () => Object.fromEntries(composerFiles) },
       fireTimers: () => { const t = HOOKS.timers.splice(0); for (const f of t) f(); return t.length; },
       type: (t) => { EL["composer-input"].value = t; }, composer: () => EL["composer-input"].value,
       picker: () => ({ open: EL.picker.style.display !== "none", search: EL["picker-search"].value, dir: EL["picker-dir"].value }),
@@ -282,7 +293,7 @@ test("round six: a reply naming a request is stale ONLY while a different create
   // a namesake with tags: the kernel's focus settles the tab, then warns that the tags were not changed — that warning must reach the user
   const a = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: C });
   a.api.startCreate(REQ); const ridA = a.api.rid()!;
-  a.api.cancelProvisional();   // the settlement (the focus / the session's frame adopts; here the ✕): no create pending
+  a.api.settle();   // the settlement (the focus / the session's frame adopts): no create pending — a ✕ would retire the request instead (round seven)
   assert.equal(a.api.stale({ rid: ridA }), false, "no create pending: nothing is stale");
   a.api.onCreateWarn({ text: '"notes" is already running; its tags were not changed', rid: ridA });
   assert.deepEqual(a.HOOKS.toasts, ['"notes" is already running; its tags were not changed'], "main's path: the toast, not dropped");
@@ -335,4 +346,61 @@ test("round six: a success focus naming a replaced create is stale while another
   assert.equal(w.api.stale({ type: "focus", id: "s-a", rid: ridA } as any), true, "A's late success focus: ignored, B keeps the front");
   assert.equal(w.api.stale({ type: "focus", id: "s-b", rid: ridB } as any), false, "B's own focus applies");
   assert.equal(w.api.stale({ type: "focus", id: "s-x" } as any), false, "a focus without a request id (an older kernel) applies");
+});
+
+// ---- round seven ----
+test("round seven: a failed create is persisted whatever the tab holds — a staged message, a citation, an attachment, or nothing — and comes back after a reload with it", () => {
+  for (const kind of ["staged", "citation", "attachment", "empty"] as const) {
+    const store: Record<string, unknown> = {};
+    const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store });
+    w.api.startCreate(REQ); const id = w.api.state().provisionalId!;
+    if (kind === "staged") w.api.held.stage(id, "a staged line"); if (kind === "citation") w.api.held.cite(id); if (kind === "attachment") w.api.held.attach(id);
+    w.api.onCreateDirMissing({ name: REQ.name, dir: REQ.dir, status: { canCreate: true } });
+    w.api.answer(null);
+    assert.ok((store.failed as any)?.[id], kind + ": the record is written though no plain draft was typed"); assert.match((store.failed as any)[id].why, /^That folder isn't there/);
+    const r = world({ activeId: null, mru: [], order: [A, B, C], nextActive: null, store });
+    const st = r.api.state();
+    assert.deepEqual(st.failed, [id], kind + ": the tab is back"); assert.match(st.why[id], /^That folder isn't there/, kind + ": with its reason");
+    if (kind === "staged") assert.deepEqual((r.api.held.staged()[id] || []).map((m: any) => m.text), ["a staged line"], "the staged message is back, not swept");
+    if (kind === "citation") assert.equal((r.api.held.citations()[id] as any[])?.[0]?.title, "a card", "the citation is back, not swept");
+    if (kind === "attachment") assert.deepEqual(r.api.held.files()[id], ["/tmp/a.png"], "the attachment is back, not swept");
+    r.api.closeTabLocally(id);
+    assert.equal((store.failed as any)[id], undefined, kind + ": the ✕ took the record");
+  }
+});
+
+test("round seven: a superseded request stays stale after the replacing create settles — its focus and warning dropped — while the settled create's own late warning toasts", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: C });
+  w.api.startCreate(REQ); const ridA = w.api.rid()!;
+  w.api.openPicker(); w.api.startCreate({ ...REQ, name: "notes-b" }); const ridB = w.api.rid()!;
+  w.api.settle();   // B lands (the focus / its frame adopts): nothing pending
+  assert.equal(w.api.rid(), null);
+  assert.equal(w.api.stale({ type: "focus", id: "s-a", rid: ridA } as any), true, "A's tagged focus, late: dropped — B's tab keeps the front (the kernel's push lists the real session in the first column)");
+  w.api.onCreateWarn({ text: "A: tags were not changed", rid: ridA }); assert.deepEqual(w.HOOKS.toasts, [], "A's late warning: dropped");
+  w.api.onCreateWarn({ text: "B: tags were not changed", rid: ridB }); assert.deepEqual(w.HOOKS.toasts, ["B: tags were not changed"], "B's own late warning: toasted (never superseded)");
+  assert.equal(w.api.stale({ type: "focus", id: "s-b", rid: ridB } as any), false);
+  // the ✕ on a pending tab retires its request too: a late folder question for it must not land on a later create
+  const c = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: C });
+  c.api.startCreate(REQ); const ridC = c.api.rid()!; c.api.cancelProvisional(); c.api.startCreate({ ...REQ, name: "notes-d" });
+  c.api.onCreateDirMissing({ name: REQ.name, dir: REQ.dir, status: { canCreate: true }, rid: ridC });
+  assert.equal(c.api.overlays(), 0, "the cancelled create's late question: nobody's"); assert.equal(c.api.state().dirQuestionFor, null);
+});
+
+test("round seven: the boot's orphan sweep REWRITES the store — the composer state restores after stagedMsgs exists, in one real sequence", () => {
+  const store: Record<string, unknown> = { drafts: { "new-orphan-from-an-older-build": "reachable by nothing", [C]: "c's draft" }, staged: {} };
+  const r = world({ activeId: null, mru: [], order: [A, B, C], nextActive: null, store });
+  assert.equal(r.api.state().drafts["new-orphan-from-an-older-build"], undefined, "pruned in memory");
+  assert.equal((store.drafts as any)["new-orphan-from-an-older-build"], undefined, "…and on disk: the rewrite ran (before round seven it threw in stagedMsgs's dead zone and was swallowed)");
+  assert.equal((store.drafts as any)[C], "c's draft", "the rest of the store is intact");
+});
+
+test("round seven: a restored failed tab sets the busy baseline — one colBusy:true at boot, and its ✕ posts exactly one colBusy:false", () => {
+  const store: Record<string, unknown> = {};
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store });
+  w.api.startCreate(REQ); const id = w.api.state().provisionalId!; w.api.type(TYPED);
+  w.api.onCreateDirMissing({ name: REQ.name, dir: REQ.dir, status: { canCreate: true } }); w.api.answer(null);
+  const r = world({ activeId: null, mru: [], order: [A, B, C], nextActive: null, store });   // the held column's iframe reloads
+  assert.equal(r.api.busy(), true); assert.deepEqual(r.HOOKS.boot.filter((p) => p.romp === "colBusy"), [{ romp: "colBusy", busy: true }], "the baseline, said once at boot");
+  r.api.closeTabLocally(id);
+  assert.deepEqual(r.HOOKS.posts.filter((p) => p.romp === "colBusy"), [{ romp: "colBusy", busy: false }], "the ✕: exactly one colBusy:false — the shell completes the held close");
 });

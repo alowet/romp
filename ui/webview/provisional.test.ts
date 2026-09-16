@@ -139,7 +139,8 @@ test("a failed create says so in a dialog, in the kernel's own words — ON the 
   // reading). The tab stays — the dialog is on top of the thread it is about.
   const fail = RENDER.slice(RENDER.indexOf("function failProvisional"), RENDER.indexOf("function cancelProvisional"));
   assert.ok(fail.includes("setActive(id);"), "foreground the failed thread before saying anything");
-  assert.ok(fail.includes("drafts.set(id, held); persistDrafts();"), "the text belongs to the failed tab, no other");
+  assert.ok(fail.includes("drafts.set(id, held);"), "the text belongs to the failed tab, no other");
+  assert.match(fail, /\n  persistDrafts\(\);   \/\/ ALWAYS/, "…and the failed record is persisted whatever the tab holds — a staged message, a citation, an attachment, or nothing (round seven)");
   assert.ok(fail.indexOf("setActive(id);") < fail.indexOf("showConfirm("), "jump first, dialog second");
   assert.ok(!fail.includes("= dropProvisional()"), "the tab is NOT torn down — it holds the text");
   assert.ok(fail.includes("failedProvisionals.add(id);"));
