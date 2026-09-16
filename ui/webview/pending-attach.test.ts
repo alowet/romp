@@ -58,7 +58,7 @@ test("a failed kernel save is NACKED and surfaces loudly — never a silent stuc
   // client: the nack retires the chip and says so in a toast
   assert.match(RENDER, /m\.type === "dropSaveFailed" && typeof m\.name === "string"/);
   assert.match(RENDER, /shipFailed\(m\.name, nackShip, m\.name \+ " couldn't be saved on the kernel, so it was not attached — try again\."\);/);   // one failure path for every ship that fails (round eleven)
-  assert.match(RENDER, /function shipFailed\(key: string, shipId: string \| undefined, why: string\): void \{\n  const owner = retirePendingShip\(key, shipId\) \|\| activeId;[\s\S]{0,500}endReloadHoldIfIdle\(\);\n  warnToast\(why \+/);   // the nack also ends the reload hold (T272), then says so
+  assert.match(RENDER, /\n  const owner = retirePendingShip\(key, shipId\) \|\| activeId;\n  const held = [\s\S]{0,500}endReloadHoldIfIdle\(\);\n  warnToast\(why \+/);   // the nack also ends the reload hold (T272), then says so
   // a FileReader failure retires it too — an unreadable file must not pulse forever, nor let a held send fire without it (round eleven)
   assert.match(RENDER, /reader\.onerror = \(\) => shipFailed\(name, shipId, name \+ " could not be read, so it was not attached — try again\."\);/);
 });

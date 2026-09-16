@@ -59,7 +59,7 @@ test("a held send LOOKS staged: the files strip wears the staged head with a liv
   // on the wait click, every ack, and every tab switch, so the line tracks exactly those events.
   assert.match(RENDER, /if \(id && sendOnShip\.has\(id\)\) \{\s*\n\s*const head = el\("div", "staged-head held-head"\);/);
   assert.match(RENDER, /"staged — sends when the upload finishes"/);
-  assert.match(RENDER, /pending\.length > 1 \? " \(" \+ pending\.length \+ " still uploading\)" : ""/,
+  assert.match(RENDER, /lbl\.textContent = uploadingHeading\(id\);/,
     "the live count rides each ack's re-render");
   assert.match(RENDER, /cancel\.addEventListener\("click", \(\) => \{ sendOnShip\.delete\(id\); renderComposerFiles\(id\); \}\);/,
     "Cancel un-holds — message and attachments stay, nothing sends");

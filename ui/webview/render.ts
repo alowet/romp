@@ -16321,11 +16321,25 @@ function shipRecord(shipId: string): PendingShip | null {
   for (const list of pendingShips.values()) { const p = list.find((x) => x.shipId === shipId); if (p) return p; }
   return null;
 }
+// The one pending ship of this document, when exactly one is pending (round fourteen): an UNTAGGED ack or nack — an older kernel
+// echoes no shipId — is unambiguous then, and is routed by that ship's kind; with none or several, the untagged reading stays
+// main's (an open comment box is the comment's ack, else the composer's).
+function soleShip(): PendingShip | null {
+  let found: PendingShip | null = null;
+  for (const list of pendingShips.values()) for (const p of list) { if (found) return null; found = p; }
+  return found;
+}
 // The COMPOSER's pending ships for a session (round thirteen): what its send gate counts, what a send held on its uploads waits
 // for, what the ✕ on its last chip settles. A comment's upload for the same session is none of the composer's business — counted
 // before, a comment's late ack could stand between a held send and its release, or release it.
 function composerShips(sid: string | null): PendingShip[] {
   return sid ? (pendingShips.get(sid) || []).filter((p) => p.kind !== "comment") : [];
+}
+// The held strip's heading (round fourteen): how many of the COMPOSER's uploads the held send still waits for — the gate releases
+// on the last composer ship, so a comment's chip on the same strip must not be counted among them.
+function uploadingHeading(sid: string | null): string {
+  const n = composerShips(sid).length;
+  return "staged — sends when the upload finishes" + (n > 1 ? " (" + n + " still uploading)" : "");
 }
 // The bytes, retained on the entry until the ack (the reconnect re-ship needs them, T215), and whether the frame that carries them
 // is riding the shim's OWN queue: posted while the local socket is down, the shim holds it and flushes it on the next open — so the
@@ -16384,8 +16398,21 @@ function retirePendingShip(key: string, shipId?: string): string | null {
 // alone, and the last surviving ack sent the message missing a file). The words stay where they are: the box, or the draft under
 // the real sid, which travels with the hand-off. The flip comes LAST: the upload's hold on the column ends with its chip.
 function shipFailed(key: string, shipId: string | undefined, why: string): void {
+  // a COMMENT's ship (round fourteen): its failure is the comment's alone — the chip goes and the failure is said, and the composer's
+  // held send, its open gate and its chips are not touched (before this any failed ship of the sid cancelled the composer's hold,
+  // so a comment's late failure left the composer's message unsent when its own file landed). An untagged failure (an older
+  // kernel's nack, no shipId) reads the sole pending ship when there is exactly one, else it is the composer's, as on main.
+  const rec = shipId ? shipRecord(shipId) : soleShip();
+  if (rec && rec.kind === "comment") {
+    const cOwner = retirePendingShip(key, shipId) || activeId;
+    endReloadHoldIfIdle();
+    warnToast(why);
+    if (cOwner && cOwner === activeId) renderComposerFiles(cOwner);   // its pending chip leaves the strip
+    syncColumnBusy();
+    return;
+  }
   const owner = retirePendingShip(key, shipId) || activeId;
-  const held = !!owner && sendOnShip.delete(owner);    // a held send must not fire without the file it waited for
+  const held = !!owner && sendOnShip.delete(owner);    // a held send must not fire without the file it waited for: any COMPOSER ship's failure cancels it (the message would be incomplete)
   const gateWasOpen = shipGateSid === owner;
   if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }   // the question is moot — but a failed save never auto-sends
   endReloadHoldIfIdle();
@@ -16990,8 +17017,7 @@ function renderComposerFilesInner(id: string | null): void {
   if (id && sendOnShip.has(id)) {
     const head = el("div", "staged-head held-head");
     const lbl = el("span");
-    lbl.textContent = "staged — sends when the upload finishes"
-      + (pending.length > 1 ? " (" + pending.length + " still uploading)" : "");
+    lbl.textContent = uploadingHeading(id);   // the COMPOSER's count (round fourteen): a comment's chip beside them is not one the send waits for
     lbl.title = "You chose to wait. The message sends itself the moment the last attachment lands.";
     const cancel = el("button", "staged-go");
     cancel.textContent = "Cancel";
@@ -19139,7 +19165,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     if (ackShip && !shipOwner(ackShip)) return;   // a duplicate of a ship already retired (a reconnect
     //                                               re-ship raced the original ack) — attaching it again
     //                                               would double the file on whatever tab is active (T215)
-    const ship = ackShip ? shipRecord(ackShip) : null;   // the ack's route (see above)
+    const ship = ackShip ? shipRecord(ackShip) : soleShip();   // the ack's route (see above); an untagged ack with exactly one ship pending is that ship's (round fourteen)
     const cbox = document.getElementById("cmt-pop")?.querySelector(".cmt-input") as HTMLTextAreaElement | null;
     if (ship ? ship.kind === "comment" : !!cbox) {
       retirePendingShip(m.path, ackShip);   // a comment's upload: the box, or — the popover gone — said by name, NEVER the composer (round thirteen)
