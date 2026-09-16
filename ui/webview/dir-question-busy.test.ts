@@ -51,13 +51,14 @@ type Api = {
   stale: (m: { rid?: unknown }) => boolean; fireTimers: () => number; settle: () => void; resolveTo: (sid: string) => void; route: (m: { rid?: unknown }) => string;
   adopt: (sid: string) => void; orphans: () => string[];
   // round ten: the hand-off's two halves (the real take arrow and adoptSessionState), an upload in flight and its held send, the kernel's ack (the real droppedPath branch)
-  take: (sid: string) => any; adoptState: (sid: string, st: unknown) => void; ship: (id: string, name: string, shipId: string, b64?: string, kind?: "composer" | "comment") => void; holdSend: (id: string) => void;
+  take: (sid: string) => any; adoptState: (sid: string, st: unknown) => void; ship: (id: string, name: string, shipId: string, b64?: string, kind?: "composer" | "comment") => void; holdSend: (id: string) => boolean;
   ships: () => Record<string, Ship[]>; heldSend: () => string[]; ack: (m: Record<string, unknown>) => void; shipFail: (name: string, shipId: string) => void;   // shipFail: the FileReader failed on it (round eleven)
   // round twelve: the shell's session question and the column's reason, the close question, a mini comment box, the strip as last seen, a host detach, the local socket's edges
   sessionBusy: (sid: string) => boolean; busyWhy: () => string; askClose: () => void; openComment: (text: string) => void; comment: () => string | null; closeComment: () => void;
   strip: (ids: string[]) => void; detach: (host: string) => void; wsdown: () => void; wsup: () => void;
   setSets: (sets: Record<string, string[]>) => void; reclaim: () => void;   // round thirteen: the shell's sets as they stand, and renderTabs's reclaim of the handed-off marker
   heading: (sid: string) => string;   // round fourteen: the held strip's heading, its count
+  unverified: (sid: string) => boolean; removeFile: (id: string, idx: number) => void;   // round twenty-one
   legacyFor: (name: string) => string | undefined;   // round sixteen: the ship a legacy (untagged) answer names, by the saved name
   shipUnposted: (id: string, name: string, shipId: string, b64?: string, kind?: "composer" | "comment") => void; post: (id: string, shipId: string) => void;   // round eighteen: the post boundary
   draft: (sid: string, text: string) => void;   // round fifteen: a session's draft, written as the box's stash would
@@ -91,7 +92,8 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
      fnOpt("mergeCitations"), fn("addPendingShip"), fn("shipSafeName"), fn("shipOwner"), fn("retirePendingShip"), fn("endReloadHoldIfIdle"), fn("addComposerFile"), fn("adoptSessionState"), TAKE, ON_DROPPED,
      fnOpt("shipFailed"), fnOpt("sendHeldFor"), fn("flushStaged"), fn("routeUserMessage"), fn("noteOrphanState"),
      fnOpt("shipRecord"), fnOpt("retainShipBytes"), fnOpt("failShipsOfHost"), fnOpt("columnBusyWhy"), fnOpt("askCloseUpload"), fnOpt("abandonPendingUploads"), fn("reshipPendingUploads"), fn("noteColumnEmptiness"),
-     fnOpt("composerShips"), lineOpt("reclaimHandedOff"), fnOpt("legacyShipFor"), lineOpt("legacyNameOf"), fnOpt("uploadingHeading"), fnOpt("postShipFrame"), fnOpt("noteAmbiguity"),   /* noteAmbiguity: gone since round nineteen; lifted when an older render.ts (780e439e) still has it, so the fail-before run reads clean */
+     fnOpt("composerShips"), lineOpt("reclaimHandedOff"), fnOpt("legacyShipFor"), lineOpt("legacyNameOf"), fnOpt("uploadingHeading"), fnOpt("postShipFrame"), fnOpt("noteAmbiguity"),
+     lineOpt("isUnverified"), lineOpt("markLegacyFile"), lineOpt("unmarkLegacyFile"), lineOpt("dropLegacyMarks"), lineOpt("moveLegacyMarks"), fnOpt("armHold"), fnOpt("disarmUnverified"), fn("removeComposerFile"),   /* noteAmbiguity: gone since round nineteen; lifted when an older render.ts (780e439e) still has it, so the fail-before run reads clean */
      winLine("__rompSessionBusy"), winLine("__rompColumnBusyWhy")].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
@@ -111,7 +113,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
     const failedWhy = new Map(); const failedInfo = new Map(); let wantActiveGone = W.wantActiveGone; const supersededRids = []; const settledRids = new Map(); let pendingCreate = null;
     const RELOADED_WHY = "The page reloaded while this session was being created. Start it again from the session picker, or discard this tab with its ✕.";
     const pendingShips = new Map(); let stagedMsgs; const composerCitations = new Map(), composerFiles = new Map();   // stagedMsgs: created in the epilogue, in PRODUCTION order relative to the boot
-    const sendOnShip = new Set(); let shipGateSid = null; const fireHeldSend = () => { HOOKS.fired++; }; let shipOrder = 0, postOrder = 0;   // the upload gate's stores; the held send's release, counted; the posts' counter (round eighteen) — and the creation counter an older render.ts (5818185b) still increments, so the fail-before run reads clean
+    const sendOnShip = new Set(); let shipGateSid = null; const fireHeldSend = () => { HOOKS.fired++; }; let shipOrder = 0, postOrder = 0; const legacyFiles = new Map(); const UNVERIFIED_NOTICE = "An attachment from an older kernel is on this message, so it can't be sent automatically — check it and send it yourself.";   // the upload gate's stores; the held send's release, counted; the posts' counter (round eighteen) — and the creation counter an older render.ts (5818185b) still increments, so the fail-before run reads clean
     const provisionalQueue = []; const failedProvisionals = new Set(); const pendingSent = new Map(); const sessions = new Map(); const closingTabs = new Map();
     // the per-column state store the real page reads at boot (vscodeApi.getState) and writes on every draft change (setState replaces it)
     const vscodeApiState = { getState: () => STORE, setState: (s) => { for (const k of Object.keys(STORE)) delete STORE[k]; Object.assign(STORE, s); } };
@@ -172,7 +174,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       ship: (id, name, shipId, b64, kind) => { addPendingShip(id, name, shipId, kind || "composer"); if (b64) { if (typeof retainShipBytes === "function") retainShipBytes(id, shipId, b64); else pendingShips.get(id).find((p) => p.shipId === shipId).b64 = b64; if (typeof postShipFrame === "function") postShipFrame(id, pendingShips.get(id).find((p) => p.shipId === shipId)); } },
       shipUnposted: (id, name, shipId, b64, kind) => { addPendingShip(id, name, shipId, kind || "composer"); if (b64) { if (typeof retainShipBytes === "function") retainShipBytes(id, shipId, b64); else pendingShips.get(id).find((p) => p.shipId === shipId).b64 = b64; } },   // still encoding: no frame out
       post: (id, shipId) => { postShipFrame(id, pendingShips.get(id).find((p) => p.shipId === shipId)); },   // the reader finished: the frame leaves the page
-      holdSend: (id) => { sendOnShip.add(id); },                 // "Wait for the upload"
+      holdSend: (id) => { if (typeof armHold === "function") return armHold(id); sendOnShip.add(id); return true; },   // "Wait for the upload" — through the one door when it exists (round twenty-one)
       ships: () => Object.fromEntries([...pendingShips].map(([k, v]) => [k, v.map((p) => ({ name: p.name, shipId: p.shipId, ...(p.b64 ? { b64: p.b64 } : {}) }))])),
       heldSend: () => [...sendOnShip],
       ack: (m) => onDroppedPath(m),                              // the kernel's droppedPath, through the real branch
@@ -184,6 +186,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       wsdown: () => { wsIsUp = false; }, wsup: () => { wsIsUp = true; reshipPendingUploads(); },   // the shim's edges, as the page's listeners read them
       setSets: (s) => { colSets = s; }, reclaim: () => reclaimHandedOff(),   // what renderTabs does first: reads the sets, reclaims the marker for a sid shown here again
       heading: (sid) => uploadingHeading(sid),
+      unverified: (sid) => (typeof isUnverified === "function" ? isUnverified(sid) : false), removeFile: (id, idx) => removeComposerFile(id, idx),   // round twenty-one: the mark, and the user's ✕ on a chip
       legacyFor: (name) => { const p = legacyShipFor(name, ""); const q = p && p.ship ? p.ship : p; return q ? q.shipId : undefined; },   // what the nack branch does with an untagged local name (rounds sixteen, seventeen, nineteen; an older render.ts answered { ship, matches })
       draft: (sid, text) => { drafts.set(sid, text); persistDrafts(); },
       route: (m) => (typeof routeCreateReply === "function" ? routeCreateReply(m).kind : "?"),
@@ -633,7 +636,7 @@ test("round eleven: an upload never crosses documents — a create resolved to a
   assert.ok(w.HOOKS.seq.lastIndexOf("persist") < w.HOOKS.seq.lastIndexOf("flip:false"), "persisted before the flip");
   assert.ok(w.HOOKS.posts.some((p) => p.romp === "orphanState" && (p.sids as string[]).includes(A)), "the completed file under an unshown session is offered to the pane that shows it");
   const st = w.api.take(A);
-  assert.deepEqual(st, { draft: TYPED, citations: [], files: ["drops/1700000000000-photo.png"], staged: [] }, "the hand-off's exact fields: no upload, no held send");
+  assert.deepEqual(st, { draft: TYPED, citations: [], files: ["drops/1700000000000-photo.png"], staged: [], legacy: [] }, "the hand-off's exact fields: no upload, no held send — and which files are unverified (none here, round twenty-one)");
   assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "dropFile").map((m) => m.shipId), ["s1"], "one frame per upload — its creation post (the unread one never posted) — and no re-send, ever");
   // the receiving pane ignores an upload or a held-send field an older page might still send: never a chip, never a hold, never a re-ship
   const r = receiving(); r.api.adoptState(A, { ...st, ships: [{ name: "x.png", shipId: "s9", b64: "QUJD" }], heldSend: true });
@@ -980,7 +983,7 @@ test("round nineteen: an untagged nack fails ONE best-guess ship — the first p
 // ---- round twenty ----
 test("round twenty: an UNMATCHED untagged answer that lands on the active composer disarms that composer's automatic send — its own later tagged answer attaches and sends NOTHING; a pick does not disarm", () => {
   const w = receiving();   // A is the active session, current kernel
-  w.api.ship(A, "a.png", "a1", "QUJD"); w.api.type(TYPED); w.api.holdSend(A); 
+  w.api.ship(A, "a.png", "a1", "QUJD"); w.api.type(TYPED); w.api.holdSend(A);
   w.api.ack({ type: "droppedPath", path: "drops/9-foreign.png", host: "TESTHOST" });   // a legacy remote's late answer: its chip was ✕'d, no record matches — the active composer takes the file, as on main
   assert.deepEqual(w.api.held.files()[A], ["drops/9-foreign.png"], "attached to A"); assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["a1"], "A's own upload still pending");
   assert.deepEqual(w.api.heldSend(), [], "A's hold disarmed"); assert.ok(w.HOOKS.toasts.some((t) => /arrived from an older kernel that names no upload and was attached here/.test(t)), "said: " + JSON.stringify(w.HOOKS.toasts));
@@ -992,4 +995,40 @@ test("round twenty: an UNMATCHED untagged answer that lands on the active compos
   assert.deepEqual(v.api.heldSend(), [A], "a pick is the user's act: the hold stands"); assert.deepEqual(v.api.held.files()[A], ["/synthetic/pick.txt"]);
   v.api.ack({ type: "droppedPath", path: "drops/1-a.png", shipId: "a1" });
   assert.equal(v.HOOKS.fired, 1, "…and A's tagged answer releases it, the pick riding along"); assert.deepEqual(v.HOOKS.toasts, []);
+});
+
+// ---- round twenty-one ----
+test("round twenty-one: an older kernel's guessed attachment makes the composer UNVERIFIED — durably: a provisional's hold does not transfer onto it, its tagged answers send nothing, a reload remembers, the gate refuses to wait; the user's ✕ on the legacy chip verifies it again and a new hold fires", () => {
+  const w = world({ activeId: A, mru: [A], order: [A], nextActive: A, store: {}, sets: { "": [A] } });   // A active; a dismissal falls back to A
+  w.api.ship(A, "a.png", "a1", "QUJD"); w.api.type(TYPED); assert.equal(w.api.holdSend(A), true);
+  w.api.ack({ type: "droppedPath", path: "drops/9-foreign.png", host: "TESTHOST" });   // an unmatched legacy answer: attached to A by the fallback
+  assert.equal(w.api.unverified(A), true, "A is unverified"); assert.deepEqual(w.api.heldSend(), [], "A's hold gone"); assert.deepEqual((w.store.legacy as any)[A], ["drops/9-foreign.png"], "…and the mark is on disk");
+  assert.equal(w.api.holdSend(A), false, "no hold may be armed on it"); assert.ok(w.HOOKS.toasts.some((t) => /can't be sent automatically/.test(t)));
+  const r = world({ activeId: null, mru: [], order: [A], nextActive: null, store: w.store, sets: { "": [A] } });   // a reload over the same store
+  assert.equal(r.api.unverified(A), true, "the reload remembers");
+  w.api.startCreate(REQ); const P = w.api.state().provisionalId!;   // a create in flight, with its own upload and a held send
+  w.api.ship(P, "p.png", "p1", "QUJD"); w.api.type("P words"); assert.equal(w.api.holdSend(P), true);
+  w.api.resolveTo(A);   // the kernel: the create is A, running
+  assert.deepEqual(w.api.heldSend(), [], "P's hold is NOT transferred onto the unverified A: cancelled"); assert.equal(w.HOOKS.toasts.filter((t) => /can't be sent automatically/.test(t)).length >= 2, true, "…and said");
+  assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["a1", "p1"], "P's upload is A's now"); assert.ok((w.api.held.drafts()[A] || "").includes("P words"), "P's words moved");
+  w.api.ack({ type: "droppedPath", path: "drops/1-a.png", shipId: "a1" }); w.api.ack({ type: "droppedPath", path: "drops/2-p.png", shipId: "p1" });
+  assert.deepEqual(w.api.held.files()[A], ["drops/9-foreign.png", "drops/1-a.png", "drops/2-p.png"]); assert.equal(w.HOOKS.fired, 0, "nothing sent"); assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage"), []);
+  w.api.removeFile(A, 0);   // the user's ✕ on the legacy chip
+  assert.equal(w.api.unverified(A), false, "verified again"); assert.equal((w.store.legacy as any)[A], undefined, "…on disk too");
+  w.api.ship(A, "z.png", "z1", "QUJD"); assert.equal(w.api.holdSend(A), true, "a NEW hold may be armed");
+  w.api.ack({ type: "droppedPath", path: "drops/3-z.png", shipId: "z1" });
+  assert.equal(w.HOOKS.fired, 1, "…and fires normally");
+});
+
+test("round twenty-one: the mark travels with the file across the hand-off — the receiving pane is unverified and a hold it held is cancelled; a legacy answer matched to its own ship marks that owner too", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {}, sets: { "2": [] } });
+  w.api.ship(A, "a.png", "a1", "QUJD"); w.api.draft(A, "A words");
+  w.api.ack({ type: "droppedPath", path: "drops/1-a.png" });   // a legacy answer matched to A's own ship: attached, A unverified
+  assert.equal(w.api.unverified(A), true);
+  const st = w.api.take(A);
+  assert.deepEqual(st.legacy, ["drops/1-a.png"], "the mark rides the state"); assert.equal(w.api.unverified(A), false, "…and leaves the source with the file");
+  const v = receiving(); v.api.ship(A, "v.png", "v1", "QUJD"); assert.equal(v.api.holdSend(A), true);
+  v.api.adoptState(A, st);
+  assert.equal(v.api.unverified(A), true, "the receiving pane is unverified"); assert.deepEqual(v.api.heldSend(), [], "its hold cancelled"); assert.ok(v.HOOKS.toasts.some((t) => /can't be sent automatically/.test(t)));
+  assert.deepEqual(v.api.held.files()[A], ["drops/1-a.png"]);
 });

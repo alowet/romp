@@ -197,7 +197,7 @@ test("closing a session clears its composer reply context — chip, draft, and e
   const body = RENDER.match(/function dismissSession\(id: string, why: DismissWhy, doomed\?: ReadonlySet<string>\): void \{[\s\S]*?\n\}/);
   assert.ok(body, "dismissSession not found");
   // the maps: the draft, the citation chip, and any pending edit mode all die with the session
-  assert.match(body![0], /drafts\.delete\(id\); composerCitations\.delete\(id\); composerEdits\.delete\(id\); composerFiles\.delete\(id\); persistDrafts\(\);/);
+  assert.match(body![0], /drafts\.delete\(id\); composerCitations\.delete\(id\); composerEdits\.delete\(id\); composerFiles\.delete\(id\); dropLegacyMarks\(id\); persistDrafts\(\);/);
   // …and when the CLOSED session was the active one, the shared chip strip is repainted for the newly
   // selected tab. Without this the dead session's chip lingered in the strip — and its ✕, bound to the
   // dead id whose map entry is already gone, early-returned in removeCitation, so the stale chip could

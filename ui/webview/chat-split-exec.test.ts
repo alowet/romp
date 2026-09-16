@@ -69,7 +69,7 @@ function world(o: { col?: string; sets?: ColSets | null; tabOrderSeen?: boolean;
   const win = { parent: PARENT, frameElement: me };
   const js = requireCjs("esbuild").transformSync(
     [line("heldHere"), line("tabInView"), line("columnBusy"), fn("forwardToOwner"), fn("claimSession"), fn("noteColumnEmptiness"),
-     fn("orphanStateSids"), fn("noteOrphanState"), fn("staleActiveFallback"), fn("adoptSessionState"), fn("mergeCitations"), fn("shipOwner")].join("\n"), { loader: "ts" }).code;
+     fn("orphanStateSids"), fn("noteOrphanState"), fn("staleActiveFallback"), fn("adoptSessionState"), fn("mergeCitations"), fn("shipOwner"), line("isUnverified"), line("markLegacyFile"), fn("disarmUnverified")].join("\n"), { loader: "ts" }).code;
   const prelude = `
     const { columnHolds, columnEmptiness, isProvisionalId, isSubId, StagedStack, HOOKS } = W;
     const COL = W.col;
@@ -86,6 +86,7 @@ function world(o: { col?: string; sets?: ColSets | null; tabOrderSeen?: boolean;
     const drafts = new Map(), composerCitations = new Map(), composerFiles = new Map(); const stagedMsgs = new StagedStack();
     const persistDrafts = () => { HOOKS.persisted++; }; const loadComposerFor = (sid) => { HOOKS.loaded.push(sid); };
     const pendingShips = new Map(), sendOnShip = new Set(); const warnToast = () => {}; const vscodeApi = { postMessage() {} }; const renderComposerFiles = () => {};   // the carry's upload half (round ten): idle in these worlds
+    const legacyFiles = new Map(); let shipGateSid = null; const closeConfirm = () => {}; const endReloadHoldIfIdle = () => {}; const UNVERIFIED_NOTICE = "";   // the unverified mark's stores (round twenty-one): none marked in these worlds
     const handedOff = new Set();   // the held send's belt (round twelve): an adopt clears the sid
   `;
   const epilogue = `

@@ -40,7 +40,7 @@ test("the strip renders pending chips (name + pulsing dots) and shows even with 
 
 test("the droppedPath ack retires the chip it answers, then attaches the thumbnail", () => {
   assert.match(RENDER, /const retired = retirePendingShip\(m\.path, ackShip\);[^\n]*\n    const owner = retired \|\| activeId;/);
-  assert.match(RENDER, /const retired = retirePendingShip\(m\.path, ackShip\);[^\n]*\n    const owner = retired \|\| activeId;[\s\S]{0,400}addComposerFile\(owner, m\.path\)/,
+  assert.match(RENDER, /const retired = retirePendingShip\(m\.path, ackShip\);[^\n]*\n    const owner = retired \|\| activeId;[\s\S]{0,400}addComposerFile\(owner, m\.path, !tagged\)/,
     "the ack attaches to the composer that SHIPPED the file (the 2026-08-16 wrong-tab attach)");
 });
 

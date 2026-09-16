@@ -8334,6 +8334,7 @@ function mergeCitations(sid: string, incoming: readonly Citation[]): void {
 function moveProvisionalState(fromId: string, toId: string): void {
   const files = composerFiles.get(fromId);
   if (files && files.length) { composerFiles.set(toId, [...(composerFiles.get(toId) ?? []), ...files]); composerFiles.delete(fromId); }
+  moveLegacyMarks(fromId, toId);   // an unverified attachment travels with its file (round twenty-one): the real session is unverified now
   const staged = stagedMsgs.takeAll(fromId);
   if (staged.length) stagedMsgs.appendAll(toId, staged);   // every item the stack accepted — a context-only one (quotes, no words) included, which restore()'s load filter dropped (round ten)
   const cites = composerCitations.get(fromId);
@@ -8345,8 +8346,10 @@ function moveProvisionalState(fromId: string, toId: string): void {
   // document; an upload never crosses documents (round eleven) — it holds the column instead (columnBusy).
   const ships = pendingShips.get(fromId);
   if (ships && ships.length) { pendingShips.set(toId, [...(pendingShips.get(toId) ?? []), ...ships]); pendingShips.delete(fromId); }
-  if (sendOnShip.delete(fromId)) sendOnShip.add(toId);
-  if (shipGateSid === fromId) shipGateSid = toId;
+  // the hold and the gate follow the ships — through the one door (round twenty-one): a session holding an unverified attachment (its own,
+  // or one that just travelled) takes no hold; the provisional's hold is cancelled and said, its words stay the draft
+  if (sendOnShip.delete(fromId)) armHold(toId);
+  if (shipGateSid === fromId) { if (isUnverified(toId)) { shipGateSid = null; closeConfirm(null); warnToast(UNVERIFIED_NOTICE); } else shipGateSid = toId; }
 }
 
 function adoptProvisional(realId: string): void {
@@ -16268,6 +16271,34 @@ let fireStage: () => void = () => { /* assigned by the composer closure */ };
 // ride the outgoing text as a trailing line, quoted when they contain spaces — the same thing the old
 // insert-at-cursor produced, now legible while you compose.
 const composerFiles = new Map<string, string[]>();   // sid -> attachment paths, in drop order
+// UNVERIFIED attachments (round twenty-one, 2026-09-16): the paths an untagged, un-picked answer — a kernel before v0.15.0, which names no
+// upload — attached to a composer by a best guess (its own ship's owner by name, or the active session as on main). While a composer
+// holds one, NO automatic send may be armed on it, transferred to it or released for it: the guessed file would ride the message. The
+// mark is durable — persisted with the drafts, so a reload does not forget — and leaves only by the user's own act on that composer:
+// the ✕ on the last such chip, or a send or a clear that empties the strip. One reader, isUnverified; one door to a hold, armHold.
+const legacyFiles = new Map<string, Set<string>>();   // sid -> the legacy-attached paths still on its strip
+function isUnverified(sid: string | null): boolean { return !!sid && (legacyFiles.get(sid)?.size ?? 0) > 0; }
+function markLegacyFile(sid: string, path: string): void { const s = legacyFiles.get(sid) || new Set<string>(); s.add(path); legacyFiles.set(sid, s); }
+function unmarkLegacyFile(sid: string, path: string): void { const s = legacyFiles.get(sid); if (!s) return; s.delete(path); if (!s.size) legacyFiles.delete(sid); }
+function dropLegacyMarks(sid: string): void { legacyFiles.delete(sid); }
+function moveLegacyMarks(fromId: string, toId: string): void { const s = legacyFiles.get(fromId); if (!s) return; for (const p of s) markLegacyFile(toId, p); legacyFiles.delete(fromId); }
+const UNVERIFIED_NOTICE = "An attachment from an older kernel is on this message, so it can't be sent automatically — check it and send it yourself.";
+// THE one door to a held send (round twenty-one): refused, and said, for a composer holding an unverified attachment; every place that
+// arms a hold — the gate's "Wait for the upload", a provisional's hold moving to the session it became — comes through here.
+function armHold(sid: string): boolean {
+  if (isUnverified(sid)) { warnToast(UNVERIFIED_NOTICE); return false; }
+  sendOnShip.add(sid);
+  return true;
+}
+// …and the one way a hold ends by the mark: cancelled, gate closed, said (the transfer to an unverified session; the release belt).
+function disarmUnverified(sid: string): void {
+  const held = sendOnShip.delete(sid), gateWasOpen = shipGateSid === sid;
+  if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }
+  if (!held && !gateWasOpen) return;
+  endReloadHoldIfIdle();
+  warnToast(UNVERIFIED_NOTICE);
+  if (sid === activeId) renderComposerFiles(sid);
+}
 
 // Files whose BYTES are still in flight to the kernel (shipFileToHost → dropFile → droppedPath ack).
 // On a phone that round trip is seconds long — base64 + a fragmented WS send + the kernel write — and
@@ -16609,7 +16640,7 @@ function restoreFailedProvisionals(): void {
   for (const k of [...drafts.keys()]) if (isProvisionalId(k) && !failedProvisionals.has(k)) { drafts.delete(k); dropped = true; }
   for (const k of Object.keys(stagedMsgs.entries())) if (isProvisionalId(k) && !failedProvisionals.has(k)) { stagedMsgs.takeAll(k); dropped = true; }   // staged text under an id no record names (round eight)
   for (const k of [...composerCitations.keys()]) if (isProvisionalId(k) && !failedProvisionals.has(k)) { composerCitations.delete(k); dropped = true; }
-  for (const k of [...composerFiles.keys()]) if (isProvisionalId(k) && !failedProvisionals.has(k)) { composerFiles.delete(k); dropped = true; }
+  for (const k of [...composerFiles.keys()]) if (isProvisionalId(k) && !failedProvisionals.has(k)) { composerFiles.delete(k); dropLegacyMarks(k); dropped = true; }
   if (dropped) persistDrafts();
   if (wantActiveGone && failedProvisionals.has(wantActiveGone)) { const failedTab = wantActiveGone; wantActiveGone = null; setTimeout(() => { if (!activeId) setActive(failedTab); }, 0); }   // the failed tab the page was on, back in front once booted
 }
@@ -16618,6 +16649,7 @@ function persistDrafts(): void {
     vscodeApi?.setState?.({ ...(vscodeApi.getState?.() || {}), drafts: Object.fromEntries(drafts),
                             citations: Object.fromEntries(composerCitations),
                             files: Object.fromEntries(composerFiles),
+                            legacy: Object.fromEntries([...legacyFiles].map(([k, v]) => [k, [...v]])),   // the unverified attachments (round twenty-one): a reload does not forget
                             staged: stagedMsgs.entries(),
                             // the FAILED creates, by their tab's id (round six): the tab comes back after a reload with its
                             // reason and its draft, and its ✕ — the one discard — takes this record with the draft
@@ -16648,6 +16680,9 @@ function bootComposerState(): void {
       const paths = (Array.isArray(v) ? v : []).filter((x): x is string => typeof x === "string" && !!x);
       if (paths.length) composerFiles.set(k, paths);
     }
+  const savedLegacy = ((vscodeApi?.getState?.() || {}) as any).legacy;   // the unverified marks, back with the files they mark (round twenty-one)
+  if (savedLegacy && typeof savedLegacy === "object")
+    for (const [k, v] of Object.entries(savedLegacy)) for (const p of (Array.isArray(v) ? v : [])) if (typeof p === "string" && p && (composerFiles.get(k) || []).includes(p)) markLegacyFile(k, p);
   const savedCites = ((vscodeApi?.getState?.() || {}) as any).citations;
   if (savedCites && typeof savedCites === "object")
     for (const [k, v] of Object.entries(savedCites)) {
@@ -16780,6 +16815,7 @@ function flushStaged(sid: string, typed?: { text: string; cites?: Citation[]; im
 // guards hold here too: a host down or a tab with no session behind it is refused, and the words stay the draft, which travels.
 function sendHeldFor(sid: string): void {
   if (!vscodeApi) return;
+  if (isUnverified(sid)) { warnToast(UNVERIFIED_NOTICE); return; }   // the belt (round twenty-one): never a guessed file on an automatic send
   const typed = (drafts.get(sid) ?? "").trim();
   const attached = composerFiles.get(sid) || [];
   // the BELT (round twelve): the words went to another column with their tab (the take ran, handedOff) and nothing of the message is
@@ -16797,7 +16833,7 @@ function sendHeldFor(sid: string): void {
   if (text) lastSent.set(sid, text);
   flushStaged(sid, text ? { text, cites, imgPaths: attached.filter((p) => previewKind(p) === "img"), paths: attached } : undefined);
   if (cites) composerCitations.delete(sid);
-  if (attached.length) composerFiles.delete(sid);
+  if (attached.length) { composerFiles.delete(sid); dropLegacyMarks(sid); }
   drafts.delete(sid); draftStartedAt.delete(sid);
   persistDrafts();
 }
@@ -17136,11 +17172,12 @@ function composerFileDoc(p: string): HTMLElement {
   return chip;
 }
 
-function addComposerFile(id: string | null, path: string): void {
+function addComposerFile(id: string | null, path: string, legacy = false): void {
   if (!id || !path) return;
   const list = composerFiles.get(id) || [];
   if (!list.includes(path)) list.push(path);       // the same file dropped twice attaches once
   composerFiles.set(id, list);
+  if (legacy) markLegacyFile(id, path);            // an older kernel's guess (round twenty-one): this composer is unverified until the user acts
   persistDrafts();
   if (id === activeId) renderComposerFiles(id);
 }
@@ -17148,6 +17185,7 @@ function addComposerFile(id: string | null, path: string): void {
 function removeComposerFile(id: string, idx: number): void {
   const list = composerFiles.get(id);
   if (!list || idx < 0 || idx >= list.length) return;
+  unmarkLegacyFile(id, list[idx]);   // the user's ✕: the last legacy chip gone, the composer is verified again (round twenty-one)
   list.splice(idx, 1);
   if (!list.length) composerFiles.delete(id);
   persistDrafts();
@@ -17416,13 +17454,14 @@ const sessionMru: string[] = [];
 // they are current), not this page's snapshot from its last render: a held column's kernel frames may not have landed since
 // the hold, and its snapshot would still call the member the peer moved away "shown here" — and drop its draft.
 (window as any).__rompOrphanStateSids = (): string[] => { colSets = readColSets(); if (activeId) stashActiveDraft(activeId); return orphanStateSids(); };   // the box's live text counts: stashed first, so an active tab this column no longer lists is in the list
-(window as any).__rompTakeSessionState = (sid: string): { draft: string; citations: Citation[]; files: string[]; staged: StagedMsg[] } | null => {
+(window as any).__rompTakeSessionState = (sid: string): { draft: string; citations: Citation[]; files: string[]; staged: StagedMsg[]; legacy: string[] } | null => {
   if (typeof sid !== "string" || !sid) return null;
   const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
   const boxHeld = sid === activeId && !!ta && !!ta.value.trim();   // the box holds words: the reload core's `typing` hold stands on it (editing())
   if (sid === activeId && ta) { if (ta.value) drafts.set(sid, ta.value); else drafts.delete(sid); }
   const draft = drafts.get(sid) ?? "", citations = composerCitations.get(sid) ?? [], files = composerFiles.get(sid) ?? [], staged = stagedMsgs.takeAll(sid);
-  drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid);
+  const legacy = [...(legacyFiles.get(sid) ?? [])];   // which of the files an older kernel attached by a guess (round twenty-one): the mark travels
+  drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid); legacyFiles.delete(sid);
   if (draft || staged.length) handedOff.add(sid);   // the words left with the tab (round twelve): a held send here would be the bare path — sendHeldFor's belt
   if (sid === activeId) { if (ta) { ta.value = ""; growComposer(ta); } renderComposerChips(sid); renderComposerFiles(sid); renderStagedStrip(sid); }
   // the typing hold's ENDING event (round eleven, 2026-09-16): the core hears a draft cleared by typing ('input') or a blur, never a
@@ -17432,7 +17471,7 @@ const sessionMru: string[] = [];
   if (boxHeld) { try { (window as any).__rompReload?.ended?.(); } catch { /* no core (the VS Code webview) */ } }
   persistDrafts();
   if (!draft && !citations.length && !files.length && !staged.length) return null;
-  return { draft, citations, files, staged };
+  return { draft, citations, files, staged, legacy };
 };
 // …and the TARGET page's half: what the source held, into the maps (joined onto anything already here, never over
 // it), persisted, and into the box when the tab is active. The shell posts it on a new column's load or at once.
@@ -17446,12 +17485,14 @@ function reclaimHandedOff(): void { for (const sid of [...handedOff]) if (heldHe
 function adoptSessionState(sid: unknown, state: unknown): void {
   if (typeof sid !== "string" || !sid || !state || typeof state !== "object") return;
   handedOff.delete(sid);   // the words are here again
-  const st = state as { draft?: unknown; citations?: unknown; files?: unknown; staged?: unknown };
+  const st = state as { draft?: unknown; citations?: unknown; files?: unknown; staged?: unknown; legacy?: unknown };
   if (typeof st.draft === "string" && st.draft) drafts.set(sid, [drafts.get(sid) ?? "", st.draft].filter(Boolean).join("\n\n"));
   if (Array.isArray(st.files) && st.files.length) {
     const paths = (st.files as unknown[]).filter((p): p is string => typeof p === "string" && !!p);
     if (paths.length) composerFiles.set(sid, [...(composerFiles.get(sid) ?? []), ...paths]);
+    if (Array.isArray(st.legacy)) for (const p of st.legacy) if (typeof p === "string" && paths.includes(p)) markLegacyFile(sid, p);   // the unverified marks arrive with their files (round twenty-one)…
   }
+  if (isUnverified(sid)) disarmUnverified(sid);   // …and a hold this session held is cancelled, said: no automatic send with a guessed file
   if (Array.isArray(st.staged) && st.staged.length) stagedMsgs.appendAll(sid, st.staged);   // every item the source's stack held, a context-only one included (round ten; restore() dropped those)
   if (Array.isArray(st.citations) && st.citations.length) mergeCitations(sid, st.citations as Citation[]);   // after the stack: the flavour rule (round ten), never a mixed list
   // NO upload arrives here, and no held send is ever armed here (round eleven, 2026-09-16): an upload's ack rides the socket of the
@@ -18693,7 +18734,7 @@ function dismissSession(id: string, why: DismissWhy, doomed?: ReadonlySet<string
     // closed session was ACTIVE: the shared chip strip above the composer still shows its chip until
     // someone repaints it, and that stale chip's ✕ targets the dead id (whose map entry is gone), so the
     // click early-returns and the chip can't even be dismissed — hence the repaint below.
-    drafts.delete(id); composerCitations.delete(id); composerEdits.delete(id); composerFiles.delete(id); persistDrafts();
+    drafts.delete(id); composerCitations.delete(id); composerEdits.delete(id); composerFiles.delete(id); dropLegacyMarks(id); persistDrafts();
   } else {
     persistDrafts();   // a host drop / omission KEEPS it all (see DismissWhy) — the stash above may have updated the copy
   }
@@ -19217,7 +19258,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     const retired = retirePendingShip(m.path, ackShip);   // the chip this ack answers — tagged, or a legacy ack matched by name — names the OWNING composer
     const owner = retired || activeId;                    // …an ack matched to no ship lands on the ACTIVE session's composer, as on main; none → said (round sixteen)
     if (!owner) { warnToast((m.path.split("/").pop() || "The file") + " arrived, but no session is open in this column to attach it to."); syncColumnBusy(); return; }
-    addComposerFile(owner, m.path);
+    addComposerFile(owner, m.path, !tagged);   // an untagged answer's file is a guess: the composer is UNVERIFIED until the user acts (round twenty-one)
     // an OPEN ship-gate dialog counts as a held send (the user 2026-08-19): the upload finishing is
     // the answer to the question it asks, so it closes itself and the send fires — no click needed.
     // ONLY a tagged ack that retired one of the owner's own composer ships may release a held send (round fifteen). An untagged
@@ -19238,11 +19279,14 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     } else if (retired && tagged && (sendOnShip.has(retired) || gateOpen) && !composerShips(retired).length) {   // the composer's own ships (round thirteen): a comment's never gate it
       // the LAST ship landed — the event the held send was waiting for (the user 2026-08-16), and every ship it waited on
       // completed (a failure cancels the hold the moment it happens, shipFailed)
-      sendOnShip.delete(retired);
-      if (gateOpen) { shipGateSid = null; closeConfirm(null); }
-      if (retired === activeId) fireHeldSend();
-      else sendHeldFor(retired);   // BY SID (round eleven): the tab need not be shown here — a held column whose create resolved to a session shown elsewhere
-      endReloadHoldIfIdle();   // the ending event follows the release: the held send has been posted
+      if (isUnverified(retired)) { disarmUnverified(retired); }   // the BELT (round twenty-one): a hold that reached an unverified composer by any road is cancelled here, never fired
+      else {
+        sendOnShip.delete(retired);
+        if (gateOpen) { shipGateSid = null; closeConfirm(null); }
+        if (retired === activeId) fireHeldSend();
+        else sendHeldFor(retired);   // BY SID (round eleven): the tab need not be shown here — a held column whose create resolved to a session shown elsewhere
+        endReloadHoldIfIdle();   // the ending event follows the release: the held send has been posted
+      }
     }
     if (owner && !heldHere(owner)) noteOrphanState();   // the file landed under a session this column does not show (a moved tab, a resolved create): offered to the pane that does, now (round eleven)
     syncColumnBusy();   // LAST: the upload's hold on the column ends with its chip — the file is under its sid, a held send has gone
@@ -19658,6 +19702,16 @@ function setupComposer() {
       const sid = activeId;
       const what = shipping === 1 ? "An attachment is" : shipping + " attachments are";
       const them = shipping === 1 ? "it" : "them";
+      if (isUnverified(sid)) {
+        // an UNVERIFIED composer (round twenty-one): an older kernel's guessed attachment is on this message, so it cannot wait and send
+        // itself — the gate offers the explicit send alone, and says why; no gate is armed for an ack to resolve
+        showConfirm(what + " still uploading",
+                    "An attachment from an older kernel is on this message, so it can't wait for the upload and send itself. Check the "
+                    + "attachment, then send — now, without " + them + ", or after the upload lands.",
+                    [{ label: "Send without " + them, value: "now", danger: true }],
+                    (v) => { if (v === "now") sendComposer({ pastShipGate: true }); });
+        return;
+      }
       shipGateSid = sid;                       // the last-ship ack resolves the open dialog itself
       showConfirm(what + " still uploading",
                   "Send now and your message goes without " + them + ". Or just wait — it sends "
@@ -19668,7 +19722,7 @@ function setupComposer() {
                     const owner = shipGateSid ?? sid;   // a settlement while the dialog stood re-keyed the gate to the real session (moveProvisionalState, round ten)
                     shipGateSid = null; endReloadHoldIfIdle();
                     if (v === "now") sendComposer({ pastShipGate: true });
-                    else if (v === "wait") { sendOnShip.add(owner); renderComposerFiles(owner); }
+                    else if (v === "wait") { if (armHold(owner)) renderComposerFiles(owner); }   // through the one door (round twenty-one)
                   });
       return;
     }
@@ -19746,7 +19800,7 @@ function setupComposer() {
         registerOptimistic(sid, text, attached.filter((p) => previewKind(p) === "img"), undefined, attached);
         sendOnShip.delete(sid);                       // a send happened — any held one is superseded
         histWalk.delete(sid);                         // …and the history walk starts fresh
-        if (attached.length) { composerFiles.delete(sid); if (sid === activeId) renderComposerFiles(sid); }
+        if (attached.length) { composerFiles.delete(sid); dropLegacyMarks(sid); if (sid === activeId) renderComposerFiles(sid); }
         drafts.delete(sid); draftStartedAt.delete(sid); persistDrafts();
         clearBox();
         return;
@@ -19776,7 +19830,7 @@ function setupComposer() {
       if (cites) { composerCitations.delete(activeId); renderComposerChips(activeId); }   // consumed on send
       sendOnShip.delete(sid);                       // a send happened — any held one is superseded
       histWalk.delete(sid);                         // …and the history walk starts fresh
-      if (attached.length) { composerFiles.delete(sid); if (sid === activeId) renderComposerFiles(sid); }   // the strip emptied into this message
+      if (attached.length) { composerFiles.delete(sid); dropLegacyMarks(sid); if (sid === activeId) renderComposerFiles(sid); }   // the strip emptied into this message — the user's own send verifies it (round twenty-one)
       drafts.delete(activeId); draftStartedAt.delete(activeId); persistDrafts();   // sent — no draft to restore on a later switch-back
       clearBox();   // a drag-expanded box snaps back to one line after a send (the user 2026-07-07)
       // The box is empty again, so a live picker re-takes it: send your pre-question draft, then just type the
