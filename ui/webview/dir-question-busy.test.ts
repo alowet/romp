@@ -34,7 +34,8 @@ const fn = (name: string): string => {
   return RENDER.slice(i, RENDER.indexOf("\n}\n", i) + 3);
 };
 const lineOpt = (name: string): string => { const i = RENDER.indexOf(`function ${name}(`); return i >= 0 ? RENDER.slice(i, RENDER.indexOf("\n", i) + 1) : ""; };   // a ONE-LINE function; "" on an older render.ts
-const fnOpt = (name: string): string => (RENDER.indexOf(`function ${name}(`) >= 0 ? fn(name) : "");   // "" on an older render.ts: the tests then fail on behaviour, not on a missing lift
+const fnOpt = (name: string): string => (RENDER.indexOf(`function ${name}(`) >= 0 ? fn(name) : "");
+const constOpt = (name: string): string => { const i = RENDER.indexOf(`const ${name} = `); return i >= 0 ? RENDER.slice(i, RENDER.indexOf("\n", i) + 1) : ""; };   // a ONE-LINE top-level const; "" on an older render.ts   // "" on an older render.ts: the tests then fail on behaviour, not on a missing lift
 
 const A = "11111111-2222-3333-4444-555555555501", B = "11111111-2222-3333-4444-555555555502", C = "11111111-2222-3333-4444-555555555503";
 const VIEWER = C + "/agent/a1";
@@ -90,7 +91,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
      fn("adoptProvisional"), fnOpt("moveProvisionalState"), fn("orphanStateSids"), lineOpt("heldHere"),
      fnOpt("mergeCitations"), fn("addPendingShip"), fn("shipSafeName"), fn("shipOwner"), fn("retirePendingShip"), fn("endReloadHoldIfIdle"), fn("addComposerFile"), fn("adoptSessionState"), TAKE, ON_DROPPED,
      fnOpt("shipFailed"), fnOpt("sendHeldFor"), fn("flushStaged"), fn("routeUserMessage"), fn("noteOrphanState"),
-     fnOpt("shipRecord"), fnOpt("retainShipBytes"), fnOpt("failShipsOfHost"), fnOpt("columnBusyWhy"), fnOpt("askCloseUpload"), fnOpt("abandonPendingUploads"), fn("reshipPendingUploads"), fn("noteColumnEmptiness"),
+     fnOpt("shipRecord"), fnOpt("retainShipBytes"), fnOpt("failShipsOfHost"), fnOpt("columnBusyWhy"), fnOpt("askCloseUpload"), fnOpt("abandonPendingUploads"), fn("reshipPendingUploads"), constOpt("disarmOnTake"), constOpt("UNTAGGED_ATTACHED_NOTICE"), fn("noteColumnEmptiness"),
      fnOpt("composerShips"), lineOpt("reclaimHandedOff"), fnOpt("legacyShipFor"), lineOpt("legacyNameOf"), fnOpt("uploadingHeading"), fnOpt("postShipFrame"), fnOpt("noteAmbiguity"),   /* noteAmbiguity: gone since round nineteen; lifted when an older render.ts (780e439e) still has it, so the fail-before run reads clean */
      winLine("__rompSessionBusy"), winLine("__rompColumnBusyWhy")].join("\n"),
     { loader: "ts" }).code;
@@ -992,4 +993,37 @@ test("round twenty: an UNMATCHED untagged answer that lands on the active compos
   assert.deepEqual(v.api.heldSend(), [A], "a pick is the user's act: the hold stands"); assert.deepEqual(v.api.held.files()[A], ["/synthetic/pick.txt"]);
   v.api.ack({ type: "droppedPath", path: "drops/1-a.png", shipId: "a1" });
   assert.equal(v.HOOKS.fired, 1, "…and A's tagged answer releases it, the pick riding along"); assert.deepEqual(v.HOOKS.toasts, []);
+});
+
+// ---- round twenty-six ----
+test("round twenty-six: an orphan hand-off born of an untagged answer carries a one-shot disarm — the receiving pane's own hold on the session is cancelled with the notice before the guessed file is appended, and its tagged ack then sends nothing", () => {
+  // S: a held column whose document still owns A's legacy upload; A is shown elsewhere (T)
+  const S = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {}, sets: { "2": [] } });
+  S.api.ship(A, "old.png", "s1", "QUJD");
+  // T: shows A; the user starts a tagged upload there and picks "Wait"
+  const T = receiving(); T.api.ship(A, "fresh.png", "t1", "QUJD"); T.api.type(TYPED); T.api.holdSend(A); assert.deepEqual(T.api.heldSend(), [A]);
+  // S's older kernel answers untagged: the guess lands on unshown A, S offers the state
+  S.api.ack({ type: "droppedPath", path: "drops/old.png" });
+  assert.deepEqual(S.api.heldSend(), [], "S's own hold, if any, is gone (round twenty)"); assert.ok(S.HOOKS.posts.some((p) => p.romp === "orphanState"), "offered");
+  const st = S.api.take(A);
+  assert.deepEqual(st.files, ["drops/old.png"]); assert.equal(st.disarm, true, "the offer carries the one-shot disarm");
+  T.api.adoptState(A, st);
+  assert.deepEqual(T.api.heldSend(), [], "T's hold is cancelled…"); assert.ok(T.HOOKS.toasts.some((t) => /older kernel that names no upload/.test(t)), "…with the notice: " + JSON.stringify(T.HOOKS.toasts));
+  assert.equal(T.api.composer(), TYPED, "the words stay for the user");
+  T.api.ack({ type: "droppedPath", path: "drops/fresh.png", shipId: "t1" });   // T's own tagged upload lands
+  assert.equal(T.HOOKS.fired, 0, "nothing sent"); assert.deepEqual(T.HOOKS.sent.filter((m) => m.type === "sendMessage"), []); assert.equal(T.api.ships()[A], undefined, "the chip settled");
+  assert.deepEqual(T.api.take(A).files, ["drops/old.png", "drops/fresh.png"], "both files attached, for the user's own send");
+  // one shot: S's next take of A carries no disarm
+  S.api.adoptState(A, { files: ["drops/other.png"] });
+  assert.equal(S.api.take(A).disarm, undefined, "consumed by the first take");
+});
+
+test("round twenty-six: an ordinary move with files carries no disarm and leaves the receiver's hold untouched — its tagged ack releases as before", () => {
+  const U = receiving(); U.api.adoptState(A, { files: ["drops/plain.png"] });
+  const st = U.api.take(A); assert.deepEqual(st.files, ["drops/plain.png"]); assert.equal(st.disarm, undefined, "no untagged answer was involved");
+  const V = receiving(); V.api.ship(A, "f.png", "v1", "QUJD"); V.api.type(TYPED); V.api.holdSend(A);
+  V.api.adoptState(A, st);
+  assert.deepEqual(V.api.heldSend(), [A], "the hold stands"); assert.deepEqual(V.HOOKS.toasts, [], "nothing said");
+  V.api.ack({ type: "droppedPath", path: "drops/f.png", shipId: "v1" });
+  assert.equal(V.HOOKS.fired, 1, "the ordinary release"); assert.deepEqual(V.api.heldSend(), []);
 });

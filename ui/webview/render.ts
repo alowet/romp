@@ -16797,6 +16797,7 @@ function sendHeldFor(sid: string): void {
   if (text) lastSent.set(sid, text);
   flushStaged(sid, text ? { text, cites, imgPaths: attached.filter((p) => previewKind(p) === "img"), paths: attached } : undefined);
   if (cites) composerCitations.delete(sid);
+  disarmOnTake.delete(sid);   // the strip empties into this message: nothing left for a hand-off to disarm over (round twenty-six)
   if (attached.length) composerFiles.delete(sid);
   drafts.delete(sid); draftStartedAt.delete(sid);
   persistDrafts();
@@ -17149,7 +17150,7 @@ function removeComposerFile(id: string, idx: number): void {
   const list = composerFiles.get(id);
   if (!list || idx < 0 || idx >= list.length) return;
   list.splice(idx, 1);
-  if (!list.length) composerFiles.delete(id);
+  if (!list.length) { composerFiles.delete(id); disarmOnTake.delete(id); }   // the strip emptied: nothing left for a hand-off to disarm over (round twenty-six)
   persistDrafts();
   if (id === activeId) renderComposerFiles(id);
 }
@@ -17416,12 +17417,13 @@ const sessionMru: string[] = [];
 // they are current), not this page's snapshot from its last render: a held column's kernel frames may not have landed since
 // the hold, and its snapshot would still call the member the peer moved away "shown here" — and drop its draft.
 (window as any).__rompOrphanStateSids = (): string[] => { colSets = readColSets(); if (activeId) stashActiveDraft(activeId); return orphanStateSids(); };   // the box's live text counts: stashed first, so an active tab this column no longer lists is in the list
-(window as any).__rompTakeSessionState = (sid: string): { draft: string; citations: Citation[]; files: string[]; staged: StagedMsg[] } | null => {
+(window as any).__rompTakeSessionState = (sid: string): { draft: string; citations: Citation[]; files: string[]; staged: StagedMsg[]; disarm?: true } | null => {
   if (typeof sid !== "string" || !sid) return null;
   const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
   const boxHeld = sid === activeId && !!ta && !!ta.value.trim();   // the box holds words: the reload core's `typing` hold stands on it (editing())
   if (sid === activeId && ta) { if (ta.value) drafts.set(sid, ta.value); else drafts.delete(sid); }
   const draft = drafts.get(sid) ?? "", citations = composerCitations.get(sid) ?? [], files = composerFiles.get(sid) ?? [], staged = stagedMsgs.takeAll(sid);
+  const disarm = disarmOnTake.delete(sid) && files.length > 0;   // one shot (round twenty-six): an untagged answer's guess is among these files — the receiver's hold must not carry it
   drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid);
   if (draft || staged.length) handedOff.add(sid);   // the words left with the tab (round twelve): a held send here would be the bare path — sendHeldFor's belt
   if (sid === activeId) { if (ta) { ta.value = ""; growComposer(ta); } renderComposerChips(sid); renderComposerFiles(sid); renderStagedStrip(sid); }
@@ -17432,7 +17434,7 @@ const sessionMru: string[] = [];
   if (boxHeld) { try { (window as any).__rompReload?.ended?.(); } catch { /* no core (the VS Code webview) */ } }
   persistDrafts();
   if (!draft && !citations.length && !files.length && !staged.length) return null;
-  return { draft, citations, files, staged };
+  return { draft, citations, files, staged, ...(disarm ? { disarm: true as const } : {}) };   // an older receiver ignores the field; `files` stays strings
 };
 // …and the TARGET page's half: what the source held, into the maps (joined onto anything already here, never over
 // it), persisted, and into the box when the tab is active. The shell posts it on a new column's load or at once.
@@ -17443,11 +17445,23 @@ const sessionMru: string[] = [];
 // counterpart, judged where the column's members are read (renderTabs).
 const handedOff = new Set<string>();
 function reclaimHandedOff(): void { for (const sid of [...handedOff]) if (heldHere(sid)) handedOff.delete(sid); }
+// A ONE-SHOT disarm that rides the next hand-off (round twenty-six, 2026-09-16): an untagged answer that attached its guessed file to a
+// session this document does NOT show cancels only this document's hold on it — but the pane that shows the session may hold a send of
+// its own, armed on a later tagged upload, and the orphan offer would append the guessed file under that hold (its release then sent
+// both). So the sid is remembered here, in memory only; the take carries `disarm: true` once and forgets it, and the receiver cancels
+// its hold and closes its gate with the notice before it appends the paths. No durable mark: a hold the user arms AFTERWARDS is ordinary.
+const disarmOnTake = new Set<string>();
+const UNTAGGED_ATTACHED_NOTICE = "A file arrived from an older kernel that names no upload and was attached here, so this message will not be sent automatically — check the attachment and send it yourself.";
 function adoptSessionState(sid: unknown, state: unknown): void {
   if (typeof sid !== "string" || !sid || !state || typeof state !== "object") return;
   handedOff.delete(sid);   // the words are here again
-  const st = state as { draft?: unknown; citations?: unknown; files?: unknown; staged?: unknown };
+  const st = state as { draft?: unknown; citations?: unknown; files?: unknown; staged?: unknown; disarm?: unknown };
   if (typeof st.draft === "string" && st.draft) drafts.set(sid, [drafts.get(sid) ?? "", st.draft].filter(Boolean).join("\n\n"));
+  if (st.disarm === true) {   // the source's untagged answer guessed a file into this state (round twenty-six): a send THIS pane holds on the session must not carry it
+    const held = sendOnShip.delete(sid), gateWasOpen = shipGateSid === sid;
+    if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }
+    if (held || gateWasOpen) { endReloadHoldIfIdle(); warnToast(UNTAGGED_ATTACHED_NOTICE); if (sid === activeId) renderComposerFiles(sid); }
+  }
   if (Array.isArray(st.files) && st.files.length) {
     const paths = (st.files as unknown[]).filter((p): p is string => typeof p === "string" && !!p);
     if (paths.length) composerFiles.set(sid, [...(composerFiles.get(sid) ?? []), ...paths]);
@@ -18693,6 +18707,7 @@ function dismissSession(id: string, why: DismissWhy, doomed?: ReadonlySet<string
     // closed session was ACTIVE: the shared chip strip above the composer still shows its chip until
     // someone repaints it, and that stale chip's ✕ targets the dead id (whose map entry is gone), so the
     // click early-returns and the chip can't even be dismissed — hence the repaint below.
+    disarmOnTake.delete(id);   // the state goes with the tab (round twenty-six)
     drafts.delete(id); composerCitations.delete(id); composerEdits.delete(id); composerFiles.delete(id); persistDrafts();
   } else {
     persistDrafts();   // a host drop / omission KEEPS it all (see DismissWhy) — the stash above may have updated the copy
@@ -19233,7 +19248,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       endReloadHoldIfIdle();
       warnToast(retired
         ? "This session's upload was answered by an older kernel that names no upload, so the message was not sent automatically — check the attachment and send it yourself."
-        : "A file arrived from an older kernel that names no upload and was attached here, so this message will not be sent automatically — check the attachment and send it yourself.");
+        : UNTAGGED_ATTACHED_NOTICE);
       if (owner === activeId) renderComposerFiles(owner);
     } else if (retired && tagged && (sendOnShip.has(retired) || gateOpen) && !composerShips(retired).length) {   // the composer's own ships (round thirteen): a comment's never gate it
       // the LAST ship landed — the event the held send was waiting for (the user 2026-08-16), and every ship it waited on
@@ -19244,6 +19259,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       else sendHeldFor(retired);   // BY SID (round eleven): the tab need not be shown here — a held column whose create resolved to a session shown elsewhere
       endReloadHoldIfIdle();   // the ending event follows the release: the held send has been posted
     }
+    if (!tagged && owner && !heldHere(owner)) disarmOnTake.add(owner);   // the guess landed under a session shown elsewhere: the hand-off below carries a one-shot disarm for THAT pane's hold (round twenty-six)
     if (owner && !heldHere(owner)) noteOrphanState();   // the file landed under a session this column does not show (a moved tab, a resolved create): offered to the pane that does, now (round eleven)
     syncColumnBusy();   // LAST: the upload's hold on the column ends with its chip — the file is under its sid, a held send has gone
   } else if (m.type === "dropSaveFailed" && typeof m.name === "string") {
@@ -19746,6 +19762,7 @@ function setupComposer() {
         registerOptimistic(sid, text, attached.filter((p) => previewKind(p) === "img"), undefined, attached);
         sendOnShip.delete(sid);                       // a send happened — any held one is superseded
         histWalk.delete(sid);                         // …and the history walk starts fresh
+        disarmOnTake.delete(sid);                     // …and the one-shot disarm with it (round twenty-six)
         if (attached.length) { composerFiles.delete(sid); if (sid === activeId) renderComposerFiles(sid); }
         drafts.delete(sid); draftStartedAt.delete(sid); persistDrafts();
         clearBox();
@@ -19776,6 +19793,7 @@ function setupComposer() {
       if (cites) { composerCitations.delete(activeId); renderComposerChips(activeId); }   // consumed on send
       sendOnShip.delete(sid);                       // a send happened — any held one is superseded
       histWalk.delete(sid);                         // …and the history walk starts fresh
+      disarmOnTake.delete(sid);                     // …and the one-shot disarm with it (round twenty-six)
       if (attached.length) { composerFiles.delete(sid); if (sid === activeId) renderComposerFiles(sid); }   // the strip emptied into this message
       drafts.delete(activeId); draftStartedAt.delete(activeId); persistDrafts();   // sent — no draft to restore on a later switch-back
       clearBox();   // a drag-expanded box snaps back to one line after a send (the user 2026-07-07)
