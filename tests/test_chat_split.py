@@ -296,7 +296,7 @@ class SplitSourcePins(unittest.TestCase):
                        "var why=refusal(src,sid);if(why==='locked')return notify(LOCKED);if(why||!movable(src,sid))return notify('Only an open session can be moved between columns.');",
                        "var BUSY='A session is still being created in this column, or an upload from it is still in flight.';",
                        "var se2=entry(from);if(se2&&se2.ids.length===1&&busy(src))return notify(BUSY);",
-                       "if(!keep&&busy(f)){if(busyWhy(f)==='upload-unshown'){try{f.contentWindow.postMessage({romp:'askCloseUpload'},'*');}catch(e){}return;}notify(BUSY);return;}"]:
+                       "if(!keep&&busy(f)){var bw=busyWhy(f);if(bw==='upload-unshown'){try{f.contentWindow.postMessage({romp:'askCloseUpload'},'*');}catch(e){}return;}if(bw==='unverified'){try{f.contentWindow.postMessage({romp:'askCloseUnverified'},'*');}catch(e){}return;}notify(BUSY);return;}"]:
             self.assertIn(needle, split, needle)
         # …and the one caller that skips close()'s refusal, the reconcile of another dashboard's write, HOLDS a busy column
         # instead of closing it (2026-09-15): nothing said (a peer's act, nothing refused), the close completing on the page's
@@ -351,6 +351,7 @@ let STORE = {};
 const CALLS = { register: [], unregister: [], growFair: [], splitGrow: [], splitShrink: [], gutter: [], wireFocus: [], wireEsc: [], colGone: [], events: [], posted: [], focus: [], notify: [], toggle: [], taken: [], sets: [] };
 let SESSBUSY = {};        // frame id → sid → whether that page reports an upload in flight (or a held send) for the session (round twelve)
 let WHY = {};             // frame id → what the page says holds its column (__rompColumnBusyWhy), '' → derived from BUSY
+let SESSWHY = {};         // frame id → sid → which fact pins the session (__rompSessionBusyWhy, round twenty-four), '' → 'upload' when SESSBUSY
 let SEQ = [];             // the order of the shell's side effects across stubs (a store write, a post, a grow, a key drop)
 let UNMOVABLE = new Set(); // ids the pages answer "not a session a column can hold" for (a create in flight, a viewer)
 let LOCKED_SIDS = new Set(); // ids whose page answers 'locked' (the tab lock, T395): the toast names the gear's menu (T405)
@@ -395,6 +396,7 @@ function mkEl(tag) {
       __rompMoveRefusal(sid) { return LOCKED_SIDS.has(sid) ? 'locked' : UNMOVABLE.has(sid) ? 'not-open' : ''; },
       __rompColumnBusy() { return !!BUSY[el.id]; },
       __rompSessionBusy(sid) { return !!(SESSBUSY[el.id] && SESSBUSY[el.id][sid]); },
+      __rompSessionBusyWhy(sid) { return (SESSWHY[el.id] && SESSWHY[el.id][sid]) || (SESSBUSY[el.id] && SESSBUSY[el.id][sid] ? 'upload' : ''); },
       __rompColumnBusyWhy() { return WHY[el.id] || (BUSY[el.id] ? 'create' : ''); },
       // the sids this page holds state for and does not show (render.ts orphanStateSids, judged against the shell's sets):
       // for a later column, not in its set; for the first, in no set
@@ -433,7 +435,7 @@ global.__rompColGone = (c) => CALLS.colGone.push(c);
 global.__rompFocusedChatId = () => FOCUSED;
 function boot(store, mobile) {
   STORE = Object.assign({}, store || {}); MOBILE = !!mobile; BYID = {}; WL = {}; TAKE = {}; FOCUSED = 'f-chat'; BODY_CLASSES = new Set(['po-chat', 'po-feed', 'po-timeline']);
-  SEQ = []; UNMOVABLE = new Set(); LOCKED_SIDS = new Set(); BUSY = {}; WRITES = []; SESSBUSY = {}; WHY = {};
+  SEQ = []; UNMOVABLE = new Set(); LOCKED_SIDS = new Set(); BUSY = {}; WRITES = []; SESSBUSY = {}; WHY = {}; SESSWHY = {};
   for (const k in CALLS) CALLS[k] = [];
   ROW = mkEl('div'); ROW.className = 'row';
   const cp = mkEl('div'); cp.id = 'chat-pane'; const fc = mkEl('iframe'); fc.id = 'f-chat'; cp.appendChild(fc); ROW.appendChild(cp);
@@ -643,6 +645,16 @@ SESSBUSY['f-chat-2'] = { [TESTS]: true };   // column 2's document ships TESTS's
 out.busyElsewhere = { home: window.__rompMoveTab(TESTS, 1), toTwo: window.__rompMoveTab(TESTS, 2), notify: CALLS.notify.slice(), taken: CALLS.taken.slice(), stored: cols(), ids: ids() };
 SESSBUSY['f-chat-2'] = {}; CALLS.notify = [];
 out.busyElsewhere.released = { home: (window.__rompMoveTab(TESTS, 1) || {}).id, notify: CALLS.notify.slice(), ids: ids() };
+// P0d) round twenty-four: an UNVERIFIED attachment (an older kernel's guess) pins its session to its document — every move is refused with
+//      its own line (nothing taken), and this user's ✕ on the column ASKS the page (askCloseUnverified) instead of refusing; released, it moves
+boot({}, false); window.__rompMoveTab(API, 'new'); CALLS.notify = []; CALLS.taken = []; CALLS.posted = [];
+SESSBUSY['f-chat-2'] = { [API]: true }; SESSWHY['f-chat-2'] = { [API]: 'unverified' };
+out.unverified = { home: window.__rompMoveTab(API, 1), toNew: window.__rompMoveTab(API, 'new'), notify: CALLS.notify.slice(), taken: CALLS.taken.slice(), stored: cols(), ids: ids() };
+BUSY['f-chat-2'] = true; WHY['f-chat-2'] = 'unverified'; CALLS.notify = []; CALLS.posted = []; CALLS.unregister = [];
+crossOf('f-chat-2').fire('click', { stopPropagation() {} });
+out.unverified.close = { ids: ids(), notify: CALLS.notify.slice(), posted: CALLS.posted.filter((p) => p.m && p.m.romp === 'askCloseUnverified').map((p) => p.id), unregister: CALLS.unregister.slice(), stored: cols() };
+SESSBUSY['f-chat-2'] = {}; SESSWHY['f-chat-2'] = {}; BUSY['f-chat-2'] = false; WHY['f-chat-2'] = ''; CALLS.notify = []; CALLS.taken = [];
+out.unverified.released = { home: (window.__rompMoveTab(API, 1) || {}).id, notify: CALLS.notify.slice(), taken: CALLS.taken.length, ids: ids() };
 // P) HELD (2026-09-15): another dashboard's write drops a column whose document is busy — its create's queued text would die
 //    with the document — so the reconcile HOLDS it instead of closing it: mounted, unlisted (the member went where the peer
 //    put it), no toast (a peer's act, not this user's; nothing is refused), nothing written. The page's colBusy flip is the
@@ -1072,7 +1084,7 @@ class SplitExecutes(unittest.TestCase):
         self.assertEqual(s["other"]["home"], "f-chat", "the other member is free to move"); self.assertEqual(s["other"]["notify"], [])
         self.assertEqual(s["released"]["home"], "f-chat", "the ack released it"); self.assertEqual(s["released"]["notify"], [])
         split = km._LANDING_SPLIT_JS
-        self.assertIn("if(sessionBusyAnywhere(sid))return notify(UPLOADING);", split)
+        self.assertIn("var sw=sessionBusyAnywhere(sid);if(sw)return notify(sw==='unverified'?UNVERIFIED:UPLOADING);", split)
         self.assertIn("zone(p,'',c.n,function(sid){moveTab(sid,c.n);});", split, "the drag zones move through moveTab")
         self.assertIn("else moveTab(sid,'new');", split)
 
@@ -1086,7 +1098,25 @@ class SplitExecutes(unittest.TestCase):
         self.assertEqual(b["taken"], []); self.assertEqual(b["ids"], ["f-chat", "f-chat-2", "f-chat-3"])
         self.assertEqual(b["released"]["home"], "f-chat"); self.assertEqual(b["released"]["notify"], [])
         split = km._LANDING_SPLIT_JS
-        self.assertIn("function sessionBusyAnywhere(sid){var fs=frames();for(var i=0;i<fs.length;i++){if(sessionBusy(fs[i],sid))return true;}return false;}", split)
+        self.assertIn("function sessionBusyAnywhere(sid){var fs=frames();for(var i=0;i<fs.length;i++){var w=sessionBusyWhy(fs[i],sid);if(w)return w;}return '';}", split)
+
+    def test_an_unverified_attachment_pins_its_session_to_its_document(self):
+        # round twenty-four: an attachment an older kernel GUESSED onto a session (the page's unverified mark) pins the session to the document
+        # that holds it — a hand-off could land on a pane running an older bundle, which keeps only the paths and would strip the mark, so a
+        # later hold would send the guessed file. Every move is refused with its own line (nothing taken — the new→old→new probe cannot start);
+        # this user's ✕ on the column asks the page (askCloseUnverified: "Close anyway" is the user's discard) instead of refusing; the chip's
+        # ✕ or the user's own send releases, and the session moves again
+        u = self.out["unverified"]
+        self.assertIsNone(u.get("home")); self.assertIsNone(u.get("toNew"))
+        self.assertEqual(u["notify"], [["warn", "An attachment from an older kernel is on this session — check it or remove it before moving."]] * 2)
+        self.assertEqual(u["taken"], [], "refused before the hand-off: nothing taken"); self.assertEqual(u["ids"], ["f-chat", "f-chat-2"])
+        self.assertEqual(u["stored"], {"v": 2, "cols": [{"n": 2, "ids": [API]}]})
+        self.assertEqual(u["close"]["posted"], ["f-chat-2"], "the close asks the page"); self.assertEqual(u["close"]["notify"], [], "no refusal toast")
+        self.assertEqual(u["close"]["ids"], ["f-chat", "f-chat-2"], "the column stands until the page answers"); self.assertEqual(u["close"]["unregister"], [])
+        self.assertEqual(u["released"]["home"], "f-chat", "released: it moves"); self.assertEqual(u["released"]["notify"], []); self.assertEqual(u["released"]["taken"], 1)
+        split = km._LANDING_SPLIT_JS
+        self.assertIn("var UNVERIFIED='An attachment from an older kernel is on this session — check it or remove it before moving.';", split)
+        self.assertIn("function sessionBusyWhy(f,sid){try{var w=f&&f.contentWindow&&f.contentWindow.__rompSessionBusyWhy;if(typeof w==='function')return String(w(sid)||'');return sessionBusy(f,sid)?'upload':'';}catch(e){return '';}}", split, "a page without the question answers 'upload' when busy")
 
     def test_the_shell_never_calls_the_reload_core_itself(self):
         # round thirteen REVERTS round twelve's parent-side tryFire: it fired while the transferred state existed only in make()'s load

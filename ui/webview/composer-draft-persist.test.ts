@@ -13,7 +13,7 @@ const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview"
 test("drafts are persisted to and reloaded from the webview's saved state", () => {
   // persist: mirror the Map into setState, alongside (not replacing) whatever else is saved — plus
   // citations, files, and the staged stack (2026-08-15)
-  assert.match(RENDER, /function persistDrafts\(\): void \{[\s\S]*setState\?\.\(\{ \.\.\.\(vscodeApi\.getState\?\.\(\) \|\| \{\}\), drafts: Object\.fromEntries\(drafts\),[\s\S]*citations: Object\.fromEntries\(composerCitations\),[\s\S]*files: Object\.fromEntries\(\[\.\.\.composerFiles\]\.map\(\(\[k, v\]\) => \[k, fileWire\(v\)\.files\]\)\),[\s\S]*filesLegacy: [\s\S]*filesIds: [\s\S]*staged: stagedMsgs\.entries\(\),[\s\S]*shipsInFlight: [\s\S]*\}\)/);
+  assert.match(RENDER, /function persistDrafts\(\): void \{[\s\S]*const prior = \{ \.\.\.\(vscodeApi\.getState\?\.\(\) \|\| \{\}\) \} as Record<string, unknown>; delete prior\.filesLegacy; delete prior\.filesIds;[^\n]*\n\s*vscodeApi\?\.setState\?\.\(\{ \.\.\.prior, drafts: Object\.fromEntries\(drafts\),[\s\S]*citations: Object\.fromEntries\(composerCitations\),[\s\S]*files: Object\.fromEntries\(\[\.\.\.composerFiles\]\.map\(\(\[k, v\]\) => \[k, fileWire\(v\)\.files\]\)\),[\s\S]*filesMeta: [\s\S]*staged: stagedMsgs\.entries\(\),[\s\S]*shipsInFlight: [\s\S]*\}\)/);
   // reload: hydrate the Map from saved state at startup (string values only)
   assert.match(RENDER, /const saved = \(\(vscodeApi\?\.getState\?\.\(\) \|\| \{\}\) as any\)\.drafts;/);
   assert.match(RENDER, /for \(const \[k, v\] of Object\.entries\(saved\)\) if \(typeof v === "string"\) drafts\.set\(k, v\);/);

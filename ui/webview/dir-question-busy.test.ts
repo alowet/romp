@@ -55,6 +55,7 @@ type Api = {
   ships: () => Record<string, Ship[]>; heldSend: () => string[]; ack: (m: Record<string, unknown>) => void; shipFail: (name: string, shipId: string) => void;   // shipFail: the FileReader failed on it (round eleven)
   // round twelve: the shell's session question and the column's reason, the close question, a mini comment box, the strip as last seen, a host detach, the local socket's edges
   sessionBusy: (sid: string) => boolean; busyWhy: () => string; askClose: () => void; openComment: (text: string) => void; comment: () => string | null; closeComment: () => void;
+  sessionBusyWhy: (sid: string) => string; askCloseUnverified: () => void;   // round twenty-four: the fact the shell's refusal names, and the close question for an unverified hold
   strip: (ids: string[]) => void; detach: (host: string) => void; wsdown: () => void; wsup: () => void;
   setSets: (sets: Record<string, string[]>) => void; reclaim: () => void;   // round thirteen: the shell's sets as they stand, and renderTabs's reclaim of the handed-off marker
   heading: (sid: string) => string;   // round fourteen: the held strip's heading, its count
@@ -95,7 +96,8 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
      fnOpt("shipRecord"), fnOpt("retainShipBytes"), fnOpt("failShipsOfHost"), fnOpt("columnBusyWhy"), fnOpt("askCloseUpload"), fnOpt("abandonPendingUploads"), fn("reshipPendingUploads"), fn("noteColumnEmptiness"),
      fnOpt("composerShips"), lineOpt("reclaimHandedOff"), fnOpt("legacyShipFor"), lineOpt("legacyNameOf"), fnOpt("uploadingHeading"), fnOpt("postShipFrame"), fnOpt("noteAmbiguity"),
      lineOpt("isUnverified"), lineOpt("markLegacyFile"), lineOpt("unmarkLegacyFile"), lineOpt("dropLegacyMarks"), lineOpt("moveLegacyMarks"), fnOpt("armHold"), fnOpt("disarmUnverified"), fn("removeComposerFile"),
-     lineOpt("filePaths"), fnOpt("fileEntriesOf"), fnOpt("restoreComposerAfterRefusedRescind"), fnOpt("citeKey"), lineOpt("mintFileId"), fnOpt("fileWire"),   /* noteAmbiguity: gone since round nineteen; lifted when an older render.ts (780e439e) still has it, so the fail-before run reads clean */
+     lineOpt("filePaths"), fnOpt("fileEntriesOf"), fnOpt("restoreComposerAfterRefusedRescind"), fnOpt("citeKey"), lineOpt("mintFileId"), fnOpt("fileWire"),
+     lineOpt("unverifiedHere"), fnOpt("fileMetaOf"), lineOpt("sameStrings"), fnOpt("askCloseUnverified"), fnOpt("discardUnverified"), winLine("__rompSessionBusyWhy"),   /* noteAmbiguity: gone since round nineteen; lifted when an older render.ts (780e439e) still has it, so the fail-before run reads clean */
      winLine("__rompSessionBusy"), winLine("__rompColumnBusyWhy")].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
@@ -182,6 +184,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       ack: (m) => onDroppedPath(m),                              // the kernel's droppedPath, through the real branch
       shipFail: (name, shipId) => shipFailed(name, shipId, name + " could not be read, so it was not attached — try again."),   // the reader's failure path (round eleven)
       sessionBusy: (sid) => window.__rompSessionBusy(sid), busyWhy: () => columnBusyWhy(), askClose: () => askCloseUpload(),
+      sessionBusyWhy: (sid) => (typeof window.__rompSessionBusyWhy === "function" ? window.__rompSessionBusyWhy(sid) : ""), askCloseUnverified: () => askCloseUnverified(),
       openComment: (text) => { CMTBOX = { value: text, dispatchEvent() {}, focus() {} }; }, comment: () => (CMTBOX ? CMTBOX.value : null), closeComment: () => { CMTBOX = null; },
       strip: (ids) => { lastStripIds = ids.slice(); noteColumnEmptiness(ids); },   // renderTabs's judgement of the kernel's strip
       detach: (host) => failShipsOfHost(host, "was still uploading when " + host + " was detached, so it was not attached — attach it again once the host is back."),   // what the romp:hostDetached listener does (pinned in chat-split.test.ts)
@@ -559,7 +562,7 @@ test("round nine: adoption carries the staged message (with its citation), the u
   assert.deepEqual(w.api.held.citations()[X], [CARD], "the unsent chip");
   assert.deepEqual(w.api.held.files()[X], ["/tmp/a.png"], "the attached file"); assert.equal(w.api.held.drafts()[X], TYPED, "the plain draft, as before");
   nothingUnder(w, id);
-  assert.deepEqual((w.store.staged as any)[X], [{ text: "staged while opening", cites: [CARD] }], "on disk under the real sid"); assert.deepEqual((w.store.files as any)[X], ["/tmp/a.png"], "the files on disk in the OLD shape — paths (round twenty-three)"); assert.deepEqual((w.store.filesLegacy as any)[X], [false]);
+  assert.deepEqual((w.store.staged as any)[X], [{ text: "staged while opening", cites: [CARD] }], "on disk under the real sid"); assert.deepEqual((w.store.files as any)[X], ["/tmp/a.png"], "the files on disk in the OLD shape — paths (round twenty-three)"); assert.deepEqual((w.store.filesMeta as any)[X].legacy, [false]); assert.deepEqual((w.store.filesMeta as any)[X].files, ["/tmp/a.png"], "…the record bound to them (round twenty-four)");
   assert.deepEqual(w.HOOKS.claims, [X]); assert.equal(w.api.busy(), false);
 });
 
@@ -886,13 +889,13 @@ test("round sixteen: an untagged, un-picked frame is a LEGACY kernel's ack — m
   const w = receiving(); w.api.ship(A, "photo.png", "a1", "QUJD"); w.api.holdSend(A); w.api.type(TYPED);
   w.api.ack({ type: "droppedPath", path: "drops/1700000000000-photo.png" });
   assert.equal(w.api.ships()[A], undefined, "the chip is retired"); assert.deepEqual(w.api.held.files()[A], ["drops/1700000000000-photo.png"]); assert.equal(w.HOOKS.fired, 0, "no automatic send from an untagged answer");
-  assert.deepEqual(w.api.heldSend(), [], "the hold is cancelled"); assert.ok(w.HOOKS.toasts.some((t) => /answered by an older kernel that names no upload/.test(t)), "said: " + JSON.stringify(w.HOOKS.toasts)); assert.equal(w.api.composer(), TYPED, "the words stay in the box"); assert.equal(w.api.busy(), false);
+  assert.deepEqual(w.api.heldSend(), [], "the hold is cancelled"); assert.ok(w.HOOKS.toasts.some((t) => /answered by an older kernel that names no upload/.test(t)), "said: " + JSON.stringify(w.HOOKS.toasts)); assert.equal(w.api.composer(), TYPED, "the words stay in the box"); assert.equal(w.api.busy(), true, "the column stays busy: the legacy attachment pins its session to this document (round twenty-four)"); assert.equal(w.api.busyWhy(), "unverified");
   // (b) no active tab, one matching pending ship: attached to its owner, the chip retired, the hold cancelled and said — nothing sent, nothing silent
   const v = world({ activeId: null, mru: [], order: [A, B], nextActive: null, store: {}, sets: { "2": [] } });
   v.api.draft(A, "A words waiting"); v.api.ship(A, "photo.png", "a1", "QUJD"); v.api.holdSend(A);
   v.api.ack({ type: "droppedPath", path: "drops/1-photo.png" });
   assert.deepEqual(v.HOOKS.sent.filter((m) => m.type === "sendMessage"), [], "nothing sent"); assert.deepEqual(v.api.held.files()[A], ["drops/1-photo.png"]); assert.equal(v.api.held.drafts()[A], "A words waiting", "the draft kept");
-  assert.equal(v.api.ships()[A], undefined); assert.deepEqual(v.api.heldSend(), []); assert.equal(v.api.busy(), false); assert.ok(v.HOOKS.toasts.some((t) => /older kernel/.test(t))); assert.ok(!v.HOOKS.toasts.some((t) => /no session is open/.test(t)));
+  assert.equal(v.api.ships()[A], undefined); assert.deepEqual(v.api.heldSend(), []); assert.equal(v.api.busy(), true, "the column stays busy: the legacy attachment pins its session to this document (round twenty-four)"); assert.equal(v.api.busyWhy(), "unverified"); assert.ok(v.HOOKS.toasts.some((t) => /older kernel/.test(t))); assert.ok(!v.HOOKS.toasts.some((t) => /no session is open/.test(t)));
   // (c) no active tab, no match: said, nothing retired, nothing attached
   const u = world({ activeId: null, mru: [], order: [A, B], nextActive: null, store: {}, sets: { "2": [] } });
   u.api.ship(A, "other.png", "o1", "QUJD");
@@ -992,7 +995,7 @@ test("round twenty: an UNMATCHED untagged answer that lands on the active compos
   assert.deepEqual(w.api.heldSend(), [], "A's hold disarmed"); assert.ok(w.HOOKS.toasts.some((t) => /arrived from an older kernel that names no upload and was attached here/.test(t)), "said: " + JSON.stringify(w.HOOKS.toasts));
   w.api.ack({ type: "droppedPath", path: "drops/1-a.png", shipId: "a1" });   // A's own tagged answer
   assert.deepEqual(w.api.held.files()[A], ["drops/9-foreign.png", "drops/1-a.png"], "the file attached"); assert.equal(w.HOOKS.fired, 0, "NOTHING sent: the foreign file would have ridden the message"); assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage"), []);
-  assert.equal(w.api.composer(), TYPED, "the words stay for the user"); assert.equal(w.api.busy(), false);
+  assert.equal(w.api.composer(), TYPED, "the words stay for the user"); assert.equal(w.api.busy(), true, "the column stays busy: the legacy attachment pins its session to this document (round twenty-four)"); assert.equal(w.api.busyWhy(), "unverified");
   const v = receiving(); v.api.ship(A, "a.png", "a1", "QUJD"); v.api.type(TYPED); v.api.holdSend(A);
   v.api.ack({ type: "droppedPath", path: "/synthetic/pick.txt", picked: true });   // the user's own pick on the active composer
   assert.deepEqual(v.api.heldSend(), [A], "a pick is the user's act: the hold stands"); assert.deepEqual(v.api.held.files()[A], ["/synthetic/pick.txt"]);
@@ -1005,7 +1008,7 @@ test("round twenty-one: an older kernel's guessed attachment makes the composer 
   const w = world({ activeId: A, mru: [A], order: [A], nextActive: A, store: {}, sets: { "": [A] } });   // A active; a dismissal falls back to A
   w.api.ship(A, "a.png", "a1", "QUJD"); w.api.type(TYPED); assert.equal(w.api.holdSend(A), true);
   w.api.ack({ type: "droppedPath", path: "drops/9-foreign.png", host: "TESTHOST" });   // an unmatched legacy answer: attached to A by the fallback
-  assert.equal(w.api.unverified(A), true, "A is unverified"); assert.deepEqual(w.api.heldSend(), [], "A's hold gone"); assert.deepEqual((w.store.files as any)[A], ["drops/9-foreign.png"], "…the file on disk in the old shape"); assert.deepEqual((w.store.filesLegacy as any)[A], [true], "…and its mark beside it");
+  assert.equal(w.api.unverified(A), true, "A is unverified"); assert.deepEqual(w.api.heldSend(), [], "A's hold gone"); assert.deepEqual((w.store.files as any)[A], ["drops/9-foreign.png"], "…the file on disk in the old shape"); assert.deepEqual((w.store.filesMeta as any)[A].legacy, [true], "…and its mark in the bound record");
   assert.equal(w.api.holdSend(A), false, "no hold may be armed on it"); assert.ok(w.HOOKS.toasts.some((t) => /can't be sent automatically/.test(t)));
   const r = world({ activeId: null, mru: [], order: [A], nextActive: null, store: w.store, sets: { "": [A] } });   // a reload over the same store
   assert.equal(r.api.unverified(A), true, "the reload remembers");
@@ -1017,7 +1020,7 @@ test("round twenty-one: an older kernel's guessed attachment makes the composer 
   w.api.ack({ type: "droppedPath", path: "drops/1-a.png", shipId: "a1" }); w.api.ack({ type: "droppedPath", path: "drops/2-p.png", shipId: "p1" });
   assert.deepEqual(w.api.held.files()[A], ["drops/9-foreign.png", "drops/1-a.png", "drops/2-p.png"]); assert.equal(w.HOOKS.fired, 0, "nothing sent"); assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage"), []);
   w.api.removeFile(A, 0);   // the user's ✕ on the legacy chip
-  assert.equal(w.api.unverified(A), false, "verified again"); assert.ok(!((w.store.filesLegacy as any)[A] || []).some((x: any) => x === true), "…on disk too");
+  assert.equal(w.api.unverified(A), false, "verified again"); assert.ok(!(((w.store.filesMeta as any)[A] || {}).legacy || []).some((x: any) => x === true), "…on disk too");
   w.api.ship(A, "z.png", "z1", "QUJD"); assert.equal(w.api.holdSend(A), true, "a NEW hold may be armed");
   w.api.ack({ type: "droppedPath", path: "drops/3-z.png", shipId: "z1" });
   assert.equal(w.HOOKS.fired, 1, "…and fires normally");
@@ -1074,7 +1077,7 @@ test("round twenty-two: entries round-trip through the store with their provenan
   const store: Record<string, unknown> = {};
   const w = world({ activeId: A, mru: [A], order: [A], nextActive: A, store, sets: { "": [A] } });
   w.api.ack({ type: "droppedPath", path: "drops/9-L.png", host: "TESTHOST" }); w.api.adoptState(A, { files: ["drops/1-ok.png"] });
-  assert.deepEqual((store.files as any)[A], ["drops/9-L.png", "drops/1-ok.png"], "persisted in the old shape"); assert.deepEqual((store.filesLegacy as any)[A], [true, false], "…the provenance beside it"); assert.equal(((store.filesIds as any)[A] || []).length, 2, "…and the ids");
+  assert.deepEqual((store.files as any)[A], ["drops/9-L.png", "drops/1-ok.png"], "persisted in the old shape"); assert.deepEqual((store.filesMeta as any)[A].legacy, [true, false], "…the provenance in the bound record"); assert.equal((store.filesMeta as any)[A].ids.length, 2, "…and the ids"); assert.deepEqual((store.filesMeta as any)[A].files, ["drops/9-L.png", "drops/1-ok.png"], "…bound to its own copy of the paths");
   const r = world({ activeId: null, mru: [], order: [A], nextActive: null, store, sets: { "": [A] } });
   assert.deepEqual(r.api.held.entries()[A], [{ path: "drops/9-L.png", legacy: true }, { path: "drops/1-ok.png", legacy: false }], "back with their marks"); assert.equal(r.api.unverified(A), true);
   const o = world({ activeId: null, mru: [], order: [A], nextActive: null, store: { files: { [A]: ["drops/old-1.png", "drops/old-2.png"] } }, sets: { "": [A] } });   // a store from before the entries
@@ -1111,4 +1114,56 @@ test("round twenty-three: the hand-off and the store keep the OLD file shape —
   assert.deepEqual(o.api.held.entries()[A], [{ path: "drops/a.png", legacy: false }, { path: "drops/b.png", legacy: false }], "all verified"); assert.equal(o.api.unverified(A), false);
   const s22 = receiving(); s22.api.adoptState(A, { files: [{ path: "drops/x.png", legacy: true }] });   // round twenty-two's interim object shape
   assert.deepEqual(s22.api.held.entries()[A], [{ path: "drops/x.png", legacy: true }], "…still read");
+});
+
+// ---- round twenty-four ----
+test("round twenty-four: an unverified attachment pins its session to its document — the session and the column read busy (why \"unverified\"), the close asks and \"Close anyway\" removes the chips and closes; the chip's ✕ releases", () => {
+  const w = receiving();
+  w.api.ack({ type: "droppedPath", path: "drops/9-L.png", host: "TESTHOST" });   // an older kernel's guess lands on A: unverified
+  assert.equal(w.api.unverified(A), true);
+  assert.equal(w.api.sessionBusy(A), true, "the shell's move question: busy — the new→old→new hand-off cannot start"); assert.equal(w.api.sessionBusyWhy(A), "unverified", "…and the fact is named for the refusal's line");
+  assert.equal(w.api.busy(), true, "the column is busy: a peer's reconcile HOLDS it, as for any busy fact"); assert.equal(w.api.busyWhy(), "unverified", "…so the shell's close asks");
+  assert.deepEqual(last(w.HOOKS), { romp: "colBusy", busy: true }, "said to the shell");
+  assert.deepEqual(w.api.orphans(), [], "the orphan offer never carries it out of this document");
+  w.api.askCloseUnverified();   // the shell's close met the hold: the question
+  assert.deepEqual(w.api.confirm()?.buttons, ["Keep", "Close anyway"]); assert.equal(w.HOOKS.closeSplit.length, 0, "not closed yet");
+  assert.ok(w.api.clickButton("Keep")); assert.equal(w.HOOKS.closeSplit.length, 0); assert.equal(w.api.unverified(A), true, "kept: the chip stands, the pin holds");
+  w.api.askCloseUnverified(); assert.ok(w.api.clickButton("Close anyway"));
+  assert.equal(w.api.held.files()[A], undefined, "the unverified chip is gone — the user's explicit discard"); assert.equal(w.api.unverified(A), false);
+  assert.equal(w.api.busy(), false); assert.deepEqual(last(w.HOOKS), { romp: "colBusy", busy: false }, "the flip, last"); assert.equal(w.HOOKS.closeSplit.length, 1, "…and the close proceeds");
+  // the other release: the user's ✕ on the chip
+  const v = receiving(); v.api.ack({ type: "droppedPath", path: "drops/9-L.png", host: "TESTHOST" }); assert.equal(v.api.sessionBusy(A), true);
+  v.api.removeFile(A, 0);
+  assert.equal(v.api.sessionBusy(A), false, "movable again"); assert.equal(v.api.sessionBusyWhy(A), ""); assert.equal(v.api.busy(), false); assert.deepEqual(last(v.HOOKS), { romp: "colBusy", busy: false });
+  // a verified strip never pins
+  const o = receiving(); o.api.adoptState(A, { files: ["drops/1-ok.png"] }); assert.equal(o.api.sessionBusy(A), false); assert.equal(o.api.busy(), false);
+});
+
+test("round twenty-four: the store binds its marks to the exact files it describes — an older page's rewrite of `files` under a stale record loads every entry unverified and rewrites the store; a matching record round-trips the marks; no record loads verified", () => {
+  const w = receiving();
+  w.api.adoptState(A, { files: ["drops/1-V.png"] });                              // V, verified
+  w.api.ack({ type: "droppedPath", path: "drops/9-L.png", host: "TESTHOST" });   // L, legacy
+  assert.deepEqual((w.store.files as any)[A], ["drops/1-V.png", "drops/9-L.png"], "the old shape");
+  assert.deepEqual((w.store.filesMeta as any)[A].files, ["drops/1-V.png", "drops/9-L.png"], "the record carries its own copy of the paths"); assert.deepEqual((w.store.filesMeta as any)[A].legacy, [false, true]);
+  assert.equal(w.store.filesLegacy, undefined, "round twenty-three's unbound sibling maps are not written"); assert.equal(w.store.filesIds, undefined);
+  const boot = (store: Record<string, unknown>) => world({ activeId: A, mru: [A], order: [A], nextActive: null, store, sets: { "": [A] } });
+  // a matching record round-trips exactly
+  const same = boot(JSON.parse(JSON.stringify(w.store)));
+  assert.deepEqual(same.api.held.entries()[A], [{ path: "drops/1-V.png", legacy: false }, { path: "drops/9-L.png", legacy: true }]); assert.deepEqual(same.api.held.raw()[A].map((e: any) => e.id), (w.store.filesMeta as any)[A].ids, "the ids too");
+  // the probe: an OLD writer (ea91a228's persistDrafts spreads the store and replaces only `files`) removes V, leaving the record stale
+  const stale = JSON.parse(JSON.stringify(w.store)); stale.files[A] = ["drops/9-L.png"];
+  const r = boot(stale);
+  assert.deepEqual(r.api.held.entries()[A], [{ path: "drops/9-L.png", legacy: true }], "the record does not name these files: L loads UNVERIFIED (by index it would have read V's `false`)");
+  assert.equal(r.api.held.raw()[A][0].why, "store", "…the chip says why"); assert.equal(r.api.unverified(A), true); assert.equal(r.api.holdSend(A), false, "no hold arms");
+  assert.deepEqual((r.store.filesMeta as any)[A].files, ["drops/9-L.png"], "the store is rewritten in the bound shape at once"); assert.deepEqual((r.store.filesMeta as any)[A].legacy, [true]); assert.deepEqual((r.store.filesMeta as any)[A].why, ["store"]);
+  assert.deepEqual(r.HOOKS.boot.filter((p) => p.romp === "colBusy"), [{ romp: "colBusy", busy: true }], "…and the column is held from boot");
+  // the same stale record the other way (the old writer removed L, kept V): V loads unverified too — the record cannot be trusted
+  const stale2 = JSON.parse(JSON.stringify(w.store)); stale2.files[A] = ["drops/1-V.png"];
+  assert.deepEqual(boot(stale2).api.held.entries()[A], [{ path: "drops/1-V.png", legacy: true }]);
+  // no record: verified (a store from before the branch — the accepted upgrade residual)
+  const o = boot({ files: { [A]: ["drops/a.png", "drops/b.png"] } });
+  assert.deepEqual(o.api.held.entries()[A], [{ path: "drops/a.png", legacy: false }, { path: "drops/b.png", legacy: false }]); assert.equal(o.api.unverified(A), false); assert.equal(o.api.busy(), false);
+  // round twenty-three's interim store — unbound top-level siblings, no record: nothing trusted, unverified; the siblings leave the store
+  const i23 = boot({ files: { [A]: ["drops/x.png"] }, filesLegacy: { [A]: [false] }, filesIds: { [A]: ["f1"] } });
+  assert.deepEqual(i23.api.held.entries()[A], [{ path: "drops/x.png", legacy: true }]); assert.equal(i23.store.filesLegacy, undefined); assert.equal(i23.store.filesIds, undefined); assert.deepEqual((i23.store.filesMeta as any)[A].files, ["drops/x.png"]);
 });

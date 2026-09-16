@@ -82,7 +82,7 @@ test("attachments ride the send as a trailing line of paths, quoted when they ho
 test("attachments live the DRAFT lifecycle: switch, reload, close", () => {
   // persisted beside drafts/citations/staged, restored as a list of strings
   assert.match(RENDER, /files: Object\.fromEntries\(\[\.\.\.composerFiles\]\.map\(\(\[k, v\]\) => \[k, fileWire\(v\)\.files\]\)\),/, "the store's `files` are paths — the old shape (round twenty-three)");
-  assert.match(RENDER, /const savedFiles = \(\(vscodeApi\?\.getState\?\.\(\) \|\| \{\}\) as any\)\.files, savedLegacy = \(\(vscodeApi\?\.getState\?\.\(\) \|\| \{\}\) as any\)\.filesLegacy, savedIds = /);
+  assert.match(RENDER, /const savedState = \(vscodeApi\?\.getState\?\.\(\) \|\| \{\}\) as any, savedFiles = savedState\.files, savedMeta = savedState\.filesMeta, interimLegacy = savedState\.filesLegacy;/, "the store's files, their bound record, and the interim maps it retires (round twenty-four)");
   // a tab switch REPAINTS the strip (unlike citations, which the switch abandons); the staged
   // strip (2026-08-15) repaints in the same breath, between the chips and the files
   assert.match(RENDER, /renderComposerChips\(id\);   \/\/ the entering tab's own citation chip \(if any\)\s*\n\s*renderStagedStrip\(id\);[^\n]*\n\s*renderComposerFiles\(id\);/);

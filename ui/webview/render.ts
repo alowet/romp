@@ -8203,22 +8203,26 @@ const PROVISIONAL_WAIT_MS = 90_000;
 // flip then carries the COMPLETED file with the other files. ONE reader — the shell's question, the flip below and the
 // emptiness report (noteColumnEmptiness) all read this, so they can never disagree (round four: the emptiness report read
 // the facts on its own and posted colEmpty from under a folder question).
-function columnBusy(): boolean { return !!provisionalId || failedProvisionals.size > 0 || pendingShips.size > 0; }
+// …and a FOURTH fact (round twenty-four): an UNVERIFIED attachment held here — an older kernel's guess — pins its session to this
+// document until the user acts on it (✕ on the chip, their own send, or the close's explicit discard): a hand-off would carry it to a
+// receiver that may run an older bundle and keep only the paths, so the mark would be stripped and the file sent by a later hold.
+function columnBusy(): boolean { return !!provisionalId || failedProvisionals.size > 0 || pendingShips.size > 0 || unverifiedHere(); }
 (window as any).__rompColumnBusy = (): boolean => columnBusy();
 // …and the SESSION-level question (round twelve, 2026-09-16): a session with an upload in flight, or a send held on one, cannot
 // MOVE to another column — the ack rides this document's socket and the held send fires here, so a move would split the send
 // from its words (the words went with the tab; the ack here sent the bare path). The shell asks before every move (moveTab:
 // the palette, the drag zones, a new column) and refuses with a line; the ack releases it.
-(window as any).__rompSessionBusy = (sid: unknown): boolean => typeof sid === "string" && !!sid && (pendingShips.has(sid) || sendOnShip.has(sid));
+(window as any).__rompSessionBusy = (sid: unknown): boolean => typeof sid === "string" && !!sid && (pendingShips.has(sid) || sendOnShip.has(sid) || isUnverified(sid));   // …or an unverified attachment (round twenty-four): the move would strip its mark on an older receiver
+// WHICH fact pins the session (round twenty-four): the shell's refusal names it — "unverified" (check it or remove it) before "upload" (wait for it)
+(window as any).__rompSessionBusyWhy = (sid: unknown): "" | "upload" | "unverified" => typeof sid !== "string" || !sid ? "" : isUnverified(sid) ? "unverified" : (pendingShips.has(sid) || sendOnShip.has(sid)) ? "upload" : "";
 // WHICH fact holds the column (round twelve): the shell's own close asks, and for a column whose ONLY hold is an upload for a
 // session it does not show — no chip is rendered here, so no ✕ can release it — it puts the question to the user instead of the
 // refusal (askCloseUpload): close anyway and lose the upload, the one acceptable loss, by an explicit choice.
-function columnBusyWhy(): "" | "create" | "failed" | "upload" | "upload-unshown" {
+function columnBusyWhy(): "" | "create" | "failed" | "upload" | "upload-unshown" | "unverified" {
   if (provisionalId) return "create";
   if (failedProvisionals.size) return "failed";
-  if (!pendingShips.size) return "";
-  for (const sid of pendingShips.keys()) if (heldHere(sid)) return "upload";
-  return "upload-unshown";
+  if (pendingShips.size) { for (const sid of pendingShips.keys()) if (heldHere(sid)) return "upload"; return "upload-unshown"; }
+  return unverifiedHere() ? "unverified" : "";   // (round twenty-four) the close asks: "Close anyway" is the user's discard of the unverified chips
 }
 (window as any).__rompColumnBusyWhy = (): string => columnBusyWhy();
 // …and the shell hears the answer CHANGE (2026-09-15): a column another dashboard's write dropped is HELD by the shell
@@ -8558,7 +8562,7 @@ function noteColumnEmptiness(ids: readonly string[]): void {
 function orphanStateSids(): string[] {
   const out = new Set<string>();
   for (const id of [...drafts.keys(), ...composerCitations.keys(), ...composerFiles.keys(), ...Object.keys(stagedMsgs.entries())]) {
-    if (!isProvisionalId(id) && !isSubId(id) && !heldHere(id)) out.add(id);
+    if (!isProvisionalId(id) && !isSubId(id) && !heldHere(id) && !isUnverified(id)) out.add(id);   // an unverified state stays pinned here (round twenty-four): the column is held, its close asks
   }
   return [...out];
 }
@@ -16288,7 +16292,7 @@ let fireStage: () => void = () => { /* assigned by the composer closure */ };
 // aligned sibling lists (`filesLegacy: boolean[]`, `filesIds: string[]`) a reader may lack: the frames of one dashboard are not
 // guaranteed one bundle (a rebuild in place; a later column loads the new render.js while a pane holding the reload runs the old),
 // and the old reader keeps only strings — a new sender's objects were every attachment dropped on a move.
-interface ComposerFile { id: string; path: string; legacy: boolean }
+interface ComposerFile { id: string; path: string; legacy: boolean; why?: "store" }   // why (round twenty-four): "store" — unverified because its saved record was changed under it, not because a kernel guessed
 const composerFiles = new Map<string, ComposerFile[]>();   // sid -> attachments, in drop order, each with its identity and provenance
 let fileSeq = 0;
 function mintFileId(): string { return "f" + Date.now().toString(36) + "." + (++fileSeq) + "." + Math.random().toString(36).slice(2, 8); }
@@ -16298,18 +16302,30 @@ function fileWire(list: readonly ComposerFile[]): { files: string[]; filesLegacy
   return { files: list.map((e) => e.path), filesLegacy: list.map((e) => e.legacy), filesIds: list.map((e) => e.id) };
 }
 function isUnverified(sid: string | null): boolean { return !!sid && (composerFiles.get(sid) || []).some((e) => e.legacy); }
+function unverifiedHere(): boolean { for (const l of composerFiles.values()) if (l.some((e) => e.legacy)) return true; return false; }   // the column's fourth busy fact (round twenty-four)
+// The store's record of a list (round twenty-four): the marks and the ids BOUND to their own copy of the paths they describe. The old
+// writer (a pane on an older bundle of the same dashboard) spreads the store and replaces only `files`, so a record left beside a
+// rewritten `files` is stale — the loader applies it only when its paths equal `files` exactly, and otherwise trusts nothing.
+function fileMetaOf(list: readonly ComposerFile[]): { files: string[]; legacy: boolean[]; ids: string[]; why: string[] } {
+  return { files: list.map((e) => e.path), legacy: list.map((e) => e.legacy), ids: list.map((e) => e.id), why: list.map((e) => e.why || "") };
+}
+function sameStrings(a: unknown, b: unknown): boolean { return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => typeof x === "string" && x === b[i]); }
 // The entries a persisted store or a hand-off carries (round twenty-three): `files` as bare paths — the old shape, and the only one
 // an older reader keeps — with the provenance and the ids in aligned sibling lists when the writer had them (a writer without them:
 // every file verified, ids minted here); or round twenty-two's `{ path, legacy }` objects, one interim store's shape (ids minted).
-function fileEntriesOf(v: unknown, legacy?: unknown, ids?: unknown): ComposerFile[] {
+function fileEntriesOf(v: unknown, legacy?: unknown, ids?: unknown, why?: unknown): ComposerFile[] {
   const out: ComposerFile[] = [];
-  const L = Array.isArray(legacy) ? legacy : [], I = Array.isArray(ids) ? ids : [];
+  const L = Array.isArray(legacy) ? legacy : [], I = Array.isArray(ids) ? ids : [], Y = Array.isArray(why) ? why : [];
   let i = 0;
   for (const x of (Array.isArray(v) ? v : [])) {
     const at = i++;
-    if (typeof x === "string" && x) out.push({ id: typeof I[at] === "string" && I[at] ? I[at] : mintFileId(), path: x, legacy: L[at] === true });
+    let e: ComposerFile | null = null;
+    if (typeof x === "string" && x) e = { id: typeof I[at] === "string" && I[at] ? I[at] : mintFileId(), path: x, legacy: L[at] === true };
     else if (x && typeof x === "object" && typeof (x as { path?: unknown }).path === "string" && (x as { path: string }).path)
-      out.push({ id: typeof (x as { id?: unknown }).id === "string" && (x as { id: string }).id ? (x as { id: string }).id : mintFileId(), path: (x as { path: string }).path, legacy: (x as { legacy?: unknown }).legacy === true });
+      e = { id: typeof (x as { id?: unknown }).id === "string" && (x as { id: string }).id ? (x as { id: string }).id : mintFileId(), path: (x as { path: string }).path, legacy: (x as { legacy?: unknown }).legacy === true };
+    if (!e) continue;
+    if (e.legacy && Y[at] === "store") e.why = "store";   // the reason rides the record (round twenty-four)
+    out.push(e);
   }
   return out;
 }
@@ -16327,6 +16343,7 @@ function restoreComposerAfterRefusedRescind(sid: string, stash: { cites: Citatio
   for (const e of stash.files) if (!files.some((x) => x.id === e.id)) files.push({ ...e });
   if (files.length) composerFiles.set(sid, files); else composerFiles.delete(sid);
   persistDrafts(); renderComposerChips(sid); renderComposerFiles(sid);
+  syncColumnBusy();   // a restored legacy entry pins the column again (round twenty-four)
 }
 const UNVERIFIED_NOTICE = "An attachment from an older kernel is on this message, so it can't be sent automatically — check it and send it yourself.";
 // THE one door to a held send (round twenty-one): refused, and said, for a composer holding an unverified attachment; every place that
@@ -16542,6 +16559,29 @@ function askCloseUpload(): void {
     (v) => { if (v === "close") { abandonPendingUploads(); try { (window.parent as any)?.__rompCloseSplit?.(Number(COL)); } catch (e) { /* no shell */ } } },
     "close-upload:" + COL);
 }
+// …and the same question for a column whose hold is an UNVERIFIED attachment (round twenty-four): the guess pins its session to this
+// document (a hand-off could strip the mark on an older receiver), so the user's close asks — "Close anyway" is the explicit discard:
+// the unverified chips go, the words stay each session's draft, and the close completes on the flip.
+function askCloseUnverified(): void {
+  if (!unverifiedHere()) { try { (window.parent as any)?.__rompCloseSplit?.(Number(COL)); } catch (e) { /* no shell */ } return; }   // released meanwhile: nothing to lose
+  const n = [...composerFiles.values()].reduce((a, l) => a + l.filter((e) => e.legacy).length, 0);
+  showConfirm(n === 1 ? "An attachment hasn't been checked" : n + " attachments haven't been checked",
+    "An older kernel guessed which message " + (n === 1 ? "an attachment" : "these attachments") + " in this column belonged to, and no one has checked it yet. "
+    + "Close anyway and " + (n === 1 ? "that attachment is" : "they are") + " removed; the words stay each session's draft.",
+    [{ label: "Keep", value: "wait" }, { label: "Close anyway", value: "close", danger: true }],
+    (v) => { if (v === "close") { discardUnverified(); try { (window.parent as any)?.__rompCloseSplit?.(Number(COL)); } catch (e) { /* no shell */ } } },
+    "close-unverified:" + COL);
+}
+function discardUnverified(): void {
+  for (const [sid, list] of [...composerFiles]) {
+    const kept = list.filter((e) => !e.legacy);
+    if (kept.length === list.length) continue;
+    if (kept.length) composerFiles.set(sid, kept); else composerFiles.delete(sid);
+    if (sid === activeId) renderComposerFiles(sid);
+  }
+  persistDrafts();
+  syncColumnBusy();   // the hold ends: the shell's close can proceed
+}
 function abandonPendingUploads(): void {
   const sids = [...pendingShips.keys()];
   pendingShips.clear();
@@ -16692,13 +16732,14 @@ function restoreFailedProvisionals(): void {
 }
 function persistDrafts(): void {
   try {
-    vscodeApi?.setState?.({ ...(vscodeApi.getState?.() || {}), drafts: Object.fromEntries(drafts),
+    const prior = { ...(vscodeApi.getState?.() || {}) } as Record<string, unknown>; delete prior.filesLegacy; delete prior.filesIds;   // round twenty-three's unbound sibling maps leave the store (round twenty-four)
+    vscodeApi?.setState?.({ ...prior, drafts: Object.fromEntries(drafts),
                             citations: Object.fromEntries(composerCitations),
-                            // the files in the OLD shape — paths — with the provenance and the ids beside them (round twenty-three): an older page of
-                            // the same dashboard reads `files` as it always did; this page rebuilds the entries from the three lists
+                            // the files in the OLD shape — paths — an older page of the same dashboard reads `files` as it always did (round twenty-three);
+                            // the marks and the ids in a record BOUND to its own copy of the paths (round twenty-four): an older page's rewrite of
+                            // `files` under it is detected at the next load, and nothing is trusted by index
                             files: Object.fromEntries([...composerFiles].map(([k, v]) => [k, fileWire(v).files])),
-                            filesLegacy: Object.fromEntries([...composerFiles].map(([k, v]) => [k, fileWire(v).filesLegacy])),
-                            filesIds: Object.fromEntries([...composerFiles].map(([k, v]) => [k, fileWire(v).filesIds])),
+                            filesMeta: Object.fromEntries([...composerFiles].map(([k, v]) => [k, fileMetaOf(v)])),
                             staged: stagedMsgs.entries(),
                             // the FAILED creates, by their tab's id (round six): the tab comes back after a reload with its
                             // reason and its draft, and its ✕ — the one discard — takes this record with the draft
@@ -16723,12 +16764,22 @@ function bootComposerState(): void {
   try {
   const saved = ((vscodeApi?.getState?.() || {}) as any).drafts;
   if (saved && typeof saved === "object") for (const [k, v] of Object.entries(saved)) if (typeof v === "string") drafts.set(k, v);
-  const savedFiles = ((vscodeApi?.getState?.() || {}) as any).files, savedLegacy = ((vscodeApi?.getState?.() || {}) as any).filesLegacy, savedIds = ((vscodeApi?.getState?.() || {}) as any).filesIds;
+  const savedState = (vscodeApi?.getState?.() || {}) as any, savedFiles = savedState.files, savedMeta = savedState.filesMeta, interimLegacy = savedState.filesLegacy;
+  let rebind = false;
   if (savedFiles && typeof savedFiles === "object")
     for (const [k, v] of Object.entries(savedFiles)) {
-      const entries = fileEntriesOf(v, savedLegacy && typeof savedLegacy === "object" ? (savedLegacy as any)[k] : undefined, savedIds && typeof savedIds === "object" ? (savedIds as any)[k] : undefined);   // paths + siblings (round twenty-three); an older store's bare paths, or round twenty-two's objects, load too
+      const m = savedMeta && typeof savedMeta === "object" ? (savedMeta as any)[k] : undefined;
+      let entries: ComposerFile[];
+      if (m && typeof m === "object" && sameStrings((m as any).files, v)) entries = fileEntriesOf(v, (m as any).legacy, (m as any).ids, (m as any).why);   // the record names exactly these paths: its marks and ids apply (round twenty-four)
+      else if ((m && typeof m === "object") || (interimLegacy && typeof interimLegacy === "object" && k in interimLegacy)) {
+        // a record that does not name these paths (an older page rewrote `files` under it), or round twenty-three's unbound siblings:
+        // nothing can be trusted by index, so EVERY entry loads unverified (the chip says why; the user's ✕ or send verifies) and the
+        // store is rewritten in the bound shape at once
+        entries = fileEntriesOf(v).map((e) => ({ ...e, legacy: true, why: "store" as const })); rebind = true;
+      } else entries = fileEntriesOf(v);   // no record: verified — a store from before the branch (the accepted upgrade residual), or round twenty-two's objects with their own marks
       if (entries.length) composerFiles.set(k, entries);
     }
+  if (rebind) persistDrafts();
   const savedCites = ((vscodeApi?.getState?.() || {}) as any).citations;
   if (savedCites && typeof savedCites === "object")
     for (const [k, v] of Object.entries(savedCites)) {
@@ -17137,7 +17188,7 @@ function renderComposerFilesInner(id: string | null): void {
   }
   paths.forEach((p, i) => {
     const box = el("span", "composer-file");
-    box.title = p + " — click opens it · ✕ removes" + (entries[i].legacy ? "\nattached by an older kernel's guess — check it before sending" : "");   // its provenance, where the chip is (round twenty-two)
+    box.title = p + " — click opens it · ✕ removes" + (entries[i].legacy ? (entries[i].why === "store" ? "\nits saved record was changed by an older page while this one was away, so it counts as unchecked — check it before sending" : "\nattached by an older kernel's guess — check it before sending") : "");   // its provenance, and why, where the chip is (rounds twenty-two, twenty-four)
     if (previewKind(p) === "img") {
       if (canPreview()) {
         // Name first, pixels when ready (the user 2026-08-04): the ext + name chip goes up IMMEDIATELY
@@ -17237,6 +17288,7 @@ function removeComposerFile(id: string, idx: number): void {
   if (!list.length) composerFiles.delete(id);
   persistDrafts();
   if (id === activeId) renderComposerFiles(id);
+  syncColumnBusy();   // LAST (round twenty-four): the last unverified chip gone, the column's hold ends and the session moves again
 }
 
 // Audit popover — the EXACT wrapped body romp will send the model for this citation, fetched from the kernel's
@@ -17507,7 +17559,7 @@ const sessionMru: string[] = [];
   const boxHeld = sid === activeId && !!ta && !!ta.value.trim();   // the box holds words: the reload core's `typing` hold stands on it (editing())
   if (sid === activeId && ta) { if (ta.value) drafts.set(sid, ta.value); else drafts.delete(sid); }
   const draft = drafts.get(sid) ?? "", citations = composerCitations.get(sid) ?? [], wire = fileWire(composerFiles.get(sid) ?? []), files = wire.files, staged = stagedMsgs.takeAll(sid);   // the files in the OLD shape, their provenance and ids beside them (round twenty-three)
-  drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid);   // the files travel as paths with their provenance and ids in sibling lists (round twenty-three)
+  drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid);   // the files travel as paths with their provenance and ids in sibling lists (round twenty-three) — never an UNVERIFIED entry while the pin holds (round twenty-four: the shell refuses the move, the orphan offer skips it, the close asks first); the lists stay for a same-generation receiver
   if (draft || staged.length) handedOff.add(sid);   // the words left with the tab (round twelve): a held send here would be the bare path — sendHeldFor's belt
   if (sid === activeId) { if (ta) { ta.value = ""; growComposer(ta); } renderComposerChips(sid); renderComposerFiles(sid); renderStagedStrip(sid); }
   // the typing hold's ENDING event (round eleven, 2026-09-16): the core hears a draft cleared by typing ('input') or a blur, never a
@@ -17547,6 +17599,7 @@ function adoptSessionState(sid: unknown, state: unknown): void {
   // sent the message short of the attachment that had not.
   persistDrafts();
   if (activeId === sid) loadComposerFor(sid);
+  syncColumnBusy();   // (round twenty-four) an unverified entry never arrives here while the pin holds; an interim page's objects with a mark would, and the column says so
 }
 function noteMru(id: string): void {
   const i = sessionMru.indexOf(id);
@@ -18780,6 +18833,7 @@ function dismissSession(id: string, why: DismissWhy, doomed?: ReadonlySet<string
     // someone repaints it, and that stale chip's ✕ targets the dead id (whose map entry is gone), so the
     // click early-returns and the chip can't even be dismissed — hence the repaint below.
     drafts.delete(id); composerCitations.delete(id); composerEdits.delete(id); composerFiles.delete(id); persistDrafts();
+    syncColumnBusy();   // the state went with the tab: an unverified hold ends here too (round twenty-four)
   } else {
     persistDrafts();   // a host drop / omission KEEPS it all (see DismissWhy) — the stash above may have updated the copy
   }
@@ -18903,6 +18957,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
   // hands them to this page, the session's column now — into the maps, persisted, and into the box when it is active
   if (m.romp === "adopt") { adoptSessionState(m.sid, m.state); return; }
   if (m.romp === "askCloseUpload") { askCloseUpload(); return; }   // the shell's close met a column held only by an upload for a session shown elsewhere (round twelve)
+  if (m.romp === "askCloseUnverified") { askCloseUnverified(); return; }   // …or held by an unverified attachment (round twenty-four): the user decides
   // the shell closed a later column whose members the kernel's strip no longer lists (colEmpty): they return to this,
   // the first column, but the kernel may still list one closed from its own cross for a push or two — held back here
   // (closingTabs, retired by the kernel's next strip as any ✕ is) so no tab flashes into this strip on its way out. The
@@ -19837,6 +19892,7 @@ function setupComposer() {
         histWalk.delete(sid);                         // …and the history walk starts fresh
         if (attached.length) { composerFiles.delete(sid); if (sid === activeId) renderComposerFiles(sid); }
         drafts.delete(sid); draftStartedAt.delete(sid); persistDrafts();
+        syncColumnBusy();   // the user's own send verified the strip (round twenty-four): the column's hold, if it was the last, ends
         clearBox();
         return;
       }
@@ -19867,6 +19923,7 @@ function setupComposer() {
       histWalk.delete(sid);                         // …and the history walk starts fresh
       if (attached.length) { composerFiles.delete(sid); if (sid === activeId) renderComposerFiles(sid); }   // the strip emptied into this message — the user's own send verifies it (round twenty-one)
       drafts.delete(activeId); draftStartedAt.delete(activeId); persistDrafts();   // sent — no draft to restore on a later switch-back
+      syncColumnBusy();   // …and the column's hold on an unverified strip ends with it (round twenty-four)
       clearBox();   // a drag-expanded box snaps back to one line after a send (the user 2026-07-07)
       // The box is empty again, so a live picker re-takes it: send your pre-question draft, then just type the
       // answer (the user 2026-07-16). Repaints the "answering" tint that draftPredatesAsk had suppressed.
