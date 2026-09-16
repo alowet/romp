@@ -1630,6 +1630,18 @@ CALLS.unregister = []; CALLS.register = [];
 STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB], row: 2 }], rowSplit: 0.5 });
 window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
 out.deferRows.movedFree = { top: order(), bottom: order2(), area: areaState(), unregister: CALLS.unregister.slice(), register: CALLS.register.slice() };
+// …and the reverse: the ONLY bottom-row column, busy, moved by the peer to the top row. Held, it stays in the bottom row with
+// the row standing and the peer's bytes untouched; the idle signal folds the row (the share reset) and remakes it in the top
+// row — unregistered once, registered once — still writing nothing
+const PEER_UP = JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB] }] });
+boot({ 'romp-chat-cols': JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB], row: 2 }], rowSplit: 0.7 }) }, false);
+BUSY['f-chat-2'] = true; CALLS.sets = []; CALLS.unregister = []; CALLS.register = [];
+STORE['romp-chat-cols'] = PEER_UP;
+window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
+out.deferRows.up = { top: order(), bottom: order2(), area: areaState(), ids: ids(), saves: saves(), unregister: CALLS.unregister.slice(), register: CALLS.register.slice(), rowOf2: window.__rompChatRowOf(2), bytes: STORE['romp-chat-cols'], peer: PEER_UP };
+BUSY['f-chat-2'] = false;
+msg({ romp: 'colBusy', busy: false }, 'f-chat-2');
+out.deferRows.upIdle = { top: order(), bottom: order2(), area: areaState(), ids: ids(), saves: saves(), unregister: CALLS.unregister.slice(), register: CALLS.register.slice(), rowOf2: window.__rompChatRowOf(2), bytes: STORE['romp-chat-cols'] };
 // M) the phone restores no rows and refuses the move below
 boot({ 'romp-chat-cols': JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB], row: 2 }], rowSplit: 0.5 }) }, true);
 CALLS.notify = [];
@@ -1897,6 +1909,20 @@ class RowsExecute(unittest.TestCase):
         f = self.out["deferRows"]["movedFree"]
         self.assertEqual(f["top"], ["chat-pane"]); self.assertEqual(f["bottom"], ["chat-pane-2"], "a column that is not busy moves rows at once")
         self.assertEqual(f["unregister"], ["chat-pane-2"]); self.assertEqual(f["register"], [["chat-pane-2", "chat2"]])
+        # the reverse: the only bottom-row column, busy, moved by the peer to the top row
+        u = self.out["deferRows"]["up"]
+        self.assertEqual(u["bottom"], ["chat-pane-2"], "held: it stays in the bottom row"); self.assertEqual(u["top"], ["chat-pane"])
+        self.assertEqual(u["area"]["cls"], "rows", "…the row standing"); self.assertEqual(u["rowOf2"], 2)
+        self.assertEqual(u["area"]["rs1"], 50, "the peer's store carries no share (no bottom row there): the half, as the rows' rule reads it")
+        self.assertEqual(u["ids"], ["f-chat", "f-chat-2"])
+        self.assertEqual(u["saves"], 0, "the peer's bytes are the truth: nothing written"); self.assertEqual(u["bytes"], u["peer"], "…and they stand exactly as written")
+        self.assertEqual(u["unregister"], []); self.assertEqual(u["register"], [], "nothing torn down, nothing remade, while the page is busy")
+        ui = self.out["deferRows"]["upIdle"]
+        self.assertEqual(ui["bottom"], [], "the idle signal: the bottom row folds…"); self.assertEqual(ui["area"], {"cls": "", "rs1": 50, "rs2": 50}, "…the share reset, the class off")
+        self.assertEqual(ui["top"], ["chat-pane", "gv-chat-2", "chat-pane-2"], "…and the column is remade in the top row, behind its gutter"); self.assertEqual(ui["rowOf2"], 1)
+        self.assertEqual(ui["unregister"], ["chat-pane-2"], "unregistered once"); self.assertEqual(ui["register"], [["chat-pane-2", "chat2"]], "registered once")
+        self.assertEqual(ui["ids"], ["f-chat", "f-chat-2"])
+        self.assertEqual(ui["saves"], 0, "still nothing written"); self.assertEqual(ui["bytes"], u["peer"], "the peer's bytes remain exactly as written")
 
     def test_the_phone_restores_no_rows_and_refuses_the_move_below(self):
         p = self.out["phone"]
