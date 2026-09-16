@@ -90,7 +90,7 @@ test("the focus handler retires the provisional QUIETLY when the kernel answered
 });
 
 test("creating a session opens the provisional tab instead of a modal", () => {
-  assert.match(RENDER, /openProvisional\(req\);/);
+  assert.match(RENDER, /openProvisional\(req, rid\);/);
   assert.doesNotMatch(RENDER, /showOpeningModal/, "the modal is gone, not merely hidden");
   assert.doesNotMatch(RENDER, /hideOpeningModal/);
   // "opening", never "working": the working chip renders an elapsed timer off sinceEpoch, and a
@@ -159,7 +159,7 @@ test("the silent-failure backstop is long, because it is no longer what you wait
 });
 
 test("closing a provisional tab aborts the pending spawn; a FAILED one is a plain local discard", () => {
-  assert.match(RENDER, /if \(id === provisionalId\) cancelProvisional\(\);\s*\n\s*else \{ failedProvisionals\.delete\(id\); dismissSession\(id, "close"\); syncColumnBusy\(\); \}/);   // …and the shell hears the column is no longer busy (a held drop of it applies; chat-split.test.ts)
+  assert.match(RENDER, /if \(id === provisionalId\) cancelProvisional\(\);\s*\n\s*else \{ failedProvisionals\.delete\(id\); failedWhy\.delete\(id\); dismissSession\(id, "close"\); syncColumnBusy\(\); \}/);   // …its reason goes with it (round five)   // …and the shell hears the column is no longer busy (a held drop of it applies; chat-split.test.ts)
   assert.match(RENDER, /vscodeApi\.postMessage\(\{ type: "cancelCreate", name \}\)/);
   // the kernel never knew a provisional id — the dead-tab ✕ must not post closeTab for one
   assert.match(RENDER, /if \(!isProvisionalId\(id\)\) vscodeApi\.postMessage\(\{ type: "closeTab", id \}\);/);
@@ -179,7 +179,7 @@ test("a starting tab shows the romp loader, not the 'No messages yet' placeholde
   assert.match(PLACEHOLDER, /case "starting": \{[\s\S]{0,400}?ph\.classList\.add\("tx-starting"\);/);   // the placeholder by kind (pane-placeholder.ts, T355)
   assert.match(RENDER, /romp-swirl-glyph\.svg/);
   assert.match(PLACEHOLDER, /"Starting " \+ ctx\.text\.sessionName \+ "… you can type now; romp sends it when it's up\."/);
-  assert.match(RENDER, /sessionName: s\.name \},/);
+  assert.match(RENDER, /sessionName: s\.name, startFailed: failedWhy\.get\(id\) \?\? null \},/);
   assert.match(CSS, /\.tx-starting-swirl \{[\s\S]*?animation: tx-starting-spin/);
   assert.match(CSS, /prefers-reduced-motion: reduce\) \{ \.tx-starting-swirl \{ animation: none/);
   assert.doesNotMatch(CSS, /opening-dots/, "the bouncing-dots modal CSS went with it");

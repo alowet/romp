@@ -111,7 +111,7 @@ test("a pick of a session another column holds is shown where it lives: the setA
   // is busy (closing it would kill the create's queued text) and closed on the page's colBusy flip, posted from every write of
   // the two facts the answer reads, only when it flipped (tests/test_chat_split.py runs the hold and both of its ends)
   assert.match(RENDER, /let columnBusyTold = false;\nfunction syncColumnBusy\(\): void \{\n\s*const busy = columnBusy\(\);\n\s*if \(busy === columnBusyTold\) return;\n\s*columnBusyTold = busy;\n\s*try \{ if \(window\.parent && window\.parent !== window\) window\.parent\.postMessage\(\{ romp: "colBusy", busy \}, "\*"\); \}/);
-  assert.match(RENDER, /\n  provisionalId = id;\n  syncColumnBusy\(\);/, "openProvisional: busy now");
+  assert.match(RENDER, /\n  provisionalId = id;\n  provisionalRid = rid;[^\n]*\n  syncColumnBusy\(\);/, "openProvisional: busy now (waiting on this request, round five)");
   // the flip is the LAST act of every settling path, after that path's last write of the text (round two, 2026-09-15: from
   // inside dropProvisional it ran ahead of resolveProvisionalToExisting's drafts.set and the text died with the document)
   const drop = RENDER.slice(RENDER.indexOf("function dropProvisional("), RENDER.indexOf("function adoptProvisional("));
@@ -126,16 +126,29 @@ test("a pick of a session another column holds is shown where it lives: the setA
   assert.ok(!dirq.includes("dropProvisional("), "the tab stays");
   assert.match(dirq, /const id = provisionalId;\n  if \(!id\) return;[^\n]*\n  if \(provisionalTimer\) \{ clearTimeout\(provisionalTimer\); provisionalTimer = undefined; \}\n  dirQuestionFor = id;/);
   assert.match(dirq, /if \(provisionalId !== id \|\| dirQuestionFor !== id\) return;/, "an answer to an older prompt never settles a newer create");
-  assert.match(dirq, /failProvisional\(dirWhy\(missing\), v === "picker"\);\n    \}, "dir:" \+ id\);/, "dismissed: a failed create, keyed prompt");
+  assert.match(dirq, /failProvisional\(dirWhy\(missing\), v === "picker" \|\| v === "replaced"\);\n    \}, key\);/, "dismissed: a failed create, keyed prompt");
   assert.match(RENDER, /if \(provisionalId && dirQuestionFor === provisionalId && pendingNewSession === provisionalName\(req\.host, req\.name\)\) \{/, "startCreate: the retry keeps the tab");
   assert.match(RENDER, /if \(abandonCreate && dirQuestionFor && dirQuestionFor === provisionalId\) failProvisional\(dirWhy\(lastCreate\?\.dir \?\? ""\)\);/);
   assert.match(RENDER, /function openPicker\(pick = false, prompt\?: string, allowNew = false\) \{\n  dismissDirPromptForPicker\(\);/);
   assert.match(RENDER, /function dismissDirPromptForPicker\(\): void \{\n  if \(confirmKey && confirmKey\.indexOf\("dir:"\) === 0\) closeConfirm\("picker"\);\n\}/);
   assert.match(RENDER, /confirmCb = null;\n  confirmKey = null;[^\n]*\n  if \(cb\) cb\(value\);/);
+  // round five (2026-09-15): every create attempt carries a request id the kernel echoes; a reply naming another request is
+  // ignored (a slow host's late answer after a second create), and the folder prompt is keyed to the request
+  assert.match(RENDER, /const rid = mintRid\(\);[^\n]*\n  if \(vscodeApi\) vscodeApi\.postMessage\(\{ type: "createSession", \.\.\.req, rid, /);
+  assert.match(RENDER, /function createReplyIsStale\(m: \{ rid\?: unknown \}\): boolean \{ return typeof m\.rid === "string" && m\.rid !== provisionalRid; \}/);
+  assert.match(dirq, /if \(createReplyIsStale\(m\)\) return;/); assert.match(dirq, /key = "dir:" \+ \(typeof m\.rid === "string" \? m\.rid : id\)/);
+  assert.match(RENDER, /function onCreateWarn\(m: \{ text: string; rid\?: unknown \}\): void \{\n  if \(createReplyIsStale\(m\)\) return;\n  if \(provisionalId\) failProvisional\(m\.text\); else warnToast\(m\.text\);\n\}/);
+  assert.match(RENDER, /else if \(m\.type === "warn" && typeof m\.text === "string" && m\.text\) onCreateWarn\(m\);/);
+  // …a dialog replacing a folder question says so, and that question fails its create quietly (no second #confirm); never two
+  assert.match(RENDER, /closeConfirm\(confirmKey !== null && confirmKey\.indexOf\("dir:"\) === 0 \? "replaced" : null\);/);
+  assert.match(RENDER, /for \(let stale = document\.getElementById\("confirm"\); stale; stale = document\.getElementById\("confirm"\)\) \{/);
+  assert.match(dirq, /failProvisional\(dirWhy\(missing\), v === "picker" \|\| v === "replaced"\);/);
+  assert.match(KERNEL, /_rid = \{"rid": rid\} if isinstance\(rid, str\) and 0 < len\(rid\) <= 80 else \{\}/);
+  assert.ok(KERNEL.includes('json.dumps({**_rid, "type": "createDirMissing"')); assert.ok(KERNEL.includes('_reveal_chat_for(client, {**_rid, "type": "focus", "id": live[nm]})'));
   // …and the shell HOLDS a busy column an emptiness report would close, as reconcile does, instead of refusing it (P2-b)
   assert.ok(KERNEL.includes("if(busy(frameOfCol(en.n))){held[en.n]=true;save();return;}\nclose(en.n);return;}"));
   assert.match(RENDER, /discards both \*\/ \}\);\n  syncColumnBusy\(\);[^\n]*\n\}/, "failProvisional: still busy, said for the invariant, last");
-  assert.match(RENDER, /else \{ failedProvisionals\.delete\(id\); dismissSession\(id, "close"\); syncColumnBusy\(\); \}/, "a failed tab's discard: the text went with it");
+  assert.match(RENDER, /else \{ failedProvisionals\.delete\(id\); failedWhy\.delete\(id\); dismissSession\(id, "close"\); syncColumnBusy\(\); \}/, "a failed tab's discard: the text went with it (and its reason, round five)");
   // …and the shell's close() takes the state the page holds for sessions it does not show, judged against the shell's current sets
   assert.match(RENDER, /\(window as any\)\.__rompOrphanStateSids = \(\): string\[\] => \{ colSets = readColSets\(\); if \(activeId\) stashActiveDraft\(activeId\); return orphanStateSids\(\); \};/);   // round three: the box's live text for an active tab the column no longer lists counts too
   assert.ok(KERNEL.includes("orphans(f).forEach(function(sid){if(cols[i].ids.indexOf(sid)>=0)return;var t=frameOfCol(ownerOf(sid));adopt(t&&t!==f&&loaded(t)?t:home,sid,take(f,sid));});"));

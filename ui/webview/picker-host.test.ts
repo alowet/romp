@@ -41,7 +41,7 @@ test("createSession carries the picked host (empty = local) so the manager route
   assert.match(RENDER, /startCreate\(\{ name, backend,\s*\n\s*dir: dirInput\.value\.trim\(\), host: hostSel, \.\.\.\(auth \? \{ auth \} : \{\}\), \.\.\.\(tags\.length \? \{ tags \} : \{\}\) \}\)/);
   // the PROVISIONAL tab (2026-07-30, which replaced the "Opening…" cue) must be matched against the
   // PREFIXED tab name a remote create produces — provisionalName() is where that join is spelled
-  assert.match(RENDER, /openProvisional\(req\);/);
+  assert.match(RENDER, /openProvisional\(req, rid\);/);
 });
 
 test("picking a remote host disables the (host-local) Browse… dialog", () => {

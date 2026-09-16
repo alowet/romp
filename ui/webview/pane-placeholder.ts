@@ -37,7 +37,7 @@ export interface PlaceholderCtx {
   button: () => any;                                  // document.createElement("button")
   br: () => any;                                      // document.createElement("br")
   swirl?: () => any;                                  // the starting tab's swirl image, when the pane has one
-  text: { error?: string | null; failedRevive?: string | null; stall: string; sessionName: string };
+  text: { error?: string | null; failedRevive?: string | null; stall: string; sessionName: string; startFailed?: string | null };   // startFailed: why a create failed (render.ts failedWhy), when known
   onRetry: () => void;
 }
 
@@ -72,7 +72,9 @@ export function fillPlaceholder(ph: any, kind: PlaceholderKind, ctx: Placeholder
       ph.textContent = "This agent has written nothing yet.";
       break;
     case "start-failed":
-      ph.textContent = "This session couldn't start. What you typed is kept in the box below; ✕ on the tab discards both.";
+      // the reason first when it is known (round five: a failure said quietly — the picker opened over its folder question, an
+      // unrelated dialog replacing it — is explained HERE, in the tab, never by a second dialog)
+      ph.textContent = (ctx.text.startFailed ? ctx.text.startFailed + "\n\n" : "") + "This session couldn't start. What you typed is kept in the box below; ✕ on the tab discards both.";
       break;
     case "starting": {
       // a PROVISIONAL tab is not empty, it is STARTING — so it wears the romp loader (the repo's rule for any wait), not

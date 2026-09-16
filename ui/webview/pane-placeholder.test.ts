@@ -70,6 +70,14 @@ test("the kinds: a failed revive first, a starting tab's loader and its failed c
   assert.equal(placeholderKind({ failedRevive: "gone", sub: { error: "x", loaded: true } }), "revive-failed");
   assert.equal(placeholderKind({ provisional: true }), "starting");
   assert.equal(placeholderKind({ provisional: true, provisionalFailed: true }), "start-failed");
+  // round five (2026-09-15): the failed tab says WHY when the reason is known (a create failed quietly, its dialog withheld
+  // because the picker or an unrelated dialog was the foreground), then the standing sentence
+  const whyCtx = (why: string | null) => ({ el: () => ({}), loader: () => ({}), button: () => ({}), br: () => ({}), text: { stall: "", sessionName: "notes", startFailed: why }, onRetry: () => {} });
+  const ph = { textContent: "", classList: { add() {} }, appendChild() {}, dataset: {} as Record<string, string> };
+  fillPlaceholder(ph, "start-failed", whyCtx("That folder isn't there: /proj/x."));
+  assert.equal(ph.textContent, "That folder isn't there: /proj/x.\n\nThis session couldn't start. What you typed is kept in the box below; ✕ on the tab discards both.");
+  fillPlaceholder(ph, "start-failed", whyCtx(null));
+  assert.equal(ph.textContent, "This session couldn't start. What you typed is kept in the box below; ✕ on the tab discards both.");
   assert.equal(placeholderKind({}), "empty");
   const c = ctx([]);
   const st = fillPlaceholder(fakeEl("div", "tx-empty"), "starting", { ...c, swirl: () => fakeEl("img", "tx-starting-swirl") });

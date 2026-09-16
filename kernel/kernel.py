@@ -63425,8 +63425,13 @@ class Handler(BaseHTTPRequestHandler):
                 _mark_views_dirty()
         elif msg and msg.get("type") == "createSession" and msg.get("name"):
             nm = str(msg["name"]).strip()
+            # the page's request id (round five, 2026-09-15), echoed on every direct reply to THIS create — a warn, the folder
+            # question, the namesake focus — so a page that has moved on to another create can tell a late answer apart
+            # (render.ts createReplyIsStale). An older page sends none, and then none is echoed: the replies are as they were.
+            rid = msg.get("rid")
+            _rid = {"rid": rid} if isinstance(rid, str) and 0 < len(rid) <= 80 else {}
             if not NAME_RE.match(nm):
-                client["send"](json.dumps({"type": "warn", "text": "session names use letters, digits, . _ - only."}))
+                client["send"](json.dumps({**_rid, "type": "warn", "text": "session names use letters, digits, . _ - only."}))
             else:
                 # the session dir is fixed at creation — validate now. mkdir: the user already saw the
                 # "that folder doesn't exist" dialog and chose to make it (see createDirMissing below).
@@ -63450,14 +63455,14 @@ class Handler(BaseHTTPRequestHandler):
                         # "Opening…" cue span for 30s over a session that was never going to exist (the user
                         # 2026-07-28). Everything else (a file in the way, an unreadable parent) has no
                         # second option, so it stays a plain warning.
-                        client["send"](json.dumps({"type": "createDirMissing", "name": nm,
+                        client["send"](json.dumps({**_rid, "type": "createDirMissing", "name": nm,
                                                    "dir": str(msg.get("dir") or ""), "status": st}))
                     else:
-                        client["send"](json.dumps({"type": "warn", "text": derr}))
+                        client["send"](json.dumps({**_rid, "type": "warn", "text": derr}))
                 elif perr or terr:
-                    client["send"](json.dumps({"type": "warn", "text": perr or terr}))
+                    client["send"](json.dumps({**_rid, "type": "warn", "text": perr or terr}))
                 elif nm in live:                 # already running → its tab is already up; just focus it
-                    _reveal_chat_for(client, {"type": "focus", "id": live[nm]})
+                    _reveal_chat_for(client, {**_rid, "type": "focus", "id": live[nm]})
                     _mark_views_dirty()          # pusher ships the tab; never a synchronous fleet build here
                     if ctags:
                         # the picker's Tags row is a PREFILL from the active tab, not an ask: applying it
@@ -63466,12 +63471,12 @@ class Handler(BaseHTTPRequestHandler):
                         # nor dropped quietly. (POST /new's existing:true arm differs on purpose: its
                         # `tags` is always an explicit `--in`, which re-asserts like model/effort.) Sent
                         # AFTER the focus so the client sees the running session first.
-                        client["send"](json.dumps({"type": "warn", "text":
+                        client["send"](json.dumps({**_rid, "type": "warn", "text":
                             '"%s" is already running; its tags were not changed — use the tab\'s Tags menu' % nm}))
                 elif _going_down():              # `romp down` in progress: the same refusal POST /new gives
-                    client["send"](json.dumps({"type": "warn", "text": GOING_DOWN_REFUSAL}))
+                    client["send"](json.dumps({**_rid, "type": "warn", "text": GOING_DOWN_REFUSAL}))
                 elif _thread_name_refusal(nm, _thread_names()):   # a thread's name (or unverifiable): never mint a namesake tab (T223)
-                    client["send"](json.dumps({"type": "warn", "text": _thread_name_refusal(nm, _thread_names())}))
+                    client["send"](json.dumps({**_rid, "type": "warn", "text": _thread_name_refusal(nm, _thread_names())}))
                 elif msg.get("backend") in (None, "", "sdk"):   # Claude Code via the Agent SDK (the default)
                     # _sdk_ready(), not _sdk(): the backend object exists even with the dependency
                     # missing, so the old check took it as a yes and created a session that could never
@@ -63489,13 +63494,13 @@ class Handler(BaseHTTPRequestHandler):
                             # a name taken or being registered since the live check above (the claim
                             # inside _create_sdk_session ruled): there is nothing to focus yet, so the
                             # refusal is said — never a second session under the name
-                            client["send"](json.dumps({"type": "warn", "text": extra.get("error") or "the session could not be created"}))
+                            client["send"](json.dumps({**_rid, "type": "warn", "text": extra.get("error") or "the session could not be created"}))
                         elif extra.get("tagError"):
-                            client["send"](json.dumps({"type": "warn", "text": "tagging the new session: %s" % extra["tagError"]}))
+                            client["send"](json.dumps({**_rid, "type": "warn", "text": "tagging the new session: %s" % extra["tagError"]}))
                     else:
                         # NEVER a silent fallback to another backend (the user asked for the SDK and got a
                         # mystery terminal session on a remote host without the venv, 2026-07-02). Say what's missing.
-                        client["send"](json.dumps({"type": "warn", "text": _sdk_setup_hint()}))
+                        client["send"](json.dumps({**_rid, "type": "warn", "text": _sdk_setup_hint()}))
                 elif msg.get("backend") == "codex":   # an OpenAI Codex thread (plans/codex-backend.md)
                     if _codex_ready():
                         try:
@@ -63509,28 +63514,28 @@ class Handler(BaseHTTPRequestHandler):
                             # a raising send must not erase the error from every record.
                             sys.stderr.write("codex create '%s' failed: %s\n" % (nm, e))
                             try:
-                                client["send"](json.dumps({"type": "warn",
+                                client["send"](json.dumps({**_rid, "type": "warn",
                                                            "text": "creating the Codex session "
                                                                    "failed: %s" % e}))
                             except Exception:
                                 pass
                         else:
                             if not _sid:   # a taken or in-flight name — the claim inside _create_codex_session ruled
-                                client["send"](json.dumps({"type": "warn", "text": extra.get("error")
+                                client["send"](json.dumps({**_rid, "type": "warn", "text": extra.get("error")
                                                            or "the Codex session could not be created — is the codex app-server running?"}))
                             elif extra.get("tagError"):
-                                client["send"](json.dumps({"type": "warn", "text": "tagging the new session: %s" % extra["tagError"]}))
+                                client["send"](json.dumps({**_rid, "type": "warn", "text": "tagging the new session: %s" % extra["tagError"]}))
                     else:
                         # same rule as SDK: the user asked for Codex — refuse loudly, never another
                         # backend's session. _codex_ready is False for a missing dep, a dead
                         # app-server, or a machine with no `codex login`.
                         be = _codex()
                         why = (getattr(be, "_client_err", "") or CODEX_SETUP_HINT) if be else CODEX_SETUP_HINT
-                        client["send"](json.dumps({"type": "warn", "text": why}))
+                        client["send"](json.dumps({**_rid, "type": "warn", "text": why}))
                 else:
                     # an unknown backend word is refused by name, never mapped to a backend the asker did
                     # not pick (the tmux backend left romp 2026-09-11)
-                    client["send"](json.dumps({"type": "warn", "text":
+                    client["send"](json.dumps({**_rid, "type": "warn", "text":
                         'unknown backend "%s": Claude Code ("sdk") or Codex ("codex")' % (msg.get("backend") or "")}))
         elif msg and msg.get("type") == "cancelCreate" and msg.get("name"):
             # The webview's "Opening…" cue was cancelled (the ✕/Esc/backdrop — the spawn hung/failed, or the

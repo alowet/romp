@@ -203,6 +203,20 @@ class CreateSessionDirFork(_Wire):
         self.addCleanup(setattr, km, "_create_sdk_session", self._real_sdk)
         self.addCleanup(setattr, km, "_sdk_ready", self._real_ready)
 
+    def test_every_reply_to_a_create_echoes_the_page_s_request_id(self):
+        # round five (2026-09-15): a page that has moved on to another create tells a slow host's late answer apart by the
+        # request id it sent (render.ts createReplyIsStale) — so the kernel echoes it on the folder question and on a warn
+        # alike; an older page sends none, and then none is echoed (its replies byte for byte as before)
+        target = os.path.join(self.tmp, "not", "yet")
+        r = self.send({"type": "createSession", "name": "web", "dir": target, "backend": "sdk", "rid": "c-req-1"})
+        self.assertEqual(r["type"], "createDirMissing"); self.assertEqual(r["rid"], "c-req-1", "the folder question names the request")
+        r = self.send({"type": "createSession", "name": "bad name", "dir": self.tmp, "backend": "sdk", "rid": "c-req-2"})
+        self.assertEqual(r["type"], "warn"); self.assertEqual(r["rid"], "c-req-2", "a refusal names the request")
+        r = self.send({"type": "createSession", "name": "web", "dir": target, "backend": "sdk"})
+        self.assertEqual(r["type"], "createDirMissing"); self.assertNotIn("rid", r, "an older page: no id sent, none echoed")
+        r = self.send({"type": "createSession", "name": "web", "dir": target, "backend": "sdk", "rid": "x" * 81})
+        self.assertNotIn("rid", r, "an id of an unexpected shape is not echoed")
+
     def test_a_missing_directory_asks_instead_of_warning_into_the_void(self):
         target = os.path.join(self.tmp, "not", "yet")
         r = self.send({"type": "createSession", "name": "web", "dir": target, "backend": "sdk"})

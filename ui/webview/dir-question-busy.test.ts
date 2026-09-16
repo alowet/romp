@@ -37,31 +37,44 @@ const VIEWER = C + "/agent/a1";
 const REQ = { name: "notes", backend: "sdk", dir: "/proj/not-there-yet", host: "" };
 const TYPED = "notes for a session whose folder is not there yet";
 
-type Hooks = { posts: Record<string, unknown>[]; sent: Record<string, unknown>[]; seq: string[]; confirms: string[]; pickers: number; persisted: number; timers: (() => void)[]; cleared: number };
-type State = { provisionalId: string | null; dirQuestionFor: string | null; failed: string[]; activeId: string | null; drafts: Record<string, string>; sessions: string[]; timer: boolean };
+type Hooks = { posts: Record<string, unknown>[]; sent: Record<string, unknown>[]; seq: string[]; confirms: string[]; pickers: number; persisted: number; timers: (() => void)[]; cleared: number; toasts: string[]; answered: (string | null)[] };
+type State = { provisionalId: string | null; dirQuestionFor: string | null; failed: string[]; activeId: string | null; drafts: Record<string, string>; sessions: string[]; timer: boolean; why: Record<string, string> };
 type Api = {
   startCreate: (req: typeof REQ, mkdir?: boolean) => void; onCreateDirMissing: (m: Record<string, unknown>) => void; closePicker: (abandon?: boolean) => void;
   openPicker: () => void; cancelProvisional: () => void; closeTabLocally: (id: string) => void;
+  onCreateWarn: (m: { text: string; rid?: unknown }) => void; showConfirm: (title: string, detail: string, buttons: { label: string; value: string }[], cb: (v: string | null) => void) => void;
   busy: () => boolean; answer: (v: string | null) => void; confirm: () => { title: string; buttons: string[]; key: string | null } | null;
+  overlays: () => number; clickButton: (label: string) => boolean; rid: () => string | null;
   type: (t: string) => void; composer: () => string; picker: () => { open: boolean; search: string; dir: string }; state: () => State;
 };
 
 function world(o: { activeId: string | null; mru: string[]; order: string[]; nextActive: string | null }): { api: Api; HOOKS: Hooks } {
-  const HOOKS: Hooks = { posts: [], sent: [], seq: [], confirms: [], pickers: 0, persisted: 0, timers: [], cleared: 0 };
+  const HOOKS: Hooks = { posts: [], sent: [], seq: [], confirms: [], pickers: 0, persisted: 0, timers: [], cleared: 0, toasts: [], answered: [] };
   const win = { parent: { postMessage(m: Record<string, unknown>) { HOOKS.posts.push(m); if (m.romp === "colBusy") HOOKS.seq.push("flip:" + m.busy); } } };
   const js = requireCjs("esbuild").transformSync(
     [lineOpt("columnBusy"), fn("syncColumnBusy"), fn("dropProvisional"), fn("openProvisional"), fn("cancelProvisional"), fn("failProvisional"),
-     fn("onCreateDirMissing"), fnOpt("dirWhy"), fnOpt("dismissDirPromptForPicker"), fn("closePicker"), fn("startCreate"), fn("closeConfirm"), fn("closeTabLocally")].join("\n"),
+     fn("onCreateDirMissing"), fnOpt("dirWhy"), fnOpt("dismissDirPromptForPicker"), fn("closePicker"), fn("startCreate"), fn("closeConfirm"), fn("closeTabLocally"),
+     fn("showConfirm"), fnOpt("onCreateWarn"), lineOpt("createReplyIsStale"), lineOpt("mintRid")].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
     const { provisionalName, mintProvisionalId, isProvisionalId, HOOKS } = W;
     let provisionalId = null, provisionalTags = [], pendingNewSession = null, provisionalTimer = undefined, dirQuestionFor = null, pendingCarry = "", dirQuestion = false;
-    let columnBusyTold = false, lastCreate = null, pickMode = false, activeId = W.activeId, confirmCb = null, confirmKey = null;
+    let columnBusyTold = false, lastCreate = null, pickMode = false, activeId = W.activeId, confirmCb = null, confirmKey = null, provisionalRid = null;
+    const failedWhy = new Map();
     const provisionalQueue = []; const failedProvisionals = new Set(); const drafts = new Map(); const pendingSent = new Map(); const sessions = new Map(); const closingTabs = new Map();
     const order = W.order.slice(); const mru = W.mru.slice();
     const PROVISIONAL_WAIT_MS = 90000;
     const EL = { "composer-input": { value: "", focus() {} }, picker: { style: { display: "none" } }, "picker-search": { value: "" }, "picker-dir": { value: "", focus() {}, select() {} } };
-    const document = { getElementById: (id) => EL[id] || null, removeEventListener() {} };
+    // a mini DOM for the REAL dialog (showConfirm / closeConfirm): elements with an id, children, listeners; #confirm found by walking the body
+    const mk = (tag, cls) => { const n = { tagName: tag, className: cls || "", id: "", textContent: "", children: [], parent: null, handlers: {}, dataset: {}, _key: undefined,
+      appendChild(c) { c.parent = n; n.children.push(c); return c; },
+      remove() { if (n.parent) { const i = n.parent.children.indexOf(n); if (i >= 0) n.parent.children.splice(i, 1); n.parent = null; } },
+      addEventListener(t, f) { (n.handlers[t] = n.handlers[t] || []).push(f); }, click() { (n.handlers.click || []).forEach((f) => f({ target: n })); },
+      get firstElementChild() { return n.children[0] || null; }, focus() {} }; return n; };
+    const body = mk("body", ""); const findId = (node, id) => { if (node.id === id) return node; for (const c of node.children) { const r = findId(c, id); if (r) return r; } return null; };
+    const document = { body, getElementById: (id) => EL[id] || findId(body, id), addEventListener() {}, removeEventListener() {} };
+    const el = (tag, cls) => mk(tag, cls);
+    const warnToast = (t) => { HOOKS.toasts.push(t); };
     const vscodeApi = { postMessage: (m) => { HOOKS.sent.push(m); } };
     const renderTabs = () => {}; const growComposer = () => {};
     // the real setActive swaps the box: the leaving tab's text to its draft, the arriving tab's draft into the box
@@ -69,9 +82,6 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
     // the HELD column: once the listed member is gone nothing is held here, so a dismissed tab leaves the box unbound (focusAfterDismiss); an ordinary column reselects (W.nextActive)
     const dismissSession = (id) => { sessions.delete(id); const i = order.indexOf(id); if (i >= 0) order.splice(i, 1); const j = mru.indexOf(id); if (j >= 0) mru.splice(j, 1); drafts.delete(id); if (activeId === id) activeId = W.nextActive; };
     const persistDrafts = () => { HOOKS.persisted++; HOOKS.seq.push("persist"); }; const loadComposerFor = () => {}; const stashActiveDraft = () => {};
-    let confirm = null;
-    // the real showConfirm's head (its body builds the dialog): a newer dialog cancels the older one FIRST, then remembers what the new one is about
-    const showConfirm = (title, detail, buttons, cb, key) => { closeConfirm(null); confirmCb = cb; confirmKey = key ?? null; confirm = { title, buttons: buttons.map((b) => b.value), key: key ?? null }; HOOKS.confirms.push(title); };
     const createDirPrompt = () => "the folder question"; const askDirComplete = () => {};
     // the real openPicker's first act (lifted), then the picker
     const openPicker = () => { if (typeof dismissDirPromptForPicker === "function") dismissDirPromptForPicker(); EL.picker.style.display = "block"; HOOKS.pickers++; };
@@ -79,14 +89,20 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
     const setTimeout = (f) => { HOOKS.timers.push(f); return HOOKS.timers.length; }; const clearTimeout = () => { HOOKS.cleared++; };
   `;
   const epilogue = `
+    const overlay = () => findId(body, "confirm");
     return {
-      startCreate, onCreateDirMissing, closePicker, openPicker, cancelProvisional, closeTabLocally,
+      startCreate, onCreateDirMissing, closePicker, openPicker, cancelProvisional, closeTabLocally, showConfirm,
+      onCreateWarn: (m) => { if (typeof onCreateWarn === "function") onCreateWarn(m); else { if (provisionalId) failProvisional(m.text); else warnToast(m.text); } },
       busy: () => (typeof columnBusy === "function" ? columnBusy() : (!!provisionalId || failedProvisionals.size > 0)),
-      answer: (v) => { closeConfirm(v); confirm = null; },
-      confirm: () => (confirmCb && confirm ? { title: confirm.title, buttons: confirm.buttons, key: confirm.key } : null),   // up only while the real closeConfirm has not run (it clears confirmCb)
+      answer: (v) => { closeConfirm(v); },
+      // the dialog up, read off the real overlay: its title, its buttons' labels, what it is about
+      confirm: () => { const o = overlay(); if (!o) return null; const box = o.children[0]; return { title: box.children[0].textContent, buttons: box.children[2].children.map((b) => b.textContent), key: confirmKey }; },
+      overlays: () => body.children.filter((c) => c.id === "confirm").length,
+      clickButton: (label) => { const o = overlay(); const b = o && o.children[0].children[2].children.find((x) => x.textContent === label); if (b) b.click(); return !!b; },
+      rid: () => provisionalRid,
       type: (t) => { EL["composer-input"].value = t; }, composer: () => EL["composer-input"].value,
       picker: () => ({ open: EL.picker.style.display !== "none", search: EL["picker-search"].value, dir: EL["picker-dir"].value }),
-      state: () => ({ provisionalId, dirQuestionFor, failed: [...failedProvisionals], activeId, drafts: Object.fromEntries(drafts), sessions: [...sessions.keys()], timer: provisionalTimer !== undefined }),
+      state: () => ({ provisionalId, dirQuestionFor, failed: [...failedProvisionals], activeId, drafts: Object.fromEntries(drafts), sessions: [...sessions.keys()], timer: provisionalTimer !== undefined, why: Object.fromEntries(failedWhy) }),
     };
   `;
   const make = new Function("W", "window", prelude + js + epilogue) as (w: unknown, win: unknown) => Api;
@@ -113,7 +129,7 @@ test("the folder question keeps the provisional TAB: its text in its box, the co
   assert.equal(st.provisionalId, id, "the tab stays: the create in flight"); assert.ok(st.sessions.includes(id)); assert.equal(st.activeId, id);
   assert.equal(w.api.composer(), TYPED, "its text where it was typed"); assert.deepEqual(st.drafts, {}, "carried nowhere");
   assert.equal(st.dirQuestionFor, id, "the question is this create's"); assert.equal(st.timer, false, "the kernel answered: the wait is the user's");
-  assert.deepEqual(w.api.confirm(), { title: "That folder isn't there", buttons: ["create", "edit"], key: "dir:" + id }, "the prompt, keyed to the create");
+  assert.deepEqual(w.api.confirm(), { title: "That folder isn't there", buttons: ["Create it and start", "Edit the path"], key: "dir:" + id }, "the prompt, keyed to the create (no request id on this reply: the tab's)");
   assert.equal(w.api.busy(), true); assert.equal(flips(w.HOOKS, false), 0, "no colBusy:false — a held column stands under the prompt");
 });
 
@@ -123,7 +139,7 @@ test("dismissed (Escape, the backdrop): a FAILED create — the text in its own 
   const st = w.api.state();
   assert.equal(st.provisionalId, null); assert.deepEqual(st.failed, [id], "a failed create now"); assert.equal(st.dirQuestionFor, null);
   assert.deepEqual(st.drafts, { [id]: TYPED }, "the text under the failed tab's own id and nowhere else"); assert.equal(w.api.composer(), TYPED); assert.equal(st.activeId, id, "shown, in place");
-  assert.ok(w.HOOKS.confirms.includes("Couldn't start notes"), "said, as for any failed create");
+  assert.equal(w.api.confirm()?.title, "Couldn't start notes", "said, as for any failed create"); assert.equal(w.api.overlays(), 1);
   assert.equal(w.api.busy(), true, "busy: the failed tab holds the text"); assert.equal(flips(w.HOOKS, false), 0);
   w.api.closeTabLocally(id);   // the user's ✕: the one discard
   assert.deepEqual(w.api.state().failed, []); assert.deepEqual(w.api.state().drafts, {});
@@ -174,14 +190,15 @@ test("the picker opened OVER the prompt (Mod+Shift+O) dismisses it first, quietl
   const { w, id: id1 } = asked();
   w.api.openPicker();
   assert.deepEqual(w.api.state().failed, [id1], "the first create: a failed tab, its text kept"); assert.deepEqual(w.api.state().drafts, { [id1]: TYPED });
-  assert.equal(w.HOOKS.confirms.filter((t) => t.startsWith("Couldn't start")).length, 0, "quietly: the picker the user asked for is the foreground"); assert.equal(w.api.confirm(), null);
+  assert.equal(w.api.overlays(), 0, "quietly: no dialog — the picker the user asked for is the foreground"); assert.equal(w.api.confirm(), null);
+  assert.match(w.api.state().why[id1] || "", /^That folder isn't there/, "…the tab's own placeholder says why");
   assert.equal(w.api.picker().open, true); assert.equal(w.api.busy(), true); assert.equal(flips(w.HOOKS, false), 0);
   w.api.startCreate({ ...REQ, name: "notes-2", dir: "/proj/also-missing" });
   const id2 = w.api.state().provisionalId!;
   assert.ok(id2 && id2 !== id1, "a second create, its own tab"); assert.equal(w.api.composer(), "", "nothing carried: the first create's text stays in its failed tab");
   w.api.type("the second note");
   w.api.onCreateDirMissing({ name: "notes-2", dir: "/proj/also-missing", status: { canCreate: true } });
-  assert.deepEqual(w.api.confirm(), { title: "That folder isn't there", buttons: ["create", "edit"], key: "dir:" + id2 }, "the second question, keyed to the second create");
+  assert.deepEqual(w.api.confirm(), { title: "That folder isn't there", buttons: ["Create it and start", "Edit the path"], key: "dir:" + id2 }, "the second question, keyed to the second create");
   assert.equal(w.api.state().provisionalId, id2); assert.deepEqual(w.api.state().failed, [id1]); assert.equal(w.api.busy(), true); assert.equal(flips(w.HOOKS, false), 0, "busy throughout");
   w.api.answer(null);
   assert.deepEqual(w.api.state().failed, [id1, id2]); assert.deepEqual(w.api.state().drafts, { [id1]: TYPED, [id2]: "the second note" });
@@ -198,6 +215,53 @@ test("an older prompt a newer create's dialog cancels settles nothing: the secon
   assert.ok(id2 !== id1); assert.equal(w.api.composer(), TYPED, "the superseded create's text, in the new tab's box"); assert.deepEqual(w.api.state().failed, []);
   w.api.onCreateDirMissing({ name: "notes-2", dir: "/proj/also-missing", status: { canCreate: true } });   // its dialog cancels the first prompt first
   assert.equal(w.api.state().provisionalId, id2, "the first prompt's cancel settled nothing"); assert.deepEqual(w.api.state().failed, []); assert.equal(w.api.state().dirQuestionFor, id2);
-  assert.deepEqual(w.api.confirm(), { title: "That folder isn't there", buttons: ["create", "edit"], key: "dir:" + id2 });
+  assert.deepEqual(w.api.confirm(), { title: "That folder isn't there", buttons: ["Create it and start", "Edit the path"], key: "dir:" + id2 });
   assert.equal(w.api.busy(), true); assert.equal(flips(w.HOOKS, false), 0);
+});
+
+test("round five: a create's request id rides the request; a late reply naming a superseded create is ignored, the current create untouched", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null });
+  w.api.startCreate(REQ);
+  const sentA = w.HOOKS.sent.filter((m) => m.type === "createSession")[0];
+  assert.equal(typeof sentA.rid, "string", "every attempt carries a request id"); assert.equal(w.api.rid(), sentA.rid, "the pending tab waits on it");
+  const idA = w.api.state().provisionalId!;
+  w.api.type("for A, on a slow host");
+  w.api.openPicker(); w.api.startCreate({ ...REQ, name: "notes-b", dir: "/proj/also-not-there" });   // A superseded before its host answered (its text comes along)
+  const idB = w.api.state().provisionalId!, sentB = w.HOOKS.sent.filter((m) => m.type === "createSession")[1];
+  assert.ok(idB !== idA); assert.equal(w.api.rid(), sentB.rid); assert.notEqual(sentB.rid, sentA.rid);
+  // A's late folder question: nobody's — no prompt over B, B still pending with its backstop, no question pending
+  w.api.onCreateDirMissing({ name: REQ.name, dir: REQ.dir, status: { canCreate: true }, rid: sentA.rid });
+  assert.equal(w.api.overlays(), 0, "ignored"); assert.equal(w.api.state().dirQuestionFor, null); assert.equal(w.api.state().provisionalId, idB); assert.equal(w.api.state().timer, true);
+  // A's late refusal: nobody's either — B is not failed, nothing toasted
+  w.api.onCreateWarn({ text: "the host refused A", rid: sentA.rid });
+  assert.equal(w.api.state().provisionalId, idB); assert.deepEqual(w.api.state().failed, []); assert.deepEqual(w.HOOKS.toasts, []); assert.equal(flips(w.HOOKS, false), 0);
+  // B's own question: B's prompt, keyed to B's request
+  w.api.onCreateDirMissing({ name: "notes-b", dir: "/proj/also-not-there", status: { canCreate: true }, rid: sentB.rid });
+  assert.deepEqual(w.api.confirm(), { title: "That folder isn't there", buttons: ["Create it and start", "Edit the path"], key: "dir:" + sentB.rid }); assert.equal(w.api.state().dirQuestionFor, idB);
+  // …and after the retry (a new request id) A's — or the first attempt's — late question is stale too
+  w.api.answer("create");
+  const sentB2 = w.HOOKS.sent.filter((m) => m.type === "createSession")[2];
+  assert.notEqual(sentB2.rid, sentB.rid); assert.equal(w.api.rid(), sentB2.rid); assert.equal(sentB2.mkdir, true);
+  w.api.onCreateDirMissing({ name: "notes-b", dir: "/proj/also-not-there", status: { canCreate: true }, rid: sentB.rid });
+  assert.equal(w.api.overlays(), 0, "the first attempt's late question: ignored"); assert.equal(w.api.state().dirQuestionFor, null);
+});
+
+test("round five: a reply WITHOUT a request id (an older kernel) is read as today — the current create's", () => {
+  const { w, id } = asked();
+  assert.equal(w.api.overlays(), 1, "the folder question landed though it named no request");
+  w.api.answer("create");
+  w.api.onCreateWarn({ text: "the kernel said no" });   // no rid: the current create's verdict
+  assert.deepEqual(w.api.state().failed, [id]); assert.equal(w.api.state().why[id], "the kernel said no");
+});
+
+test("round five: an unrelated dialog replacing the folder question leaves ONE #confirm — the newer, working on its first click — and the create is a failed tab with its text, its reason on the tab", () => {
+  const { w, id } = asked();
+  assert.equal(w.api.overlays(), 1);
+  let delivered = null;
+  w.api.showConfirm("That action was not delivered", "the kernel could not take it", [{ label: "Dismiss", value: "ok" }], (v) => { delivered = v; });
+  assert.equal(w.api.overlays(), 1, "never two #confirm"); assert.equal(w.api.confirm()?.title, "That action was not delivered", "the newer dialog is the one up");
+  assert.deepEqual(w.api.state().failed, [id], "the folder question's create: a failed tab"); assert.deepEqual(w.api.state().drafts, { [id]: TYPED }, "its text kept");
+  assert.match(w.api.state().why[id] || "", /^That folder isn't there/, "the reason on the tab, not in a second dialog"); assert.equal(w.api.busy(), true); assert.equal(flips(w.HOOKS, false), 0);
+  assert.equal(w.api.clickButton("Dismiss"), true);
+  assert.equal(delivered, "ok", "the visible dialog's own callback ran on the first click"); assert.equal(w.api.overlays(), 0, "…and it is gone"); assert.equal(w.api.confirm(), null);
 });

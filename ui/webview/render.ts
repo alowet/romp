@@ -8119,6 +8119,16 @@ let provisionalTimer: ReturnType<typeof setTimeout> | undefined;
 // user's ✕ the one discard, exactly a failed create. (Rounds one to three carried the text in a document-local variable
 // keyed to no session: a held column's close could not hand it anywhere, and its fallbacks put it in other sessions' drafts.)
 let dirQuestionFor: string | null = null;
+// …and WHICH request the pending provisional is waiting on (round five, 2026-09-15): every create attempt carries a request id
+// the kernel echoes on each of its direct replies — the folder question, a warn, the namesake focus — so a reply to a create
+// the user has since superseded (a slow host's late answer, after a second create opened) is told apart and ignored, instead
+// of being read against whatever tab is current. A reply WITHOUT one (an older kernel) is read as today: the current create's.
+let provisionalRid: string | null = null;
+function mintRid(): string { return "c-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
+function createReplyIsStale(m: { rid?: unknown }): boolean { return typeof m.rid === "string" && m.rid !== provisionalRid; }
+// the reason a create failed, by its failed tab (failProvisional): the tab's own placeholder shows it, so a failure said
+// quietly (the picker opened over its prompt, an unrelated dialog replacing it) is still explained where the text is
+const failedWhy = new Map<string, string>();
 // Provisional tabs whose create FAILED (the user 2026-08-08): the tab — and whatever was typed into
 // it — STAYS, foregrounded, with the failure dialog on top. It used to be torn down and the held text
 // dumped into whichever tab happened to be active, polluting an unrelated thread's draft. The set keys
@@ -8160,12 +8170,13 @@ function syncColumnBusy(): void {
   try { if (window.parent && window.parent !== window) window.parent.postMessage({ romp: "colBusy", busy }, "*"); } catch (e) { /* no shell */ }
 }
 
-function openProvisional(req: CreateReq): void {
+function openProvisional(req: CreateReq, rid: string | null = null): void {
   const prev = dropProvisional();          // never two at once: a second create supersedes the first — and takes its text (below)
   const display = provisionalName(req.host, req.name);
   pendingNewSession = display;
   const id = mintProvisionalId(Date.now().toString(36) + Math.random().toString(36).slice(2));
   provisionalId = id;
+  provisionalRid = rid;                    // the request this tab waits on: its replies carry it back
   syncColumnBusy();                        // this column is busy now: the shell holds a peer's drop of it until the create settles
   provisionalTags = req.tags?.slice() ?? [];   // the strip sections it under each of these from the first paint
   // state "opening", NOT "working": updateStatusline renders the working chip with an elapsed timer off
@@ -8193,6 +8204,7 @@ function openProvisional(req: CreateReq): void {
 function dropProvisional(): { queued: string[]; draft: string } {
   const id = provisionalId;
   provisionalId = null;
+  provisionalRid = null;                   // no request pending: a late reply to it is nobody's
   dirQuestionFor = null;                   // whatever question that create had is over with it
   provisionalTags = [];
   pendingNewSession = null;
@@ -8261,6 +8273,8 @@ function failProvisional(why: string, quiet = false): void {
   if (!provisionalId) return;
   const id = provisionalId;
   dirQuestionFor = null;             // whatever question it had is over: the tab is a failed create now
+  provisionalRid = null;             // …and no request is pending for it
+  failedWhy.set(id, why);            // the tab's placeholder says why, dialog or no dialog
   const name = pendingNewSession || "that session";
   // retire the create MACHINERY only — dropProvisional() would dismiss the tab too
   provisionalId = null;
@@ -8868,13 +8882,15 @@ let lastCreate: CreateReq | null = null;
 function startCreate(req: CreateReq, mkdir = false): void {
   lastCreate = req;
   rememberDir(req.host, req.dir);   // what you used on that machine is the right prefill for it next time
-  if (vscodeApi) vscodeApi.postMessage({ type: "createSession", ...req, ...(mkdir ? { mkdir: true } : {}) });
+  const rid = mintRid();   // this attempt's request id: the kernel echoes it on every reply to it (createReplyIsStale)
+  if (vscodeApi) vscodeApi.postMessage({ type: "createSession", ...req, rid, ...(mkdir ? { mkdir: true } : {}) });
   closePicker(false);   // a create from the picker RETRIES a pending folder question, never dismisses it (closePicker)
   // the folder question's retry — "Create it and start", or the same name created again from the picker "Edit the path"
   // reopened: ONE tab, one create. The pending tab stays, its box untouched; the kernel's answer lands on it as on any
   // create (adoptsProvisional matches the name), and the backstop is armed again
   if (provisionalId && dirQuestionFor === provisionalId && pendingNewSession === provisionalName(req.host, req.name)) {
     dirQuestionFor = null;
+    provisionalRid = rid;   // the tab waits on the retry now: the first attempt's late replies are stale
     provisionalTags = req.tags?.slice() ?? [];
     if (provisionalTimer) clearTimeout(provisionalTimer);
     provisionalTimer = setTimeout(() => failProvisional("romp asked to start it, but nothing came back."), PROVISIONAL_WAIT_MS);
@@ -8883,7 +8899,7 @@ function startCreate(req: CreateReq, mkdir = false): void {
   }
   // …and the tab is THERE, with a live composer, before the kernel has answered. A remote session's tab
   // arrives host-prefixed, so that is the name the provisional one is matched against on arrival.
-  openProvisional(req);
+  openProvisional(req, rid);
 }
 
 function onCreateDirMissing(m: any): void {
@@ -8891,11 +8907,12 @@ function onCreateDirMissing(m: any): void {
   // typed, and the tab is the create still in flight (see dirQuestionFor). The kernel has answered, so the backstop stands
   // down: the wait is the user's now. The prompt is bound to THIS create (its key names the tab), so an answer to an older
   // prompt can never settle a newer create, and the picker opened over it dismisses it as its own create's (openPicker).
+  if (createReplyIsStale(m)) return;   // a create the user has since superseded: its late question is nobody's (round five)
   const id = provisionalId;
   if (!id) return;   // no create pending here: answered elsewhere, or settled already
   if (provisionalTimer) { clearTimeout(provisionalTimer); provisionalTimer = undefined; }
   dirQuestionFor = id;
-  const req = lastCreate, missing = String(m.dir || "");
+  const req = lastCreate, missing = String(m.dir || ""), key = "dir:" + (typeof m.rid === "string" ? m.rid : id);   // keyed to the request, so two attempts' questions never share a key
   showConfirm("That folder isn't there",
     createDirPrompt(String(m.name), (m.status || null) as DirStatus | null, missing),
     [{ label: "Create it and start", value: "create" }, { label: "Edit the path", value: "edit" }],
@@ -8912,10 +8929,18 @@ function onCreateDirMissing(m: any): void {
         if (dir) { dir.value = req.dir; dir.focus(); dir.select(); askDirComplete(dir.value); }
         return;
       }
-      // dismissed — Escape, the backdrop, a newer dialog (null), the picker opened over it ("picker"), or nothing to retry: a
-      // failed create, its text kept in its box until the user's ✕; quietly when the picker is what the user asked for
-      failProvisional(dirWhy(missing), v === "picker");
-    }, "dir:" + id);
+      // dismissed — Escape, the backdrop (null), the picker opened over it ("picker"), an unrelated dialog replacing it
+      // ("replaced"), or nothing to retry: a failed create, its text kept in its box until the user's ✕; quietly when another
+      // surface is the foreground — the tab's own placeholder says why (failedWhy), never a second dialog under the first
+      failProvisional(dirWhy(missing), v === "picker" || v === "replaced");
+    }, key);
+}
+// A warn arriving while a create is in flight IS that create's verdict (a name the kernel won't take, an unreadable
+// parent, the SDK setup hint): a dialog naming the reason, the tab a failed one — a toast would slide past the one moment
+// it needed to be read. Unless it answers a create the user has since superseded (its rid names the old request): ignored.
+function onCreateWarn(m: { text: string; rid?: unknown }): void {
+  if (createReplyIsStale(m)) return;
+  if (provisionalId) failProvisional(m.text); else warnToast(m.text);
 }
 // the reason a dismissed folder question leaves on its failed tab (the dialog adds where the text is, as for any failed create)
 function dirWhy(dir: string): string {
@@ -9341,7 +9366,15 @@ function reviveFailedLocal(id: string, name: string, text: string) {
 let confirmCb: ((v: string | null) => void) | null = null;
 let confirmKey: string | null = null;   // what the dialog up is about, for a caller that must know (the folder question: "dir:<provisional id>"); null for the rest
 function showConfirm(title: string, detail: string, buttons: Array<{ label: string; value: string; danger?: boolean }>, cb: (v: string | null) => void, key?: string) {
-  closeConfirm(null);   // a newer dialog replaces (and cancels) an older one — whose callback checks the cancel is still about its own create (onCreateDirMissing)
+  // a newer dialog replaces (and cancels) an older one. A folder question is told so ("replaced"): its callback then fails
+  // the create QUIETLY — a dialog of its own here would be a second #confirm under this one, whose first click closed the
+  // wrong overlay (round five, 2026-09-15). Every other dialog's callback sees null, as it always did.
+  closeConfirm(confirmKey !== null && confirmKey.indexOf("dir:") === 0 ? "replaced" : null);
+  // …and whatever a callback may have put up meanwhile goes too: there is never a second #confirm (the pin)
+  for (let stale = document.getElementById("confirm"); stale; stale = document.getElementById("confirm")) {
+    const k = (stale as any)._key; if (k) document.removeEventListener("keydown", k, true);
+    stale.remove();
+  }
   confirmCb = cb;
   confirmKey = key ?? null;
   const overlay = el("div", "picker-overlay confirm-overlay"); overlay.id = "confirm";
@@ -12145,14 +12178,14 @@ function syncViewInner(id: string, atBottom?: boolean): View {
     // error sentence, the stall past the wait, or "written nothing yet"; a starting tab's loader to the couldn't-start
     // notice (its create failed); the same kind twice is left alone (no churn on repeated pushes that stay empty).
     const kind = placeholderKind({ sub: s.sub, failedRevive: failedRevives.get(id) || null,
-                                   provisional: isProvisionalId(id), provisionalFailed: failedProvisionals.has(id) });
+                                   provisional: isProvisionalId(id), provisionalFailed: failedProvisionals.has(id) });   // (its reason: failedWhy, below)
     if (!only || !only.classList?.contains("tx-empty") || !placeholderStands(only, kind)) {
       while (v.el.firstChild) v.el.removeChild(v.el.firstChild);
       const ph = el("div", "tx-empty"); v.el.appendChild(ph);
       fillPlaceholder(ph, kind, {
         el, loader: rompLoaderInner, button: () => document.createElement("button"), br: () => document.createElement("br"),
         swirl: () => { const sw = el("img", "tx-starting-swirl") as HTMLImageElement; sw.src = mediaSrc("romp-swirl-glyph.svg"); sw.alt = ""; sw.onerror = () => sw.remove(); return sw; },
-        text: { error: s.sub?.error, failedRevive: failedRevives.get(id), stall: subagentStallText(), sessionName: s.name },
+        text: { error: s.sub?.error, failedRevive: failedRevives.get(id), stall: subagentStallText(), sessionName: s.name, startFailed: failedWhy.get(id) ?? null },
         onRetry: () => askSubagent(id),
       });
     }
@@ -18127,7 +18160,7 @@ function closeTabLocally(id: string): void {
   // (and the kernel never knew the id): its ✕ is a plain local discard — tab, draft, and all.
   if (isProvisionalId(id)) {
     if (id === provisionalId) cancelProvisional();
-    else { failedProvisionals.delete(id); dismissSession(id, "close"); syncColumnBusy(); }   // the text went with the discard: a held drop of this column applies now
+    else { failedProvisionals.delete(id); failedWhy.delete(id); dismissSession(id, "close"); syncColumnBusy(); }   // the text went with the discard: a held drop of this column applies now
     return;
   }
   dismissSession(id, "close");
@@ -18539,12 +18572,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     notifyShell("refused", m.text, typeof m.sid === "string" ? m.sid : "");
     warnToast(m.text);
   }
-  else if (m.type === "warn" && typeof m.text === "string" && m.text) {
-    // A warn arriving while a create is in flight IS that create's verdict (a name the kernel won't take,
-    // an unreadable parent, the SDK setup hint). It gets a dialog naming the reason and takes the
-    // provisional tab down with it; a toast would slide past the one moment it needed to be read.
-    if (provisionalId) failProvisional(m.text); else warnToast(m.text);
-  }
+  else if (m.type === "warn" && typeof m.text === "string" && m.text) onCreateWarn(m);   // a create's verdict while one is in flight (onCreateWarn), else a toast
   else if (m.type === "spendCeiling" && typeof m.text === "string" && m.text) {
     // the spend guard's word (T350): a session crossed the hourly spend ceiling, or fell back under it. Its OWN type,
     // never `warn`: a warn arriving while a create is in flight is read above as that create's verdict, and this

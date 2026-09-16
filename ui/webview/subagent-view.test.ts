@@ -224,7 +224,7 @@ test("frames: events replace in place through appendActive (the chat's scroll ru
   assert.match(PLACEHOLDER, /if \(st\.sub\.error\) return "sub-error";[\s\S]{0,200}?if \(!st\.sub\.loaded\) return "sub-loading";/);
   assert.match(PLACEHOLDER, /case "sub-error":[\s\S]{0,200}?ph\.textContent = ctx\.text\.error \|\| "";/);
   assert.match(PLACEHOLDER, /case "sub-loading":[\s\S]{0,300}?ph\.appendChild\(ctx\.loader\("opening the agent's transcript…"\)\);/);
-  assert.match(RENDER, /text: \{ error: s\.sub\?\.error, failedRevive: failedRevives\.get\(id\), stall: subagentStallText\(\), sessionName: s\.name \},/);
+  assert.match(RENDER, /text: \{ error: s\.sub\?\.error, failedRevive: failedRevives\.get\(id\), stall: subagentStallText\(\), sessionName: s\.name, startFailed: failedWhy\.get\(id\) \?\? null \},/);
   assert.match(RENDER, /el, loader: rompLoaderInner, button: \(\) => document\.createElement\("button"\)/);
   // file/preview URLs bake the PARENT's id for a viewer
   assert.match(RENDER, /const subOf = subParts\(id\);\s*\n\s*if \(subOf\) renderingOwnerSid = subOf\.parentId;/);
