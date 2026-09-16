@@ -15,7 +15,7 @@ const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview"
 const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
 
 test("a send with ships in flight is gated by the confirm: send-without is explicit, wait is the default", () => {
-  assert.match(RENDER, /const shipping = \(pendingShips\.get\(activeId\) \|\| \[\]\)\.length;/,
+  assert.match(RENDER, /const shipping = composerShips\(activeId\)\.length;/,
     "the send path finally consults the in-flight list");
   assert.match(RENDER, /if \(shipping && !opts\?\.pastShipGate\) \{/);
   assert.match(RENDER, /\{ label: "Wait for the upload", value: "wait" \}/);
@@ -26,8 +26,8 @@ test("a send with ships in flight is gated by the confirm: send-without is expli
 });
 
 test("the held send fires on the LAST ack — event-based — and a nack cancels it loudly", () => {
-  assert.match(RENDER, /if \(owner && \(sendOnShip\.has\(owner\) \|\| gateOpen\) && !\(pendingShips\.get\(owner\) \|\| \[\]\)\.length\) \{/,
-    "the deciding event is the last pending ship retiring — for a held send AND an open gate dialog");
+  assert.match(RENDER, /if \(owner && \(sendOnShip\.has\(owner\) \|\| gateOpen\) && !composerShips\(owner\)\.length\) \{/,
+    "the deciding event is the last of the COMPOSER's pending ships retiring — for a held send AND an open gate dialog (a comment's upload is none of it, round thirteen)");
   assert.match(RENDER, /if \(owner === activeId\) fireHeldSend\(\);/);
   assert.match(RENDER, /if \(owner === activeId\) fireHeldSend\(\);\n\s*else sendHeldFor\(owner\);/,
     "a held send whose tab is not shown here goes BY SID from this document (round eleven): the ack rides this socket, so a held column whose create resolved to a session shown elsewhere sends from here");

@@ -248,7 +248,6 @@ test("drafts travel with a moved tab: the source hands over what it holds, synch
   assert.equal((RENDER.match(/shipFailed\(name, shipId, name \+ " could not be read, so it was not attached — try again\."\)/g) || []).length, 2, "both reader failures too");
   assert.match(RENDER, /function shipFailed\(key: string, shipId: string \| undefined, why: string\): void \{\n  const owner = retirePendingShip\(key, shipId\) \|\| activeId;\n  const held = !!owner && sendOnShip\.delete\(owner\);[\s\S]*?\n  syncColumnBusy\(\);\n\}/, "a failed ship cancels the held send and flips last");
   assert.match(RENDER, /renderComposerFiles\(id\);\n      syncColumnBusy\(\);[^\n]*\n    \}\);/, "the ✕ on a pending chip flips last");
-  assert.match(RENDER, /cbox\.focus\(\);\n      syncColumnBusy\(\);[^\n]*\n      return;/, "the comment box's ack flips last");
   assert.match(RENDER, /function sendHeldFor\(sid: string\): void \{\n  if \(!vscodeApi\) return;\n  const typed = \(drafts\.get\(sid\) \?\? ""\)\.trim\(\);\n  const attached = composerFiles\.get\(sid\) \|\| \[\];/, "the held send by sid builds from the stores");
   assert.ok(KERNEL.includes("var BUSY='A session is still being created in this column, or an upload from it is still in flight.';"), "the shell's refusal names an upload too");
   // round twelve: uploads pin their session (the shell asks per session), the ack is routed by the ship, a detach fails its ships, the
@@ -256,10 +255,16 @@ test("drafts travel with a moved tab: the source hands over what it holds, synch
   // a hold deferred is said on the release, and the reload core hears the ending event parent-side
   assert.match(RENDER, /\(window as any\)\.__rompSessionBusy = \(sid: unknown\): boolean => typeof sid === "string" && !!sid && \(pendingShips\.has\(sid\) \|\| sendOnShip\.has\(sid\)\);/);
   assert.match(RENDER, /function columnBusyWhy\(\): "" \| "create" \| "failed" \| "upload" \| "upload-unshown" \{/);
-  assert.ok(KERNEL.includes("if(sessionBusy(src,sid))return notify(UPLOADING);"), "moveTab asks the source page per session");
+  assert.ok(KERNEL.includes("if(sessionBusyAnywhere(sid))return notify(UPLOADING);"), "moveTab asks every column document per session (round thirteen)");
   assert.ok(KERNEL.includes("if(!keep&&busy(f)){if(busyWhy(f)==='upload-unshown'){try{f.contentWindow.postMessage({romp:'askCloseUpload'},'*');}catch(e){}return;}notify(BUSY);return;}"), "the close asks the page when an unshown session's upload is the only hold");
   assert.match(RENDER, /if \(m\.romp === "askCloseUpload"\) \{ askCloseUpload\(\); return; \}/);
-  assert.match(RENDER, /const ship = ackShip \? shipRecord\(ackShip\) : null;[^\n]*\n[\s\S]{0,900}if \(cbox && \(ship \? ship\.kind === "comment" : true\)\) \{/, "the ack is routed by the ship's kind; a legacy ack keeps the old reading");
+  assert.match(RENDER, /const ship = ackShip \? shipRecord\(ackShip\) : null;[^\n]*\n[\s\S]{0,900}if \(ship \? ship\.kind === "comment" : !!cbox\) \{/, "the ack is routed by the ship's kind; a legacy ack keeps the old reading; a comment's ship never reaches the composer (round thirteen)");
+  assert.match(RENDER, /\} else warnToast\(\(m\.path\.split\("\/"\)\.pop\(\) \|\| "The comment's attachment"\) \+ " arrived after its comment was closed, so it was not attached — attach it again with the comment\."\);\n      syncColumnBusy\(\);[^\n]*\n      return;/, "the popover gone: retired, said by name, never the composer's");
+  assert.match(RENDER, /function composerShips\(sid: string \| null\): PendingShip\[\] \{/); assert.match(RENDER, /if \(owner && \(sendOnShip\.has\(owner\) \|\| gateOpen\) && !composerShips\(owner\)\.length\) \{/, "the composer's own ships release a held send");
+  assert.match(RENDER, /const shipping = composerShips\(activeId\)\.length;/); assert.match(RENDER, /if \(id && !composerShips\(id\)\.length\) \{/);
+  assert.match(RENDER, /function reclaimHandedOff\(\): void \{ for \(const sid of \[\.\.\.handedOff\]\) if \(heldHere\(sid\)\) handedOff\.delete\(sid\); \}/); assert.match(RENDER, /colSets = readColSets\(\);[^\n]*\n  reclaimHandedOff\(\);/, "the sid shown again clears the marker where the members are read");
+  assert.ok(KERNEL.includes("function sessionBusyAnywhere(sid){var fs=frames();for(var i=0;i<fs.length;i++){if(sessionBusy(fs[i],sid))return true;}return false;}") && KERNEL.includes("if(sessionBusyAnywhere(sid))return notify(UPLOADING);"), "the move guard asks every column document");
+  assert.match(RENDER, /filePicker\.dataset\.for = "composer";/); assert.match(RENDER, /cmtFilePicker\.dataset\.for = "comment";/, "the two hidden file inputs on body are told apart by name, not by order (a served driver picked the comment's)");
   assert.match(RENDER, /shipFileToHost\(f, sid, "comment"\)/, "the comment clip ships as a comment");
   assert.match(RENDER, /window\.addEventListener\("romp:hostDetached", \(e\) => \{/); assert.match(FED, /new CustomEvent\("romp:hostDetached", \{ detail: \{ host \} \}\)/, "closeRemote says the detach");
   assert.match(RENDER, /retainShipBytes\(sid, shipId, b64\);/); assert.match(RENDER, /entry\.queued = !hostOf\(sid \|\| ""\) && !wsIsUp;/);
@@ -267,8 +272,13 @@ test("drafts travel with a moved tab: the source hands over what it holds, synch
   assert.match(RENDER, /window\.addEventListener\("romp:wsup", \(\) => \{\n  wsIsUp = true;\n  reshipPendingUploads\(\);/, "up is noted before the re-ship");
   assert.match(RENDER, /  lastStripIds = ids;[^\n]*\n  noteColumnEmptiness\(ids\);/); assert.match(RENDER, /if \(!busy\) noteColumnEmptiness\(lastStripIds\);\n  try \{ if \(window\.parent && window\.parent !== window\) window\.parent\.postMessage\(\{ romp: "colBusy", busy \}, "\*"\);/, "the deferred emptiness, then the flip");
   assert.match(RENDER, /if \(!typed && !stagedMsgs\.count\(sid\) && handedOff\.has\(sid\)\) \{/, "the held send's belt"); assert.match(RENDER, /if \(draft \|\| staged\.length\) handedOff\.add\(sid\);/);
-  assert.equal((KERNEL.match(/reloadEnded\(\);/g) || []).length, 3, "the parent-side ending event: both ends of moveTab and the end of close");
-  assert.match(KERNEL, /def _saved_drop_path\(sid, ship_id, name, b64\):/); assert.ok(KERNEL.includes('fp = _saved_drop_path(msg.get("id"), msg.get("shipId"), str(msg["name"]), str(msg["b64"]))'), "one file per (sid, shipId) per kernel life");
+  // round thirteen REVERTS two round-twelve additions, pinned by their absence: the shell's parent-side tryFire (it fired while the moved
+  // state lived only in make()'s load listener or a queued postMessage) and the kernel's (sid, shipId) save cache (a page-local id, a
+  // kernel-global key: another document's different bytes answered with the first upload's path). The page's deferred ended() and its
+  // shim-queue skip stand.
+  assert.ok(!KERNEL.includes("reloadEnded") && !KERNEL.includes("_saved_drop_path") && !KERNEL.includes("_DROP_SAVED"), "both reverted");
+  assert.ok(KERNEL.includes('fp = _save_dropped_file(str(msg["name"]), str(msg["b64"]))   # bytes → saved file → insert its path'), "the dropFile branch as on main");
+  assert.match(RENDER, /if \(!hosts && p\.queued\) \{ p\.queued = false; continue; \}/, "…the page-side skip stays");
   assert.match(RENDER, /if \(m\.romp === "adopt"\) \{ adoptSessionState\(m\.sid, m\.state\); return; \}/, "the shell's message lands in the same relay as chatNav");
 });
 

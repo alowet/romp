@@ -56,6 +56,7 @@ type Api = {
   // round twelve: the shell's session question and the column's reason, the close question, a mini comment box, the strip as last seen, a host detach, the local socket's edges
   sessionBusy: (sid: string) => boolean; busyWhy: () => string; askClose: () => void; openComment: (text: string) => void; comment: () => string | null; closeComment: () => void;
   strip: (ids: string[]) => void; detach: (host: string) => void; wsdown: () => void; wsup: () => void;
+  setSets: (sets: Record<string, string[]>) => void; reclaim: () => void;   // round thirteen: the shell's sets as they stand, and renderTabs's reclaim of the handed-off marker
   held: { stage: (id: string, text: string, cites?: unknown[]) => void; cite: (id: string, chips?: unknown[]) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown>; drafts: () => Record<string, string> };
   busy: () => boolean; answer: (v: string | null) => void; confirm: () => { title: string; buttons: string[]; key: string | null } | null;
   overlays: () => number; clickButton: (label: string) => boolean; rid: () => string | null;
@@ -86,6 +87,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
      fnOpt("mergeCitations"), fn("addPendingShip"), fn("shipSafeName"), fn("shipOwner"), fn("retirePendingShip"), fn("endReloadHoldIfIdle"), fn("addComposerFile"), fn("adoptSessionState"), TAKE, ON_DROPPED,
      fnOpt("shipFailed"), fnOpt("sendHeldFor"), fn("flushStaged"), fn("routeUserMessage"), fn("noteOrphanState"),
      fnOpt("shipRecord"), fnOpt("retainShipBytes"), fnOpt("failShipsOfHost"), fnOpt("columnBusyWhy"), fnOpt("askCloseUpload"), fnOpt("abandonPendingUploads"), fn("reshipPendingUploads"), fn("noteColumnEmptiness"),
+     fnOpt("composerShips"), lineOpt("reclaimHandedOff"),
      winLine("__rompSessionBusy"), winLine("__rompColumnBusyWhy")].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
@@ -173,6 +175,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       strip: (ids) => { lastStripIds = ids.slice(); noteColumnEmptiness(ids); },   // renderTabs's judgement of the kernel's strip
       detach: (host) => failShipsOfHost(host, "was still uploading when " + host + " was detached, so it was not attached — attach it again once the host is back."),   // what the romp:hostDetached listener does (pinned in chat-split.test.ts)
       wsdown: () => { wsIsUp = false; }, wsup: () => { wsIsUp = true; reshipPendingUploads(); },   // the shim's edges, as the page's listeners read them
+      setSets: (s) => { colSets = s; }, reclaim: () => reclaimHandedOff(),   // what renderTabs does first: reads the sets, reclaims the marker for a sid shown here again
       route: (m) => (typeof routeCreateReply === "function" ? routeCreateReply(m).kind : "?"),
       // (each persists, as the page's own staging / citing / attaching does)
       held: { stage: (id, text, cites) => { stagedMsgs.push(id, { text, cites: cites || [] }); persistDrafts(); }, cite: (id, chips) => { composerCitations.set(id, chips || [{ title: "a card", itemId: "g1" }]); persistDrafts(); }, attach: (id) => { composerFiles.set(id, ["/tmp/a.png"]); persistDrafts(); },
@@ -784,4 +787,32 @@ test("round twelve: the strip's last member gone while an upload was in flight �
   w.api.ack({ type: "droppedPath", path: "drops/1-c.png", shipId: "c1" });
   assert.deepEqual(w.HOOKS.posts.filter((p) => p.romp === "colEmpty"), [{ romp: "colEmpty", gone: [C], crossed: [] }], "said on the release");
   assert.deepEqual(last(w.HOOKS), { romp: "colBusy", busy: false }, "the flip, last"); assert.ok(w.HOOKS.seq.indexOf("empty") < w.HOOKS.seq.lastIndexOf("flip:false"));
+});
+
+// ---- round thirteen ----
+test("round thirteen: a comment's upload acked after its popover closed never reaches the composer — retired, said by name; a send held on the composer's uploads is neither released nor gated by it", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {} });
+  w.api.startCreate(REQ); const id = w.api.state().provisionalId!;
+  w.api.ship(id, "photo.png", "s1", "QUJD"); w.api.holdSend(id); w.api.type(TYPED);
+  w.api.adopt(X);
+  w.api.ship(X, "shot.png", "s2", "QUJD", "comment");   // the comment's clip, then the popover closes
+  w.api.ack({ type: "droppedPath", path: "drops/2-shot.png", shipId: "s2" });
+  assert.equal(w.api.held.files()[X], undefined, "the comment's file is on no composer strip");
+  assert.ok(w.HOOKS.toasts.some((t) => /2-shot\.png arrived after its comment was closed/.test(t)), "said by name: " + JSON.stringify(w.HOOKS.toasts));
+  assert.equal(w.HOOKS.fired, 0, "the held send is not released by it"); assert.deepEqual(w.api.heldSend(), [X], "…and still armed: it waits on the composer's own ship");
+  assert.deepEqual(w.api.ships()[X].map((p) => p.shipId), ["s1"], "the comment's chip retired");
+  w.api.ack({ type: "droppedPath", path: "drops/1-photo.png", shipId: "s1" });
+  assert.equal(w.HOOKS.fired, 1, "the composer's own last ship releases it"); assert.deepEqual(w.api.held.files()[X], ["drops/1-photo.png"]); assert.equal(w.api.busy(), false);
+});
+
+test("round thirteen: a tab moved back with NO state clears the handed-off marker the moment this column shows the sid again — a later send held on an upload here, with nothing typed, goes", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {}, sets: { "2": [] } });
+  w.api.startCreate(REQ); w.api.type(TYPED); w.api.resolveTo(A);
+  assert.equal(w.api.take(A).draft, TYPED, "the words left with the tab: the marker stands");
+  w.api.setSets({ "2": [A] }); w.api.reclaim();   // the tab comes back to this column with no state (the shell skipped the adopt); renderTabs reads the sets
+  w.api.ship(A, "later.png", "l1", "QUJD"); w.api.holdSend(A);   // an attachment and "Wait for the upload", nothing typed
+  w.api.ack({ type: "droppedPath", path: "drops/9-later.png", shipId: "l1" });
+  const sent = w.HOOKS.sent.filter((m) => m.type === "sendMessage");
+  assert.deepEqual(sent.map((m) => ({ id: m.id, text: m.text })), [{ id: A, text: "drops/9-later.png" }], "the held send goes: the attachment alone was the message");
+  assert.ok(!w.HOOKS.toasts.some((t) => /moved to another column/.test(t)), "no belt toast: the words were never elsewhere for this send");
 });

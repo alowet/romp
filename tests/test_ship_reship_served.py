@@ -228,7 +228,7 @@ const tab = await page.waitForSelector("#tabs .tab, #tabs [data-sid]", { timeout
 if (!tab) await die("no session tab — the lab seed never reached the chat payload");
 await page.waitForTimeout(500);   // let the shim's ws settle onto the live kernel
 process.kill(cfg.kernelPid, "SIGSTOP");
-await page.setInputFiles("body > input[type=file]", cfg.file);
+await page.setInputFiles("body > input[type=file][data-for=composer]", cfg.file);   // the composer's 📎, not the comment clip beside it on body (round thirteen)
 await page.waitForSelector(".composer-file-pending", { timeout: 10000 }).catch(() => {});
 out.wedge.chipUpAfterShip = await page.locator(".composer-file-pending").count();
 await page.fill("#composer-input", cfg.msg);
@@ -327,7 +327,7 @@ await page.waitForTimeout(1000);
 // the reload must NOT cry ship-loss: the wedge's ships all settled before it
 out.regression.lossToast = await page.evaluate(
   () => (document.getElementById("warn-toasts")?.textContent || "").includes("still uploading"));
-await page.setInputFiles("body > input[type=file]", cfg.file);
+await page.setInputFiles("body > input[type=file][data-for=composer]", cfg.file);   // the composer's 📎, not the comment clip beside it on body (round thirteen)
 const acked = await page.waitForFunction(() =>
   document.querySelectorAll(".composer-file-pending").length === 0 &&
   document.querySelectorAll(".composer-file").length > 0, { timeout: 15000 })
@@ -679,7 +679,7 @@ await page.waitForTimeout(500);
 // stop the kernel so the ship's ack cannot land, then WALK AWAY mid-flight: the loss shape.
 // No restart needed — determinism comes from the page dying before any ack or re-ship can settle.
 process.kill(cfg.kernelPid, "SIGSTOP");
-await page.setInputFiles("body > input[type=file]", cfg.file);
+await page.setInputFiles("body > input[type=file][data-for=composer]", cfg.file);   // the composer's 📎, not the comment clip beside it on body (round thirteen)
 await page.waitForSelector(".composer-file-pending", { timeout: 10000 }).catch(() => {});
 out.chipUp = await page.locator(".composer-file-pending").count();
 await page.goto("about:blank");            // the page dies with the ship pending — no client left to ack
@@ -765,7 +765,7 @@ if (!tab) await die("no session tab: the lab seed never reached the chat payload
 await page.waitForTimeout(500);   // let the shim's ws settle onto the live kernel
 // ServedWedge's stage: a ship on a live socket the stopped kernel never answers, the send held on the gate
 process.kill(cfg.kernelPid, "SIGSTOP");
-await page.setInputFiles("body > input[type=file]", cfg.file);
+await page.setInputFiles("body > input[type=file][data-for=composer]", cfg.file);   // the composer's 📎, not the comment clip beside it on body (round thirteen)
 await page.waitForSelector(".composer-file-pending", { timeout: 10000 }).catch(() => {});
 out.chipUpAfterShip = await page.locator(".composer-file-pending").count();
 await page.fill("#composer-input", cfg.msg);

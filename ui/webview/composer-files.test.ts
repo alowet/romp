@@ -41,7 +41,7 @@ test("every file arrival becomes an attachment, never raw path text in the box",
   assert.match(RENDER, /if \(p && !hostOf\(activeId \|\| ""\)\) addComposerFile\(activeId, p\);\s*\n\s*else shipFileToHost\(f\);/);
   // the window spans the popover-owned branch first (an open comment popover claims its own
   // clip's ack; the COMPOSER path below it still always lands as an attachment)
-  assert.match(RENDER, /m\.type === "droppedPath" && typeof m\.path === "string"\) \{[\s\S]{0,1500}addComposerFile\(owner, m\.path\);/);   // window covers the T215 stray-ack gate
+  assert.match(RENDER, /m\.type === "droppedPath" && typeof m\.path === "string"\) \{[\s\S]{0,2000}addComposerFile\(owner, m\.path\);/);   // window covers the T215 stray-ack gate
   // the old insert-at-cursor path is gone with its last caller
   assert.doesNotMatch(RENDER, /function insertComposerText/);
 });

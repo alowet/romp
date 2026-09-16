@@ -6577,6 +6577,7 @@ function renderTabs() {
   const bar = document.getElementById("tabs");
   if (!bar) return;
   colSets = readColSets();   // the partition (the chat split): which sessions each column holds, read ONCE per render — tabInView, the plan and the signature all read this snapshot
+  reclaimHandedOff();        // a session this column shows again has its words here again (round thirteen)
   // TABS-FIRST (the user 2026-06-26): render the WHOLE strip up front, in `order` — the kernel's order
   // verbatim (applyTabOrder), plus any just-arrived tab not yet pushed. An id whose session hasn't landed yet
   // draws as a placeholder (name+color, non-interactive) that fills in when build_session arrives — so tabs
@@ -9834,6 +9835,7 @@ let cmtPopPreMax: CmtPopFrac | null = null;     // the size the box had before t
 // ship through the SAME dropFile flow; the droppedPath ack sees the open popover and lands there
 const cmtFilePicker = document.createElement("input");
 cmtFilePicker.type = "file";
+cmtFilePicker.dataset.for = "comment";   // the comment's clip: its ships are the comment's (kind), never the composer's
 cmtFilePicker.multiple = true;
 cmtFilePicker.style.display = "none";
 cmtFilePicker.addEventListener("change", () => {
@@ -16319,6 +16321,12 @@ function shipRecord(shipId: string): PendingShip | null {
   for (const list of pendingShips.values()) { const p = list.find((x) => x.shipId === shipId); if (p) return p; }
   return null;
 }
+// The COMPOSER's pending ships for a session (round thirteen): what its send gate counts, what a send held on its uploads waits
+// for, what the ✕ on its last chip settles. A comment's upload for the same session is none of the composer's business — counted
+// before, a comment's late ack could stand between a held send and its release, or release it.
+function composerShips(sid: string | null): PendingShip[] {
+  return sid ? (pendingShips.get(sid) || []).filter((p) => p.kind !== "comment") : [];
+}
 // The bytes, retained on the entry until the ack (the reconnect re-ship needs them, T215), and whether the frame that carries them
 // is riding the shim's OWN queue: posted while the local socket is down, the shim holds it and flushes it on the next open — so the
 // re-ship that open's romp:wsup runs must skip it, or the kernel saves the file twice (round twelve).
@@ -17049,7 +17057,7 @@ function renderComposerFilesInner(id: string | null): void {
       // dismissing the LAST chip settles an armed hold the same way a nack does — cancelled
       // LOUDLY, never auto-sent: the ✕ removed the very entry whose ack the hold was waiting
       // for, so left armed it would wait forever (review finding 2026-09-01)
-      if (id && !(pendingShips.get(id) || []).length) {
+      if (id && !composerShips(id).length) {   // the composer's last chip (round thirteen)
         const held = sendOnShip.delete(id);
         const gateWasOpen = shipGateSid === id;
         if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }
@@ -17376,9 +17384,13 @@ const sessionMru: string[] = [];
 };
 // …and the TARGET page's half: what the source held, into the maps (joined onto anything already here, never over
 // it), persisted, and into the box when the tab is active. The shell posts it on a new column's load or at once.
-// The sids whose WORDS this page handed to another column (the take) and has not had back (an adopt): sendHeldFor refuses to
-// send for one of them with nothing of the message here (round twelve).
+// The sids whose WORDS this page handed to another column (the take) and has not had back: sendHeldFor refuses to send for one of
+// them with nothing of the message here (round twelve). Cleared by an adopt, and by the sid SHOWN here again (round thirteen,
+// reclaimHandedOff): a tab moved back with NO state hands nothing, the shell skips the adopt, and the marker stood — a later send
+// held on an upload here, with nothing typed, was refused with the wrong words. The sid listed in this column is the take's
+// counterpart, judged where the column's members are read (renderTabs).
 const handedOff = new Set<string>();
+function reclaimHandedOff(): void { for (const sid of [...handedOff]) if (heldHere(sid)) handedOff.delete(sid); }
 function adoptSessionState(sid: unknown, state: unknown): void {
   if (typeof sid !== "string" || !sid || !state || typeof state !== "object") return;
   handedOff.delete(sid);   // the words are here again
@@ -19129,13 +19141,14 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     //                                               would double the file on whatever tab is active (T215)
     const ship = ackShip ? shipRecord(ackShip) : null;   // the ack's route (see above)
     const cbox = document.getElementById("cmt-pop")?.querySelector(".cmt-input") as HTMLTextAreaElement | null;
-    if (cbox && (ship ? ship.kind === "comment" : true)) {
-      // a comment popover is open — its own clip shipped this file, so the path lands in ITS box
-      retirePendingShip(m.path, ackShip);
-      cbox.value = (cbox.value ? cbox.value.trimEnd() + " " : "") + m.path + " ";
-      cbox.dispatchEvent(new Event("input"));   // the draft listener persists it
-      if (previewKind(m.path) === "img") cmtShippedImgs.push(m.path);   // the echo's thumbnail ride
-      cbox.focus();
+    if (ship ? ship.kind === "comment" : !!cbox) {
+      retirePendingShip(m.path, ackShip);   // a comment's upload: the box, or — the popover gone — said by name, NEVER the composer (round thirteen)
+      if (cbox) {
+        cbox.value = (cbox.value ? cbox.value.trimEnd() + " " : "") + m.path + " ";
+        cbox.dispatchEvent(new Event("input"));   // the draft listener persists it
+        if (previewKind(m.path) === "img") cmtShippedImgs.push(m.path);   // the echo's thumbnail ride
+        cbox.focus();
+      } else warnToast((m.path.split("/").pop() || "The comment's attachment") + " arrived after its comment was closed, so it was not attached — attach it again with the comment.");
       syncColumnBusy();   // LAST (round eleven): the upload's hold on the column ends with its chip
       return;
     }
@@ -19144,7 +19157,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     // an OPEN ship-gate dialog counts as a held send (the user 2026-08-19): the upload finishing is
     // the answer to the question it asks, so it closes itself and the send fires — no click needed
     const gateOpen = shipGateSid === owner;
-    if (owner && (sendOnShip.has(owner) || gateOpen) && !(pendingShips.get(owner) || []).length) {
+    if (owner && (sendOnShip.has(owner) || gateOpen) && !composerShips(owner).length) {   // the composer's own ships (round thirteen): a comment's never gate it
       // the LAST ship landed — the event the held send was waiting for (the user 2026-08-16), and every ship it waited on
       // completed (a failure cancels the hold the moment it happens, shipFailed)
       sendOnShip.delete(owner);
@@ -19561,7 +19574,7 @@ function setupComposer() {
     // only acked paths), so sending now silently drops it — the exact report. Intercept with the same
     // pane-local confirm the /clear guard uses: send WITHOUT it explicitly, or hold the send and let
     // the last droppedPath ack fire it (event-based; a save nack cancels the hold loudly instead).
-    const shipping = (pendingShips.get(activeId) || []).length;
+    const shipping = composerShips(activeId).length;   // the composer's own (round thirteen): a comment's upload never gates the composer's send
     if (shipping && !opts?.pastShipGate) {
       const sid = activeId;
       const what = shipping === 1 ? "An attachment is" : shipping + " attachments are";
@@ -20404,6 +20417,7 @@ function setupComposer() {
   const isWebPage = location.protocol === "http:" || location.protocol === "https:";
   const filePicker = document.createElement("input");
   filePicker.type = "file";
+  filePicker.dataset.for = "composer";   // the composer's 📎 — the comment clip is another hidden input on body (round thirteen: a driver told them apart by order alone)
   filePicker.style.display = "none";
   filePicker.addEventListener("change", () => {
     Array.from(filePicker.files || []).forEach((f) => shipFileToHost(f));

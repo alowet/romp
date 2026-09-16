@@ -49021,30 +49021,6 @@ def _img_data_url(p0):
         return None
 
 
-# (sid, shipId) → the path a dropFile with that ship id was saved under, per kernel life (round twelve, 2026-09-16): the page
-# re-ships retained bytes on a reconnect (T215) and the standalone shim flushes a queued frame on its open, so the same upload can
-# arrive twice — a repeat with a known ship id answers the SAME path and writes nothing, instead of a second timestamped file
-# under drops/. Bounded; an entry whose file is gone (a sweep) saves anew. No orphan cleanup under drops/ here (pre-existing).
-_DROP_SAVED = {}
-_DROP_SAVED_MAX = 4096
-
-
-def _saved_drop_path(sid, ship_id, name, b64):
-    """The path for this ship: the one already saved for (sid, shipId) when the file still stands, else a fresh save
-    (recorded under the key when there is one). None when the save failed."""
-    key = (str(sid or ""), str(ship_id)) if ship_id else None
-    if key is not None:
-        known = _DROP_SAVED.get(key)
-        if known and os.path.isfile(known):
-            return known
-    fp = _save_dropped_file(name, b64)
-    if fp and key is not None:
-        _DROP_SAVED[key] = fp
-        while len(_DROP_SAVED) > _DROP_SAVED_MAX:
-            _DROP_SAVED.pop(next(iter(_DROP_SAVED)))
-    return fp
-
-
 def _save_dropped_file(name, b64):
     """A file dropped/pasted on the composer arrives as BYTES (a sandboxed webview exposes no path). Save
     under the state dir's drops/ and return the saved path for the prompt to reference. None on failure."""
@@ -58287,10 +58263,10 @@ function sessionBusy(f,sid){try{var b=f&&f.contentWindow&&f.contentWindow.__romp
 // WHICH fact holds a column (round twelve): 'upload-unshown' — an upload for a session shown elsewhere is the only hold, and no chip is drawn
 // there to release it — turns this user's close into a question for the page (askCloseUpload) instead of a refusal
 function busyWhy(f){try{var w=f&&f.contentWindow&&f.contentWindow.__rompColumnBusyWhy;return typeof w==='function'?String(w()||''):'';}catch(e){return '';}}
-// the reload core's ending event, said PARENT-SIDE (round twelve): a pane's take() empties its box and tells its core through a
-// deferred callback, which dies with the iframe the move or close removes in the same stack — an owed reload then waited for the
-// minute's backstop. tryFire re-checks every hold and fires only an owed reload; called once the store is written, never before it.
-function reloadEnded(){try{if(window.__rompReload)window.__rompReload.tryFire();}catch(e){}}
+// the SESSION question, asked of EVERY mounted column document (round thirteen): the upload's ack rides the socket of the document
+// that shipped it, which need not be the column the store lists the session in (a peer's write moved the tab; a create resolved to a
+// session shown elsewhere while its column was held) — asking the store's owner alone let the session move during the upload
+function sessionBusyAnywhere(sid){var fs=frames();for(var i=0;i<fs.length;i++){if(sessionBusy(fs[i],sid))return true;}return false;}
 function loaded(f){try{return !!(f&&f.contentWindow&&typeof f.contentWindow.__rompTakeSessionState==='function');}catch(e){return false;}}   // the page's bundle has evaluated, so a posted message is heard
 var BUSY='A session is still being created in this column, or an upload from it is still in flight.';
 var UPLOADING='An attachment for this session is still on its way — move it once it lands.';
@@ -58326,14 +58302,14 @@ function unlist(sid){for(var i=0;i<cols.length;i++){var c=cols[i],j=c.ids.indexO
 function moveTab(sid,to){if(typeof sid!=='string'||!sid)return null;
 var from=ownerOf(sid),src=frameOfCol(from);
 var why=refusal(src,sid);if(why==='locked')return notify(LOCKED);if(why||!movable(src,sid))return notify('Only an open session can be moved between columns.');
-if(sessionBusy(src,sid))return notify(UPLOADING);   // every move (the palette, the drag zones, a new column) asks: an upload in flight pins its session to its document (round twelve)
+if(sessionBusyAnywhere(sid))return notify(UPLOADING);   // every move (the palette, the drag zones, a new column) asks every column's document: an upload in flight pins its session to the document that ships it (rounds twelve, thirteen)
 if(to==='new'){var se=entry(from);if(se&&se.ids.length===1)return notify('This session is already alone in its column.');
 if(!canSplit())return refuse();
 try{if(!document.body.classList.contains('po-chat')&&window.__rompPaneToggle)window.__rompPaneToggle('chat',true);}catch(e){}   // a hidden chat group comes forward first
 var state=take(src,sid),n=nextNumber();
 if(window.__rompSplitGrow)window.__rompSplitGrow(lastPane(),'chat'+n);   // the rightmost column and the new one each take half its width
 unlist(sid);cols.push({n:n,ids:[sid]});save();
-var nf=make(n,sid,state);try{nf.contentWindow.focus();}catch(e){}reloadEnded();return nf;}
+var nf=make(n,sid,state);try{nf.contentWindow.focus();}catch(e){}return nf;}
 var tn=Number(to);if(tn!==1&&!entry(tn))return null;
 var tf=frameOfCol(tn);if(!tf)return null;
 if(tn===from)return tf;   // already there: nothing moves
@@ -58341,7 +58317,7 @@ var se2=entry(from);if(se2&&se2.ids.length===1&&busy(src))return notify(BUSY);  
 var st=take(src,sid),emptied=unlist(sid);if(tn!==1){entry(tn).ids.push(sid);delete held[tn];}save();   // a member ends a hold: the column is listed again
 adopt(tf,sid,st);try{tf.contentWindow.postMessage({type:'focus',id:sid},'*');}catch(e){}   // a plain focus: the target is the owner now, so its own gate takes it
 if(emptied)close(emptied);   // the origin's last member left: it closes (the ring lands on the target below, not on the origin's neighbour)
-try{tf.contentWindow.focus();}catch(e){}reloadEnded();return tf;}
+try{tf.contentWindow.focus();}catch(e){}return tf;}
 // CLOSE a column: its sessions return to the first column — the entry goes whole, so the first column derives them —
 // drafts and all (what the closing page holds for each is handed to the first column's page); the pane, its gutter
 // and its grow go; the Log drops its connection state; the ring moves to the column on its left. `keep` skips the
@@ -58364,7 +58340,7 @@ if(p)p.remove();if(g)g.remove();
 if(window.__rompColGone)window.__rompColGone(String(n));
 try{window.dispatchEvent(new CustomEvent('romp-chat-cols',{detail:{col:n,open:false}}));}catch(e){}
 var pf=document.getElementById(i>0?frameId(cols[i-1].n):'f-chat');   // the ring moves to the column before it
-try{pf&&pf.contentWindow.focus();}catch(e){}reloadEnded();}
+try{pf&&pf.contentWindow.focus();}catch(e){}}
 function closeFocused(){var f=focused(),c=f?colOf(f.contentWindow):'';if(!c&&cols.length)c=String(cols[cols.length-1].n);if(c)close(Number(c));}
 // the palette's Move this session to a new column: the focused column's active tab (the one DOM read kept, for this)
 window.__rompSplitChat=function(sid){var id=typeof sid==='string'&&sid?sid:activeIn(focused());if(!id)return notify('No session is open in this column to move.');return moveTab(id,'new');};
@@ -63726,7 +63702,7 @@ class Handler(BaseHTTPRequestHandler):
             # the composer just refused a send to a downed host — user demand, dial it now (2026-08-16)
             _demand_redial(str(msg["host"]), "timeout")
         elif msg and msg.get("type") == "dropFile" and msg.get("name") and msg.get("b64"):
-            fp = _saved_drop_path(msg.get("id"), msg.get("shipId"), str(msg["name"]), str(msg["b64"]))   # bytes → saved file (once per ship id, round twelve) → insert its path
+            fp = _save_dropped_file(str(msg["name"]), str(msg["b64"]))   # bytes → saved file → insert its path
             if fp:
                 ack = {"type": "droppedPath", "path": fp}
             else:

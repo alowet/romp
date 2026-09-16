@@ -348,7 +348,7 @@ class SplitSourcePins(unittest.TestCase):
 HARNESS = r"""
 'use strict';
 let STORE = {};
-const CALLS = { register: [], unregister: [], growFair: [], splitGrow: [], splitShrink: [], gutter: [], wireFocus: [], wireEsc: [], colGone: [], events: [], posted: [], focus: [], notify: [], toggle: [], taken: [], sets: [], tryFire: [] };
+const CALLS = { register: [], unregister: [], growFair: [], splitGrow: [], splitShrink: [], gutter: [], wireFocus: [], wireEsc: [], colGone: [], events: [], posted: [], focus: [], notify: [], toggle: [], taken: [], sets: [] };
 let SESSBUSY = {};        // frame id → sid → whether that page reports an upload in flight (or a held send) for the session (round twelve)
 let WHY = {};             // frame id → what the page says holds its column (__rompColumnBusyWhy), '' → derived from BUSY
 let SEQ = [];             // the order of the shell's side effects across stubs (a store write, a post, a grow, a key drop)
@@ -431,7 +431,6 @@ global.__rompWireFocus = (f) => CALLS.wireFocus.push(f.id);
 global.__rompWireEsc = (f) => CALLS.wireEsc.push(f.id);
 global.__rompColGone = (c) => CALLS.colGone.push(c);
 global.__rompFocusedChatId = () => FOCUSED;
-global.__rompReload = { tryFire() { CALLS.tryFire.push(1); } };   // the dashboard's reload core: the shell tells it the ending event parent-side (round twelve)
 function boot(store, mobile) {
   STORE = Object.assign({}, store || {}); MOBILE = !!mobile; BYID = {}; WL = {}; TAKE = {}; FOCUSED = 'f-chat'; BODY_CLASSES = new Set(['po-chat', 'po-feed', 'po-timeline']);
   SEQ = []; UNMOVABLE = new Set(); LOCKED_SIDS = new Set(); BUSY = {}; WRITES = []; SESSBUSY = {}; WHY = {};
@@ -637,12 +636,13 @@ out.askClose.shown = { ids: ids(), notify: CALLS.notify.slice(), posted: CALLS.p
 BUSY['f-chat-2'] = false; WHY['f-chat-2'] = ''; CALLS.posted = [];
 crossOf('f-chat-2').fire('click', { stopPropagation() {} });
 out.askClose.free = { ids: ids(), posted: CALLS.posted.filter((p) => p.m && p.m.romp === 'askCloseUpload').length };
-// P0c) round twelve: the reload core hears the ending event PARENT-SIDE, synchronously, at the end of a move and of a close
-boot({}, false); CALLS.tryFire = [];
-window.__rompMoveTab(API, 'new'); const firedAfterNew = CALLS.tryFire.length;
-window.__rompMoveTab(TESTS, 2); const firedAfterMove = CALLS.tryFire.length;
-window.__rompCloseSplit(2); const firedAfterClose = CALLS.tryFire.length;
-out.reloadEnded = { afterNew: firedAfterNew, afterMove: firedAfterMove, afterClose: firedAfterClose, ids: ids() };
+// P0c) round thirteen: the upload may sit in a document OTHER than the store's owner (a peer's write moved the tab; a create resolved
+//      to a session shown elsewhere while its column was held): every mounted column document is asked, any yes refuses the move
+boot({}, false); window.__rompMoveTab(API, 'new'); window.__rompMoveTab(TESTS, 'new'); CALLS.notify = []; CALLS.taken = [];
+SESSBUSY['f-chat-2'] = { [TESTS]: true };   // column 2's document ships TESTS's upload; TESTS is listed in column 3
+out.busyElsewhere = { home: window.__rompMoveTab(TESTS, 1), toTwo: window.__rompMoveTab(TESTS, 2), notify: CALLS.notify.slice(), taken: CALLS.taken.slice(), stored: cols(), ids: ids() };
+SESSBUSY['f-chat-2'] = {}; CALLS.notify = [];
+out.busyElsewhere.released = { home: (window.__rompMoveTab(TESTS, 1) || {}).id, notify: CALLS.notify.slice(), ids: ids() };
 // P) HELD (2026-09-15): another dashboard's write drops a column whose document is busy — its create's queued text would die
 //    with the document — so the reconcile HOLDS it instead of closing it: mounted, unlisted (the member went where the peer
 //    put it), no toast (a peer's act, not this user's; nothing is refused), nothing written. The page's colBusy flip is the
@@ -1072,9 +1072,28 @@ class SplitExecutes(unittest.TestCase):
         self.assertEqual(s["other"]["home"], "f-chat", "the other member is free to move"); self.assertEqual(s["other"]["notify"], [])
         self.assertEqual(s["released"]["home"], "f-chat", "the ack released it"); self.assertEqual(s["released"]["notify"], [])
         split = km._LANDING_SPLIT_JS
-        self.assertIn("if(sessionBusy(src,sid))return notify(UPLOADING);", split)
+        self.assertIn("if(sessionBusyAnywhere(sid))return notify(UPLOADING);", split)
         self.assertIn("zone(p,'',c.n,function(sid){moveTab(sid,c.n);});", split, "the drag zones move through moveTab")
         self.assertIn("else moveTab(sid,'new');", split)
+
+    def test_the_move_guard_asks_every_column_document_not_the_stores_owner(self):
+        # round thirteen: the upload's ack rides the socket of the document that shipped it — after a peer's write moved the tab, or a create
+        # resolved to a session shown elsewhere while its column was held, that is not the column the store lists the session in
+        b = self.out["busyElsewhere"]
+        self.assertEqual(b["stored"], {"v": 2, "cols": [{"n": 2, "ids": [API]}, {"n": 3, "ids": [TESTS]}]}, "TESTS is column 3's; its upload is column 2's document's")
+        self.assertIsNone(b["home"]); self.assertIsNone(b["toTwo"])
+        self.assertEqual(b["notify"], [["warn", "An attachment for this session is still on its way — move it once it lands."]] * 2)
+        self.assertEqual(b["taken"], []); self.assertEqual(b["ids"], ["f-chat", "f-chat-2", "f-chat-3"])
+        self.assertEqual(b["released"]["home"], "f-chat"); self.assertEqual(b["released"]["notify"], [])
+        split = km._LANDING_SPLIT_JS
+        self.assertIn("function sessionBusyAnywhere(sid){var fs=frames();for(var i=0;i<fs.length;i++){if(sessionBusy(fs[i],sid))return true;}return false;}", split)
+
+    def test_the_shell_never_calls_the_reload_core_itself(self):
+        # round thirteen REVERTS round twelve's parent-side tryFire: it fired while the transferred state existed only in make()'s load
+        # listener or a queued postMessage, so the reload lost the move. The page's deferred ended() stands; an owed reload after a
+        # column close waits for the core's backstop, exactly as on main.
+        split = km._LANDING_SPLIT_JS
+        self.assertNotIn("reloadEnded", split); self.assertNotIn("tryFire", split); self.assertNotIn("__rompReload", split)
 
     def test_this_users_cross_on_a_column_held_only_by_an_upload_for_a_session_shown_elsewhere_asks_the_page(self):
         # round twelve: no chip is drawn there to release the hold, so the user decides — the page shows the confirm (askCloseUpload) and,
@@ -1085,16 +1104,6 @@ class SplitExecutes(unittest.TestCase):
         self.assertEqual(a["shown"]["notify"], [["warn", "A session is still being created in this column, or an upload from it is still in flight."]], "an upload for a session shown HERE: the chip's ✕ releases it, so the refusal stands")
         self.assertEqual(a["shown"]["posted"], 0)
         self.assertEqual(a["free"]["ids"], ["f-chat"], "not busy: the cross closes it"); self.assertEqual(a["free"]["posted"], 0)
-
-    def test_the_reload_core_hears_the_ending_event_parent_side_at_the_end_of_a_move_and_a_close(self):
-        # round twelve: a pane's take() tells its own core through a setTimeout that dies with the iframe removed in the same stack, so an
-        # owed reload waited for the minute's backstop; the shell calls the dashboard's core itself, once the store is written
-        r = self.out["reloadEnded"]
-        self.assertGreaterEqual(r["afterNew"], 1, "a move to a new column"); self.assertGreater(r["afterMove"], r["afterNew"], "a move between columns")
-        self.assertGreater(r["afterClose"], r["afterMove"], "a close"); self.assertEqual(r["ids"], ["f-chat"])
-        split = km._LANDING_SPLIT_JS
-        self.assertIn("function reloadEnded(){try{if(window.__rompReload)window.__rompReload.tryFire();}catch(e){}}", split)
-        self.assertEqual(split.count("reloadEnded();"), 3, "both ends of moveTab and the end of close")
 
     def test_a_column_with_a_create_in_flight_keeps_its_last_member_and_stays_open(self):
         # its queued text and draft would die with the document (review find 2026-09-11): the move that would empty it,
