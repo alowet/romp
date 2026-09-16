@@ -44,7 +44,7 @@ test("📎 routes the chosen files through the existing dropFile pipeline (no ne
   // gets {type:"droppedPath"} back — we reuse it rather than add a second uploader
   assert.match(RENDER, /filePicker\.files \|\| \[\]\)\.forEach\(\(f\) => shipFileToHost\(f\)\)/);
   assert.match(RENDER, /const name = f\.name \|\| "pasted\.png";/);
-  assert.match(RENDER, /\{ type: "dropFile", name, b64, shipId \}/);
+  assert.match(RENDER, /if \(entry\) postShipFrame\(sid, entry\);/); assert.match(RENDER, /function postShipFrame\(sid: string \| null, p: PendingShip\): void \{[\s\S]{0,300}\{ type: "dropFile", name: p\.name, b64: p\.b64, shipId: p\.shipId \}/);
 });
 
 test("📎 in the VS Code webview still uses the native host dialog (pickFile)", () => {

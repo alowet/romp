@@ -16285,8 +16285,13 @@ const composerFiles = new Map<string, string[]>();   // sid -> attachment paths,
 // `kind` (round twelve): whose upload — the composer's or a comment's — so the ack is routed by the SHIP, never by whichever box
 // happens to be open. `queued`: the frame was posted while the local socket was down, so the shim's own queue flushes it on the
 // next open — the reconnect re-ship must not post it again (the kernel saved two files, one per frame).
-interface PendingShip { name: string; shipId: string; b64?: string; kind: "composer" | "comment"; queued?: boolean; seq: number }   // seq: creation order across the document (round seventeen: a legacy answer takes the OLDEST same-name upload of its host)
-let shipOrder = 0;   // the creation counter behind PendingShip.seq
+// postSeq (round eighteen): the ship's place in the order its dropFile frames were POSTED — stamped at every post (postShipFrame: the
+// reader's, each re-ship), the latest winning — because the kernel answers a connection's frames in the order it receives them, and
+// creation order is not that order (a small file started after a large one encodes and posts first). Unposted: no frame is out, so no
+// answer can be its. ambiguous: another pending ship of the same host carries the same sanitised name, so a legacy answer could be
+// either's — a hold on its owner is cancelled at once and never released by it.
+interface PendingShip { name: string; shipId: string; b64?: string; kind: "composer" | "comment"; queued?: boolean; postSeq?: number; ambiguous?: boolean }
+let postOrder = 0;   // the post counter behind PendingShip.postSeq
 let wsIsUp = true;   // the local socket, as the shim's events say (romp:wsdown / romp:wsup); the first connect fires no wsup, so up until told otherwise
 window.addEventListener("romp:wsdown", () => { wsIsUp = false; });
 let shipSeq = 0;   // per-page mint — a shipId only ever meets acks for this page's own ships
@@ -16303,7 +16308,7 @@ function shipSafeName(name: string): string {
 function addPendingShip(id: string | null, name: string, shipId: string, kind: PendingShip["kind"] = "composer"): void {
   if (!id) return;
   const list = pendingShips.get(id) || [];
-  list.push({ name, shipId, kind, seq: ++shipOrder });
+  list.push({ name, shipId, kind });
   pendingShips.set(id, list);
   persistDrafts();   // the NAMES ride the draft store so a reload can say what it lost (T215)
   if (id === activeId) renderComposerFiles(id);
@@ -16324,19 +16329,49 @@ function shipRecord(shipId: string): PendingShip | null {
 }
 // A LEGACY kernel's ack or nack (before v0.15.0's shipId echo, 2026-09-01; a federated host updates only by an explicit `romp update`,
 // so one still on v0.14 answers untagged) names no ship: it is matched to a pending ship by the SAVED NAME — shipSafeName mirrors the
-// kernel's saved-name sanitizer, so drops/<ms>-<safe name> ends with the ship's own name — among the pending ships of the HOST that
-// answered (round seventeen: federation stamps a remote kernel's answer with its host; the local socket's carries none), since two hosts
-// uploading one name must never be matched against each other. Several matches take the OLDEST by creation (the kernel answers a
-// connection's dropFiles in order), and the count comes back with it: the caller settles fully on exactly one match and, on more,
-// attaches without releasing any held send — the file is main's answer, the auto-send is not. A frame that carries `picked` (the
-// extension's 📎 and editor handoff, the kernel's native dialog) never comes here: a picker's answer stands for no upload.
+// kernel's saved-name sanitizer, so drops/<ms>-<safe name> ends with the ship's own name — among the POSTED pending ships of the HOST
+// that answered (round seventeen: federation stamps a remote kernel's answer with its host; the local socket's carries none), since
+// two hosts uploading one name must never be matched against each other, and a ship whose frame is not out yet cannot have been
+// answered. Several matches take the FIRST POSTED (round eighteen: the kernel answers a connection's frames in the order it receives
+// them — creation order is not that order), and the count comes back with it: the caller settles fully on exactly one match and, on
+// more, attaches without releasing any held send. A frame that carries `picked` never comes here: a picker's answer stands for no upload.
 function legacyShipFor(key: string, host: string): { ship: PendingShip; matches: number } | null {
   const k = "-" + shipSafeName(key.split("/").pop() || key);
   const found: PendingShip[] = [];
-  for (const [sid, list] of pendingShips) { if (hostOf(sid) !== host) continue; for (const p of list) if (k.endsWith("-" + shipSafeName(p.name))) found.push(p); }
+  for (const [sid, list] of pendingShips) { if (hostOf(sid) !== host) continue; for (const p of list) if (p.postSeq !== undefined && k.endsWith("-" + shipSafeName(p.name))) found.push(p); }
   if (!found.length) return null;
-  found.sort((a, b) => a.seq - b.seq);
+  found.sort((a, b) => a.postSeq! - b.postSeq!);
   return { ship: found[0], matches: found.length };
+}
+// THE POST (round eighteen): the one place a dropFile frame leaves the page — the reader's first post and every re-ship — so the ship's
+// postSeq is its place in the kernel's answer order (the shim's queue is first-in first-out over these posts, so a frame queued while the
+// socket was down keeps its place). And the moment a SECOND pending ship of the same host carries the same sanitised name, the ambiguity
+// is knowable: every such ship is marked, and a send held on any of their owners is cancelled at once — a legacy answer for that name
+// could be either's, so none of them may ever fire a message automatically. Tagged (v0.15+) answers never consult names.
+function postShipFrame(sid: string | null, p: PendingShip): void {
+  if (!vscodeApi || !p.b64) return;
+  const msg: { type: string; name: string; b64: string; shipId: string; id?: string } = { type: "dropFile", name: p.name, b64: p.b64, shipId: p.shipId };
+  if (sid) msg.id = sid;   // the owning session → the owning kernel
+  p.postSeq = ++postOrder;
+  noteAmbiguity(sid, p);
+  vscodeApi.postMessage(msg);
+}
+function noteAmbiguity(sid: string | null, p: PendingShip): void {
+  const host = hostOf(sid || ""), safe = shipSafeName(p.name);
+  const twins: [string, PendingShip][] = [];
+  for (const [id, list] of pendingShips) { if (hostOf(id) !== host) continue; for (const q of list) if (shipSafeName(q.name) === safe) twins.push([id, q]); }
+  if (twins.length < 2) return;
+  const owners = new Set<string>();
+  for (const [id, q] of twins) { q.ambiguous = true; owners.add(id); }
+  for (const owner of owners) {
+    if (!composerShips(owner).some((q) => q.ambiguous)) continue;   // a comment's twin is not the composer's business
+    const held = sendOnShip.delete(owner), gateWasOpen = shipGateSid === owner;
+    if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }
+    if (!held && !gateWasOpen) continue;
+    endReloadHoldIfIdle();
+    warnToast("Another upload named " + p.name + " is on its way for a different session, so this message will not be sent automatically — check the attachment when it lands and send it yourself.");
+    if (owner === activeId) renderComposerFiles(owner);
+  }
 }
 // The COMPOSER's pending ships for a session (round thirteen): what its send gate counts, what a send held on its uploads waits
 // for, what the ✕ on its last chip settles. A comment's upload for the same session is none of the composer's business — counted
@@ -16479,10 +16514,7 @@ function reshipPendingUploads(hosts?: readonly string[]): void {
     for (const p of list) {
       if (!p.b64) continue;
       if (!hosts && p.queued) { p.queued = false; continue; }   // the shim's own queue flushed this frame on the open that fired this wsup (round twelve): posting it again saved the file twice
-      const msg: { type: string; name: string; b64: string; shipId: string; id?: string } =
-        { type: "dropFile", name: p.name, b64: p.b64, shipId: p.shipId };
-      if (id) msg.id = id;
-      vscodeApi.postMessage(msg);
+      postShipFrame(id, p);   // a re-ship is a post too: its place in the new connection's answer order (round eighteen)
     }
   }
 }
@@ -19201,6 +19233,8 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       syncColumnBusy();   // LAST (round eleven): the upload's hold on the column ends with its chip
       return;
     }
+    const retiredShip = ackShip ? shipRecord(ackShip) : null;   // read before the retire: a ship marked ambiguous never releases a hold (round eighteen)
+    if (retiredShip && retiredShip.ambiguous) ambiguous = true;
     const retired = retirePendingShip(m.path, ackShip);   // the chip this ack answers — tagged, or a legacy ack matched by name — names the OWNING composer
     const owner = retired || activeId;                    // …an ack matched to no ship lands on the ACTIVE session's composer, as on main; none → said (round sixteen)
     if (!owner) { warnToast((m.path.split("/").pop() || "The file") + " arrived, but no session is open in this column to attach it to."); syncColumnBusy(); return; }
@@ -20567,10 +20601,8 @@ function shipFileToHost(f: File, sidAt: string | null = activeId, kind: PendingS
     const b64 = String(reader.result || "").split(",")[1] || "";
     if (!b64 || !vscodeApi) { shipFailed(name, shipId, name + " could not be read, so it was not attached — try again."); return; }   // a held send must not fire short of it (round eleven)
     retainShipBytes(sid, shipId, b64);   // retained until the ack — the reconnect re-ship needs the bytes (T215); marked if the shim's queue carries the frame (round twelve)
-    const msg: { type: string; name: string; b64: string; shipId: string; id?: string } =
-      { type: "dropFile", name, b64, shipId };
-    if (sid) msg.id = sid;   // the owning session → the owning kernel
-    vscodeApi.postMessage(msg);
+    const entry = shipRecord(shipId);
+    if (entry) postShipFrame(sid, entry);   // THE post: its place in the kernel's answer order, and the same-name check (round eighteen)
   };
   reader.onerror = () => shipFailed(name, shipId, name + " could not be read, so it was not attached — try again.");   // an unreadable file must not leave a stuck chip, nor a held send that fires without it (round eleven)
   reader.readAsDataURL(f);

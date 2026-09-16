@@ -59,6 +59,7 @@ type Api = {
   setSets: (sets: Record<string, string[]>) => void; reclaim: () => void;   // round thirteen: the shell's sets as they stand, and renderTabs's reclaim of the handed-off marker
   heading: (sid: string) => string;   // round fourteen: the held strip's heading, its count
   legacyFor: (name: string) => string | undefined;   // round sixteen: the ship a legacy (untagged) answer names, by the saved name
+  shipUnposted: (id: string, name: string, shipId: string, b64?: string, kind?: "composer" | "comment") => void; post: (id: string, shipId: string) => void;   // round eighteen: the post boundary
   draft: (sid: string, text: string) => void;   // round fifteen: a session's draft, written as the box's stash would
   held: { stage: (id: string, text: string, cites?: unknown[]) => void; cite: (id: string, chips?: unknown[]) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown>; drafts: () => Record<string, string> };
   busy: () => boolean; answer: (v: string | null) => void; confirm: () => { title: string; buttons: string[]; key: string | null } | null;
@@ -90,7 +91,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
      fnOpt("mergeCitations"), fn("addPendingShip"), fn("shipSafeName"), fn("shipOwner"), fn("retirePendingShip"), fn("endReloadHoldIfIdle"), fn("addComposerFile"), fn("adoptSessionState"), TAKE, ON_DROPPED,
      fnOpt("shipFailed"), fnOpt("sendHeldFor"), fn("flushStaged"), fn("routeUserMessage"), fn("noteOrphanState"),
      fnOpt("shipRecord"), fnOpt("retainShipBytes"), fnOpt("failShipsOfHost"), fnOpt("columnBusyWhy"), fnOpt("askCloseUpload"), fnOpt("abandonPendingUploads"), fn("reshipPendingUploads"), fn("noteColumnEmptiness"),
-     fnOpt("composerShips"), lineOpt("reclaimHandedOff"), fnOpt("legacyShipFor"), fnOpt("uploadingHeading"),
+     fnOpt("composerShips"), lineOpt("reclaimHandedOff"), fnOpt("legacyShipFor"), fnOpt("uploadingHeading"), fnOpt("postShipFrame"), fnOpt("noteAmbiguity"),
      winLine("__rompSessionBusy"), winLine("__rompColumnBusyWhy")].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
@@ -110,7 +111,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
     const failedWhy = new Map(); const failedInfo = new Map(); let wantActiveGone = W.wantActiveGone; const supersededRids = []; const settledRids = new Map(); let pendingCreate = null;
     const RELOADED_WHY = "The page reloaded while this session was being created. Start it again from the session picker, or discard this tab with its ✕.";
     const pendingShips = new Map(); let stagedMsgs; const composerCitations = new Map(), composerFiles = new Map();   // stagedMsgs: created in the epilogue, in PRODUCTION order relative to the boot
-    const sendOnShip = new Set(); let shipGateSid = null; const fireHeldSend = () => { HOOKS.fired++; }; let shipOrder = 0;   // the upload gate's stores; the held send's release, counted; the ships' creation counter (round seventeen)
+    const sendOnShip = new Set(); let shipGateSid = null; const fireHeldSend = () => { HOOKS.fired++; }; let shipOrder = 0, postOrder = 0;   // the upload gate's stores; the held send's release, counted; the posts' counter (round eighteen) — and the creation counter an older render.ts (5818185b) still increments, so the fail-before run reads clean
     const provisionalQueue = []; const failedProvisionals = new Set(); const pendingSent = new Map(); const sessions = new Map(); const closingTabs = new Map();
     // the per-column state store the real page reads at boot (vscodeApi.getState) and writes on every draft change (setState replaces it)
     const vscodeApiState = { getState: () => STORE, setState: (s) => { for (const k of Object.keys(STORE)) delete STORE[k]; Object.assign(STORE, s); } };
@@ -167,7 +168,10 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       orphans: () => orphanStateSids(),                          // what this page would hand the shell at a close (the sids it holds state for and does not show)
       take: (sid) => window.__rompTakeSessionState(sid),         // the shell's close(): this page's state for a session, taken whole (round ten: the real arrow)
       adoptState: (sid, st) => adoptSessionState(sid, st),       // the receiving pane's half
-      ship: (id, name, shipId, b64, kind) => { addPendingShip(id, name, shipId, kind || "composer"); if (b64) { if (typeof retainShipBytes === "function") retainShipBytes(id, shipId, b64); else pendingShips.get(id).find((p) => p.shipId === shipId).b64 = b64; } },   // a file picked: the chip is up, the bytes retained (through the real retention when it exists)
+      // a file picked: the chip is up, the bytes retained (through the real retention when it exists) and — with bytes — the frame POSTED (the real post when it exists, round eighteen)
+      ship: (id, name, shipId, b64, kind) => { addPendingShip(id, name, shipId, kind || "composer"); if (b64) { if (typeof retainShipBytes === "function") retainShipBytes(id, shipId, b64); else pendingShips.get(id).find((p) => p.shipId === shipId).b64 = b64; if (typeof postShipFrame === "function") postShipFrame(id, pendingShips.get(id).find((p) => p.shipId === shipId)); } },
+      shipUnposted: (id, name, shipId, b64, kind) => { addPendingShip(id, name, shipId, kind || "composer"); if (b64) { if (typeof retainShipBytes === "function") retainShipBytes(id, shipId, b64); else pendingShips.get(id).find((p) => p.shipId === shipId).b64 = b64; } },   // still encoding: no frame out
+      post: (id, shipId) => { postShipFrame(id, pendingShips.get(id).find((p) => p.shipId === shipId)); },   // the reader finished: the frame leaves the page
       holdSend: (id) => { sendOnShip.add(id); },                 // "Wait for the upload"
       ships: () => Object.fromEntries([...pendingShips].map(([k, v]) => [k, v.map((p) => ({ name: p.name, shipId: p.shipId, ...(p.b64 ? { b64: p.b64 } : {}) }))])),
       heldSend: () => [...sendOnShip],
@@ -630,7 +634,7 @@ test("round eleven: an upload never crosses documents — a create resolved to a
   assert.ok(w.HOOKS.posts.some((p) => p.romp === "orphanState" && (p.sids as string[]).includes(A)), "the completed file under an unshown session is offered to the pane that shows it");
   const st = w.api.take(A);
   assert.deepEqual(st, { draft: TYPED, citations: [], files: ["drops/1700000000000-photo.png"], staged: [] }, "the hand-off's exact fields: no upload, no held send");
-  assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "dropFile"), [], "no upload re-sent, ever");
+  assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "dropFile").map((m) => m.shipId), ["s1"], "one frame per upload — its creation post (the unread one never posted) — and no re-send, ever");
   // the receiving pane ignores an upload or a held-send field an older page might still send: never a chip, never a hold, never a re-ship
   const r = receiving(); r.api.adoptState(A, { ...st, ships: [{ name: "x.png", shipId: "s9", b64: "QUJD" }], heldSend: true });
   assert.deepEqual(r.api.ships(), {}); assert.deepEqual(r.api.heldSend(), []); assert.deepEqual(r.HOOKS.sent.filter((m) => m.type === "dropFile"), []);
@@ -778,14 +782,15 @@ test("round twelve: what holds the column, by name; a column held only by an upl
 
 test("round twelve: a frame the shim's own queue flushes on the reconnect is not re-shipped by that reconnect's romp:wsup — one frame per upload; a ship made before the drop is re-shipped once", () => {
   const w = receiving();
-  w.api.ship(A, "before.png", "p1", "QUJD");   // shipped on the live socket, unacked at the drop
+  const frames = () => w.HOOKS.sent.filter((m) => m.type === "dropFile").map((m) => m.shipId);
+  w.api.ship(A, "before.png", "p1", "QUJD");   // shipped on the live socket (its frame posted), unacked at the drop
   w.api.wsdown();
   w.api.ship(A, "during.png", "q1", "QUJD");   // posted while down: the shim queues it and flushes it on the open
+  assert.deepEqual(frames(), ["p1", "q1"], "each ship posted once at creation");
   w.api.wsup();
-  const frames = () => w.HOOKS.sent.filter((m) => m.type === "dropFile").map((m) => m.shipId);
-  assert.deepEqual(frames(), ["p1"], "the queued frame rides the shim's flush; only the earlier ship is re-sent");
+  assert.deepEqual(frames(), ["p1", "q1", "p1"], "the queued frame rides the shim's flush; only the earlier ship is re-sent");
   w.api.wsdown(); w.api.wsup();
-  assert.deepEqual(frames(), ["p1", "p1", "q1"], "a second drop before the acks: both re-ship (the kernel answers one path per ship id)");
+  assert.deepEqual(frames(), ["p1", "q1", "p1", "p1", "q1"], "a second drop before the acks: both re-ship (the kernel answers one path per ship id)");
 });
 
 test("round twelve: the strip's last member gone while an upload was in flight — the emptiness is reported on the release, before the flip", () => {
@@ -925,17 +930,16 @@ test("round seventeen: a legacy answer that two same-host uploads of one name co
   const w = receiving();   // A is active
   w.api.ship(A, "unrelated.png", "u1", "QUJD", "comment");   // A's map entry comes first: an unrelated pending comment ship
   w.api.draft(B, "B words waiting"); w.api.ship(B, "same.txt", "b1", "QUJD"); w.api.holdSend(B);   // B uploads same.txt first…
-  w.api.ship(A, "same.txt", "a1", "QUJD"); w.api.type(TYPED); w.api.holdSend(A);                    // …then A does, and both hold their sends
-  w.api.ack({ type: "droppedPath", path: "drops/1-same.txt" });   // the legacy ack for B's OLDER same.txt
-  assert.equal(w.api.ships()[B], undefined, "B's — the older — upload is the one retired"); assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["u1", "a1"], "A's newer upload stands");
+  w.api.type(TYPED); w.api.holdSend(A); w.api.ship(A, "same.txt", "a1", "QUJD");                    // …then A does, its send held: the second same-name post marks both (round eighteen)
+  assert.deepEqual(w.api.heldSend(), [], "both holds cancelled the moment the name became ambiguous"); assert.equal(w.HOOKS.toasts.filter((t) => /same\.txt is on its way for a different session/.test(t)).length, 2, "one toast per cancelled hold: " + JSON.stringify(w.HOOKS.toasts));
+  w.api.ack({ type: "droppedPath", path: "drops/1-same.txt" });   // the legacy ack for B's same.txt — posted first
+  assert.equal(w.api.ships()[B], undefined, "B's — posted first — is the one retired"); assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["u1", "a1"], "A's stands");
   assert.deepEqual(w.api.held.files()[B], ["drops/1-same.txt"], "the file lands on B: main's answer"); assert.equal(w.api.held.files()[A], undefined);
   assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage" || m.type === "askFollowUp"), [], "nothing auto-sent"); assert.equal(w.HOOKS.fired, 0);
   assert.equal(w.api.held.drafts()[B], "B words waiting", "B's draft kept"); assert.equal(w.api.composer(), TYPED, "A's words still in the box");
-  assert.deepEqual(w.api.heldSend(), [A], "B's hold cancelled — the user sends; A's stands on its own upload");
-  assert.deepEqual(w.HOOKS.toasts.filter((t) => /not sent automatically/.test(t)).length, 1, "one toast: " + JSON.stringify(w.HOOKS.toasts)); assert.ok(w.HOOKS.toasts.some((t) => /same\.txt/.test(t)));
-  // the single same-host match still settles fully (round sixteen kept): A's own later legacy ack releases A's send
+  // A's own later legacy ack: the only match left, but a ship once ambiguous never fires a message — the file attaches, A sends by hand
   w.api.ack({ type: "droppedPath", path: "drops/2-same.txt" });
-  assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["u1"]); assert.equal(w.HOOKS.fired, 1, "exactly one match now: settled, the held send fires");
+  assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["u1"]); assert.deepEqual(w.api.held.files()[A], ["drops/2-same.txt"]); assert.equal(w.HOOKS.fired, 0, "the 'unambiguous-looking' second answer fires nothing");
 });
 
 test("round seventeen: two hosts each with a pending upload of one name — an answer settles only the ANSWERING host's ship; the local kernel's answer never touches a remote host's", () => {
@@ -949,4 +953,36 @@ test("round seventeen: two hosts each with a pending upload of one name — an a
   assert.deepEqual(w.api.heldSend(), [A]);
   w.api.ack({ type: "droppedPath", path: "drops/2-same.txt" });   // the local kernel's legacy answer: no host key
   assert.equal(w.api.ships()[A], undefined); assert.equal(w.HOOKS.fired, 1, "the local match releases the local send");
+});
+
+// ---- round eighteen ----
+test("round eighteen: a legacy answer names the first-POSTED same-name ship, never the first-created — and two same-host same-name ships posted make every hold on them cancel at once, so neither answer can fire anything", () => {
+  const w = receiving();   // A is active
+  w.api.draft(B, "B words waiting"); w.api.shipUnposted(B, "same.bin", "b1", "QUJD"); w.api.holdSend(B);   // B creates the OLDER (large) same.bin: still encoding
+  w.api.shipUnposted(A, "same.bin", "a1", "QUJD"); w.api.type(TYPED); w.api.holdSend(A);              // A creates the NEWER (small) one
+  assert.deepEqual(w.api.heldSend(), [B, A], "nothing posted: nothing ambiguous yet");
+  w.api.post(A, "a1");   // the small file encodes first: A's frame is out first — and B's same-name ship, still encoding, WILL follow: the name is ambiguous from here
+  assert.deepEqual(w.api.heldSend(), [], "both holds cancelled at once, at the first post that makes a same-name pair"); assert.equal(w.HOOKS.toasts.filter((t) => /same\.bin is on its way for a different session/.test(t)).length, 2, "one toast per cancelled hold: " + JSON.stringify(w.HOOKS.toasts));
+  w.api.post(B, "b1");   // B's frame follows
+  assert.equal(w.HOOKS.toasts.length, 2, "nothing more to say");
+  w.api.ack({ type: "droppedPath", path: "drops/1-same.bin" });   // the kernel answers in post order: A's first
+  assert.equal(w.api.ships()[A], undefined, "the first-POSTED ship settled"); assert.deepEqual(w.api.ships()[B].map((p) => p.shipId), ["b1"], "B's, created earlier, stands");
+  assert.deepEqual(w.api.held.files()[A], ["drops/1-same.bin"]); assert.equal(w.HOOKS.fired, 0); assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage"), [], "nothing auto-sent");
+  w.api.ack({ type: "droppedPath", path: "drops/2-same.bin" });   // B's answer, second
+  assert.equal(w.api.ships()[B], undefined); assert.deepEqual(w.api.held.files()[B], ["drops/2-same.bin"], "attached to the other"); assert.equal(w.HOOKS.fired, 0); assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage"), [], "the second, 'unambiguous-looking' answer fires nothing either");
+  assert.equal(w.api.held.drafts()[B], "B words waiting", "B's draft kept"); assert.equal(w.api.composer(), TYPED, "A's words kept"); assert.equal(w.api.busy(), false);
+});
+
+test("round eighteen: an unposted ship is never a candidate; a posted single name still settles fully; the untagged nack takes the first-posted candidate", () => {
+  const v = world({ activeId: null, mru: [], order: [A, B], nextActive: null, store: {}, sets: { "2": [] } });
+  v.api.shipUnposted(A, "x.txt", "x1", "QUJD"); v.api.holdSend(A);
+  v.api.ack({ type: "droppedPath", path: "drops/1-x.txt" });   // an answer for a frame that is not out yet cannot be its
+  assert.deepEqual(v.api.ships()[A].map((p) => p.shipId), ["x1"], "not a candidate: nothing retired"); assert.deepEqual(v.api.heldSend(), [A]); assert.ok(v.HOOKS.toasts.some((t) => /no session is open/.test(t)), "no match, no active tab: said");
+  v.api.post(A, "x1"); v.api.draft(A, "words");
+  v.api.ack({ type: "droppedPath", path: "drops/2-x.txt" });
+  assert.equal(v.api.ships()[A], undefined, "posted: the single match settles fully"); assert.deepEqual(v.HOOKS.sent.filter((m) => m.type === "sendMessage").map((m) => m.id), [A], "…and the held send goes");
+  const n = receiving(); n.api.ship(B, "same.bin", "b1", "QUJD"); n.api.holdSend(B); n.api.holdSend(A); n.api.ship(A, "same.bin", "a1", "QUJD");   // both posted at creation, B first, both sends held before the pair: both marked, both holds cancelled
+  assert.deepEqual(n.api.heldSend(), []);
+  n.api.shipFail("same.bin", n.api.legacyFor("same.bin") as string);   // a legacy nack: the first-posted candidate fails
+  assert.equal(n.api.ships()[B], undefined, "B's, posted first, is the one failed"); assert.deepEqual(n.api.ships()[A].map((p) => p.shipId), ["a1"]); assert.ok(n.HOOKS.toasts.some((t) => /same\.bin could not be read/.test(t)));
 });

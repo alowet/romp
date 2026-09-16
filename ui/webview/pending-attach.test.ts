@@ -91,7 +91,7 @@ test("a kernel restart between ship and ack RE-SHIPS the retained bytes on recon
   // The ack rides the socket the dropFile went out on, so a restart in that window means it can
   // never arrive: the chip pulsed forever and a held send never fired. The payload is retained on
   // the entry and re-shipped on romp:wsup — the exact kernel-is-back event, never a timer.
-  assert.match(RENDER, /interface PendingShip \{ name: string; shipId: string; b64\?: string; kind: "composer" \| "comment"; queued\?: boolean; seq: number \}/);
+  assert.match(RENDER, /interface PendingShip \{ name: string; shipId: string; b64\?: string; kind: "composer" \| "comment"; queued\?: boolean; postSeq\?: number; ambiguous\?: boolean \}/);
   assert.match(RENDER, /function retainShipBytes\(sid: string \| null, shipId: string, b64: string\): void \{[\s\S]{0,300}entry\.b64 = b64;\n  entry\.queued = !hostOf\(sid \|\| ""\) && !wsIsUp;/);
   assert.match(RENDER, /function reshipPendingUploads\(hosts\?: readonly string\[\]\): void \{/);
   assert.match(RENDER, /window\.addEventListener\("romp:wsup", \(\) => \{\n  wsIsUp = true;\n  reshipPendingUploads\(\);/);   // up is noted first (round twelve); the listener grew a body (T246: the local active-tab re-arm rides it too)
