@@ -19188,14 +19188,14 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
   // THREE producers, three routes (round sixteen): a PICKED frame (the extension's 📎 and editor handoff, the kernel's native dialog —
   // `picked`) stands for no upload: it lands on the active composer, retires nothing, releases nothing, and is said when no session
   // is open here. A TAGGED ack (shipId) is its ship's, wherever that ship lives. An untagged, un-picked frame is a LEGACY kernel's
-  // ack (before v0.15.0): matched to a pending ship by the saved name (legacyShipFor) and then settled exactly as a tagged one;
-  // matched to none, it lands on the active composer as on main (an open comment box is the comment's), and is said when no
-  // session is open here — never silent.
+  // ack (before v0.15.0): the FILE goes to a best guess — the pending ship of the answering host with the same saved name
+  // (legacyShipFor), else the active composer as on main (an open comment box is the comment's), else it is said — and wherever it
+  // lands, that composer's automatic send is DISARMED (round twenty): a guess may never ride a message that goes out by itself.
   else if (m.type === "droppedPath" && typeof m.path === "string") {   // host-saved drop/paste/pick → a thumbnail, not path text (the user 2026-08-04)
     const picked = m.picked === true;   // three producers, three routes: see above the branch (round sixteen)
     let ackShip = typeof m.shipId === "string" && m.shipId ? m.shipId : undefined;
     if (ackShip && !shipOwner(ackShip)) return;   // a duplicate of a ship already retired (a reconnect re-ship raced the original ack): dropped, never attached again (T215)
-    const tagged = !!ackShip;   // the kernel named the upload (v0.15+): the answer settles exactly; an untagged one is a guess for the FILE and never a send (round nineteen)
+    const tagged = !!ackShip;   // the kernel named the upload (v0.15+): the answer settles exactly; an untagged one is a guess for the FILE, and disarms the send of whichever composer it lands on (rounds nineteen, twenty)
     if (!ackShip && !picked) { const legacy = legacyShipFor(legacyNameOf(m.path), typeof m.host === "string" ? m.host : ""); if (legacy) ackShip = legacy.shipId; }
     const ship = ackShip ? shipRecord(ackShip) : null;   // the ack's route (see above)
     const cbox = document.getElementById("cmt-pop")?.querySelector(".cmt-input") as HTMLTextAreaElement | null;
@@ -19220,17 +19220,21 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     addComposerFile(owner, m.path);
     // an OPEN ship-gate dialog counts as a held send (the user 2026-08-19): the upload finishing is
     // the answer to the question it asks, so it closes itself and the send fires — no click needed.
-    // ONLY a tagged ack that retired one of the owner's own composer ships may release a held send (round fifteen): an untagged
-    // answer never calls sendHeldFor, never touches sendOnShip or shipGateSid — read as B's, the picker's answer for A sent B's words
-    const gateOpen = !!retired && shipGateSid === retired;
-    if (retired && !tagged && (sendOnShip.has(retired) || gateOpen)) {
-      // an UNTAGGED answer (a kernel before v0.15.0) names no upload: the file above is a best guess by name, and a guess may never send a
-      // message (round nineteen). The hold is cancelled and said; the words stay the draft for the user to check the attachment and send.
-      sendOnShip.delete(retired);
+    // ONLY a tagged ack that retired one of the owner's own composer ships may release a held send (round fifteen). An untagged
+    // answer never releases one — and, ONE RULE for every composer it lands on (round twenty), it DISARMS that composer's send:
+    // matched to its own ship, or matched to none and attached to the active session as on main. The file it attached is a guess,
+    // and the composer's later TAGGED answer would otherwise release the hold and sendHeldFor / the box's send would carry EVERY
+    // attachment on the strip — the guessed file with it (a legacy remote's late answer after its chip was ✕'d, a stale duplicate,
+    // an old extension host's untagged pick). A `picked` frame took its own exit above: a pick is the user's act, so its hold may fire.
+    const gateOpen = shipGateSid === owner;
+    if (!tagged && (sendOnShip.has(owner) || gateOpen)) {
+      sendOnShip.delete(owner);
       if (gateOpen) { shipGateSid = null; closeConfirm(null); }
       endReloadHoldIfIdle();
-      warnToast("This session's upload was answered by an older kernel that names no upload, so the message was not sent automatically — check the attachment and send it yourself.");
-      if (retired === activeId) renderComposerFiles(retired);
+      warnToast(retired
+        ? "This session's upload was answered by an older kernel that names no upload, so the message was not sent automatically — check the attachment and send it yourself."
+        : "A file arrived from an older kernel that names no upload and was attached here, so this message will not be sent automatically — check the attachment and send it yourself.");
+      if (owner === activeId) renderComposerFiles(owner);
     } else if (retired && tagged && (sendOnShip.has(retired) || gateOpen) && !composerShips(retired).length) {   // the composer's own ships (round thirteen): a comment's never gate it
       // the LAST ship landed — the event the held send was waiting for (the user 2026-08-16), and every ship it waited on
       // completed (a failure cancels the hold the moment it happens, shipFailed)

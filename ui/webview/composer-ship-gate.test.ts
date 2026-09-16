@@ -43,7 +43,7 @@ test("the OPEN gate dialog resolves itself on the last ack: closes and sends, no
   // dialog just sat there. The upload finishing IS the answer to the question the dialog asks.
   assert.match(RENDER, /let shipGateSid: string \| null = null;/);
   assert.match(RENDER, /shipGateSid = sid;\s*\/\/ the last-ship ack resolves the open dialog itself/);
-  assert.match(RENDER, /const gateOpen = !!retired && shipGateSid === retired;/);
+  assert.match(RENDER, /const gateOpen = shipGateSid === owner;/);
   assert.match(RENDER, /if \(gateOpen\) \{ shipGateSid = null; closeConfirm\(null\); \}/,
     "the dialog dismisses itself the moment the last ship lands, then the send fires");
   assert.match(RENDER, /shipGateSid = null; endReloadHoldIfIdle\(\);\n\s*if \(v === "now"\)/,

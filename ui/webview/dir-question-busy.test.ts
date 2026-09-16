@@ -976,3 +976,20 @@ test("round nineteen: an untagged nack fails ONE best-guess ship — the first p
   assert.equal(n.api.ships()[B], undefined, "B's, posted first, is the one failed"); assert.deepEqual(n.api.ships()[A].map((p) => p.shipId), ["a1"], "A's stands");
   assert.deepEqual(n.api.heldSend(), [A], "B's hold cancelled by the failure, A's stands"); assert.ok(n.HOOKS.toasts.some((t) => /same\.bin could not be read.*NOT sent/.test(t))); assert.equal(n.api.legacyFor("nobody.bin"), undefined, "no such name: no guess");
 });
+
+// ---- round twenty ----
+test("round twenty: an UNMATCHED untagged answer that lands on the active composer disarms that composer's automatic send — its own later tagged answer attaches and sends NOTHING; a pick does not disarm", () => {
+  const w = receiving();   // A is the active session, current kernel
+  w.api.ship(A, "a.png", "a1", "QUJD"); w.api.type(TYPED); w.api.holdSend(A); 
+  w.api.ack({ type: "droppedPath", path: "drops/9-foreign.png", host: "TESTHOST" });   // a legacy remote's late answer: its chip was ✕'d, no record matches — the active composer takes the file, as on main
+  assert.deepEqual(w.api.held.files()[A], ["drops/9-foreign.png"], "attached to A"); assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["a1"], "A's own upload still pending");
+  assert.deepEqual(w.api.heldSend(), [], "A's hold disarmed"); assert.ok(w.HOOKS.toasts.some((t) => /arrived from an older kernel that names no upload and was attached here/.test(t)), "said: " + JSON.stringify(w.HOOKS.toasts));
+  w.api.ack({ type: "droppedPath", path: "drops/1-a.png", shipId: "a1" });   // A's own tagged answer
+  assert.deepEqual(w.api.held.files()[A], ["drops/9-foreign.png", "drops/1-a.png"], "the file attached"); assert.equal(w.HOOKS.fired, 0, "NOTHING sent: the foreign file would have ridden the message"); assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage"), []);
+  assert.equal(w.api.composer(), TYPED, "the words stay for the user"); assert.equal(w.api.busy(), false);
+  const v = receiving(); v.api.ship(A, "a.png", "a1", "QUJD"); v.api.type(TYPED); v.api.holdSend(A);
+  v.api.ack({ type: "droppedPath", path: "/synthetic/pick.txt", picked: true });   // the user's own pick on the active composer
+  assert.deepEqual(v.api.heldSend(), [A], "a pick is the user's act: the hold stands"); assert.deepEqual(v.api.held.files()[A], ["/synthetic/pick.txt"]);
+  v.api.ack({ type: "droppedPath", path: "drops/1-a.png", shipId: "a1" });
+  assert.equal(v.HOOKS.fired, 1, "…and A's tagged answer releases it, the pick riding along"); assert.deepEqual(v.HOOKS.toasts, []);
+});
