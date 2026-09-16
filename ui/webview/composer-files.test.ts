@@ -32,7 +32,7 @@ test("the composer has an attachment strip, its own row above the chips — on B
 });
 
 test("every file arrival becomes an attachment, never raw path text in the box", () => {
-  assert.match(RENDER, /const composerFiles = new Map<string, ComposerFile\[\]>\(\);/);
+  assert.match(RENDER, /const composerFiles = new Map<string, string\[\]>\(\);/);
   // the drop handler's three path sources all land in addComposerFile
   assert.match(RENDER, /const fromUri = \(u: string\) => addComposerFile\(activeId, decodeURIComponent\(u\.replace\(\/\^file:\\\/\\\/\/, ""\)\)\);/);
   assert.match(RENDER, /if \(p\) \{ addComposerFile\(activeId, p\); return; \}/);
@@ -41,7 +41,7 @@ test("every file arrival becomes an attachment, never raw path text in the box",
   assert.match(RENDER, /if \(p && !hostOf\(activeId \|\| ""\)\) addComposerFile\(activeId, p\);\s*\n\s*else shipFileToHost\(f\);/);
   // the window spans the popover-owned branch first (an open comment popover claims its own
   // clip's ack; the COMPOSER path below it still always lands as an attachment)
-  assert.match(RENDER, /m\.type === "droppedPath" && typeof m\.path === "string"\) \{[\s\S]{0,3000}addComposerFile\(owner, m\.path, !tagged\);/);   // window covers the T215 stray-ack gate
+  assert.match(RENDER, /m\.type === "droppedPath" && typeof m\.path === "string"\) \{[\s\S]{0,3000}addComposerFile\(owner, m\.path\);/);   // window covers the T215 stray-ack gate
   // the old insert-at-cursor path is gone with its last caller
   assert.doesNotMatch(RENDER, /function insertComposerText/);
 });
@@ -65,11 +65,11 @@ test("an image thumbnail renders per surface; other files wear an ext + name chi
   assert.match(fn, /openPath\(p, id \|\| null, e\);/);   // with its click: a modified click on a PDF takes a browser tab
   assert.match(fn, /if \(id\) removeComposerFile\(id, i\);/);
   // the same file dropped twice attaches once
-  assert.match(RENDER, /const hit = list\.find\(\(e\) => e\.path === path\);\n  if \(hit\) hit\.legacy = hit\.legacy \|\| legacy;[^\n]*\n  else list\.push\(\{ id: mintFileId\(\), path, legacy \}\);/);
+  assert.match(RENDER, /if \(!list\.includes\(path\)\) list\.push\(path\);/);
 });
 
 test("attachments ride the send as a trailing line of paths, quoted when they hold spaces", () => {
-  assert.match(RENDER, /const attached = filePaths\(activeId\);/);
+  assert.match(RENDER, /const attached = composerFiles\.get\(activeId\) \|\| \[\];/);
   assert.match(RENDER, /if \(!typed && !attached\.length\) return;/);   // attachment-only sends are real sends
   assert.match(RENDER, /\(typed \? typed \+ "\\n" : ""\) \+ attached\.map\(\(p\) => \(\/\\s\/\.test\(p\) \? '"' \+ p \+ '"' : p\)\)\.join\(" "\)/);
   // consumed on delivery (the provisional queue path included) — the strip emptied into this message
@@ -81,8 +81,8 @@ test("attachments ride the send as a trailing line of paths, quoted when they ho
 
 test("attachments live the DRAFT lifecycle: switch, reload, close", () => {
   // persisted beside drafts/citations/staged, restored as a list of strings
-  assert.match(RENDER, /files: Object\.fromEntries\(\[\.\.\.composerFiles\]\.map\(\(\[k, v\]\) => \[k, fileWire\(v\)\.files\]\)\),/, "the store's `files` are paths — the old shape (round twenty-three)");
-  assert.match(RENDER, /const savedState = \(vscodeApi\?\.getState\?\.\(\) \|\| \{\}\) as any, savedFiles = savedState\.files, savedMeta = savedState\.filesMeta, interimLegacy = savedState\.filesLegacy;/, "the store's files, their bound record, and the interim maps it retires (round twenty-four)");
+  assert.match(RENDER, /files: Object\.fromEntries\(composerFiles\),/);
+  assert.match(RENDER, /const savedFiles = \(\(vscodeApi\?\.getState\?\.\(\) \|\| \{\}\) as any\)\.files;/);
   // a tab switch REPAINTS the strip (unlike citations, which the switch abandons); the staged
   // strip (2026-08-15) repaints in the same breath, between the chips and the files
   assert.match(RENDER, /renderComposerChips\(id\);   \/\/ the entering tab's own citation chip \(if any\)\s*\n\s*renderStagedStrip\(id\);[^\n]*\n\s*renderComposerFiles\(id\);/);

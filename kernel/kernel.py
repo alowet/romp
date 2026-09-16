@@ -58260,19 +58260,16 @@ function busy(f){try{var b=f&&f.contentWindow&&f.contentWindow.__rompColumnBusy;
 // the SESSION-level question (round twelve, 2026-09-16): an upload in flight for this session, or a send held on one — its ack rides the
 // source document's socket, so the session cannot move (the words would leave, the ack would send the bare path); an older page answers no
 function sessionBusy(f,sid){try{var b=f&&f.contentWindow&&f.contentWindow.__rompSessionBusy;return typeof b==='function'&&!!b(sid);}catch(e){return false;}}
-// …and WHICH fact pins it (round twenty-four): 'unverified' (an older kernel's guessed attachment — the user checks or removes it) or 'upload'; a page without the question answers 'upload' when busy
-function sessionBusyWhy(f,sid){try{var w=f&&f.contentWindow&&f.contentWindow.__rompSessionBusyWhy;if(typeof w==='function')return String(w(sid)||'');return sessionBusy(f,sid)?'upload':'';}catch(e){return '';}}
 // WHICH fact holds a column (round twelve): 'upload-unshown' — an upload for a session shown elsewhere is the only hold, and no chip is drawn
 // there to release it — turns this user's close into a question for the page (askCloseUpload) instead of a refusal
 function busyWhy(f){try{var w=f&&f.contentWindow&&f.contentWindow.__rompColumnBusyWhy;return typeof w==='function'?String(w()||''):'';}catch(e){return '';}}
 // the SESSION question, asked of EVERY mounted column document (round thirteen): the upload's ack rides the socket of the document
 // that shipped it, which need not be the column the store lists the session in (a peer's write moved the tab; a create resolved to a
 // session shown elsewhere while its column was held) — asking the store's owner alone let the session move during the upload
-function sessionBusyAnywhere(sid){var fs=frames();for(var i=0;i<fs.length;i++){var w=sessionBusyWhy(fs[i],sid);if(w)return w;}return '';}   // the first fact any column's document names, '' when none
+function sessionBusyAnywhere(sid){var fs=frames();for(var i=0;i<fs.length;i++){if(sessionBusy(fs[i],sid))return true;}return false;}
 function loaded(f){try{return !!(f&&f.contentWindow&&typeof f.contentWindow.__rompTakeSessionState==='function');}catch(e){return false;}}   // the page's bundle has evaluated, so a posted message is heard
 var BUSY='A session is still being created in this column, or an upload from it is still in flight.';
 var UPLOADING='An attachment for this session is still on its way — move it once it lands.';
-var UNVERIFIED='An attachment from an older kernel is on this session — check it or remove it before moving.';
 var LOCKED='The tabs are locked: unlock them in the settings (Chat, Tab strip) to move this session.';
 function make(n,sid,state){var have=document.getElementById(frameId(n));if(have)return have;
 var g=document.createElement('div');g.className='gv gv-chat';g.id='gv-chat-'+n;
@@ -58305,7 +58302,7 @@ function unlist(sid){for(var i=0;i<cols.length;i++){var c=cols[i],j=c.ids.indexO
 function moveTab(sid,to){if(typeof sid!=='string'||!sid)return null;
 var from=ownerOf(sid),src=frameOfCol(from);
 var why=refusal(src,sid);if(why==='locked')return notify(LOCKED);if(why||!movable(src,sid))return notify('Only an open session can be moved between columns.');
-var sw=sessionBusyAnywhere(sid);if(sw)return notify(sw==='unverified'?UNVERIFIED:UPLOADING);   // every move (the palette, the drag zones, a new column) asks every column's document: an upload in flight pins its session to the document that ships it (rounds twelve, thirteen); so does an unverified attachment (round twenty-four)
+if(sessionBusyAnywhere(sid))return notify(UPLOADING);   // every move (the palette, the drag zones, a new column) asks every column's document: an upload in flight pins its session to the document that ships it (rounds twelve, thirteen)
 if(to==='new'){var se=entry(from);if(se&&se.ids.length===1)return notify('This session is already alone in its column.');
 if(!canSplit())return refuse();
 try{if(!document.body.classList.contains('po-chat')&&window.__rompPaneToggle)window.__rompPaneToggle('chat',true);}catch(e){}   // a hidden chat group comes forward first
@@ -58328,7 +58325,7 @@ try{tf.contentWindow.focus();}catch(e){}return tf;}
 // which HOLDS a busy column itself rather than close it, see reconcile).
 function close(n,keep){var i=idx(n);if(i<0)return;
 var f=document.getElementById(frameId(n)),home=document.getElementById('f-chat');
-if(!keep&&busy(f)){var bw=busyWhy(f);if(bw==='upload-unshown'){try{f.contentWindow.postMessage({romp:'askCloseUpload'},'*');}catch(e){}return;}if(bw==='unverified'){try{f.contentWindow.postMessage({romp:'askCloseUnverified'},'*');}catch(e){}return;}notify(BUSY);return;}   // a create in flight would die with the document (its queued text with it); an upload for a session shown elsewhere is the user's call (round twelve); so is an unverified attachment's discard (round twenty-four)
+if(!keep&&busy(f)){if(busyWhy(f)==='upload-unshown'){try{f.contentWindow.postMessage({romp:'askCloseUpload'},'*');}catch(e){}return;}notify(BUSY);return;}   // a create in flight would die with the document (its queued text with it); an upload for a session shown elsewhere is the user's call (round twelve)
 if(f&&home){cols[i].ids.forEach(function(sid){adopt(home,sid,take(f,sid));});
 // …and the state the page holds for sessions it does NOT show goes to each one's owner — the column that lists it, when
 // its page can hear the message, else the first column (whose page offers it on, orphanState) — instead of dying with the

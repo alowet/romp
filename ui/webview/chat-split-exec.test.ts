@@ -49,7 +49,7 @@ type Api = {
   heldHere: (id: string) => boolean;
   state: () => { activeId: string | null; wantActive: string | null; colSets: ColSets | null; colEmptyPosted: boolean; tabOrderSeen: boolean };
   set: (p: { activeId?: string | null; wantActive?: string | null; provisionalId?: string | null; tabOrderSeen?: boolean; failed?: string[]; hostsSeen?: string[] }) => void;
-  maps: { drafts: Map<string, string>; composerCitations: Map<string, unknown[]>; composerFiles: Map<string, { id: string; path: string; legacy: boolean }[]>; stagedMsgs: StagedStack };
+  maps: { drafts: Map<string, string>; composerCitations: Map<string, unknown[]>; composerFiles: Map<string, string[]>; stagedMsgs: StagedStack };
 };
 type World = { api: Api; HOOKS: Hooks; W: { sets: ColSets | null; owner: ((sid: string) => unknown) | null }; me: { id: string }; other: { id: string; contentWindow: unknown } };
 
@@ -68,8 +68,8 @@ function world(o: { col?: string; sets?: ColSets | null; tabOrderSeen?: boolean;
   };
   const win = { parent: PARENT, frameElement: me };
   const js = requireCjs("esbuild").transformSync(
-    [line("heldHere"), line("tabInView"), line("columnBusy"), line("unverifiedHere"), fn("forwardToOwner"), fn("claimSession"), fn("noteColumnEmptiness"),
-     fn("orphanStateSids"), fn("noteOrphanState"), fn("staleActiveFallback"), fn("adoptSessionState"), fn("mergeCitations"), fn("shipOwner"), line("isUnverified"), fn("fileEntriesOf"), line("mintFileId"), fn("disarmUnverified")].join("\n"), { loader: "ts" }).code;
+    [line("heldHere"), line("tabInView"), line("columnBusy"), fn("forwardToOwner"), fn("claimSession"), fn("noteColumnEmptiness"),
+     fn("orphanStateSids"), fn("noteOrphanState"), fn("staleActiveFallback"), fn("adoptSessionState"), fn("mergeCitations"), fn("shipOwner")].join("\n"), { loader: "ts" }).code;
   const prelude = `
     const { columnHolds, columnEmptiness, isProvisionalId, isSubId, StagedStack, HOOKS } = W;
     const COL = W.col;
@@ -86,7 +86,6 @@ function world(o: { col?: string; sets?: ColSets | null; tabOrderSeen?: boolean;
     const drafts = new Map(), composerCitations = new Map(), composerFiles = new Map(); const stagedMsgs = new StagedStack();
     const persistDrafts = () => { HOOKS.persisted++; }; const loadComposerFor = (sid) => { HOOKS.loaded.push(sid); };
     const pendingShips = new Map(), sendOnShip = new Set(); const warnToast = () => {}; const vscodeApi = { postMessage() {} }; const renderComposerFiles = () => {};   // the carry's upload half (round ten): idle in these worlds
-    let shipGateSid = null; const closeConfirm = () => {}; const endReloadHoldIfIdle = () => {}; const UNVERIFIED_NOTICE = ""; let fileSeq = 0; const syncColumnBusy = () => {};   // the unverified mark's neighbours (rounds twenty-one, twenty-two): the mark lives on the file entries; none marked in these worlds
     const handedOff = new Set();   // the held send's belt (round twelve): an adopt clears the sid
   `;
   const epilogue = `
@@ -278,7 +277,7 @@ test("a later column claims a created session on the shell and re-reads the sets
 test("orphaned state: sids held for sessions this column does not show are offered once the board is heard; held, provisional and viewer ids never", () => {
   const w = world({ col: "2", sets: { "2": [API] } });
   w.api.maps.drafts.set(API, "mine"); w.api.maps.drafts.set(WEB, "a v1 blob's draft for a session the first column shows");
-  w.api.maps.composerFiles.set(TESTS, [{ id: "t1", path: "/tmp/a.png", legacy: false }]); w.api.maps.composerCitations.set(WEB, [{ title: "a card" }]);
+  w.api.maps.composerFiles.set(TESTS, ["/tmp/a.png"]); w.api.maps.composerCitations.set(WEB, [{ title: "a card" }]);
   w.api.maps.stagedMsgs.push(WEB + "9", { text: "s", cites: [] });
   w.api.maps.drafts.set(PROV, "typed into the create in flight"); w.api.maps.drafts.set(VIEWER, "a viewer's");
   assert.deepEqual(w.api.orphanStateSids().sort(), [WEB, TESTS, WEB + "9"].sort(), "every slice, each sid once; this column's member and its own tabs excluded");
@@ -303,11 +302,11 @@ test("orphaned state: sids held for sessions this column does not show are offer
 
 test("adoptSessionState joins every slice onto what is already here, persists once, and fills the box only for the active tab; junk is ignored", () => {
   const w = world({ col: "2", sets: { "2": [API] }, activeId: API });
-  w.api.maps.drafts.set(API, "already here"); w.api.maps.composerFiles.set(API, [{ id: "a1", path: "/tmp/a.png", legacy: false }]); w.api.maps.stagedMsgs.push(API, { text: "first", cites: [] });
+  w.api.maps.drafts.set(API, "already here"); w.api.maps.composerFiles.set(API, ["/tmp/a.png"]); w.api.maps.stagedMsgs.push(API, { text: "first", cites: [] });
   w.api.adoptSessionState(API, { draft: "moved in", citations: [{ title: "a card" }], files: ["/tmp/b.png", 7, ""], staged: [{ text: "second", cites: [] }] });
   assert.equal(w.api.maps.drafts.get(API), "already here\n\nmoved in", "joined, never over");
   assert.deepEqual(w.api.maps.composerCitations.get(API), [{ title: "a card" }]);
-  assert.deepEqual(w.api.maps.composerFiles.get(API)!.map((e) => ({ path: e.path, legacy: e.legacy })), [{ path: "/tmp/a.png", legacy: false }, { path: "/tmp/b.png", legacy: false }], "strings only, as verified entries (round twenty-two); each with an id of its own (round twenty-three)"); assert.ok(w.api.maps.composerFiles.get(API)!.every((e) => typeof e.id === "string" && e.id));
+  assert.deepEqual(w.api.maps.composerFiles.get(API), ["/tmp/a.png", "/tmp/b.png"], "strings only");
   assert.deepEqual(w.api.maps.stagedMsgs.list(API), [{ text: "first", cites: [] }, { text: "second", cites: [] }], "in order: what was here, then what arrived");
   assert.equal(w.HOOKS.persisted, 1);
   assert.deepEqual(w.HOOKS.loaded, [API], "the active tab's box is refilled");
@@ -344,13 +343,12 @@ function stripWorld(o: { col: string; sets: ColSets | null; wantActive?: string 
   const PARENT = { postMessage(m: Record<string, unknown>) { HOOKS.posts.push(m); }, __rompChatSets: () => W.sets };
   const win = { parent: PARENT, frameElement: { id: "f-chat-" + o.col } };
   const js = requireCjs("esbuild").transformSync(
-    [line("heldHere"), line("tabInView"), line("columnBusy"), line("unverifiedHere"), fn("stripLists"), fn("ackClosingTabs"), fn("applyTabOrder"), fn("noteColumnEmptiness")].join("\n"), { loader: "ts" }).code;
+    [line("heldHere"), line("tabInView"), line("columnBusy"), fn("stripLists"), fn("ackClosingTabs"), fn("applyTabOrder"), fn("noteColumnEmptiness")].join("\n"), { loader: "ts" }).code;
   const prelude = `
     const { columnHolds, columnEmptiness, isProvisionalId, isSubId, syncSessionsFromTabMeta, reconcileTabOrder, retainLiveOmitted, hostOf, localStrip, stripHost, HOOKS } = W;
     const COL = W.col;
     let colSets = W.sets, tabOrderSeen = false, activeId = null, provisionalId = null, wantActive = W.wantActive, vanishedId = null;
     const failedProvisionals = new Set(); let colEmptyPosted = false; let boardLive = new Set(); const hostsSeen = new Set();
-    const composerFiles = new Map();   // the column's fourth fact reads it (round twenty-four): no attachment in these worlds
     const pendingShips = new Map();   // the third busy fact (round eleven): no upload in flight in these worlds
     const readColSets = () => W.shell.sets;
     const syncTabKeysWithStrip = () => {};   // per-tab hot keys (2026-09-10): none in these worlds

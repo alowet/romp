@@ -22,7 +22,7 @@ test("a send with ships in flight is gated by the confirm: send-without is expli
   assert.match(RENDER, /\{ label: "Send without " \+ them, value: "now", danger: true \}/,
     "sending without the file is the marked-dangerous, explicit choice");
   assert.match(RENDER, /if \(v === "now"\) sendComposer\(\{ pastShipGate: true \}\);/);
-  assert.match(RENDER, /const owner = shipGateSid \?\? sid;[^\n]*\n(?:[^\n]*\n){2}\s*else if \(v === "wait"\) \{ if \(armHold\(owner\)\) renderComposerFiles\(owner\); \}/, "wait arms the hold for the gate's owner — the real session when a settlement re-keyed the gate while the dialog stood (round ten)");
+  assert.match(RENDER, /const owner = shipGateSid \?\? sid;[^\n]*\n(?:[^\n]*\n){2}\s*else if \(v === "wait"\) \{ sendOnShip\.add\(owner\); renderComposerFiles\(owner\); \}/, "wait arms the hold for the gate's owner — the real session when a settlement re-keyed the gate while the dialog stood (round ten)");
 });
 
 test("the held send fires on the LAST ack — event-based — and a nack cancels it loudly", () => {
@@ -75,7 +75,7 @@ test("any successful send supersedes a hold, so a spent hold can never double-se
 test("the ack attaches to the composer that SHIPPED the file, not whatever tab is active", () => {
   assert.match(RENDER, /function retirePendingShip\(key: string, shipId\?: string\): string \| null \{/);
   assert.match(RENDER, /const retired = retirePendingShip\(m\.path, ackShip\);[^\n]*\n    const owner = retired \|\| activeId;/);
-  assert.match(RENDER, /addComposerFile\(owner, m\.path, !tagged\);/);
+  assert.match(RENDER, /addComposerFile\(owner, m\.path\);/);
 });
 
 test("a held send is visible on the button and always inspectable", () => {
