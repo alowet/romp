@@ -91,7 +91,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
      fnOpt("mergeCitations"), fn("addPendingShip"), fn("shipSafeName"), fn("shipOwner"), fn("retirePendingShip"), fn("endReloadHoldIfIdle"), fn("addComposerFile"), fn("adoptSessionState"), TAKE, ON_DROPPED,
      fnOpt("shipFailed"), fnOpt("sendHeldFor"), fn("flushStaged"), fn("routeUserMessage"), fn("noteOrphanState"),
      fnOpt("shipRecord"), fnOpt("retainShipBytes"), fnOpt("failShipsOfHost"), fnOpt("columnBusyWhy"), fnOpt("askCloseUpload"), fnOpt("abandonPendingUploads"), fn("reshipPendingUploads"), fn("noteColumnEmptiness"),
-     fnOpt("composerShips"), lineOpt("reclaimHandedOff"), fnOpt("legacyShipFor"), fnOpt("uploadingHeading"), fnOpt("postShipFrame"), fnOpt("noteAmbiguity"),
+     fnOpt("composerShips"), lineOpt("reclaimHandedOff"), fnOpt("legacyShipFor"), lineOpt("legacyNameOf"), fnOpt("uploadingHeading"), fnOpt("postShipFrame"), fnOpt("noteAmbiguity"),   /* noteAmbiguity: gone since round nineteen; lifted when an older render.ts (780e439e) still has it, so the fail-before run reads clean */
      winLine("__rompSessionBusy"), winLine("__rompColumnBusyWhy")].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
@@ -184,7 +184,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       wsdown: () => { wsIsUp = false; }, wsup: () => { wsIsUp = true; reshipPendingUploads(); },   // the shim's edges, as the page's listeners read them
       setSets: (s) => { colSets = s; }, reclaim: () => reclaimHandedOff(),   // what renderTabs does first: reads the sets, reclaims the marker for a sid shown here again
       heading: (sid) => uploadingHeading(sid),
-      legacyFor: (name) => { const p = legacyShipFor(name, ""); return p ? p.ship.shipId : undefined; },   // what the nack branch does with an untagged local name (rounds sixteen, seventeen)
+      legacyFor: (name) => { const p = legacyShipFor(name, ""); const q = p && p.ship ? p.ship : p; return q ? q.shipId : undefined; },   // what the nack branch does with an untagged local name (rounds sixteen, seventeen, nineteen; an older render.ts answered { ship, matches })
       draft: (sid, text) => { drafts.set(sid, text); persistDrafts(); },
       route: (m) => (typeof routeCreateReply === "function" ? routeCreateReply(m).kind : "?"),
       // (each persists, as the page's own staging / citing / attaching does)
@@ -876,25 +876,26 @@ test("round fifteen: an UNTAGGED droppedPath (the VS Code picker) for the active
 });
 
 test("round sixteen: an untagged, un-picked frame is a LEGACY kernel's ack — matched by the saved name to the ship it answers, wherever that ship lives, and settled as a tagged ack would be", () => {
-  // (a) the active session's own upload: the chip retired, the held send fires
+  // (a) the active session's own upload: the chip retired, the file attached — and the held send CANCELLED, said (round nineteen: an untagged answer never sends)
   const w = receiving(); w.api.ship(A, "photo.png", "a1", "QUJD"); w.api.holdSend(A); w.api.type(TYPED);
   w.api.ack({ type: "droppedPath", path: "drops/1700000000000-photo.png" });
-  assert.equal(w.api.ships()[A], undefined, "the chip is retired"); assert.deepEqual(w.api.held.files()[A], ["drops/1700000000000-photo.png"]); assert.equal(w.HOOKS.fired, 1, "the held send fires"); assert.equal(w.api.busy(), false);
-  // (b) no active tab, one matching pending ship: attached to its owner and settled — the held send goes by sid, nothing silent
+  assert.equal(w.api.ships()[A], undefined, "the chip is retired"); assert.deepEqual(w.api.held.files()[A], ["drops/1700000000000-photo.png"]); assert.equal(w.HOOKS.fired, 0, "no automatic send from an untagged answer");
+  assert.deepEqual(w.api.heldSend(), [], "the hold is cancelled"); assert.ok(w.HOOKS.toasts.some((t) => /answered by an older kernel that names no upload/.test(t)), "said: " + JSON.stringify(w.HOOKS.toasts)); assert.equal(w.api.composer(), TYPED, "the words stay in the box"); assert.equal(w.api.busy(), false);
+  // (b) no active tab, one matching pending ship: attached to its owner, the chip retired, the hold cancelled and said — nothing sent, nothing silent
   const v = world({ activeId: null, mru: [], order: [A, B], nextActive: null, store: {}, sets: { "2": [] } });
   v.api.draft(A, "A words waiting"); v.api.ship(A, "photo.png", "a1", "QUJD"); v.api.holdSend(A);
   v.api.ack({ type: "droppedPath", path: "drops/1-photo.png" });
-  assert.deepEqual(v.HOOKS.sent.filter((m) => m.type === "sendMessage").map((m) => ({ id: m.id, text: m.text })), [{ id: A, text: "A words waiting\ndrops/1-photo.png" }], "settled: A's held send goes with A's file");
-  assert.equal(v.api.ships()[A], undefined); assert.equal(v.api.busy(), false); assert.ok(!v.HOOKS.toasts.some((t) => /no session is open/.test(t)));
+  assert.deepEqual(v.HOOKS.sent.filter((m) => m.type === "sendMessage"), [], "nothing sent"); assert.deepEqual(v.api.held.files()[A], ["drops/1-photo.png"]); assert.equal(v.api.held.drafts()[A], "A words waiting", "the draft kept");
+  assert.equal(v.api.ships()[A], undefined); assert.deepEqual(v.api.heldSend(), []); assert.equal(v.api.busy(), false); assert.ok(v.HOOKS.toasts.some((t) => /older kernel/.test(t))); assert.ok(!v.HOOKS.toasts.some((t) => /no session is open/.test(t)));
   // (c) no active tab, no match: said, nothing retired, nothing attached
   const u = world({ activeId: null, mru: [], order: [A, B], nextActive: null, store: {}, sets: { "2": [] } });
   u.api.ship(A, "other.png", "o1", "QUJD");
   u.api.ack({ type: "droppedPath", path: "drops/1-photo.png" });
   assert.ok(u.HOOKS.toasts.some((t) => /1-photo\.png arrived, but no session is open/.test(t)), "said: " + JSON.stringify(u.HOOKS.toasts)); assert.deepEqual(u.api.ships()[A].map((p) => p.shipId), ["o1"], "nothing retired"); assert.equal(u.api.held.files()[A], undefined);
-  // (g) two pending ships with the same sanitised name: the OLDEST match
+  // (g) two pending ships with the same sanitised name: the FIRST POSTED takes the file (the best guess; it decides no send)
   const g = receiving(); g.api.ship(A, "photo.png", "p1", "QUJD"); g.api.ship(A, "photo.png", "p2", "QUJD");
   g.api.ack({ type: "droppedPath", path: "drops/2-photo.png" });
-  assert.deepEqual(g.api.ships()[A].map((p) => p.shipId), ["p2"], "the oldest match retired, the later one waits for its own ack");
+  assert.deepEqual(g.api.ships()[A].map((p) => p.shipId), ["p2"], "the first-posted match retired, the later one waits for its own ack");
   // a legacy ack for another session's ship, A active: it is that ship's, not A's
   const o = receiving(); o.api.ship(B, "b.png", "b1", "QUJD");
   o.api.ack({ type: "droppedPath", path: "drops/3-b.png" });
@@ -926,63 +927,52 @@ test("round sixteen: a legacy (untagged) nack is matched by name and fails that 
 });
 
 // ---- round seventeen ----
-test("round seventeen: a legacy answer that two same-host uploads of one name could be takes the OLDEST by creation and attaches — but auto-sends nothing: the hold is cancelled and said, both drafts kept", () => {
-  const w = receiving();   // A is active
-  w.api.ship(A, "unrelated.png", "u1", "QUJD", "comment");   // A's map entry comes first: an unrelated pending comment ship
-  w.api.draft(B, "B words waiting"); w.api.ship(B, "same.txt", "b1", "QUJD"); w.api.holdSend(B);   // B uploads same.txt first…
-  w.api.type(TYPED); w.api.holdSend(A); w.api.ship(A, "same.txt", "a1", "QUJD");                    // …then A does, its send held: the second same-name post marks both (round eighteen)
-  assert.deepEqual(w.api.heldSend(), [], "both holds cancelled the moment the name became ambiguous"); assert.equal(w.HOOKS.toasts.filter((t) => /same\.txt is on its way for a different session/.test(t)).length, 2, "one toast per cancelled hold: " + JSON.stringify(w.HOOKS.toasts));
-  w.api.ack({ type: "droppedPath", path: "drops/1-same.txt" });   // the legacy ack for B's same.txt — posted first
-  assert.equal(w.api.ships()[B], undefined, "B's — posted first — is the one retired"); assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["u1", "a1"], "A's stands");
-  assert.deepEqual(w.api.held.files()[B], ["drops/1-same.txt"], "the file lands on B: main's answer"); assert.equal(w.api.held.files()[A], undefined);
-  assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage" || m.type === "askFollowUp"), [], "nothing auto-sent"); assert.equal(w.HOOKS.fired, 0);
-  assert.equal(w.api.held.drafts()[B], "B words waiting", "B's draft kept"); assert.equal(w.api.composer(), TYPED, "A's words still in the box");
-  // A's own later legacy ack: the only match left, but a ship once ambiguous never fires a message — the file attaches, A sends by hand
-  w.api.ack({ type: "droppedPath", path: "drops/2-same.txt" });
-  assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["u1"]); assert.deepEqual(w.api.held.files()[A], ["drops/2-same.txt"]); assert.equal(w.HOOKS.fired, 0, "the 'unambiguous-looking' second answer fires nothing");
-});
 
 test("round seventeen: two hosts each with a pending upload of one name — an answer settles only the ANSWERING host's ship; the local kernel's answer never touches a remote host's", () => {
   const w = receiving();
   w.api.draft(RA, "remote words"); w.api.ship(RA, "same.txt", "r1", "QUJD"); w.api.holdSend(RA);   // TESTHOST's session uploads same.txt first
   w.api.ship(A, "same.txt", "a1", "QUJD"); w.api.holdSend(A); w.api.type(TYPED);                  // the local session too
   w.api.ack({ type: "droppedPath", path: "drops/1-same.txt", host: "TESTHOST" });   // TESTHOST's legacy answer, stamped by federation
-  assert.equal(w.api.ships()[RA], undefined, "the remote ship settled"); assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["a1"], "the local ship untouched though it is the same name");
-  assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage").map((m) => ({ id: m.id, text: m.text })), [{ id: RA, text: "remote words\ndrops/1-same.txt" }], "the one same-host match: settled fully — the remote session's held send goes by sid, the file on its trailing line");
-  assert.equal(w.api.held.files()[RA], undefined, "…and its strip is empty: the file went with the message"); assert.equal(w.api.held.files()[A], undefined, "nothing on the local session's strip");
-  assert.deepEqual(w.api.heldSend(), [A]);
+  assert.equal(w.api.ships()[RA], undefined, "the remote ship retired"); assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["a1"], "the local ship untouched though it is the same name");
+  assert.deepEqual(w.api.held.files()[RA], ["drops/1-same.txt"], "the file lands on the remote session"); assert.equal(w.api.held.files()[A], undefined, "nothing on the local session's strip");
+  assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage"), [], "an untagged answer sends nothing (round nineteen)"); assert.deepEqual(w.api.heldSend(), [A], "the remote hold cancelled, the local one stands"); assert.equal(w.api.held.drafts()[RA], "remote words");
   w.api.ack({ type: "droppedPath", path: "drops/2-same.txt" });   // the local kernel's legacy answer: no host key
-  assert.equal(w.api.ships()[A], undefined); assert.equal(w.HOOKS.fired, 1, "the local match releases the local send");
+  assert.equal(w.api.ships()[A], undefined); assert.equal(w.HOOKS.fired, 0, "the local match attaches and cancels — never fires"); assert.deepEqual(w.api.heldSend(), []); assert.equal(w.api.composer(), TYPED);
 });
 
-// ---- round eighteen ----
-test("round eighteen: a legacy answer names the first-POSTED same-name ship, never the first-created — and two same-host same-name ships posted make every hold on them cancel at once, so neither answer can fire anything", () => {
-  const w = receiving();   // A is active
-  w.api.draft(B, "B words waiting"); w.api.shipUnposted(B, "same.bin", "b1", "QUJD"); w.api.holdSend(B);   // B creates the OLDER (large) same.bin: still encoding
-  w.api.shipUnposted(A, "same.bin", "a1", "QUJD"); w.api.type(TYPED); w.api.holdSend(A);              // A creates the NEWER (small) one
-  assert.deepEqual(w.api.heldSend(), [B, A], "nothing posted: nothing ambiguous yet");
-  w.api.post(A, "a1");   // the small file encodes first: A's frame is out first — and B's same-name ship, still encoding, WILL follow: the name is ambiguous from here
-  assert.deepEqual(w.api.heldSend(), [], "both holds cancelled at once, at the first post that makes a same-name pair"); assert.equal(w.HOOKS.toasts.filter((t) => /same\.bin is on its way for a different session/.test(t)).length, 2, "one toast per cancelled hold: " + JSON.stringify(w.HOOKS.toasts));
-  w.api.post(B, "b1");   // B's frame follows
-  assert.equal(w.HOOKS.toasts.length, 2, "nothing more to say");
-  w.api.ack({ type: "droppedPath", path: "drops/1-same.bin" });   // the kernel answers in post order: A's first
-  assert.equal(w.api.ships()[A], undefined, "the first-POSTED ship settled"); assert.deepEqual(w.api.ships()[B].map((p) => p.shipId), ["b1"], "B's, created earlier, stands");
-  assert.deepEqual(w.api.held.files()[A], ["drops/1-same.bin"]); assert.equal(w.HOOKS.fired, 0); assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage"), [], "nothing auto-sent");
-  w.api.ack({ type: "droppedPath", path: "drops/2-same.bin" });   // B's answer, second
-  assert.equal(w.api.ships()[B], undefined); assert.deepEqual(w.api.held.files()[B], ["drops/2-same.bin"], "attached to the other"); assert.equal(w.HOOKS.fired, 0); assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage"), [], "the second, 'unambiguous-looking' answer fires nothing either");
-  assert.equal(w.api.held.drafts()[B], "B words waiting", "B's draft kept"); assert.equal(w.api.composer(), TYPED, "A's words kept"); assert.equal(w.api.busy(), false);
+
+
+// ---- round nineteen ----
+test("round nineteen: two same-name TAGGED uploads with held sends both release normally — an up-to-date kernel names its uploads, and no name heuristic touches them", () => {
+  const w = receiving();
+  w.api.draft(B, "B words"); w.api.ship(B, "same.bin", "b1", "QUJD"); w.api.holdSend(B);
+  w.api.type(TYPED); w.api.holdSend(A); w.api.ship(A, "same.bin", "a1", "QUJD");
+  assert.deepEqual(w.api.heldSend(), [B, A], "both holds stand: nothing is cancelled for a name a tagged kernel will name");
+  w.api.ack({ type: "droppedPath", path: "drops/1-same.bin", shipId: "a1" });
+  assert.equal(w.HOOKS.fired, 1, "A's tagged answer releases A's send"); assert.deepEqual(w.api.held.files()[A], ["drops/1-same.bin"]);
+  w.api.ack({ type: "droppedPath", path: "drops/2-same.bin", shipId: "b1" });
+  assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage").map((m) => ({ id: m.id, text: m.text })), [{ id: B, text: "B words\ndrops/2-same.bin" }], "B's tagged answer releases B's send, by sid, with B's file");
+  assert.deepEqual(w.api.heldSend(), []); assert.equal(w.api.busy(), false); assert.deepEqual(w.HOOKS.toasts, []);
 });
 
-test("round eighteen: an unposted ship is never a candidate; a posted single name still settles fully; the untagged nack takes the first-posted candidate", () => {
-  const v = world({ activeId: null, mru: [], order: [A, B], nextActive: null, store: {}, sets: { "2": [] } });
-  v.api.shipUnposted(A, "x.txt", "x1", "QUJD"); v.api.holdSend(A);
-  v.api.ack({ type: "droppedPath", path: "drops/1-x.txt" });   // an answer for a frame that is not out yet cannot be its
-  assert.deepEqual(v.api.ships()[A].map((p) => p.shipId), ["x1"], "not a candidate: nothing retired"); assert.deepEqual(v.api.heldSend(), [A]); assert.ok(v.HOOKS.toasts.some((t) => /no session is open/.test(t)), "no match, no active tab: said");
-  v.api.post(A, "x1"); v.api.draft(A, "words");
-  v.api.ack({ type: "droppedPath", path: "drops/2-x.txt" });
-  assert.equal(v.api.ships()[A], undefined, "posted: the single match settles fully"); assert.deepEqual(v.HOOKS.sent.filter((m) => m.type === "sendMessage").map((m) => m.id), [A], "…and the held send goes");
-  const n = receiving(); n.api.ship(B, "same.bin", "b1", "QUJD"); n.api.holdSend(B); n.api.holdSend(A); n.api.ship(A, "same.bin", "a1", "QUJD");   // both posted at creation, B first, both sends held before the pair: both marked, both holds cancelled
-  assert.deepEqual(n.api.heldSend(), []);
-  n.api.shipFail("same.bin", n.api.legacyFor("same.bin") as string);   // a legacy nack: the first-posted candidate fails
-  assert.equal(n.api.ships()[B], undefined, "B's, posted first, is the one failed"); assert.deepEqual(n.api.ships()[A].map((p) => p.shipId), ["a1"]); assert.ok(n.HOOKS.toasts.some((t) => /same\.bin could not be read/.test(t)));
+test("round nineteen: untagged answers have no send side effects — across a reconnect seam and a near-name pair, each answer attaches its best guess, cancels that owner's hold with the notice, and nothing is ever sent automatically", () => {
+  const w = receiving();
+  w.api.ship(A, "x-foo.txt", "a1", "QUJD"); w.api.type(TYPED); w.api.holdSend(A);   // A's upload, posted first
+  w.api.draft(B, "B words"); w.api.ship(B, "foo.txt", "b1", "QUJD"); w.api.holdSend(B);   // B's, a near name, posted second
+  w.api.wsdown(); w.api.wsup();   // the reconnect re-posts both (postSeq rewritten) while the old socket's answers may still be draining
+  w.api.ack({ type: "droppedPath", path: "drops/1-x-foo.txt" });   // exact name: A's
+  assert.equal(w.api.ships()[A], undefined, "A's chip retired"); assert.deepEqual(w.api.held.files()[A], ["drops/1-x-foo.txt"]); assert.deepEqual(w.api.ships()[B].map((p) => p.shipId), ["b1"], "no suffix relation: B's foo.txt is not x-foo.txt");
+  assert.deepEqual(w.api.heldSend(), [B], "A's hold cancelled"); assert.equal(w.HOOKS.fired, 0);
+  w.api.ack({ type: "droppedPath", path: "drops/2-foo.txt" });   // exact name: B's
+  assert.equal(w.api.ships()[B], undefined); assert.deepEqual(w.api.held.files()[B], ["drops/2-foo.txt"]); assert.deepEqual(w.api.heldSend(), []);
+  assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage" || m.type === "askFollowUp"), [], "nothing sent, by either answer"); assert.equal(w.HOOKS.fired, 0);
+  assert.equal(w.HOOKS.toasts.filter((t) => /older kernel that names no upload/.test(t)).length, 2, "one notice per cancelled hold"); assert.equal(w.api.composer(), TYPED); assert.equal(w.api.held.drafts()[B], "B words");
+});
+
+test("round nineteen: an untagged nack fails ONE best-guess ship — the first posted of that exact name — and cancels that owner's hold with the failure's own notice; a second same-name ship stands", () => {
+  const n = receiving(); n.api.draft(B, "B words"); n.api.ship(B, "same.bin", "b1", "QUJD"); n.api.holdSend(B); n.api.holdSend(A); n.api.ship(A, "same.bin", "a1", "QUJD");
+  assert.deepEqual(n.api.heldSend(), [B, A], "nothing cancelled at the post: no name is ambiguous for a kernel that names its uploads");
+  n.api.shipFail("same.bin", n.api.legacyFor("same.bin") as string);   // a legacy nack: the first-posted of that exact name
+  assert.equal(n.api.ships()[B], undefined, "B's, posted first, is the one failed"); assert.deepEqual(n.api.ships()[A].map((p) => p.shipId), ["a1"], "A's stands");
+  assert.deepEqual(n.api.heldSend(), [A], "B's hold cancelled by the failure, A's stands"); assert.ok(n.HOOKS.toasts.some((t) => /same\.bin could not be read.*NOT sent/.test(t))); assert.equal(n.api.legacyFor("nobody.bin"), undefined, "no such name: no guess");
 });

@@ -54,7 +54,7 @@ test("ack↔chip matching is by the echoed shipId alone: an untagged answer reti
   assert.ok(!RENDER.includes("list.splice(i >= 0 ? i : 0, 1);"), "no oldest-first fallback in retirePendingShip");
   // …the saved-name match lives in legacyShipFor alone (round sixteen): an untagged, UN-PICKED frame is a legacy kernel's ack and names its ship by
   // the saved name; a picker's frame carries `picked` and is never matched
-  assert.match(RENDER, /function legacyShipFor\(key: string, host: string\): \{ ship: PendingShip; matches: number \} \| null \{/); assert.equal((RENDER.match(/k\.endsWith\("-" \+ shipSafeName\(p\.name\)\)/g) || []).length, 1, "one name match, in legacyShipFor");
+  assert.match(RENDER, /function legacyShipFor\(name: string, host: string\): PendingShip \| null \{/); assert.equal((RENDER.match(/shipSafeName\(p\.name\) === want/g) || []).length, 1, "one name match — an EQUALITY, never a suffix (round nineteen) — in legacyShipFor"); assert.ok(!RENDER.includes('k.endsWith("-" + shipSafeName(p.name))'), "the suffix relation is gone");
 });
 
 test("a failed kernel save is NACKED and surfaces loudly — never a silent stuck chip", () => {
@@ -91,7 +91,7 @@ test("a kernel restart between ship and ack RE-SHIPS the retained bytes on recon
   // The ack rides the socket the dropFile went out on, so a restart in that window means it can
   // never arrive: the chip pulsed forever and a held send never fired. The payload is retained on
   // the entry and re-shipped on romp:wsup — the exact kernel-is-back event, never a timer.
-  assert.match(RENDER, /interface PendingShip \{ name: string; shipId: string; b64\?: string; kind: "composer" \| "comment"; queued\?: boolean; postSeq\?: number; ambiguous\?: boolean \}/);
+  assert.match(RENDER, /interface PendingShip \{ name: string; shipId: string; b64\?: string; kind: "composer" \| "comment"; queued\?: boolean; postSeq\?: number \}/);
   assert.match(RENDER, /function retainShipBytes\(sid: string \| null, shipId: string, b64: string\): void \{[\s\S]{0,300}entry\.b64 = b64;\n  entry\.queued = !hostOf\(sid \|\| ""\) && !wsIsUp;/);
   assert.match(RENDER, /function reshipPendingUploads\(hosts\?: readonly string\[\]\): void \{/);
   assert.match(RENDER, /window\.addEventListener\("romp:wsup", \(\) => \{\n  wsIsUp = true;\n  reshipPendingUploads\(\);/);   // up is noted first (round twelve); the listener grew a body (T246: the local active-tab re-arm rides it too)

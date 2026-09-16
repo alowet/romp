@@ -26,7 +26,7 @@ test("a send with ships in flight is gated by the confirm: send-without is expli
 });
 
 test("the held send fires on the LAST ack — event-based — and a nack cancels it loudly", () => {
-  assert.match(RENDER, /if \(retired && \(sendOnShip\.has\(retired\) \|\| gateOpen\) && !composerShips\(retired\)\.length\) \{/,
+  assert.match(RENDER, /if \(retired && tagged && \(sendOnShip\.has\(retired\) \|\| gateOpen\) && !composerShips\(retired\)\.length\) \{/,
     "the deciding event is the last of the COMPOSER's pending ships retiring — for a held send AND an open gate dialog (a comment's upload is none of it, round thirteen)");
   assert.match(RENDER, /if \(retired === activeId\) fireHeldSend\(\);/);
   assert.match(RENDER, /if \(retired === activeId\) fireHeldSend\(\);\n\s*else sendHeldFor\(retired\);/,
