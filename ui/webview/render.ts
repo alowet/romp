@@ -16285,7 +16285,8 @@ const composerFiles = new Map<string, string[]>();   // sid -> attachment paths,
 // `kind` (round twelve): whose upload — the composer's or a comment's — so the ack is routed by the SHIP, never by whichever box
 // happens to be open. `queued`: the frame was posted while the local socket was down, so the shim's own queue flushes it on the
 // next open — the reconnect re-ship must not post it again (the kernel saved two files, one per frame).
-interface PendingShip { name: string; shipId: string; b64?: string; kind: "composer" | "comment"; queued?: boolean }
+interface PendingShip { name: string; shipId: string; b64?: string; kind: "composer" | "comment"; queued?: boolean; seq: number }   // seq: creation order across the document (round seventeen: a legacy answer takes the OLDEST same-name upload of its host)
+let shipOrder = 0;   // the creation counter behind PendingShip.seq
 let wsIsUp = true;   // the local socket, as the shim's events say (romp:wsdown / romp:wsup); the first connect fires no wsup, so up until told otherwise
 window.addEventListener("romp:wsdown", () => { wsIsUp = false; });
 let shipSeq = 0;   // per-page mint — a shipId only ever meets acks for this page's own ships
@@ -16302,7 +16303,7 @@ function shipSafeName(name: string): string {
 function addPendingShip(id: string | null, name: string, shipId: string, kind: PendingShip["kind"] = "composer"): void {
   if (!id) return;
   const list = pendingShips.get(id) || [];
-  list.push({ name, shipId, kind });
+  list.push({ name, shipId, kind, seq: ++shipOrder });
   pendingShips.set(id, list);
   persistDrafts();   // the NAMES ride the draft store so a reload can say what it lost (T215)
   if (id === activeId) renderComposerFiles(id);
@@ -16323,14 +16324,19 @@ function shipRecord(shipId: string): PendingShip | null {
 }
 // A LEGACY kernel's ack or nack (before v0.15.0's shipId echo, 2026-09-01; a federated host updates only by an explicit `romp update`,
 // so one still on v0.14 answers untagged) names no ship: it is matched to a pending ship by the SAVED NAME — shipSafeName mirrors the
-// kernel's saved-name sanitizer, so drops/<ms>-<safe name> ends with the ship's own name — across every session this document holds.
-// Several matches take the OLDEST (the kernel answers a connection's dropFiles in order: main's fallback, scoped to name matches).
-// A frame that carries `picked` (the extension's 📎 and editor handoff, the kernel's native dialog) never comes here: a picker's
-// answer stands for no upload and must match none — read as one, the pick for A retired B's upload and sent B's words (round sixteen).
-function legacyShipFor(key: string): PendingShip | null {
+// kernel's saved-name sanitizer, so drops/<ms>-<safe name> ends with the ship's own name — among the pending ships of the HOST that
+// answered (round seventeen: federation stamps a remote kernel's answer with its host; the local socket's carries none), since two hosts
+// uploading one name must never be matched against each other. Several matches take the OLDEST by creation (the kernel answers a
+// connection's dropFiles in order), and the count comes back with it: the caller settles fully on exactly one match and, on more,
+// attaches without releasing any held send — the file is main's answer, the auto-send is not. A frame that carries `picked` (the
+// extension's 📎 and editor handoff, the kernel's native dialog) never comes here: a picker's answer stands for no upload.
+function legacyShipFor(key: string, host: string): { ship: PendingShip; matches: number } | null {
   const k = "-" + shipSafeName(key.split("/").pop() || key);
-  for (const list of pendingShips.values()) for (const p of list) if (k.endsWith("-" + shipSafeName(p.name))) return p;
-  return null;
+  const found: PendingShip[] = [];
+  for (const [sid, list] of pendingShips) { if (hostOf(sid) !== host) continue; for (const p of list) if (k.endsWith("-" + shipSafeName(p.name))) found.push(p); }
+  if (!found.length) return null;
+  found.sort((a, b) => a.seq - b.seq);
+  return { ship: found[0], matches: found.length };
 }
 // The COMPOSER's pending ships for a session (round thirteen): what its send gate counts, what a send held on its uploads waits
 // for, what the ✕ on its last chip settles. A comment's upload for the same session is none of the composer's business — counted
@@ -19176,7 +19182,8 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     const picked = m.picked === true;   // three producers, three routes: see above the branch (round sixteen)
     let ackShip = typeof m.shipId === "string" && m.shipId ? m.shipId : undefined;
     if (ackShip && !shipOwner(ackShip)) return;   // a duplicate of a ship already retired (a reconnect re-ship raced the original ack): dropped, never attached again (T215)
-    if (!ackShip && !picked) { const legacy = legacyShipFor(m.path); if (legacy) ackShip = legacy.shipId; }
+    let ambiguous = false;   // a legacy answer that several same-host uploads of one name could be (round seventeen): the oldest takes the file, no held send is released
+    if (!ackShip && !picked) { const legacy = legacyShipFor(m.path, typeof m.host === "string" ? m.host : ""); if (legacy) { ackShip = legacy.ship.shipId; ambiguous = legacy.matches > 1; } }
     const ship = ackShip ? shipRecord(ackShip) : null;   // the ack's route (see above)
     const cbox = document.getElementById("cmt-pop")?.querySelector(".cmt-input") as HTMLTextAreaElement | null;
     if (picked) {   // a pick: the active composer only (see above)
@@ -19203,7 +19210,16 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     // ONLY a tagged ack that retired one of the owner's own composer ships may release a held send (round fifteen): an untagged
     // answer never calls sendHeldFor, never touches sendOnShip or shipGateSid — read as B's, the picker's answer for A sent B's words
     const gateOpen = !!retired && shipGateSid === retired;
-    if (retired && (sendOnShip.has(retired) || gateOpen) && !composerShips(retired).length) {   // the composer's own ships (round thirteen): a comment's never gate it
+    if (retired && ambiguous && (sendOnShip.has(retired) || gateOpen)) {
+      // AMBIGUOUS (round seventeen): another session on the same host had an upload of the same name, so this answer may not be this
+      // upload's — the file is attached (main's answer), but the message is NOT sent automatically: the hold is cancelled, said, and
+      // the words stay the draft for the user to send
+      sendOnShip.delete(retired);
+      if (gateOpen) { shipGateSid = null; closeConfirm(null); }
+      endReloadHoldIfIdle();
+      warnToast("Another session had an upload named " + (m.path.split("/").pop() || "the same") + " too, so this message was not sent automatically — check the attachment and send it yourself.");
+      if (retired === activeId) renderComposerFiles(retired);
+    } else if (retired && (sendOnShip.has(retired) || gateOpen) && !composerShips(retired).length) {   // the composer's own ships (round thirteen): a comment's never gate it
       // the LAST ship landed — the event the held send was waiting for (the user 2026-08-16), and every ship it waited on
       // completed (a failure cancels the hold the moment it happens, shipFailed)
       sendOnShip.delete(retired);
@@ -19220,7 +19236,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     let nackShip = typeof m.shipId === "string" && m.shipId ? m.shipId : undefined;
     if (nackShip && !shipOwner(nackShip)) return;   // duplicate nack for a chip already settled — the
     //                                                 first one warned; a re-warn would double the toast
-    if (!nackShip) { const legacy = legacyShipFor(m.name); if (legacy) nackShip = legacy.shipId; }   // a legacy kernel's untagged nack: the ship it names by name (round sixteen); none → said only (shipFailed)
+    if (!nackShip) { const legacy = legacyShipFor(m.name, typeof m.host === "string" ? m.host : ""); if (legacy) nackShip = legacy.ship.shipId; }   // a legacy kernel's untagged nack: the oldest same-name ship of the answering host (rounds sixteen, seventeen); none → said only (shipFailed)
     shipFailed(m.name, nackShip, m.name + " couldn't be saved on the kernel, so it was not attached — try again.");
   }
   // an EDITOR highlight (VS Code host, onDidChangeTextEditorSelection — the user 2026-07-13) seeds the

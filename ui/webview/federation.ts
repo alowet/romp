@@ -176,6 +176,11 @@ export function prefixInbound(host: string, msg: any): any {
   // host ("") took the identity exit above, so a local frame has no host key: the gear words it as
   // this machine. The echoed `gesture` inside passes through untouched — it is re-issued as-is.
   if (out.type === "settingStale") out.host = host;
+  // an upload's answer — the saved path, or the save's failure — from a remote kernel is stamped with the host that answered (round
+  // seventeen, 2026-09-16): a LEGACY kernel (before v0.15.0) echoes no shipId, so the pane matches its answer to a pending upload by
+  // the saved NAME, and two hosts uploading the same name must never be matched against each other — host B's answer retired host
+  // A's upload and attached a path that does not exist on A. The local socket's answers carry no host key (the identity exit above).
+  if (out.type === "droppedPath" || out.type === "dropSaveFailed") out.host = host;
   if (out.type === "sessionList" && Array.isArray(out.items)) {
     out.items = out.items.map((it: any) => (it && typeof it === "object" && typeof it.id === "string"
       ? { ...it, id: prefixId(host, it.id),

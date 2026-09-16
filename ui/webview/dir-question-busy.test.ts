@@ -110,7 +110,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
     const failedWhy = new Map(); const failedInfo = new Map(); let wantActiveGone = W.wantActiveGone; const supersededRids = []; const settledRids = new Map(); let pendingCreate = null;
     const RELOADED_WHY = "The page reloaded while this session was being created. Start it again from the session picker, or discard this tab with its ✕.";
     const pendingShips = new Map(); let stagedMsgs; const composerCitations = new Map(), composerFiles = new Map();   // stagedMsgs: created in the epilogue, in PRODUCTION order relative to the boot
-    const sendOnShip = new Set(); let shipGateSid = null; const fireHeldSend = () => { HOOKS.fired++; };   // the upload gate's stores; the held send's release, counted
+    const sendOnShip = new Set(); let shipGateSid = null; const fireHeldSend = () => { HOOKS.fired++; }; let shipOrder = 0;   // the upload gate's stores; the held send's release, counted; the ships' creation counter (round seventeen)
     const provisionalQueue = []; const failedProvisionals = new Set(); const pendingSent = new Map(); const sessions = new Map(); const closingTabs = new Map();
     // the per-column state store the real page reads at boot (vscodeApi.getState) and writes on every draft change (setState replaces it)
     const vscodeApiState = { getState: () => STORE, setState: (s) => { for (const k of Object.keys(STORE)) delete STORE[k]; Object.assign(STORE, s); } };
@@ -180,7 +180,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       wsdown: () => { wsIsUp = false; }, wsup: () => { wsIsUp = true; reshipPendingUploads(); },   // the shim's edges, as the page's listeners read them
       setSets: (s) => { colSets = s; }, reclaim: () => reclaimHandedOff(),   // what renderTabs does first: reads the sets, reclaims the marker for a sid shown here again
       heading: (sid) => uploadingHeading(sid),
-      legacyFor: (name) => { const p = legacyShipFor(name); return p ? p.shipId : undefined; },   // what the nack branch does with an untagged name (round sixteen)
+      legacyFor: (name) => { const p = legacyShipFor(name, ""); return p ? p.ship.shipId : undefined; },   // what the nack branch does with an untagged local name (rounds sixteen, seventeen)
       draft: (sid, text) => { drafts.set(sid, text); persistDrafts(); },
       route: (m) => (typeof routeCreateReply === "function" ? routeCreateReply(m).kind : "?"),
       // (each persists, as the page's own staging / citing / attaching does)
@@ -918,4 +918,35 @@ test("round sixteen: a legacy (untagged) nack is matched by name and fails that 
   assert.ok(w.HOOKS.toasts.some((t) => /nobody\.png could not be read/.test(t))); assert.deepEqual(w.api.heldSend(), [A, B], "both holds stand"); assert.equal(Object.keys(w.api.ships()).length, 2);
   w.api.shipFail("a.png", w.api.legacyFor("a.png") as string);   // resolved by name, as the nack branch resolves it
   assert.equal(w.api.ships()[A], undefined, "A's ship failed"); assert.deepEqual(w.api.heldSend(), [B], "A's hold cancelled, B's stands");
+});
+
+// ---- round seventeen ----
+test("round seventeen: a legacy answer that two same-host uploads of one name could be takes the OLDEST by creation and attaches — but auto-sends nothing: the hold is cancelled and said, both drafts kept", () => {
+  const w = receiving();   // A is active
+  w.api.ship(A, "unrelated.png", "u1", "QUJD", "comment");   // A's map entry comes first: an unrelated pending comment ship
+  w.api.draft(B, "B words waiting"); w.api.ship(B, "same.txt", "b1", "QUJD"); w.api.holdSend(B);   // B uploads same.txt first…
+  w.api.ship(A, "same.txt", "a1", "QUJD"); w.api.type(TYPED); w.api.holdSend(A);                    // …then A does, and both hold their sends
+  w.api.ack({ type: "droppedPath", path: "drops/1-same.txt" });   // the legacy ack for B's OLDER same.txt
+  assert.equal(w.api.ships()[B], undefined, "B's — the older — upload is the one retired"); assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["u1", "a1"], "A's newer upload stands");
+  assert.deepEqual(w.api.held.files()[B], ["drops/1-same.txt"], "the file lands on B: main's answer"); assert.equal(w.api.held.files()[A], undefined);
+  assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage" || m.type === "askFollowUp"), [], "nothing auto-sent"); assert.equal(w.HOOKS.fired, 0);
+  assert.equal(w.api.held.drafts()[B], "B words waiting", "B's draft kept"); assert.equal(w.api.composer(), TYPED, "A's words still in the box");
+  assert.deepEqual(w.api.heldSend(), [A], "B's hold cancelled — the user sends; A's stands on its own upload");
+  assert.deepEqual(w.HOOKS.toasts.filter((t) => /not sent automatically/.test(t)).length, 1, "one toast: " + JSON.stringify(w.HOOKS.toasts)); assert.ok(w.HOOKS.toasts.some((t) => /same\.txt/.test(t)));
+  // the single same-host match still settles fully (round sixteen kept): A's own later legacy ack releases A's send
+  w.api.ack({ type: "droppedPath", path: "drops/2-same.txt" });
+  assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["u1"]); assert.equal(w.HOOKS.fired, 1, "exactly one match now: settled, the held send fires");
+});
+
+test("round seventeen: two hosts each with a pending upload of one name — an answer settles only the ANSWERING host's ship; the local kernel's answer never touches a remote host's", () => {
+  const w = receiving();
+  w.api.draft(RA, "remote words"); w.api.ship(RA, "same.txt", "r1", "QUJD"); w.api.holdSend(RA);   // TESTHOST's session uploads same.txt first
+  w.api.ship(A, "same.txt", "a1", "QUJD"); w.api.holdSend(A); w.api.type(TYPED);                  // the local session too
+  w.api.ack({ type: "droppedPath", path: "drops/1-same.txt", host: "TESTHOST" });   // TESTHOST's legacy answer, stamped by federation
+  assert.equal(w.api.ships()[RA], undefined, "the remote ship settled"); assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["a1"], "the local ship untouched though it is the same name");
+  assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage").map((m) => ({ id: m.id, text: m.text })), [{ id: RA, text: "remote words\ndrops/1-same.txt" }], "the one same-host match: settled fully — the remote session's held send goes by sid, the file on its trailing line");
+  assert.equal(w.api.held.files()[RA], undefined, "…and its strip is empty: the file went with the message"); assert.equal(w.api.held.files()[A], undefined, "nothing on the local session's strip");
+  assert.deepEqual(w.api.heldSend(), [A]);
+  w.api.ack({ type: "droppedPath", path: "drops/2-same.txt" });   // the local kernel's legacy answer: no host key
+  assert.equal(w.api.ships()[A], undefined); assert.equal(w.HOOKS.fired, 1, "the local match releases the local send");
 });

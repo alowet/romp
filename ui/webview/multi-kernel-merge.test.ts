@@ -149,10 +149,15 @@ test("routeOutbound: dropFile routes by its session id — attachment bytes reac
   assert.equal(routes[0].msg.b64, "aGVsbG8=");
   // a local session's attachment (bare id) stays local, the single-kernel path unchanged
   assert.equal(routeOutbound({ type: "dropFile", name: "a.png", b64: "eA==", id: U })[0].host, "");
-  // ...and the droppedPath REPLY carries no session field, so prefixInbound passes it through
-  // untouched — the pane attaches it to its own activeId, which is already host-prefixed.
+  // ...and the droppedPath REPLY carries no session field, so nothing in it is prefixed — but it IS stamped with the host that
+  // answered (round seventeen, 2026-09-16): a kernel before v0.15.0 echoes no shipId, so the pane matches its answer to a pending
+  // upload by the saved name, and that match must stay within the answering host — two hosts uploading one name were matched
+  // against each other, host B's answer retiring host A's upload with a path that does not exist on A. The save's failure is
+  // stamped alike; the local socket's answers carry no host key (the identity exit).
   const reply = { type: "droppedPath", path: "~/.local/state/romp/drops/1-screenshot.png" };
-  assert.deepEqual(prefixInbound("gpu1", reply), reply);
+  assert.deepEqual(prefixInbound("gpu1", reply), { ...reply, host: "gpu1" });
+  assert.deepEqual(prefixInbound("gpu1", { type: "dropSaveFailed", name: "screenshot.png" }), { type: "dropSaveFailed", name: "screenshot.png", host: "gpu1" });
+  assert.deepEqual(prefixInbound("", reply), reply, "the local kernel's answer: untouched, no host key");
 });
 
 test("prefixInbound: a remote kernel's settingStale frame is host-stamped (the gear names the refusing machines)", () => {
