@@ -69,7 +69,7 @@ function world(o: { col?: string; sets?: ColSets | null; tabOrderSeen?: boolean;
   const win = { parent: PARENT, frameElement: me };
   const js = requireCjs("esbuild").transformSync(
     [line("heldHere"), line("tabInView"), line("columnBusy"), fn("forwardToOwner"), fn("claimSession"), fn("noteColumnEmptiness"),
-     fn("orphanStateSids"), fn("noteOrphanState"), fn("staleActiveFallback"), fn("adoptSessionState")].join("\n"), { loader: "ts" }).code;
+     fn("orphanStateSids"), fn("noteOrphanState"), fn("staleActiveFallback"), fn("adoptSessionState"), fn("mergeCitations"), fn("adoptShips"), fn("shipOwner")].join("\n"), { loader: "ts" }).code;
   const prelude = `
     const { columnHolds, columnEmptiness, isProvisionalId, isSubId, StagedStack, HOOKS } = W;
     const COL = W.col;
@@ -85,6 +85,7 @@ function world(o: { col?: string; sets?: ColSets | null; tabOrderSeen?: boolean;
     const setActive = (id) => { HOOKS.activated.push(id); activeId = id; };
     const drafts = new Map(), composerCitations = new Map(), composerFiles = new Map(); const stagedMsgs = new StagedStack();
     const persistDrafts = () => { HOOKS.persisted++; }; const loadComposerFor = (sid) => { HOOKS.loaded.push(sid); };
+    const pendingShips = new Map(), sendOnShip = new Set(); const warnToast = () => {}; const vscodeApi = { postMessage() {} }; const renderComposerFiles = () => {};   // the carry's upload half (round ten): idle in these worlds
   `;
   const epilogue = `
     return {

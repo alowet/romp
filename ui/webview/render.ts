@@ -8283,13 +8283,43 @@ function dropProvisional(): { queued: string[]; draft: string } {
 // (__rompOrphanStateSids → close()'s transfer, which carries all four stores). Before this a settlement kept the plain draft
 // alone: the chips and files were deleted with the tab, and the staged stack stayed under the retired id until the boot
 // sweep dropped it. Appended, never over what the real session already holds.
+// Citation chips arriving onto a list that may already hold some (round ten, 2026-09-15): a settlement's carry, a pane's adoption.
+// The list never holds both FLAVOURS — the composer's own seeds drop the other flavour (setCitation: a card click replaces the
+// quotes; seedQuote / seedEditorQuote: a quote drops the goal) and the send routes goal XOR quotes (routeUserMessage: a goal
+// present, the quotes are silently left behind). A carry merges under that invariant WITHOUT dropping either side: quotes stack,
+// as the composer stacks them; a goal chip keeps the list, and the quotes — whichever side held them — become a CONTEXT-ONLY
+// STAGED item under the session (the composer's own shape for quotes ahead of a goal-cited message: ⌘⏎ over an empty box
+// stages the context alone, and the release wraps the run and the typed words in the goal's follow-up, stagedPosts). Two goals
+// cannot both ride (the kernel wraps one goal per message; the composer holds one, a card click replacing the held one), so the
+// ARRIVING goal is the follow-up and the held one's card is said to have been replaced — loud, never silent.
+// Never persists or renders: the caller does, once, after everything it moves. Appends to the stack, so the caller moves the
+// stack FIRST — the displaced quotes stage behind what was staged, ahead of the typed words.
+function mergeCitations(sid: string, incoming: readonly Citation[]): void {
+  if (!incoming.length) return;
+  const all = [...(composerCitations.get(sid) ?? []), ...incoming];
+  const goals = all.filter((c) => !!c.itemId);
+  if (!goals.length) { composerCitations.set(sid, all); return; }
+  const quotes = all.filter((c) => !c.itemId);
+  if (quotes.length) stagedMsgs.appendAll(sid, [{ text: "", cites: quotes }]);
+  composerCitations.set(sid, [goals[goals.length - 1]]);
+  if (goals.length > 1) warnToast("Two follow-up cards met on one message box — " + goals[goals.length - 1].title + " is the follow-up now; the earlier card (" + goals[0].title + ") was replaced.");
+}
+
 function moveProvisionalState(fromId: string, toId: string): void {
-  const cites = composerCitations.get(fromId);
-  if (cites && cites.length) { composerCitations.set(toId, [...(composerCitations.get(toId) ?? []), ...cites]); composerCitations.delete(fromId); }
   const files = composerFiles.get(fromId);
   if (files && files.length) { composerFiles.set(toId, [...(composerFiles.get(toId) ?? []), ...files]); composerFiles.delete(fromId); }
   const staged = stagedMsgs.takeAll(fromId);
-  if (staged.length) stagedMsgs.restore({ [toId]: [...stagedMsgs.list(toId), ...staged] });
+  if (staged.length) stagedMsgs.appendAll(toId, staged);   // every item the stack accepted — a context-only one (quotes, no words) included, which restore()'s load filter dropped (round ten)
+  const cites = composerCitations.get(fromId);
+  if (cites && cites.length) { composerCitations.delete(fromId); mergeCitations(toId, cites); }   // AFTER the stack: the flavour rule stages displaced quotes behind what was staged
+  // …and an UPLOAD still in flight (round ten): its pending chip, its held send and its open gate are the real session's now, so the
+  // ack — droppedPath, echoing the shipId — attaches the saved path under the real sid and releases the send THERE, never under the
+  // retired id (retirePendingShip found the chip under new-*, addComposerFile put the file there, and the held send waited on a tab
+  // that no longer existed). The bytes stay retained in the entry: a reconnect re-ships them as before.
+  const ships = pendingShips.get(fromId);
+  if (ships && ships.length) { pendingShips.set(toId, [...(pendingShips.get(toId) ?? []), ...ships]); pendingShips.delete(fromId); }
+  if (sendOnShip.delete(fromId)) sendOnShip.add(toId);
+  if (shipGateSid === fromId) shipGateSid = toId;
 }
 
 function adoptProvisional(realId: string): void {
@@ -8297,7 +8327,10 @@ function adoptProvisional(realId: string): void {
   rememberSettled(provisionalRid, realId); // the request settled here: its follow-ups (a tagError) are toasts for this session, never the next create's verdict (routeCreateReply)
   if (provisionalId) moveProvisionalState(provisionalId, realId);   // the staged messages, chips and files, before the tab's maps go (dropProvisional → dismissSession)
   const { queued, draft } = dropProvisional();
-  if (draft) drafts.set(realId, draft);    // set BEFORE the switch — setActive fills the box from drafts
+  // set BEFORE the switch — setActive fills the box from drafts; JOINED onto a draft already under the arriving id (round ten: the
+  // gate above is sessions.has, not "no state under it" — a draft from an omitted frame, a host drop or the persisted store stood
+  // there, and the create's text wrote over it), the way resolveProvisionalToExisting and adoptSessionState join
+  if (draft) drafts.set(realId, [drafts.get(realId) ?? "", draft].filter(Boolean).join("\n\n"));
   setActive(realId);
   for (const text of queued) {
     const qid = mintQid();                                  // the copy's id, minted here: the real send carries it…
@@ -17189,31 +17222,64 @@ const sessionMru: string[] = [];
 // they are current), not this page's snapshot from its last render: a held column's kernel frames may not have landed since
 // the hold, and its snapshot would still call the member the peer moved away "shown here" — and drop its draft.
 (window as any).__rompOrphanStateSids = (): string[] => { colSets = readColSets(); if (activeId) stashActiveDraft(activeId); return orphanStateSids(); };   // the box's live text counts: stashed first, so an active tab this column no longer lists is in the list
-(window as any).__rompTakeSessionState = (sid: string): { draft: string; citations: Citation[]; files: string[]; staged: StagedMsg[] } | null => {
+(window as any).__rompTakeSessionState = (sid: string): { draft: string; citations: Citation[]; files: string[]; staged: StagedMsg[]; ships: PendingShip[]; heldSend: boolean } | null => {
   if (typeof sid !== "string" || !sid) return null;
   const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
   if (sid === activeId && ta) { if (ta.value) drafts.set(sid, ta.value); else drafts.delete(sid); }
   const draft = drafts.get(sid) ?? "", citations = composerCitations.get(sid) ?? [], files = composerFiles.get(sid) ?? [], staged = stagedMsgs.takeAll(sid);
-  drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid);
+  // …and an UPLOAD still in flight for it (round ten): the ack rides THIS document's socket and dies with it, so the entry — name,
+  // shipId, the retained bytes — travels, and the receiving pane re-ships the bytes the way the reconnect re-ship does (a duplicate
+  // file in drops/ is an orphan, never attached; the shipId-matched ack retires the chip there). A send HELD on it travels as the
+  // fact; an open ship-gate dialog dies with the document unanswered — a gate nobody answered never auto-sends (the nack rule)
+  const ships = pendingShips.get(sid) ?? [], heldSend = sendOnShip.delete(sid);
+  drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid); pendingShips.delete(sid);
+  const gateWasOpen = shipGateSid === sid;
+  if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }
+  if (ships.length || gateWasOpen) endReloadHoldIfIdle();   // ONLY when a hold left with the state: the core's ended() re-tries an owed reload, and a plain tab move must not fire one
   if (sid === activeId) { if (ta) { ta.value = ""; growComposer(ta); } renderComposerChips(sid); renderComposerFiles(sid); renderStagedStrip(sid); }
   persistDrafts();
-  if (!draft && !citations.length && !files.length && !staged.length) return null;
-  return { draft, citations, files, staged };
+  if (!draft && !citations.length && !files.length && !staged.length && !ships.length && !heldSend) return null;
+  return { draft, citations, files, staged, ships, heldSend };
 };
 // …and the TARGET page's half: what the source held, into the maps (joined onto anything already here, never over
 // it), persisted, and into the box when the tab is active. The shell posts it on a new column's load or at once.
 function adoptSessionState(sid: unknown, state: unknown): void {
   if (typeof sid !== "string" || !sid || !state || typeof state !== "object") return;
-  const st = state as { draft?: unknown; citations?: unknown; files?: unknown; staged?: unknown };
+  const st = state as { draft?: unknown; citations?: unknown; files?: unknown; staged?: unknown; ships?: unknown; heldSend?: unknown };
   if (typeof st.draft === "string" && st.draft) drafts.set(sid, [drafts.get(sid) ?? "", st.draft].filter(Boolean).join("\n\n"));
-  if (Array.isArray(st.citations) && st.citations.length) composerCitations.set(sid, [...(composerCitations.get(sid) ?? []), ...(st.citations as Citation[])]);
   if (Array.isArray(st.files) && st.files.length) {
     const paths = (st.files as unknown[]).filter((p): p is string => typeof p === "string" && !!p);
     if (paths.length) composerFiles.set(sid, [...(composerFiles.get(sid) ?? []), ...paths]);
   }
-  if (Array.isArray(st.staged) && st.staged.length) stagedMsgs.restore({ [sid]: [...stagedMsgs.list(sid), ...st.staged] });
+  if (Array.isArray(st.staged) && st.staged.length) stagedMsgs.appendAll(sid, st.staged);   // every item the source's stack held, a context-only one included (round ten; restore() dropped those)
+  if (Array.isArray(st.citations) && st.citations.length) mergeCitations(sid, st.citations as Citation[]);   // after the stack: the flavour rule (round ten), never a mixed list
+  const shipped = Array.isArray(st.ships) && st.ships.length ? adoptShips(sid, st.ships as unknown[]) : 0;   // the uploads still in flight, re-shipped from here (round ten)
+  if (st.heldSend === true) {
+    if (shipped) sendOnShip.add(sid);   // the hold waits on a chip of its own here — armed with none it would wait forever (the ✕ rule)
+    else warnToast("The message held for an upload was not sent — the upload did not survive its column closing. Review it on that tab.");
+  }
   persistDrafts();
   if (activeId === sid) loadComposerFor(sid);
+}
+// The uploads a closing pane handed over with a session's state (round ten): each entry that still has its bytes becomes a pending
+// chip here under the same shipId and re-ships them to the owning kernel — the reconnect re-ship's frame, byte for byte
+// (reshipPendingUploads) — so the ack lands on THIS document's socket and retires exactly that chip. One whose FileReader had not
+// finished when the source page went (no bytes yet) cannot be re-sent from here: said loudly, never a chip that pulses forever.
+// Returns how many chips were added. Never persists: adoptSessionState does, once.
+function adoptShips(sid: string, items: readonly unknown[]): number {
+  let n = 0;
+  for (const it of items) {
+    const p = it as { name?: unknown; shipId?: unknown; b64?: unknown };
+    if (!p || typeof p !== "object" || typeof p.name !== "string" || typeof p.shipId !== "string" || !p.shipId) continue;
+    if (shipOwner(p.shipId)) continue;   // adopted twice: the chip is already here
+    if (typeof p.b64 !== "string" || !p.b64) { warnToast(p.name + " was still being read when its column closed, so it was not attached — attach it again."); continue; }
+    const list = pendingShips.get(sid) || [];
+    list.push({ name: p.name, shipId: p.shipId, b64: p.b64 });
+    pendingShips.set(sid, list); n++;
+    if (vscodeApi) vscodeApi.postMessage({ type: "dropFile", name: p.name, b64: p.b64, shipId: p.shipId, id: sid });
+  }
+  if (n && sid === activeId) renderComposerFiles(sid);
+  return n;
 }
 function noteMru(id: string): void {
   const i = sessionMru.indexOf(id);
@@ -19387,9 +19453,10 @@ function setupComposer() {
                   [{ label: "Wait for the upload", value: "wait" },
                    { label: "Send without " + them, value: "now", danger: true }],
                   (v) => {
+                    const owner = shipGateSid ?? sid;   // a settlement while the dialog stood re-keyed the gate to the real session (moveProvisionalState, round ten)
                     shipGateSid = null; endReloadHoldIfIdle();
                     if (v === "now") sendComposer({ pastShipGate: true });
-                    else if (v === "wait") { sendOnShip.add(sid); renderComposerFiles(sid); }
+                    else if (v === "wait") { sendOnShip.add(owner); renderComposerFiles(owner); }
                   });
       return;
     }

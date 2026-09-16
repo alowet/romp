@@ -41,7 +41,8 @@ const VIEWER = C + "/agent/a1";
 const REQ = { name: "notes", backend: "sdk", dir: "/proj/not-there-yet", host: "" };
 const TYPED = "notes for a session whose folder is not there yet";
 
-type Hooks = { posts: Record<string, unknown>[]; boot: Record<string, unknown>[]; sent: Record<string, unknown>[]; seq: string[]; confirms: string[]; pickers: number; persisted: number; timers: (() => void)[]; cleared: number; toasts: string[]; answered: (string | null)[]; claims: string[] };
+type Hooks = { posts: Record<string, unknown>[]; boot: Record<string, unknown>[]; sent: Record<string, unknown>[]; seq: string[]; confirms: string[]; pickers: number; persisted: number; timers: (() => void)[]; cleared: number; toasts: string[]; answered: (string | null)[]; claims: string[]; fired: number };
+type Ship = { name: string; shipId: string; b64?: string };
 type State = { provisionalId: string | null; dirQuestionFor: string | null; failed: string[]; activeId: string | null; drafts: Record<string, string>; sessions: string[]; timer: boolean; why: Record<string, string> };
 type Api = {
   startCreate: (req: typeof REQ, mkdir?: boolean) => void; onCreateDirMissing: (m: Record<string, unknown>) => void; closePicker: (abandon?: boolean) => void;
@@ -49,16 +50,24 @@ type Api = {
   onCreateWarn: (m: { text: string; rid?: unknown }) => void; showConfirm: (title: string, detail: string, buttons: { label: string; value: string }[], cb: (v: string | null) => void) => void;
   stale: (m: { rid?: unknown }) => boolean; fireTimers: () => number; settle: () => void; resolveTo: (sid: string) => void; route: (m: { rid?: unknown }) => string;
   adopt: (sid: string) => void; orphans: () => string[];
-  held: { stage: (id: string, text: string, cites?: unknown[]) => void; cite: (id: string) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown>; drafts: () => Record<string, string> };
+  // round ten: the hand-off's two halves (the real take arrow and adoptSessionState), an upload in flight and its held send, the kernel's ack (the real droppedPath branch)
+  take: (sid: string) => any; adoptState: (sid: string, st: unknown) => void; ship: (id: string, name: string, shipId: string, b64?: string) => void; holdSend: (id: string) => void;
+  ships: () => Record<string, Ship[]>; heldSend: () => string[]; ack: (m: Record<string, unknown>) => void;
+  held: { stage: (id: string, text: string, cites?: unknown[]) => void; cite: (id: string, chips?: unknown[]) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown>; drafts: () => Record<string, string> };
   busy: () => boolean; answer: (v: string | null) => void; confirm: () => { title: string; buttons: string[]; key: string | null } | null;
   overlays: () => number; clickButton: (label: string) => boolean; rid: () => string | null;
   type: (t: string) => void; composer: () => string; picker: () => { open: boolean; search: string; dir: string }; state: () => State;
 };
 
+// the source pane's half of the hand-off is an arrow on window, not a function: sliced whole (assigned onto the harness's window)
+const TAKE = (() => { const i = RENDER.indexOf("(window as any).__rompTakeSessionState = "); assert.ok(i >= 0, "the take arrow"); return RENDER.slice(i, RENDER.indexOf("\n};\n", i) + 4); })();
+// the kernel's upload ack is a branch of the message switch: sliced and wrapped, so the test runs the real attach + held-send release
+const ON_DROPPED = (() => { const i = RENDER.indexOf('if (m.type === "droppedPath" && typeof m.path === "string")'); const j = RENDER.indexOf('} else if (m.type === "dropSaveFailed"', i); assert.ok(i >= 0 && j > i, "the droppedPath branch"); return "function onDroppedPath(m: any): void {\n" + RENDER.slice(i, j + 1) + "\n}\n"; })();
+
 function world(o: { activeId: string | null; mru: string[]; order: string[]; nextActive: string | null; store?: Record<string, unknown>; session?: Record<string, string>; sets?: Record<string, string[]> | null }): { api: Api; HOOKS: Hooks; store: Record<string, unknown>; session: Record<string, string> } {
   const store: Record<string, unknown> = o.store ?? {};
   const session: Record<string, string> = o.session ?? {};   // the page's sessionStorage (the reload notices ride it)
-  const HOOKS: Hooks = { posts: [], boot: [], sent: [], seq: [], confirms: [], pickers: 0, persisted: 0, timers: [], cleared: 0, toasts: [], answered: [], claims: [] };
+  const HOOKS: Hooks = { posts: [], boot: [], sent: [], seq: [], confirms: [], pickers: 0, persisted: 0, timers: [], cleared: 0, toasts: [], answered: [], claims: [], fired: 0 };
   const win = { parent: { postMessage(m: Record<string, unknown>) { HOOKS.posts.push(m); if (m.romp === "colBusy") HOOKS.seq.push("flip:" + m.busy); } } };
   const js = requireCjs("esbuild").transformSync(
     [lineOpt("columnBusy"), fn("syncColumnBusy"), fn("dropProvisional"), fn("openProvisional"), fn("cancelProvisional"), fn("failProvisional"),
@@ -66,7 +75,8 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
      fn("showConfirm"), fnOpt("onCreateWarn"), lineOpt("createReplyIsStale"), lineOpt("mintRid"),
      fn("persistDrafts").replace("function persistDrafts(", "function persistDraftsReal("), fnOpt("restoreFailedProvisionals"),
      fnOpt("bootComposerState"), fnOpt("announceColumnBusy"), lineOpt("retireRid"), fnOpt("finishBoot"), fnOpt("routeCreateReply"), lineOpt("rememberSettled"), fn("resolveProvisionalToExisting"),
-     fn("adoptProvisional"), fnOpt("moveProvisionalState"), fn("orphanStateSids"), lineOpt("heldHere")].join("\n"),
+     fn("adoptProvisional"), fnOpt("moveProvisionalState"), fn("orphanStateSids"), lineOpt("heldHere"),
+     fnOpt("mergeCitations"), fn("addPendingShip"), fn("shipSafeName"), fn("shipOwner"), fn("retirePendingShip"), fn("endReloadHoldIfIdle"), fn("addComposerFile"), fnOpt("adoptShips"), fn("adoptSessionState"), TAKE, ON_DROPPED].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
     const { provisionalName, mintProvisionalId, isProvisionalId, isSubId, columnHolds, StagedStack, HOOKS, STORE, takeReloadNotices } = W;
@@ -79,6 +89,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
     const failedWhy = new Map(); const failedInfo = new Map(); let wantActiveGone = W.wantActiveGone; const supersededRids = []; const settledRids = new Map(); let pendingCreate = null;
     const RELOADED_WHY = "The page reloaded while this session was being created. Start it again from the session picker, or discard this tab with its ✕.";
     const pendingShips = new Map(); let stagedMsgs; const composerCitations = new Map(), composerFiles = new Map();   // stagedMsgs: created in the epilogue, in PRODUCTION order relative to the boot
+    const sendOnShip = new Set(); let shipGateSid = null; const fireHeldSend = () => { HOOKS.fired++; };   // the upload gate's stores; the held send's release, counted
     const provisionalQueue = []; const failedProvisionals = new Set(); const pendingSent = new Map(); const sessions = new Map(); const closingTabs = new Map();
     // the per-column state store the real page reads at boot (vscodeApi.getState) and writes on every draft change (setState replaces it)
     const vscodeApiState = { getState: () => STORE, setState: (s) => { for (const k of Object.keys(STORE)) delete STORE[k]; Object.assign(STORE, s); } };
@@ -133,9 +144,16 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       resolveTo: (sid) => resolveProvisionalToExisting(sid),     // the real settlement onto a running session (remembers the request as settled)
       adopt: (sid) => adoptProvisional(sid),                     // the real settlement onto the session the create made
       orphans: () => orphanStateSids(),                          // what this page would hand the shell at a close (the sids it holds state for and does not show)
+      take: (sid) => window.__rompTakeSessionState(sid),         // the shell's close(): this page's state for a session, taken whole (round ten: the real arrow)
+      adoptState: (sid, st) => adoptSessionState(sid, st),       // the receiving pane's half
+      ship: (id, name, shipId, b64) => { addPendingShip(id, name, shipId); const e = pendingShips.get(id).find((p) => p.shipId === shipId); if (b64) e.b64 = b64; },   // a file picked: the chip is up, the bytes retained
+      holdSend: (id) => { sendOnShip.add(id); },                 // "Wait for the upload"
+      ships: () => Object.fromEntries([...pendingShips].map(([k, v]) => [k, v.map((p) => ({ name: p.name, shipId: p.shipId, ...(p.b64 ? { b64: p.b64 } : {}) }))])),
+      heldSend: () => [...sendOnShip],
+      ack: (m) => onDroppedPath(m),                              // the kernel's droppedPath, through the real branch
       route: (m) => (typeof routeCreateReply === "function" ? routeCreateReply(m).kind : "?"),
       // (each persists, as the page's own staging / citing / attaching does)
-      held: { stage: (id, text, cites) => { stagedMsgs.push(id, { text, cites: cites || [] }); persistDrafts(); }, cite: (id) => { composerCitations.set(id, [{ title: "a card", itemId: "g1" }]); persistDrafts(); }, attach: (id) => { composerFiles.set(id, ["/tmp/a.png"]); persistDrafts(); },
+      held: { stage: (id, text, cites) => { stagedMsgs.push(id, { text, cites: cites || [] }); persistDrafts(); }, cite: (id, chips) => { composerCitations.set(id, chips || [{ title: "a card", itemId: "g1" }]); persistDrafts(); }, attach: (id) => { composerFiles.set(id, ["/tmp/a.png"]); persistDrafts(); },
               staged: () => stagedMsgs.entries(), citations: () => Object.fromEntries(composerCitations), files: () => Object.fromEntries(composerFiles), drafts: () => Object.fromEntries(drafts) },
       fireTimers: () => { const t = HOOKS.timers.splice(0); for (const f of t) f(); return t.length; },
       type: (t) => { EL["composer-input"].value = t; }, composer: () => EL["composer-input"].value,
@@ -516,4 +534,87 @@ test("round nine: resolution to a session shown in ANOTHER pane keys the moved s
   const r = world({ activeId: null, mru: [], order: [A, B, C], nextActive: null, store: w.store, sets: { "2": [] } });
   assert.deepEqual(r.api.held.staged()[A], [{ text: "staged while opening", cites: [CARD] }]); assert.deepEqual(r.api.held.files()[A], ["/tmp/a.png"]);
   assert.equal(Object.keys((r.store.staged as any) || {}).filter((k) => k.startsWith("new-")).length, 0); assert.equal(Object.keys((r.store.drafts as any) || {}).filter((k) => k.startsWith("new-")).length, 0);
+});
+
+// ---- round ten ----
+const QUOTE = { title: "a highlighted line", quote: "the highlighted line" }, QUOTE2 = { title: "another line", quote: "another highlighted line" }, CARD2 = { title: "a second card", itemId: "g2" };
+const SHIP = { name: "photo.png", shipId: "s1", b64: "QUJD" };
+const receiving = () => world({ activeId: A, mru: [A], order: [A], nextActive: null, store: {}, sets: { "": [A] } });   // the pane that SHOWS A
+
+test("round ten: a context-only staged citation (quotes, no words) survives both settlements and the hand-off — the load filter is the store's, never a move's", () => {
+  const a = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {} });
+  a.api.startCreate(REQ); const idA = a.api.state().provisionalId!;
+  a.api.held.stage(idA, "", [QUOTE]);   // ⌘⏎ over an empty box: the context alone
+  a.api.adopt(X);
+  assert.deepEqual(a.api.held.staged()[X], [{ text: "", cites: [QUOTE] }], "adoption: the context-only item, under the new session"); assert.equal(a.api.held.staged()[idA], undefined);
+  assert.deepEqual((a.store.staged as any)[X], [{ text: "", cites: [QUOTE] }], "…and on disk");
+  const b = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {}, sets: { "2": [] } });   // a held column
+  b.api.startCreate(REQ); const idB = b.api.state().provisionalId!;
+  b.api.held.stage(idB, "", [QUOTE]);
+  b.api.resolveTo(A);
+  assert.deepEqual(b.api.held.staged()[A], [{ text: "", cites: [QUOTE] }], "resolution: under the running session");
+  const st = b.api.take(A);   // the shell's close(): to the pane that shows A
+  assert.deepEqual(st.staged, [{ text: "", cites: [QUOTE] }], "taken whole"); assert.equal(b.api.held.staged()[A], undefined, "…and gone from the closing page");
+  const r = receiving(); r.api.adoptState(A, st);
+  assert.deepEqual(r.api.held.staged()[A], [{ text: "", cites: [QUOTE] }], "adopted whole");
+  const again = world({ activeId: null, mru: [], order: [A], nextActive: null, store: r.store, sets: { "": [A] } });   // the receiving pane reloads
+  assert.deepEqual(again.api.held.staged()[A], [{ text: "", cites: [QUOTE] }], "…and back after a reload (restore() keeps a context-only item now)");
+});
+
+test("round ten: adoption JOINS the create's text onto a draft already under the arriving session — never over it", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: { drafts: { [X]: "typed for it before its frame came" } } });
+  w.api.startCreate(REQ); w.api.type(TYPED);
+  w.api.adopt(X);
+  assert.equal(w.api.held.drafts()[X], "typed for it before its frame came\n\n" + TYPED, "what was there first, a blank line, the create's text — as resolution and adoptSessionState join");
+  assert.equal(w.api.composer(), "typed for it before its frame came\n\n" + TYPED, "…and that is what the box shows");
+});
+
+test("round ten: an upload in flight on the pending tab is the new session's after adoption — the ack attaches the file under the real sid and the send held on it fires there", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {} });
+  w.api.startCreate(REQ); const id = w.api.state().provisionalId!;
+  w.api.ship(id, SHIP.name, SHIP.shipId, SHIP.b64); w.api.holdSend(id);
+  w.api.adopt(X);
+  assert.deepEqual(w.api.ships(), { [X]: [SHIP] }, "the pending chip under the real sid, none under the retired id"); assert.deepEqual(w.api.heldSend(), [X], "the held send, re-keyed");
+  w.api.ack({ type: "droppedPath", path: "drops/1700000000000-photo.png", shipId: "s1" });
+  assert.deepEqual(w.api.held.files()[X], ["drops/1700000000000-photo.png"], "the saved path on the real session's strip"); assert.equal(w.api.held.files()[id], undefined, "nothing under the retired id");
+  assert.deepEqual(w.api.ships(), {}); assert.deepEqual(w.api.heldSend(), []); assert.equal(w.HOOKS.fired, 1, "the held send fired — the real session is the active tab"); assert.deepEqual(w.HOOKS.toasts, []);
+});
+
+test("round ten: resolved to a session shown in another pane, the upload in flight travels with the state — the receiving pane re-ships the bytes, its ack attaches the file there, the held send fires there; bytes not yet read are announced lost, never a chip pulsing forever", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {}, sets: { "2": [] } });   // a held column
+  w.api.startCreate(REQ); const id = w.api.state().provisionalId!;
+  w.api.ship(id, SHIP.name, SHIP.shipId, SHIP.b64); w.api.holdSend(id); w.api.type(TYPED);
+  w.api.resolveTo(A);
+  assert.deepEqual(w.api.ships(), { [A]: [SHIP] }); assert.deepEqual(w.api.heldSend(), [A]); assert.ok(w.api.orphans().includes(A));
+  const st = w.api.take(A);
+  assert.deepEqual(st.ships, [SHIP], "the entry travels, bytes and all"); assert.equal(st.heldSend, true); assert.equal(st.draft, TYPED);
+  assert.deepEqual(w.api.ships(), {}, "gone from the closing page"); assert.deepEqual(w.api.heldSend(), []);
+  const r = receiving(); r.api.adoptState(A, st);
+  assert.deepEqual(r.HOOKS.sent.filter((m) => m.type === "dropFile"), [{ type: "dropFile", name: "photo.png", b64: "QUJD", shipId: "s1", id: A }], "re-shipped to A's kernel: the reconnect re-ship's frame");
+  assert.deepEqual(r.api.ships(), { [A]: [SHIP] }); assert.deepEqual(r.api.heldSend(), [A]); assert.equal(r.api.held.drafts()[A], TYPED);
+  r.api.ack({ type: "droppedPath", path: "drops/1700000000001-photo.png", shipId: "s1" });
+  assert.deepEqual(r.api.held.files()[A], ["drops/1700000000001-photo.png"]); assert.equal(r.HOOKS.fired, 1, "the held send fires in the pane that shows A"); assert.deepEqual(r.api.ships(), {});
+  const q = receiving(); q.api.adoptState(A, { ships: [{ name: "late.png", shipId: "s2" }], heldSend: true });   // the FileReader had not finished when the source page went
+  assert.deepEqual(q.api.ships(), {}); assert.deepEqual(q.api.heldSend(), [], "a hold with nothing to wait on is not armed");
+  assert.equal(q.HOOKS.toasts.length, 2, "said twice — the upload lost, the message not sent: " + JSON.stringify(q.HOOKS.toasts)); assert.match(q.HOOKS.toasts[0], /late\.png .*attach it again/); assert.match(q.HOOKS.toasts[1], /not sent/);
+});
+
+test("round ten: flavours never mix in a carry — a goal chip keeps the list and the quotes stage as context, whichever side held them; quotes stack; two goals: the arriving one, said; the receiving pane's adopt follows the same rule", () => {
+  const held = () => world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {}, sets: { "2": [] } });
+  // the running session holds a goal chip; the create carried a quote chip
+  const a = held(); a.api.held.cite(A, [CARD]); a.api.startCreate(REQ); a.api.held.cite(a.api.state().provisionalId!, [QUOTE]); a.api.resolveTo(A);
+  assert.deepEqual(a.api.held.citations()[A], [CARD], "the goal keeps the list"); assert.deepEqual(a.api.held.staged()[A], [{ text: "", cites: [QUOTE] }], "the quote is context, staged: on the strip, released ahead of the follow-up's words");
+  // the reverse: quotes on the running session, a goal on the create — the quotes stage (a goal cannot be context alone), behind what was staged
+  const b = held(); b.api.held.cite(A, [QUOTE]); b.api.held.stage(A, "already staged here"); b.api.startCreate(REQ); const idB = b.api.state().provisionalId!; b.api.held.cite(idB, [CARD]); b.api.held.stage(idB, "staged on the pending tab", [QUOTE2]); b.api.resolveTo(A);
+  assert.deepEqual(b.api.held.citations()[A], [CARD]);
+  assert.deepEqual(b.api.held.staged()[A], [{ text: "already staged here", cites: [] }, { text: "staged on the pending tab", cites: [QUOTE2] }, { text: "", cites: [QUOTE] }], "what was staged here, what arrived staged, then the displaced quotes");
+  // one flavour: quotes stack, as the composer stacks them
+  const c = held(); c.api.held.cite(A, [QUOTE]); c.api.startCreate(REQ); c.api.held.cite(c.api.state().provisionalId!, [QUOTE2]); c.api.resolveTo(A);
+  assert.deepEqual(c.api.held.citations()[A], [QUOTE, QUOTE2]); assert.equal(c.api.held.staged()[A], undefined);
+  // two goals: one goal per message — the arriving card is the follow-up and the replaced one is said
+  const d = held(); d.api.held.cite(A, [CARD]); d.api.startCreate(REQ); d.api.held.cite(d.api.state().provisionalId!, [CARD2]); d.api.resolveTo(A);
+  assert.deepEqual(d.api.held.citations()[A], [CARD2]); assert.equal(d.HOOKS.toasts.length, 1); assert.match(d.HOOKS.toasts[0], /a second card is the follow-up now; the earlier card \(a card\) was replaced/);
+  // the receiving pane's adopt: the same rule, the same order
+  const r = receiving(); r.api.held.cite(A, [CARD]); r.api.adoptState(A, { citations: [QUOTE], staged: [{ text: "arrived staged", cites: [] }] });
+  assert.deepEqual(r.api.held.citations()[A], [CARD]); assert.deepEqual(r.api.held.staged()[A], [{ text: "arrived staged", cites: [] }, { text: "", cites: [QUOTE] }]);
 });

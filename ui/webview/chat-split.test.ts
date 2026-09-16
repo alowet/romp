@@ -159,6 +159,16 @@ test("a pick of a session another column holds is shown where it lives: the setA
   // dismisses the tab (whose close deletes those maps), keyed under the real sid before the flip hands them on
   assert.match(RENDER, /function moveProvisionalState\(fromId: string, toId: string\): void \{/);
   assert.equal((RENDER.match(/\n  if \(provisionalId\) moveProvisionalState\(provisionalId, realId\);[^\n]*\n  const \{ queued, draft \} = dropProvisional\(\);/g) || []).length, 2, "adoptProvisional and resolveProvisionalToExisting alike, before the drop");
+  // round ten: the one sequence — the claim, the request remembered, the move, the drop — pinned as a sequence
+  assert.match(RENDER, /function adoptProvisional\(realId: string\): void \{\n  claimSession\(realId\);[^\n]*\n  rememberSettled\(provisionalRid, realId\);[^\n]*\n  if \(provisionalId\) moveProvisionalState\(provisionalId, realId\);[^\n]*\n  const \{ queued, draft \} = dropProvisional\(\);/, "adoptProvisional: claim → remember → move → drop, in that order");
+  assert.match(RENDER, /if \(draft\) drafts\.set\(realId, \[drafts\.get\(realId\) \?\? "", draft\]\.filter\(Boolean\)\.join\("\\n\\n"\)\);\n  setActive\(realId\);/, "adoptProvisional joins onto a draft already under the arriving id, never over it (round ten)");
+  // round ten: the carry — files, then the stack whole (appendAll: a context-only item kept), then the chips under the flavour rule, then the upload in flight
+  const move = RENDER.slice(RENDER.indexOf("function moveProvisionalState("), RENDER.indexOf("function adoptProvisional("));
+  assert.match(move, /composerFiles\.set\(toId[\s\S]*stagedMsgs\.appendAll\(toId, staged\);[\s\S]*mergeCitations\(toId, cites\);[\s\S]*pendingShips\.set\(toId[\s\S]*if \(sendOnShip\.delete\(fromId\)\) sendOnShip\.add\(toId\);\n  if \(shipGateSid === fromId\) shipGateSid = toId;\n\}/, "the move: files, stack, chips, then the upload's chip, held send and gate");
+  assert.ok(!move.includes("stagedMsgs.restore("), "never restore() for a move: its text filter dropped a context-only item");
+  assert.equal((RENDER.match(/stagedMsgs\.restore\(/g) || []).length, 1, "restore() is the boot's load alone");
+  assert.match(RENDER, /function mergeCitations\(sid: string, incoming: readonly Citation\[\]\): void \{\n  if \(!incoming\.length\) return;\n  const all = \[\.\.\.\(composerCitations\.get\(sid\) \?\? \[\]\), \.\.\.incoming\];\n  const goals = all\.filter\(\(c\) => !!c\.itemId\);\n  if \(!goals\.length\) \{ composerCitations\.set\(sid, all\); return; \}\n  const quotes = all\.filter\(\(c\) => !c\.itemId\);\n  if \(quotes\.length\) stagedMsgs\.appendAll\(sid, \[\{ text: "", cites: quotes \}\]\);\n  composerCitations\.set\(sid, \[goals\[goals\.length - 1\]\]\);/, "the flavour rule: quotes stack; a goal keeps the list and the quotes stage as context; the arriving goal");
+  assert.match(RENDER, /const owner = shipGateSid \?\? sid;[^\n]*\n\s*shipGateSid = null; endReloadHoldIfIdle\(\);\n\s*if \(v === "now"\) sendComposer\(\{ pastShipGate: true \}\);\n\s*else if \(v === "wait"\) \{ sendOnShip\.add\(owner\); renderComposerFiles\(owner\); \}/, "the ship gate's answer arms the hold for the re-keyed owner");
   assert.match(RENDER, /pendingCreate = \{ id, name: display, dir: req\.dir, rid \};/); assert.match(RENDER, /pending: pendingCreate,/);
   assert.match(RENDER, /for \(const k of Object\.keys\(stagedMsgs\.entries\(\)\)\) if \(isProvisionalId\(k\) && !failedProvisionals\.has\(k\)\) \{ stagedMsgs\.takeAll\(k\); dropped = true; \}/);
   assert.match(RENDER, /function announceColumnBusy\(\): void \{\n  columnBusyTold = columnBusy\(\);/);
@@ -212,14 +222,20 @@ test("drafts travel with a moved tab: the source hands over what it holds, synch
   // the composer's text is stashed first when the tab is active, then the four slices persistDrafts writes leave the maps
   assert.match(take, /if \(sid === activeId && ta\) \{ if \(ta\.value\) drafts\.set\(sid, ta\.value\); else drafts\.delete\(sid\); \}/);
   assert.match(take, /const draft = drafts\.get\(sid\) \?\? "", citations = composerCitations\.get\(sid\) \?\? \[\], files = composerFiles\.get\(sid\) \?\? \[\], staged = stagedMsgs\.takeAll\(sid\);/);
-  assert.match(take, /drafts\.delete\(sid\); composerCitations\.delete\(sid\); composerFiles\.delete\(sid\);/);
+  // round ten: the upload in flight and its held send travel too; an open gate dies unanswered (never an auto-send)
+  assert.match(take, /const ships = pendingShips\.get\(sid\) \?\? \[\], heldSend = sendOnShip\.delete\(sid\);\n  drafts\.delete\(sid\); composerCitations\.delete\(sid\); composerFiles\.delete\(sid\); pendingShips\.delete\(sid\);\n  const gateWasOpen = shipGateSid === sid;\n  if \(gateWasOpen\) \{ shipGateSid = null; closeConfirm\(null\); \}\n  if \(ships\.length \|\| gateWasOpen\) endReloadHoldIfIdle\(\);/, "the reload hold ends only when a hold left with the state — a plain move must not poke the core (it re-tries an owed reload)");
   assert.match(take, /persistDrafts\(\);/);
-  assert.match(take, /if \(!draft && !citations\.length && !files\.length && !staged\.length\) return null;/, "null when nothing was held");
+  assert.match(take, /if \(!draft && !citations\.length && !files\.length && !staged\.length && !ships\.length && !heldSend\) return null;\n  return \{ draft, citations, files, staged, ships, heldSend \};/, "null when nothing was held");
   // an active tab's box is emptied: the re-point that follows must not re-stash the moved text here
   assert.match(take, /if \(sid === activeId\) \{ if \(ta\) \{ ta\.value = ""; growComposer\(ta\); \}/);
   // the target: into the maps, persisted, and into the box when the tab is active
   const adopt = RENDER.slice(RENDER.indexOf("function adoptSessionState("), RENDER.indexOf("function noteMru("));
   assert.match(adopt, /persistDrafts\(\);\n\s*if \(activeId === sid\) loadComposerFor\(sid\);/);
+  // round ten: the stack whole, then the chips under the flavour rule, then the uploads re-shipped and the held send armed only with a chip to wait on
+  assert.match(adopt, /stagedMsgs\.appendAll\(sid, st\.staged\);[^\n]*\n  if \(Array\.isArray\(st\.citations\) && st\.citations\.length\) mergeCitations\(sid, st\.citations as Citation\[\]\);/);
+  assert.match(adopt, /const shipped = Array\.isArray\(st\.ships\) && st\.ships\.length \? adoptShips\(sid, st\.ships as unknown\[\]\) : 0;/);
+  assert.match(adopt, /if \(st\.heldSend === true\) \{\n    if \(shipped\) sendOnShip\.add\(sid\);/);
+  assert.match(adopt, /if \(vscodeApi\) vscodeApi\.postMessage\(\{ type: "dropFile", name: p\.name, b64: p\.b64, shipId: p\.shipId, id: sid \}\);/, "the re-ship: the reconnect re-ship's frame");
   assert.match(RENDER, /if \(m\.romp === "adopt"\) \{ adoptSessionState\(m\.sid, m\.state\); return; \}/, "the shell's message lands in the same relay as chatNav");
 });
 

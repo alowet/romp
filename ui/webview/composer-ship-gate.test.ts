@@ -22,7 +22,7 @@ test("a send with ships in flight is gated by the confirm: send-without is expli
   assert.match(RENDER, /\{ label: "Send without " \+ them, value: "now", danger: true \}/,
     "sending without the file is the marked-dangerous, explicit choice");
   assert.match(RENDER, /if \(v === "now"\) sendComposer\(\{ pastShipGate: true \}\);/);
-  assert.match(RENDER, /else if \(v === "wait"\) \{ sendOnShip\.add\(sid\); renderComposerFiles\(sid\); \}/);
+  assert.match(RENDER, /const owner = shipGateSid \?\? sid;[^\n]*\n(?:[^\n]*\n){2}\s*else if \(v === "wait"\) \{ sendOnShip\.add\(owner\); renderComposerFiles\(owner\); \}/, "wait arms the hold for the gate's owner — the real session when a settlement re-keyed the gate while the dialog stood (round ten)");
 });
 
 test("the held send fires on the LAST ack — event-based — and a nack cancels it loudly", () => {

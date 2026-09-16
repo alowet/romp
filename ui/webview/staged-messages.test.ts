@@ -37,13 +37,24 @@ test("the persistence round-trip keeps text, context and order — and drops jun
   const s = new StagedStack();
   s.push("a", { text: "one", cites: [{ quote: "q", title: "t" }] });
   s.push("a", { text: "two", cites: [] });
+  s.push("a", { text: "", cites: [{ quote: "context alone", title: "t" }] });   // ⌘⏎ over an empty box: the context, no words (round ten: this died at the reload)
   const r = new StagedStack();
   r.restore(JSON.parse(JSON.stringify(s.entries())));
-  assert.deepEqual(r.list("a").map((m) => m.text), ["one", "two"]);
+  assert.deepEqual(r.list("a").map((m) => m.text), ["one", "two", ""], "a context-only item is not junk");
   assert.equal((r.list("a")[0].cites[0] as any).quote, "q", "the context survives the reload");
-  r.restore({ b: [{ text: "" }, { nope: 1 }, "junk"], c: "junk" });   // a hand-edited/old store
+  assert.equal((r.list("a")[2].cites[0] as any).quote, "context alone");
+  r.restore({ b: [{ text: "" }, { text: "", cites: [] }, { nope: 1 }, "junk"], c: "junk" });   // a hand-edited/old store
   assert.equal(r.count("b"), 0, "junk hydrates to nothing, never a crash");
   assert.equal(r.count("c"), 0);
+});
+
+test("appendAll (a move, round ten): every accepted item is kept — a context-only one included — appended after what is held, in order; other stacks untouched; junk dropped", () => {
+  const s = new StagedStack();
+  s.push("a", { text: "held", cites: [] }); s.push("b", { text: "elsewhere", cites: [] });
+  assert.equal(s.appendAll("a", [{ text: "", cites: [{ quote: "q", title: "t" }] }, { text: "words", cites: [] }, { text: "" }, { text: "", cites: [] }, { nope: 1 }, "junk", null]), 2, "two kept");
+  assert.deepEqual(s.list("a"), [{ text: "held", cites: [] }, { text: "", cites: [{ quote: "q", title: "t" }] }, { text: "words", cites: [] }], "after what was held, in the order given");
+  assert.deepEqual(s.list("b").map((m) => m.text), ["elsewhere"], "no other stack touched");
+  assert.equal(s.appendAll("c", [{ nope: 1 }]), 0); assert.equal(s.count("c"), 0, "nothing kept makes no stack");
 });
 
 test("a staged line stays inside the pane: shrinkable strips, ellipsis, click-to-expand tail", () => {

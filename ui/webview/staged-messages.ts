@@ -126,14 +126,36 @@ export class StagedStack {
     return Object.fromEntries(this.m);
   }
 
-  /** Hydrate from a persisted shape; junk entries are dropped, never a crash. */
+  /** A MOVE between stacks in one page or across two (round ten, 2026-09-15): a settlement carrying a provisional tab's
+   *  stack to the session it became, a pane adopting what a closing pane held for a session it shows. Every item the
+   *  stack accepted when it was staged is kept — a CONTEXT-ONLY item (quotes, no words: the composer stages those, ⌘⏎
+   *  over an empty box) above all, which restore()'s text filter would drop, that filter being for an old or hand-edited
+   *  store. Appended after what `sid` already holds, in order; no other stack is touched. Not an object, no text field,
+   *  or nothing at all (no words, no context — never staged) is dropped. Returns how many were kept. */
+  appendAll(sid: string, items: readonly unknown[]): number {
+    const l = this.m.get(sid) || [];
+    let n = 0;
+    for (const m of items) {
+      if (!m || typeof m !== "object" || typeof (m as any).text !== "string") continue;
+      const cites: unknown[] = Array.isArray((m as any).cites) ? (m as any).cites : [];
+      if (!(m as any).text && !cites.length) continue;
+      l.push({ text: (m as any).text, cites }); n++;
+    }
+    if (l.length) this.m.set(sid, l);
+    return n;
+  }
+
+  /** Hydrate from a persisted shape; junk entries are dropped, never a crash. A CONTEXT-ONLY item (no words, quotes)
+   *  is not junk (round ten, 2026-09-15: the composer has staged those since 2026-08-23, and this dropped them at the
+   *  next reload); an item with neither words nor context is. */
   restore(saved: unknown): void {
     if (!saved || typeof saved !== "object") return;
     for (const [sid, v] of Object.entries(saved as Record<string, unknown>)) {
       const list: StagedMsg[] = [];
       for (const m of Array.isArray(v) ? v : []) {
-        if (m && typeof (m as any).text === "string" && (m as any).text)
-          list.push({ text: (m as any).text, cites: Array.isArray((m as any).cites) ? (m as any).cites : [] });
+        const cites: unknown[] = m && Array.isArray((m as any).cites) ? (m as any).cites : [];
+        if (m && typeof (m as any).text === "string" && ((m as any).text || cites.length))
+          list.push({ text: (m as any).text, cites });
       }
       if (list.length) this.m.set(sid, list);
     }
