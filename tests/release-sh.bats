@@ -114,11 +114,14 @@ STUB
     grep -q "pr create" "$GH_LOG"
     grep -q "pr merge" "$GH_LOG"
     # The version PR carries its tier label at creation: a required upstream check holds an
-    # unlabeled PR red. The label is the tier-0 label as it exists upstream (`tests-only`; both
-    # checks read it as `docs` until the maintainers rename it, and `gh` resolves the name on the
-    # server). Under the tier policy the VERSION PR is held anyway until the maintainers decide its
-    # tier; the pin is that the release path names a real, existing label.
-    grep -q "pr create .*--label tests-only" "$GH_LOG"
+    # unlabeled PR red. The label is `docs`, tier 0 as the repository names it (docs and fix are one
+    # tier that merges on green; the pre-rename spelling `tests-only` exists only as a body alias, and
+    # `gh` resolves the label name on the server, so naming a label the repository lacks fails the
+    # cut one step after the version branch is pushed, as v0.16.0's first cut did on 2026-09-16).
+    grep -q "pr create .*--label docs" "$GH_LOG"
+    # And the body says the tier too, the road a contributor who cannot label uses, so the tier
+    # workflow can re-apply the label should its name move again.
+    grep -q "Tier: docs" "$GH_LOG"
     # BY NUMBER, never by branch name (the user 2026-08-01): every PR here is fork-headed, because
     # rulesets block branch pushes upstream — and `gh pr merge <branch> --repo <upstream>` cannot
     # resolve a branch that lives on the fork. It failed with "no pull requests found for branch

@@ -26,8 +26,9 @@ The guards here:
     a normal ship+send against the restarted kernel behaves exactly as before. Skips LOUDLY
     when the extension deps or a playwright browser are absent (CI installs no browsers).
   * NackNoticeSurvivesReload: the same wedge with the relaunched kernel unable to save the
-    re-shipped file. Its nack retires the last pending ship, which lets the restart's held
-    reload fire on the next task, and the notice the nack raised (the file was not saved, the
+    re-shipped file. Its nack retires the last pending ship, which lets the held reload (the
+    offer the changed build stood, accepted by the driver as the user's Reload; 2026-09-16)
+    fire on the next task, and the notice the nack raised (the file was not saved, the
     held message not sent) must be shown again by the fresh page, once.
   * LabKernelEnv, which runs everywhere: a lab kernel's environment is built from names (kernel_env,
     which every lab that boots a kernel uses), never from a copy of the runner's: a live kernel's
@@ -262,10 +263,12 @@ const k2 = spawn(cfg.relaunch.cmd, [], { env: cfg.relaunch.env, detached: true,
   stdio: ["ignore", fs.openSync(cfg.relaunch.log, "a"), fs.openSync(cfg.relaunch.log, "a")] });
 k2.unref();   // the kernel outlives this driver — an un-unref'd child held node open past RESULT
 fs.writeSync(1, "KPID:" + k2.pid + "\n");
-// T272: the restart's reload request normally rides the next keepalive (its cadence, not this test's); it is raised
-// HERE, while the ship is pending and the send held, so the hold is exercised on every run: on a pane without the
-// busy report the page reloads at once and the wait below dies (reloadedEarly), which is the failure this pins. The
-// probe marks THIS page: its disappearance is the reload firing on its own once the pane is idle again.
+// T272: a reload owed while the ship is pending and the send held must WAIT for them. Since 2026-09-16 a restart owes the page
+// no reload of its own (a same-build restart is invisible, a newer build is offered), so the reload this lab holds is the
+// core's forced path (require: the safety valve a kernel may send as reloadRequired; nothing sends it today), raised HERE,
+// while the ship is pending, so the hold is exercised on every run: on a pane without the busy report the page reloads at
+// once and the wait below dies (reloadedEarly), which is the failure this pins. The probe marks THIS page: its
+// disappearance is the reload firing on its own once the pane is idle again.
 // the hold is recorded by the core's own event (the held hook fires when the request finds the pane busy), not by a poll
 // that must catch the busy window: on a fast heal the first poll of the wait below found the pane idle and read no hold
 // (a CI red of 2026-09-15). The FIRST hold is kept: the chat pane's redial holds on fresh too once invisible restarts landed.
@@ -276,12 +279,12 @@ await page.evaluate(() => { window.__probe = 1; const R = window.__rompReload; i
   // nothing (a CI red of 2026-09-15 on two unrelated heads). The core's own record says what it waits on: read it first.
   if (R.owed() && !R.fired() && R.waiting) window.__t272HeldWhileBusy = String(R.waiting);
   const prev = R.held; R.held = (b, o) => { if (!window.__t272HeldWhileBusy) window.__t272HeldWhileBusy = String(b); if (prev) prev(b, o); };
-  R.request("restart", "forced-by-the-test"); } }).catch(() => {});
+  R.require("forced-by-the-test"); } }).catch(() => {});
 // today (pre-fix) this wait dies: the chip pulses forever and the held send never fires.
 // with the fix: romp:wsup re-ships, the ack retires the chip, and fireHeldSend sends the message.
-// T272: the dashboard reloads itself on the restart (a new boot id, T265) — but only once this pane is no longer
-// busy: the pending ship and the held send hold the reload (render.ts __rompPaneBusy) until the ack lands and the
-// send fires, all on THIS page. A reload before that would take the upload's bytes with it (the loss toast) and
+// T272: an owed reload (here the forced one above; before 2026-09-16 the restart's own) fires only once this pane is no
+// longer busy: the pending ship and the held send hold the reload (render.ts __rompPaneBusy) until the ack lands and
+// the send fires, all on THIS page. A reload before that would take the upload's bytes with it (the loss toast) and
 // leave the send unfired: an early navigation here is the failure this test exists for, so it is recorded, never
 // swallowed.
 let reloadedEarly = false;
@@ -632,9 +635,10 @@ class ServedWedge(_ShipLab):
                         % (w, Path(self.klog).read_text()[-500:]))
         # the heart of T272, read at the EVENT: the core's persist hook runs as the last call before location.reload(), and the
         # pane's pending state then must be clear (no chip, the held send released). Whether the reload was HELD depends on
-        # when it was owed: by the driver's request while the ship was pending (a hold announced, recorded before the kill),
-        # or by the pane's own reopen after the heal (no hold needed, and none announced); both are right, and neither is a
-        # matter of when this driver looked (three CI reds of 2026-09-15 were the driver looking late).
+        # when it was owed: by the driver's forced request while the ship was pending (a hold announced, recorded before the
+        # kill), or after the heal (no hold needed, and none announced); both are right, and neither is a matter of when this
+        # driver looked (three CI reds of 2026-09-15 were the driver looking late). Since 2026-09-16 the restart itself owes
+        # nothing, so the forced request is the one reload here.
         self.assertIsNotNone(w.get("atFire"), "the core's persist hook recorded the pane's state at the fire: %r" % w)
         self.assertEqual(w["atFire"]["pending"], 0, "the reload fired with no ship pending: %r" % w)
         self.assertEqual(w["atFire"]["input"], "", "…and the held send released: %r" % w)
@@ -704,8 +708,9 @@ process.exit(0);
 
 class ServedWedgeRaced(ServedWedge):
     """The reproduced race of the three CI reds of 2026-09-15: the driver's request comes seconds after the relaunch, so the
-    pane's own reopen has owed the restart's reload (and, the ship having healed, fired it) before the driver looks. The claim
-    is the same and holds at the fire; the lab's kernel is per class and the driver kills it once, so the road has its own."""
+    pane has reconnected, re-shipped and healed before the request is made (before 2026-09-16 the pane's own reopen owed the
+    restart's reload and fired it by then; now the forced request finds an idle pane and fires at once). The claim is the same
+    and holds at the fire; the lab's kernel is per class and the driver kills it once, so the road has its own."""
 
     def test_restart_between_ship_and_ack_reships_heals_and_releases_the_held_send(self):
         self._wedge(race_delay_ms=4000)
@@ -803,13 +808,17 @@ out.bootBefore = bootBefore;
 fs.rmSync(cfg.drops, { recursive: true, force: true });
 fs.writeFileSync(cfg.drops, "not a directory");
 process.kill(cfg.kernelPid, "SIGKILL");
-// Invisible restarts (2026-09-14): a restart of the SAME code owes the page no reload (the board stays, the panes redial),
-// so the reload this lab is about, the one the restart owes and holds behind the pending ship, exists only when the
-// relaunched kernel is a changed build. ROMP_CODE_IDENT stands in for the computed code identity (kernel.py _code_ident).
+// Invisible restarts (2026-09-14): a restart of the SAME code owes the page no reload (the board stays, the panes redial); a
+// changed build is OFFERED (2026-09-16), never taken, so the reload this lab is about, the one held behind the pending ship,
+// is the offer the user ACCEPTS: the driver takes the offer the instant the page stands it (the standalone page's own bar;
+// the core's accept is what its Reload button calls), while the ship is still pending or just after its nack, and the reload
+// then waits for the ship as any owed reload does. ROMP_CODE_IDENT stands in for the computed code identity (kernel.py _code_ident).
 const k2 = spawn(cfg.relaunch.cmd, [], { env: { ...cfg.relaunch.env, ROMP_CODE_IDENT: "changed-build" }, detached: true,
   stdio: ["ignore", fs.openSync(cfg.relaunch.log, "a"), fs.openSync(cfg.relaunch.log, "a")] });
 k2.unref();
 fs.writeSync(1, "KPID:" + k2.pid + "\n");
+out.offered = await until(() => { const R = window.__rompReload; const o = R && R.offered(); return o ? JSON.stringify(o) : false; }, null, 45000) || null;
+await page.evaluate(() => { const R = window.__rompReload; if (R && R.offered()) R.accept(); }).catch(() => {});   // the user's Reload
 // the OLD page saw the nack (the re-shipped file could not be saved); then the reload core's turn
 out.nackSeen = await until(() => JSON.parse(sessionStorage.getItem("probe:nackSeen") || "null"), null, 45000) || null;
 out.reloaded = await until((boot) => window.__probe !== 1 && !!window.__rompReload && window.__rompReload.boot !== boot, bootBefore, 30000);
@@ -842,8 +851,9 @@ process.exit(0);
 
 
 class NackNoticeSurvivesReload(_ShipLab):
-    """The reload core's restart reload (the relaunch is a changed build, since a restart of the same code owes no reload
-    since 2026-09-14) follows the LAST pending ship's retirement: retirePendingShip ends the hold
+    """The reload the user accepts from the offer a changed build stands (a restart of the same code owes no reload since
+    2026-09-14, and since 2026-09-16 a changed build is offered, never taken) follows the LAST pending ship's retirement:
+    retirePendingShip ends the hold
     (endReloadHoldIfIdle, __rompReload.ended()) and the core fires on the next task. The nack that retired the ship
     raises its toast in the same handler, after the hold ended, so the notice (the file was not saved, the held
     message NOT sent) was appended one task before the page went: never read, and the fresh page's loss toast had
@@ -869,7 +879,10 @@ class NackNoticeSurvivesReload(_ShipLab):
         self.assertIn("shot.png couldn't be saved", r["nackSeen"]["text"])
         self.assertIn("Your message was NOT sent", r["nackSeen"]["text"], "the held send did not fire without its file")
         self.assertTrue(r["nackSeen"].get("ephemeralOnScreen"), "the toast wearing the ephemeral mark was on screen as the core took the page: %r" % r)
-        # then the reload the core owed (held while the ship awaited its answer)
+        # the changed build was offered (the standalone page's own bar), the driver accepted, and the accepted reload fired once
+        # the ships settled
+        self.assertIsNotNone(r["offered"], "the relaunched build was offered, never taken by the page: %r" % r)
+        self.assertEqual(json.loads(r["offered"])["code"], "changed-build", "the offer names the changed code identity: %r" % r["offered"])
         self.assertTrue(r["reloaded"], "the reload core reloads once the ships settled: %r" % r)
         self.assertNotEqual(r["bootAfter"], r["bootBefore"], "the fresh page carries the relaunched kernel's boot id: %r" % r)
         # the heart of it: the fresh page says it again, once, and only that

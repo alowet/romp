@@ -52,15 +52,21 @@ class RefreshButtonDecoupledTest(unittest.TestCase):
 
 
 class RestartReloadRaceTest(unittest.TestCase):
-    """The restart flow reloads on the NEW kernel's answer, never a bare 200 (the user 2026-07-27).
+    """The restart flow acts on the NEW kernel's answer, never a bare 200 (the user 2026-07-27), and since
+    2026-09-16 it reloads nothing by itself.
 
     The old poll reloaded on the first /healthz 200 — but the OLD kernel keeps answering for a beat
     after the /restart ack (the manager SIGTERMs it asynchronously), so the reload routinely landed on
     a dying server and the browser sat on its connection-error page until a manual refresh. Now the
     page embeds the boot id it was served under, /healthz stamps every answer with X-Romp-Boot, and
-    the poll reloads only when the id FLIPS — an exact process-identity event, not a timing guess.
+    the poll acts only when the id FLIPS — an exact process-identity event, not a timing guess.
     While it waits, the romp boot splash is rebuilt over the page (the loading rule), with a reload
-    backstop so the splash can never trap the user."""
+    backstop so the splash can never trap the user. What the flip DOES is the reload core's call (the
+    user 2026-09-16, the design block above kernel.py _RELOAD_CORE_JS): the splash drops and the new
+    kernel's /version is read; an unchanged build reloads nothing (the panes redial, the board updates
+    in place), a changed build is OFFERED as one line with Reload and Not now, never taken. The ↻ is a
+    request for a restart, not for a reload. tests/test_dashboard_auto_reload.py runs the button's
+    function with the core over both answers; these pins hold its source."""
 
     def test_reload_waits_for_the_boot_id_to_flip(self):
         import json
@@ -73,6 +79,20 @@ class RestartReloadRaceTest(unittest.TestCase):
         self.assertNotIn("__ROMP_LOADER__", html)
         # the racy first-200 reload is gone
         self.assertNotIn("if(r&&r.ok)location.reload()", html)
+
+    def test_the_flip_hands_the_decision_to_the_reload_core_and_never_reloads_by_itself(self):
+        import json
+        html = km._landing()
+        a = html.index("window.__rompRestart=function(){")
+        fn = html[a:html.index("var rf=document.getElementById('rail-refresh');", a)]
+        self.assertIn("if(b&&b!==%s){boot.classList.add('gone');if(window.__rompReload)window.__rompReload.checkBoot();else location.reload();}" % json.dumps(km._BOOT_ID), fn,
+                      "the flip drops the splash and asks the core to read /version; only a page without the core reloads as before")
+        self.assertNotIn("if(b&&b!==%s)location.reload()" % json.dumps(km._BOOT_ID), fn, "the flip's own reload is gone (2026-09-14)")
+        self.assertEqual(fn.count("location.reload()"), 3, "the no-core fallback and the two-minute backstop's two arms: nothing else reloads here")
+        # the ruling's words stand beside the code
+        self.assertIn("A changed build: the core OFFERS the reload", fn)
+        # and the gear's own ↻ handler, dead since the control moved to the rail, is gone with its first-200 reload
+        self.assertNotIn("rrefresh", _gear_src())
 
     def test_wait_wears_the_boot_splash(self):
         import json

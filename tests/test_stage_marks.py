@@ -628,7 +628,7 @@ def _who(rec): return sys.modules.get("romp_event_model").author_of(rec)
             i = src.index("    def %s(self):" % m)
             head = src[max(0, i - 200):i]
             self.assertIn('@_stage_marked(lambda self: "http.%s." + _route_seg(self.path))' % m.split("_")[1], head, m)
-        self.assertIn('_set_stage("judge." + threading.current_thread().name)', inspect.getsource(km._run_tier), "the tier threads")
+        self.assertIn('_set_stage("judge." + name)', inspect.getsource(km.jd._run_tier), "the tier threads (the shared runner)")
 
     def test_the_route_names_the_stage_with_two_segments_where_the_roads_differ_by_the_second(self):
         self.assertEqual([km._route_seg(p) for p in ("/chat/x/y", "/ws", "/remote/h/ws", "/", "", "/perf?stacks=1", "/state?x=1",
@@ -669,7 +669,7 @@ class BuildsCountUnderTheThreadsStage(unittest.TestCase):
         return {k: v - before.get(k, 0) for k, v in after.items() if v - before.get(k, 0)}
 
     def test_a_tier_threads_build_lands_under_judge_and_its_tier_name(self):
-        delta = self._build_on(lambda build: km._run_tier(build), name="triage")
+        delta = self._build_on(lambda build: jd._run_tier(build, "triage", jd._pass_acc()), name="triage")
         self.assertEqual(list(delta), ["judge.triage:<lambda>"], delta)
 
     def test_a_pool_workers_build_lands_under_the_tier_that_submitted_it(self):
@@ -678,7 +678,7 @@ class BuildsCountUnderTheThreadsStage(unittest.TestCase):
         def tier(build):
             with jd._TimedPool(max_workers=1) as ex:
                 ex.submit(build).result(10)
-        delta = self._build_on(lambda build: km._run_tier(lambda: tier(build)), name="triage")
+        delta = self._build_on(lambda build: jd._run_tier(lambda: tier(build), "triage", jd._pass_acc()), name="triage")
         self.assertEqual(list(delta), ["judge.triage:<lambda>"], delta)
 
     def test_a_pool_worker_restores_its_previous_mark_after_the_run(self):
@@ -689,7 +689,7 @@ class BuildsCountUnderTheThreadsStage(unittest.TestCase):
                 ex.submit(lambda: seen.append(km._current_read_stage())).result(10)
                 ex.submit(lambda: None).result(10)
                 seen.append(ex.submit(lambda: km._current_read_stage()).result(10))
-        th = threading.Thread(target=lambda: km._run_tier(tier), name="index"); th.start(); th.join(10)
+        th = threading.Thread(target=lambda: jd._run_tier(tier, "index", jd._pass_acc()), name="index"); th.start(); th.join(10)
         self.assertEqual(seen, ["judge.index", "judge.index", "judge.index"], seen)
 
     def _push_through_the_backend(self, handed):

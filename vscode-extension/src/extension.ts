@@ -114,10 +114,12 @@ function maybeBuildNotice(dv: unknown): void {
 // AUTH-EXEMPT route: anything answering on the kernel port could then choose the directory we ran a
 // shell command from, and drive the prompt that invites the click besides. When this copy isn't a
 // checkout it can't rebuild anything, so we say so and point at the terminal rather than running some
-// other install.sh. Reload stays a user click here, never automatic: the served dashboard reloads ITSELF on a
-// kernel restart or a newer bundle since 2026-09-08 (superseding the 2026-07-13 banner preference, T265), but a
-// VS Code webview reload cannot fix bundled-code drift — the bundle comes from the installed VSIX, so only a
-// reinstall plus the editor's own reload lands new code, and that is the user's click.
+// other install.sh. Reload stays a user click here under every ruling: the served dashboard reloaded ITSELF on a
+// kernel restart or a newer bundle from 2026-09-08 (T265, superseding the 2026-07-13 banner preference), and since
+// 2026-09-16 it OFFERS the reload instead (a same-build restart is invisible; a newer build is one line with Reload
+// and Not now; the design block above kernel.py _RELOAD_CORE_JS). A VS Code webview reload cannot fix bundled-code
+// drift either way — the bundle comes from the installed VSIX, so only a reinstall plus the editor's own reload lands
+// new code, and that is the user's click.
 let updating = false;
 async function updateExtension(): Promise<void> {
   if (updating) return;                                    // one run per host (double-click, or toast + palette)

@@ -178,25 +178,39 @@ test("executed: planStrip — sections + folds; the flat strip when off or untag
   assert.deepEqual(planStrip(["loose"], unions, st, null, false).items, [{ id: "loose" }], "an untagged world: flat");
 });
 
-test("executed: the PHONE layout renders the flat strip — every visible id, nothing folded, whatever the store says (sectioning is desktop-only)", () => {
-  // the kernel's phone chat page hides #tabs and builds its session list by scraping every rendered
-  // tab; it has no header to unfold and no switch, so a folded section there (archived, by default)
-  // made its sessions unreachable from the only switcher
+test("executed: the PHONE layout sections like the desktop — the same headings in the same order, every member under its header — and folds NOTHING, whatever the store says", () => {
+  // the kernel's phone chat page hides #tabs and builds its session list by scraping the strip's children
+  // in order (a heading row per header, a row per tab copy). It listed the sessions in the raw view order
+  // while the desktop grouped them by tag (the user 2026-09-16), because the phone plan flattened: a fold
+  // there would have hidden its members from the phone's only switcher (archived, by default). Now the
+  // plan sections on the phone too, and the FOLD alone stays desktop-only: the picker's heading is a
+  // label with no fold to open, so every member renders under its header
   const unions = viewTagUnion({ ...V, tags: [...V.tags, { id: "g4", name: "archived", color: "#6b7280", members: ["old1", "old2"] }] });
+  const ids = ["web", "old1", "loose", "old2", "tests"];
+  const shape = (p: ReturnType<typeof planStrip>) => p.items.map((i) => ("head" in i ? `#${i.head.name ?? ""}${i.folded ? "(folded)" : ""}` : i.id));
   for (const st of [parseTabGroups(null), { on: true, collapsed: ["infra", "qa"], expanded: [], pinned: [] }]) {
-    const p = planStrip(["web", "old1", "loose", "old2", "tests"], unions, st, null, true);
-    assert.equal(p.sectioned, false);
-    assert.deepEqual(p.items, [{ id: "web" }, { id: "old1" }, { id: "loose" }, { id: "old2" }, { id: "tests" }], "the flat strip, in strip order");
+    const p = planStrip(ids, unions, st, "old1", true);
+    assert.equal(p.sectioned, true, "the phone sections");
+    assert.deepEqual(shape(p), ["#qa", "tests", "#infra", "web", "#archived", "old1", "old2", "#", "loose"],
+      "qa, infra, archived in union order, each member under its header, the untagged trail last — the desktop's order");
+    const desk = planStrip(ids, unions, { ...st, collapsed: [], expanded: ["archived"] }, "old1", false);
+    assert.deepEqual(p.items, desk.items, "…item for item what the desktop renders with every section open (the same headings, copies and active mark)");
     assert.deepEqual([...p.folded], [], "visibleOrder excludes nothing on the phone");
+    assert.ok(!p.items.some((i) => "head" in i && (i.folded || i.hidden.length)), "no header folded, none standing in for a hidden member");
+    assert.deepEqual(p.items.filter((i) => "head" in i && i.active).map((i) => ("head" in i ? i.head.name : "")), ["archived"], "the active tab's holder is marked, as on the desktop");
   }
+  assert.deepEqual(planStrip(ids, unions, { ...parseTabGroups(null), on: false }, null, true).items, ids.map((id) => ({ id })),
+    "the switch off: the flat strip on the phone as on the desktop (the phone's tag menu offers the switch too)");
   // render.ts decides "phone" by the SAME media rule the kernel's page uses to swap the strip for its
   // list (_CHAT_MOBILE_CSS) — one string on each side, pinned equal here, so they cannot drift
   const media = RENDER.match(/const PHONE_LAYOUT_MEDIA = "([^"]+)";/)![1];
   assert.equal(media, "(pointer:coarse) and (max-width:1024px)");
   assert.ok(KERNEL.includes('"@media ' + media + '{"'), "the kernel's phone CSS gate is the very same rule");
   assert.match(RENDER, /function phoneLayout\(\): boolean \{\s*\n\s*try \{ return window\.matchMedia\(PHONE_LAYOUT_MEDIA\)\.matches; \} catch \{ return false; \}/);
-  // …and the phone layout offers no switch, on either mount
-  assert.match(RENDER, /\.\.\.\(phoneLayout\(\) \? \{\} : \{\s*\n\s*groupToggle: \{ label: "Group tabs by tag"/);
+  // …and the switch is on BOTH mounts, one object: the strip's tag button and the phone header's (the phone
+  // groups by the same store now, so the phone can turn it off too)
+  assert.match(RENDER, /const groupToggle = \{ label: "Group tabs by tag", on: \(\) => readTabGroups\(\)\.on,/);
+  assert.doesNotMatch(RENDER, /phoneLayout\(\) \? \{\} :/, "no phone gate on the switch");
   // crossing the boundary (an iPad rotation) re-plans the strip: the CSS side of the same rule flips
   // the instant the media query does, so a plan sampled per render only went stale under the phone
   // list (folded tabs absent from the scrape) until the next push. The flip IS the event — one
@@ -380,15 +394,16 @@ test("dragging a header reorders tagOrder through the views path — the store t
   assert.match(CSS, /\.tab-group-head\.drop-target \{ box-shadow: inset 2px 0 0 var\(--accent\); \}/);
 });
 
-test("the switch lives at the foot of the chat tag-lens menu beside Configure tags…, desktop mount only", () => {
+test("the switch lives at the foot of the chat tag-lens menu beside Configure tags…, on both mounts", () => {
   assert.match(MENU, /groupToggle\?: \{ label: string; on: \(\) => boolean; toggle: \(\) => void \};/);
   assert.match(MENU, /if \(opts\.groupToggle\)\s*\n\s*row\(opts\.groupToggle\.label, opts\.groupToggle\.on\(\), true, true\)\.addEventListener\("click", \(\) => \{ opts\.groupToggle!\.toggle\(\); build\(\); \}\);/,   // the checkbox row (menuitemcheckbox, aria-checked, the two-state mark), the strip tidy after T413
     "✓-marked when on; flips and repaints in place like the tag rows");
   assert.ok(MENU.indexOf("if (opts.groupToggle)") < MENU.indexOf('row("Configure tags…"'), "beside — above — Configure tags…");
-  assert.match(RENDER, /groupToggle: \{ label: "Group tabs by tag", on: \(\) => readTabGroups\(\)\.on,/);
+  assert.match(RENDER, /const groupToggle = \{ label: "Group tabs by tag", on: \(\) => readTabGroups\(\)\.on,/);
+  assert.equal((RENDER.match(/^\s*groupToggle,/gm) || []).length, 2, "one object, passed to the strip's menu and the phone header's alike");
   const mobileAt = RENDER.indexOf('const mslot = document.getElementById("mtag-slot")');
   const mobile = RENDER.slice(mobileAt, RENDER.indexOf("paintTabRowLines(bar);", mobileAt));   // the paint after the mount (the strip's observer paints earlier in the file, T413 round two)
-  assert.ok(!mobile.includes("groupToggle"), "the phone page hides the strip itself, so its mount offers no switch");
+  assert.ok(mobile.includes("groupToggle,"), "the phone page's picker groups by the same store (2026-09-16), so its mount offers the same switch");
 });
 
 test("the picker's Tags row: prefilled from the ACTIVE tab, visible and editable, posted as `tags` on createSession", () => {
@@ -1715,9 +1730,10 @@ test("the toggle is a row in the tab menu's Tags flyout beside the Move-to rows:
   assert.doesNotMatch(adopt, /if \(!renames\.length\) return;/, "no early return on a frame without renames");
   assert.equal(RENDER.split("followAdoption(").length - 1, 1, "one call site: the adoption");
   assert.equal(RENDER.split("followTagRenames(").length - 1, 0, "…and the follow itself is reached only through it");
-  // the phone layout's flat strip has no fold to show through: the plan ignores pins there (no-op by construction)
+  // the phone layout folds nothing, so a pin has nothing to show through: the member renders under its open
+  // header there like any other (a no-op by construction)
   const p = planStrip(["web", "old1", "old2"], viewTagUnion(VP), setPinned(parseTabGroups(null), ARCH, "old2", true), "web", true);
-  assert.deepEqual(p.items, [{ id: "web" }, { id: "old1" }, { id: "old2" }]);
+  assert.deepEqual(p.items.map((i) => ("head" in i ? `#${i.head.name}${i.folded ? "(folded)" : ""}` : i.id)), ["#infra", "web", "#archived", "old1", "old2"]);
   // docs: the guide says the setting survives the group's rename
   assert.match(GUIDE, /A tab set to show when folded keeps that setting when its\s+group is renamed\./);
 });

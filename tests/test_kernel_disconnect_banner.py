@@ -216,11 +216,12 @@ process.stdout.write(JSON.stringify({
         # a pane's build-drift raise rides the same wsStale channel tagged build:1 → the shell shows
         # BUILDMSG (not the connection wording), and latches it so its own /version poll — whose token
         # may be current — can't clear the prompt out from under the stale pane (the user 2026-07-13)
-        # T265 (the user 2026-09-08): a build:1 is handed to the reload core (the page reloads itself); the
-        # BUILDMSG wording shows only where the core is absent
-        self.assertIn("if(m.build){if(RL)RL.request('build','');else{buildStale=true;show(BUILDMSG);}}else{connStale=true;show(CONNMSG);}", km._STALE_JS)
+        # T265 (the user 2026-09-08): a build:1 is handed to the reload core; since 2026-09-16 the core is asked
+        # for the authoritative /version reading, which it OFFERS (the same box paints the offer); the BUILDMSG
+        # wording shows only where the core is absent
+        self.assertIn("if(m&&m.romp==='wsStale'){if(m.build){if(RL)RL.checkBoot();else buildStale=true;}else connStale=true;paint();}", km._STALE_JS)
         self.assertIn("!connStale&&!buildStale", km._STALE_JS, "the poll's clear respects both latches")
-        self.assertIn("connStale=false;buildStale=false;", km._STALE_JS, "Dismiss clears both")
+        self.assertIn("connStale=false;buildStale=false;paint();", km._STALE_JS, "Dismiss clears both")
 
     def test_the_connection_prompt_retires_when_the_resync_lands(self):
         """The prompt must go away on its own once what it warns about is over (the user 2026-08-01).
@@ -265,11 +266,11 @@ process.stdout.write(JSON.stringify({
         self.assertLess(js.index('msg.type==="ka"'), js.index("if(freshPending)"),
                         "the keepalive early-return sits ahead of the retire")
         self.assertIn('window.parent.postMessage({romp:"wsFresh"}', js, "embedded pane tells the shell")
-        # …and the shell drops the connection prompt on it, while a BUILD prompt survives (a resync
-        # delivers state, never new code — only a reload answers that one)
+        # …and the shell drops the connection prompt on it, while a BUILD offer survives (a resync
+        # delivers state, never new code — only a reload answers that one): the painter shows the offer again
         self.assertIn("m.romp==='wsFresh'", km._STALE_JS)
-        self.assertIn("connStale=false;if(buildStale)show(BUILDMSG);else box.classList.remove('show');",
-                      km._STALE_JS)
+        self.assertIn("else if(m&&m.romp==='wsFresh'){connStale=false;paint();}", km._STALE_JS)
+        self.assertIn("else if(offer){box.classList.add('offer');dm.textContent='Not now';show(offer.text);}", km._STALE_JS)
 
     def test_the_foregrounded_tab_path_arms_the_same_way(self):
         # a tab foregrounded onto a dead socket forces a reconnect and used to prompt immediately; that
@@ -289,7 +290,8 @@ process.stdout.write(JSON.stringify({
         self.assertIn('b.dataset.kind=kind||"conn"', js, "the self-injected bar records which prompt it is")
         self.assertIn('selfBar("romp lost the live connection, so what you see may be stale.","conn")', js)
         self.assertIn('selfBar("A newer romp build is available.","build")', js)
-        self.assertIn('if(b&&b.dataset.kind==="conn")b.remove();', js, "only the conn bar retires")
+        self.assertIn('if(b&&b.dataset.kind==="conn"){b.remove();', js, "only the conn bar retires")
+        self.assertIn('if(RO&&RO.offer&&RO.offered())RO.offer(RO.offered());', js, "…and a reload offer that yielded its slot to it comes back (2026-09-16)")
 
     def test_timeline_page_uses_the_shared_shim(self):
         # The timeline used to hand-roll its own WebSocket in _TIMELINE_BOOT (a copy of _shim's

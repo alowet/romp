@@ -332,6 +332,28 @@ class EntryEncodeMemo(unittest.TestCase):
         import inspect
         self.assertIn("_delta_split(kind, value, memo_key=(ftype, name))", inspect.getsource(km._delta_parts))
 
+    def test_a_memo_hit_hands_back_the_previous_split_pair_and_a_miss_mints_one_pair(self):
+        """A split's (object, json) pair is a tuple that holds a dict, which the collector tracks for life, and a split's
+        pairs live until the next build: long enough to reach the oldest generation, whose collection walks every tracked
+        object the kernel holds (2026-09-16: two fresh pairs per bar per build, the memo saving the encode and not the
+        tuples). So a hit hands back the LAST split's own pair, and a miss mints one pair for the memo and the entries both."""
+        km._delta_entry_memo.clear()
+        sep = km._DELTA_SEP
+        b1, b2 = {"id": "b1", "start": 1, "end": 2}, {"id": "b2", "start": 3, "end": 4}
+        k1 = "S" + sep + "b1"
+        ents1, _ = km._delta_split("dictlist:id", {"S": [b1, b2]}, memo_key=("bars", "turns"))
+        memo1 = km._delta_entry_memo[("bars", "turns")]
+        self.assertIs(memo1[id(b1)], ents1[k1], "a miss: ONE pair, the memo's and the entries' the same tuple")
+        self.assertIs(memo1[id(b2)], ents1["S" + sep + "b2"])
+        ents2, _ = km._delta_split("dictlist:id", {"S": [b1, b2]}, memo_key=("bars", "turns"))
+        self.assertIs(ents2[k1], ents1[k1], "a hit: the previous split's pair itself, no new tuple")
+        self.assertIs(km._delta_entry_memo[("bars", "turns")][id(b1)], ents2[k1], "and the rebuilt memo holds that same pair")
+        self.assertEqual(ents2[k1], (b1, json.dumps(b1)), "the pair is the same value as ever: the object and its string")
+        b1b = dict(b1)                                   # equal content, a NEW object: a miss, one fresh pair
+        ents3, _ = km._delta_split("dictlist:id", {"S": [b1b]}, memo_key=("bars", "turns"))
+        self.assertIsNot(ents3[k1], ents1[k1])
+        self.assertIs(km._delta_entry_memo[("bars", "turns")][id(b1b)], ents3[k1])
+
 
 # ── the judging derivation split (_derive_judging_marks + _judging_assemble): what the one-pass form emitted ──
 LIVE_SID = "44444444-5555-6666-7777-888888888801"      # private synthetic sids: the classes below mint goal stores, and a

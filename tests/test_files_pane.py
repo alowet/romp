@@ -156,7 +156,7 @@ class Plumbing(unittest.TestCase):
         _has(self, "var NOSTALE=true;", on)
         _has(self, "function armStale(why){if(NOSTALE)return;stalePending=why;staleKa=0;}", on)
         _has(self, 'function clearStale(){stalePending="";   // armed but never shown → nothing to see\nif(NOSTALE)return;', on)
-        _has(self, "function raiseBuild(){if(buildRaised)return;buildRaised=true;", on, "the build prompt is not gated")
+        _has(self, "function raiseBuild(dv){var R=window.__rompReload;if(R){R.noteDv(dv);return;}", on, "the build offer is not gated")
         _has(self, "var NOSTALE=false;", km._shim("feed", 1), "the default keeps the arm")
         for page in (km._chat_page(), km._feed_page(), km._fleet_page(), km._timeline_page()):
             _has(self, "var NOSTALE=false;", page)

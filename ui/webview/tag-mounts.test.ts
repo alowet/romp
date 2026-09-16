@@ -75,14 +75,17 @@ test("the chat strip and the outline both mount the shared component (source pin
   assert.match(KERNEL, /\*\*_views_payload\(\),   # the rendered views blob — the outline \+ feed tag mounts read it/);
 });
 
-test("the chat's menu carries the 'Group tabs by tag' switch at its foot; the phone mount does not (its strip is hidden)", () => {
+test("the chat's menu carries the 'Group tabs by tag' switch at its foot, on the strip's mount and the phone's alike", () => {
   // tab groups (the user 2026-09-04): the per-browser sectioned-strip switch rides the SHARED menu
-  // as an optional foot row beside Configure tags… — the chat strip passes it, the outline does not
+  // as an optional foot row beside Configure tags… — the chat strip passes it, the outline does not.
+  // ONE object for both chat mounts (2026-09-16): the phone's picker is built from the strip's
+  // sections now (planStrip sections on the phone too), so the phone header's menu offers the switch
   const desktop = RENDER.slice(RENDER.indexOf('tagMenuButton("filter these tabs by tag"'), RENDER.indexOf('tagBtn.classList.add("tab-tagfilter");'));
-  assert.match(desktop, /groupToggle: \{ label: "Group tabs by tag"/);
+  assert.match(desktop, /^\s*groupToggle,$/m);
+  assert.match(RENDER, /const groupToggle = \{ label: "Group tabs by tag", on: \(\) => readTabGroups\(\)\.on,/);
   const mobileAt = RENDER.indexOf('const mslot = document.getElementById("mtag-slot")');
   const mobile = RENDER.slice(mobileAt, RENDER.indexOf("paintTabRowLines(bar);", mobileAt));
-  assert.ok(!mobile.includes("groupToggle"), "the kernel's mobile page hides #tabs (_CHAT_MOBILE_CSS) — nothing to section there");
+  assert.match(mobile, /^\s*groupToggle,/m, "the kernel's mobile page groups its picker by the same store: the same switch");
   assert.ok(!FLEET.includes("groupToggle"), "the outline filters; it has no strip to section");
   assert.match(MENU, /if \(opts\.groupToggle \|\| opts\.onConfigure\) \{/, "the foot divider appears for either entry");
 });

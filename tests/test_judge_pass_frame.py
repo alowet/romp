@@ -13,6 +13,7 @@ and the caption memo keys on it, so a key can never be newer than the content it
 parse runs under stays live; the pair a parse was actually served under is recorded beside it.
 SYNTHETIC fixtures only."""
 import json
+import inspect
 import os
 import tempfile
 import threading
@@ -462,13 +463,13 @@ class PassFrame(unittest.TestCase):
             body = jsrc.split(fn, 1)[1]
             self.assertLess(body.find("begin_pass_frame()"), body.find("def ", 10),
                             "%s opens (or joins) a pass frame before any stage runs" % fn)
+        psrc = inspect.getsource(jd.run_pass)
+        self.assertIn("frame = begin_pass_frame()", psrc, "the shared pass body pins ONE frame for both tiers")
+        self.assertLess(psrc.index("frame = begin_pass_frame()"), psrc.index("t.start()"), "opened before a tier starts")
+        self.assertRegex(psrc, r"finally:\n\s+end_pass_frame\(frame\)", "and ends it in a finally (leak-proof)")
         ksrc = open(os.path.join(os.path.dirname(BIN), "kernel", "kernel.py")).read()
-        self.assertIn("_own_frame = jd.begin_pass_frame()", ksrc,
-                      "the kernel producer pins ONE frame for both tiers")
-        self.assertIn("jd.end_pass_frame(_own_frame)", ksrc,
-                      "and ends it (join path plus the finally safety net)")
-        self.assertEqual(ksrc.count("jd.end_pass_frame(_own_frame)"), 2,
-                         "normal-path end after the join AND the leak-proof finally")
+        self.assertIn("res = jd.run_pass(_tiers_may_start(tracking), before_tier=_tier_started)", ksrc, "the kernel producer runs the shared body")
+        self.assertNotIn("jd.begin_pass_frame()", ksrc, "and opens no frame of its own")
 
 
 

@@ -1085,10 +1085,12 @@ function visibleOrder(): string[] { return order.filter((id) => tabInView(id) &&
  *  PR 1661, low 3, for the folded ones). */
 function stripShowsTab(id: string): boolean { return stripShows(id) && !collapsedTabIds.has(id); }
 // THE PHONE LAYOUT: the kernel's chat page swaps the tab strip for its own session list (#mhdr/#mlist,
-// built by scraping every rendered tab) under EXACTLY this media rule (_CHAT_MOBILE_CSS in kernel.py)
-// — the same string here, so what the CSS hides and what the plan flattens cannot disagree. Sections
-// are desktop-only: the phone list has no header to unfold and no switch, so a folded section there
-// made its sessions unreachable (tests pin the two strings equal).
+// built by scraping the strip's children in order, group headers included) under EXACTLY this media rule
+// (_CHAT_MOBILE_CSS in kernel.py) — the same string here, so what the CSS hides and what the plan does
+// for it cannot disagree. The phone plan sections like the desktop's (the user 2026-09-16: the picker
+// must read in the strip's order, under the same headings), but FOLDS are desktop-only: the phone list's
+// heading is a label, not a fold control, so a folded section there made its sessions unreachable from
+// the phone's only switcher (tests pin the two strings equal).
 const PHONE_LAYOUT_MEDIA = "(pointer:coarse) and (max-width:1024px)";
 function phoneLayout(): boolean {
   try { return window.matchMedia(PHONE_LAYOUT_MEDIA).matches; } catch { return false; }
@@ -6640,9 +6642,10 @@ function renderTabs() {
   // gist survives the fold (progressive disclosure). The ACTIVE tab's section folds like any other: its
   // header is then the hidden tab's stand-in (focus, the arrows) and the pane shows the section at a
   // glance (renderSnapshot); the keyboard walk (visibleOrder()) drops the folded ids so ←/→
-  // skip them. DESKTOP ONLY: on the phone layout (phoneLayout — the kernel page's own media rule) the
-  // plan is the flat strip, since the phone's session list is scraped from every rendered tab and has
-  // no header to unfold. A create in flight (the provisional tab) sections under the tags its request
+  // skip them. On the phone layout (phoneLayout — the kernel page's own media rule) the plan sections
+  // the same way, so the phone's session list, scraped from the strip's children in order, reads as the
+  // desktop strip does (the user 2026-09-16); nothing folds there, since that list's heading is a label
+  // with no fold to open. A create in flight (the provisional tab) sections under the tags its request
   // named.
   const unions = viewTagUnion(effViews());
   const plan = planStrip(visibleIds, unions, readTabGroups(unions), activeId, phoneLayout(),
@@ -6832,6 +6835,12 @@ function renderTabs() {
   bar.appendChild(add);
   // (THE TAB LOCK's button left the strip 2026-09-13, T405, the user; since T415, 2026-09-14, the lock is a checkbox row in the
   // settings' Tab strip section, where the strip's gear jumps; its state, its drag rules and its saveSettings road are unchanged.)
+  // "Group tabs by tag" (tab groups, the user 2026-09-04): the per-browser sectioned-strip switch, at the
+  // foot of the tag menu beside Configure tags… — the write notifies and the strip re-renders. ONE object
+  // for both mounts: the strip's button here and the phone header's below (2026-09-16: the phone plan
+  // sections by the same store now, so the phone offers the same switch).
+  const groupToggle = { label: "Group tabs by tag", on: () => readTabGroups().on,
+                        toggle: () => { const st = tabGroups(); writeTabGroups({ ...st, on: !st.on }); } };
   // the shared TAG-ICON filter (the user 2026-08-25): identical across surfaces, opening the one
   // multi-select lens menu — this instance governs the TAB STRIP (actives.chat)
   const tagBtn = tagMenuButton("filter these tabs by tag", (btn) => {
@@ -6839,13 +6848,7 @@ function renderTabs() {
       lens: () => surfaceLens(effViews(), "chat"),
       unions: () => viewTagUnion(effViews()),
       onApply: (l) => { postLens({ actives: Object.assign({}, (effViews() || {}).actives, { chat: l }) }); },
-      // "Group tabs by tag" (tab groups, the user 2026-09-04): the per-browser sectioned-strip
-      // switch, at the foot beside Configure tags… — the write notifies and the strip re-renders.
-      // Desktop only: the phone layout renders the flat strip (planStrip), so it offers no switch —
-      // neither here nor on the phone mount below.
-      ...(phoneLayout() ? {} : {
-        groupToggle: { label: "Group tabs by tag", on: () => readTabGroups().on,
-                       toggle: () => { const st = tabGroups(); writeTabGroups({ ...st, on: !st.on }); } } }),
+      groupToggle,
       onConfigure: () => { vscodeApi?.postMessage({ type: "openTagsDialog" }); },
     });
   });
@@ -6917,6 +6920,7 @@ function renderTabs() {
           lens: () => surfaceLens(effViews(), "chat"),
           unions: () => viewTagUnion(effViews()),
           onApply: (l) => { postLens({ actives: Object.assign({}, (effViews() || {}).actives, { chat: l }) }); },
+          groupToggle,   // the phone's picker groups by the same store (2026-09-16): the same switch, the same menu
           onConfigure: () => { vscodeApi?.postMessage({ type: "openTagsDialog" }); },
         });
       });
@@ -8131,6 +8135,16 @@ const PROVISIONAL_WAIT_MS = 90_000;
 // "only an open session" for the rest, instead of one line for both
 (window as any).__rompMoveRefusal = (sid: unknown): string => typeof sid !== "string" || !sid || isProvisionalId(sid) || isSubId(sid) ? "not-open" : settings.tabsLocked ? "locked" : "";
 (window as any).__rompColumnBusy = (): boolean => !!provisionalId || failedProvisionals.size > 0;
+// …and the busy answer's TRANSITION to idle, said to the shell once per transition. The shell's reconcile of another
+// dashboard tab's write used to close a dropped column outright, its `keep` passing close()'s busy gate, so a peer closing
+// a column tore THIS tab's column down over a create in flight and the queued text died with the document. The shell now
+// defers that close while the page is busy and carries it out on this signal, against a fresh read of the store
+// (_LANDING_SPLIT_JS reconcile and the colBusy handler). Nothing while a failed create still holds its text (its ✕ is the
+// transition then), and nothing from the first column, which never closes.
+function noteColumnIdle(): void {
+  if (!COL || provisionalId || failedProvisionals.size) return;
+  try { window.parent.postMessage({ romp: "colBusy", busy: false }, "*"); } catch (e) { /* no shell */ }
+}
 
 function openProvisional(req: CreateReq): void {
   dropProvisional();                       // never two at once: a second create supersedes the first
@@ -8175,6 +8189,7 @@ function dropProvisional(): { queued: string[]; draft: string } {
     draft = (activeId === id && ta) ? ta.value : (drafts.get(id) ?? "");
     pendingSent.delete(id);                // the optimistic bubbles belong to a tab that is going away
     dismissSession(id, "close");           // drops it from sessions/order/views and reselects
+    noteColumnIdle();                      // the create is gone: a peer's deferred close of this column may go ahead
   }
   return { queued, draft };
 }
@@ -8380,7 +8395,7 @@ function staleActiveFallback(ids: readonly string[], visibleIds: readonly string
   if (wantActive && heldHere(wantActive)) return;   // awaited by this column, listed or not: T357's restore takes it when it comes
   // a wanted tab another column holds is nobody's to await here (dragged away before the reload): retired, the first visible member takes the box
   const first = visibleIds[0];
-  setTimeout(() => { if (!activeId && !provisionalId && tabInView(first)) { wantActive = null; setActive(first); } }, 0);
+  setTimeout(() => { if (!activeId && !vanishedId && !provisionalId && tabInView(first)) { wantActive = null; silentActivate(first); } }, 0);   // SILENT: a shown column adopts its tab without a focus hop (2026-09-15). !vanishedId matches the schedule-time guard above: a teardown between the schedule and this timer must not let a silent activate sit beside a stale vanished record for applyTabOrder's restore (back = vanishedId || wantActive) to act on (round three, low a)
 }
 
 // Full-screen bridge (the user 2026-07-05): the picker is rendered inside the /chat iframe, so its
@@ -12652,6 +12667,50 @@ function notifyActive() {
   try { if (window.parent && window.parent !== window) window.parent.postMessage({ romp: "activeTab", id: activeId, nonce, gesture }, "*"); } catch (e) { /* standalone page — no shell */ }
 }
 
+// Announce THIS column's own SHOWN tab to the kernel/relay ONLY (never the shell): the relay re-arm on a socket's
+// (re)open (romp:hostRelayUp / romp:wsup) must carry the tab THIS column shows, from the column's own state, not the
+// page-level focus. A SPLIT column that is not the focused one has activeId unset (focus is arbitrated across
+// columns, setActive forwards a non-held id and returns), so activeTabToReannounce(activeId) read nothing and the
+// column's relay stayed no-active, its shown tab skeletoned by the no-active diet with nothing to re-announce it
+// (the user's board, 2026-09-15: the focused column held one thread, a second column showed a long session that came
+// back a skeleton after a relay reopen). This posts activeTab for the column's shown tab WITHOUT the shell hop, so a
+// non-focused column re-arms its own relay without claiming focus. (relay-active.ts decides IF; this is the send.)
+function announceActiveToRelay(sid: string): void {
+  if (vscodeApi) vscodeApi.postMessage({ type: "activeTab", id: sid, nonce: ++activeTabNonce });
+}
+
+// The tab THIS column shows, from the column's OWN state: the live activeId when set, else the persisted wantActive
+// (this column's blob activeId, read at load before a non-focused column has activated its tab). What the relay
+// re-arm announces so every SHOWN column, focused or not, keeps its own tab out of the kernel's skeleton diet.
+function shownTabForRelay(): string | null { const id = activeId || wantActive; return (id && heldHere(id) && tabInView(id)) ? id : null; }   // this column's OWN shown tab, never a want another column holds (round two, low b)
+
+// A SHOWN column with no active adopts its OWN shown tab SILENTLY (the split-board scroll-back wall, 2026-09-15).
+// Each chat column is its own iframe; a NON-focused split column has activeId unset (focus is arbitrated across
+// columns), so its relay dial dropped the active (the host-match guard) and the kernel's no-active diet skeletoned
+// its shown tab: a long session came back a skeleton with no head gap and could not scroll back. The fix: a shown
+// column always has an active. A stripped setActive: it enters the recency stack, sets activeId, PERSISTS the blob
+// (so the next dial carries the shown tab past the guard's timing), loads the draft, marks the tab active, and
+// REVEALS the transcript (showActive). showActive re-arms the relay through notifyActive, and the window's feed
+// focused-session section moves through the kernel either way (base behaviour, not a regression). What it omits is
+// the FOCUS hop (no focusActiveTab) and setActive's nav/anchor/landing, so a non-focused split column re-arms and
+// shows its own tab without stealing keyboard focus. Keyed on the show-tab EVENTS (staleActiveFallback from a
+// renderTabs reconcile, including a re-listing after a kill; the relay reopen re-runs the render), never a one-shot
+// or timer; a column showing nothing activates nothing (staleActiveFallback's own guard).
+function silentActivate(id: string): void {
+  noteMru(id);                 // enter the recency stack, as setActive opens (round two, low c)
+  if (activeId === id) return;
+  activeId = id;
+  loadComposerFor(id, true);   // the tab's own draft
+  persistActive(id);           // the column's blob, so the next dial carries the shown tab
+  renderTabs();                // mark the shown tab active in this column's strip
+  // deliberately NO unfoldSectionOf (unlike setActive, which unfolds a collapsed tab it activates): silentActivate is
+  // a SILENT non-gesture adoption, so it leaves any fold to the user. A folded active tab is a designed state (its
+  // section header stands in and showActive renders the section snapshot, tabInView admits a folded tab), and the
+  // persist + relay re-arm carry the tab to the kernel regardless of the strip fold (round three, low d)
+  showActive();                // reveal the transcript on its own, and re-arm the relay via notifyActive; NO focus
+  //                              hop (no focusActiveTab), no nav/anchor/landing (round two, medium 1)
+}
+
 // Move id to the front of the recency stack (most-recently-active).
 function touchMru(id: string) {
   const i = mru.indexOf(id);
@@ -16108,7 +16167,7 @@ window.addEventListener("romp:wsup", () => {
   // redial carries ?active= from the PERSISTED activeId, which a dismissal's fallback and a sole-tab adoption
   // change without setActive — so a restarted local kernel could key a tab the user had left and serve the
   // one they are looking at as a background tab. The live activeId is re-announced on the socket's open.
-  if (activeTabToReannounce(activeId, "")) notifyActive();
+  const st = shownTabForRelay(); if (st && activeTabToReannounce(st, "")) announceActiveToRelay(st);   // this column's OWN shown tab, focused or not
 });
 // federation dispatches this on a host relay socket (re)connect — the exact event that makes that
 // host's owed acks reachable again; the detail names the host, so only its entries re-ship
@@ -16120,6 +16179,7 @@ window.addEventListener("romp:hostRelayUp", (e) => {
   // make their one attempt here as well
   refreshSettledPreviews();
   reaskWaitingSubagents(h);   // …and that host's subagent viewers still waiting ask again (T355: a remote kernel's restart; an empty host is the local one)
+  reaskOutstandingGaps(Array.from(gapLoading), h);   // …and re-send every loadTurns still outstanding for that host: a relay drop fires no romp:wsdown, so gapLoading kept its keys and, with the guard now correct, the gap would stay suppressed until a reload (2026-09-15)
   // …and the tab this pane is LOOKING AT, when that host owns it (T246, the user 2026-09-07): the relay's
   // open is the moment the remote kernel holds a FRESH client for this pane — after that kernel restarted,
   // one with no active tab at all. Its pusher builds and flushes a client's active tab first; every tab is
@@ -16131,7 +16191,11 @@ window.addEventListener("romp:hostRelayUp", (e) => {
   // connect hint on every dial; the relay has no hint, so the same fact is re-sent here as the activeTab
   // message every tab switch sends (notifyActive; routeOutbound strips the host prefix). Decision in
   // relay-active.ts.
-  if (activeTabToReannounce(activeId, h)) notifyActive();
+  const st = shownTabForRelay(); if (st && activeTabToReannounce(st, h)) announceActiveToRelay(st);   // this column's OWN shown tab, focused or not
+  // …and the shown-tab silent activation keyed on THIS event too (2026-09-15): the host was OFFLINE at reload (no strip,
+  // !tabOrderSeen), so the one-shot fallback was blocked; the relay reopening is a show-tab event, re-run the strip
+  // render, which re-fires staleActiveFallback → silentActivate for a shown column that still has no active.
+  if (!activeId && !provisionalId) renderTabs();
 });
 
 // Sids whose SEND is HELD until every pending ship acks (the user 2026-08-16: sending mid-upload
@@ -17354,7 +17418,12 @@ function onWireDown(): void {
   // notice stands forever. gapLoading and its glyphs, the landing's held gap, the older-ask set, and the notice all go; a landing in flight
   // is told once the jump was lost. A gap met again on the healed socket asks anew.
   const liveLanding = !!landingNoticeSid || Array.from(windowAsks.values()).some((a) => a.some((r) => !r.cancelled && !!r.gap));   // a jump the reader already cancelled owes no toast (round four, low 1)
-  gapLoading.clear(); windowAsks.clear(); loadingOlder.clear();   // every window ask's record too (round eight): its reply comes on no socket, and a cancelled one left standing would eat the next landing on its anchor
+  // clear only the LOCAL in-flight gaps: their replies come on no socket, and the gap observer re-fires after the redial's rebuild
+  // and re-asks by itself (windowAsks is cleared here, so gapHasAsk no longer suppresses that re-fire), so the local road needs no
+  // explicit re-ask. A relay host's keys are KEPT: a relay drop fires no romp:wsdown, so a local outage must not strip the remote
+  // keys the relay's own reopen (romp:hostRelayUp) re-asks from (2026-09-15, review round two: the local re-ask was dropped).
+  for (const k of Array.from(gapLoading)) if (hostOf(parseGapKey(k).sid) === "") gapLoading.delete(k);
+  windowAsks.clear(); loadingOlder.clear();   // every window ask's record too (round eight): its reply comes on no socket, and a cancelled one left standing would eat the next landing on its anchor
   document.querySelectorAll("#content .tx-gap-loading").forEach((g) => g.classList.remove("tx-gap-loading"));
   hideLandingNotice();
   pendingAnchor = null; anchorPendingOlder = false;
@@ -17489,13 +17558,36 @@ function insertRegionRun(s: Session, lo: number, hi: number, events: ChatEvent[]
 }
 const gapLoading = new Set<string>();                                        // "sid:lo:hi" of the page asks in flight
 const gapKey = (sid: string, lo: number, hi: number): string => sid + ":" + lo + ":" + hi;
+// lo/hi are the last two colon fields; a REMOTE sid carries a host prefix ("HOST:uuid"), so the sid is everything
+// before them, parse from the RIGHT, never k.split(":")[0], which for a federated key named only the host and left
+// the in-flight guard unable to match a remote session (it re-asked the gap on every observer fire).
+function parseGapKey(k: string): { sid: string; lo: number; hi: number } {
+  const parts = k.split(":"); const hi = Number(parts.pop()), lo = Number(parts.pop());
+  return { sid: parts.join(":"), lo, hi };
+}
 function gapHasAsk(sid: string, gap: { lo: number; hi: number }): boolean {
   for (const r of windowAsks.get(sid) ?? []) if (!r.cancelled && r.gap && r.gap.lo === gap.lo && r.gap.hi === gap.hi) return true;   // a live landing's window on the wire for this gap (the pre-jump; per ask, round eight)
   for (const k of gapLoading) {   // a page ask whose span lies inside the gap
-    const [ksid, a, b] = k.split(":");
-    if (ksid === sid && Number(a) >= gap.lo && Number(b) <= gap.hi) return true;
+    const p = parseGapKey(k);
+    if (p.sid === sid && p.lo >= gap.lo && p.hi <= gap.hi) return true;
   }
   return false;
+}
+// The redial re-ask (2026-09-15): a RELAY socket that dropped WITH a loadTurns outstanding never gets that page's reply,
+// and with the in-flight guard now correct for a remote sid the gap stays suppressed until a full reload. So on a relay
+// (re)open the page re-sends every loadTurns still outstanding for that host, keyed on the event (romp:hostRelayUp),
+// never a timer: a relay drop fires no romp:wsdown, so gapLoading still holds the host's keys and they are re-sent from it.
+// The LOCAL socket needs no such re-ask (review round two, 2026-09-15): its drop fires romp:wsdown, onWireDown clears the
+// window-ask records, and the gap observer re-fires after the redial's rebuild and re-asks by itself.
+function reaskOutstandingGaps(keys: Iterable<string>, host: string | null): void {
+  for (const k of keys) {
+    const { sid, lo, hi } = parseGapKey(k);
+    if (host !== null && hostOf(sid) !== host) continue;
+    const s = sessions.get(sid);
+    if (!s || s.proto !== 2 || !Number.isFinite(lo) || !Number.isFinite(hi)) continue;
+    gapLoading.add(k);   // still in flight after the re-send; the reply (chatTurns) clears it
+    vscodeApi?.postMessage({ type: "loadTurns", id: sid, lo, hi });
+  }
 }
 /** The romp loading glyph at a size read at a glance (the swirl as the o of the wordmark, the three accent dots): the mark of a gap
  *  whose page is on the wire; never the small pill. */
@@ -18013,7 +18105,7 @@ function closeTabLocally(id: string): void {
   // (and the kernel never knew the id): its ✕ is a plain local discard — tab, draft, and all.
   if (isProvisionalId(id)) {
     if (id === provisionalId) cancelProvisional();
-    else { failedProvisionals.delete(id); dismissSession(id, "close"); }
+    else { failedProvisionals.delete(id); dismissSession(id, "close"); noteColumnIdle(); }   // the last failed one discarded: idle again, and the shell's deferred close may go ahead
     return;
   }
   dismissSession(id, "close");

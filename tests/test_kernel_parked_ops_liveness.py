@@ -117,7 +117,7 @@ class DeliveryRidesTheSettle(unittest.TestCase):
         # The pass stays stuck for the whole test; at its end the stop seam is set FIRST and the gate released
         # SECOND, so the tiers return, the pass completes under these same stubs, and the producer ends at its
         # next turn of the wheel instead of outliving the module (T282).
-        with mock.patch.object(km, "_run_tier", lambda fn: gate.wait()), \
+        with mock.patch.object(km.jd, "_run_tier", lambda fn, name, acc, before=None: gate.wait()), \
              mock.patch.object(km, "_retry_paused_on", lambda: False), \
              mock.patch.object(km, "_episode_boundary_tick", lambda now: None), \
              mock.patch.object(km, "_begin_goals_pass", lambda: None), \

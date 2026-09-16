@@ -32,7 +32,27 @@ class MobilePickerClickSafe(unittest.TestCase):
         self.assertNotIn("list.innerHTML=''", km._CHAT_MOBILE_JS,
                          "a wipe destroys the row under the finger and resets the scroll")
         self.assertIn("if(!row)row=rowMake(s);else rowUpdate(row,s);", km._CHAT_MOBILE_JS,
-                      "rows update in place, keyed by data-id")
+                      "rows update in place, keyed the strip's way (data-key: the tab's id and the group of its copy)")
+
+    def test_the_list_mirrors_the_strips_children_headings_and_the_trails_divider_included(self):
+        """The phone listed the sessions in another order than the desktop strip once the tabs were grouped
+        by tag (the user 2026-09-16): the plan flattened on the phone and the picker scraped that flat strip.
+        Now the plan sections there too (tab-groups.ts planStrip; nothing folds on the phone) and the picker
+        walks the strip's children in order — a heading per group header, a row per tab copy, a divider where
+        the untagged trail begins — keyed the strip's way. tests/test_mobile_picker_order_browser.py executes
+        it in a real browser against the desktop strip."""
+        js, css = km._CHAT_MOBILE_JS, km._CHAT_MOBILE_CSS
+        self.assertIn("[].forEach.call(tabs.children,function(t){", js, "the strip's children in order, not a tab query")
+        self.assertNotIn("tabs.querySelectorAll('.tab[data-id]')", js)
+        self.assertIn("if(t.classList.contains('tab-group-head')&&t.hasAttribute('data-group'))", js, "a heading per group header")
+        self.assertIn("if(t.classList.contains('tab-group-sep')){out.push({key:'sep'});return;}", js, "a divider where the trail begins")
+        self.assertIn("key:'t:'+id+'/'+(copy===null?'':copy)", js, "a row per COPY: a session under two tags is a row under each")
+        self.assertIn("row.appendChild(s.chip.cloneNode(true))", js, "the header's own chip, cloned: one tag treatment")
+        self.assertNotIn("tab-group-caret", js, "no caret: the phone folds nothing, and a chevron would promise a fold")
+        self.assertIn("if(!ts[i].id)continue;", js, "the current chip falls back to the first SESSION row, never a heading")
+        self.assertIn(".mhead{", css)
+        self.assertIn(".msep{", css)
+        self.assertNotIn("list.querySelector(", js, "rows are found by key through a map, never a selector (a tag name needs no escaping)")
 
     def test_one_delegated_listener_on_the_stable_list(self):
         self.assertIn("list.addEventListener('click',function(e){", km._CHAT_MOBILE_JS)

@@ -849,10 +849,11 @@ class SkeletonReconnect(unittest.TestCase):
 
 
 
+
 class RestartDiet(unittest.TestCase):
     """The user's ruling (2026-09-14): after a reload the selected tab builds first, the strip's other tabs spread over later refreshes,
-    hidden tabs not until shown; and restarts are invisible, so the one reload the reload core still fires is a changed build, a fresh
-    page on a kernel that just restarted. The client half: the main chat pane's FIRST dial after any reload the core fired is a skeleton
+    hidden tabs not until shown; and restarts are invisible, so the one reload the reload core fires is the one the user accepts when a
+    newer build is offered (2026-09-16), a fresh page on a kernel that has the build. The client half: the main chat pane's FIRST dial after any reload the core fired is a skeleton
     dial (the later column's shape), so the kernel's existing handshake serves the strip with the skeleton set, one full for the active
     tab and a status per other tab; a redial carries the diet through reconnect=1 as before. Pinned in the served shim's source: the
     reload core keeps the reason and the document's path in a durable record (announce() removes the announce record before a pane

@@ -8,6 +8,7 @@ thread (`_jobs_loop`, one pass per JOBS_PASS_S) with its own liveness snapshot, 
 and `jobs`), and the boot-health row carries both firsts (`firstCycleS`, the browser's wait; `jobsFirstPassS`, the housekeeping's)."""
 import inspect
 import io
+import json
 import os
 import re
 import sys
@@ -21,7 +22,7 @@ from test_asm_checkpoint import kernel_module   # noqa: E402
 
 JOB_NAME_RE = r"_job_stage\(['\"](\w+)['\"]"
 
-PUSHER_JOBS = ("beginCheckpointCycle", "applyPendingOps", "turnNotify", "persistCheckpoints", "convergeCheckpoints",
+PUSHER_JOBS = ("beginCheckpointCycle", "sessionsListing", "applyPendingOps", "turnNotify", "persistCheckpoints", "convergeCheckpoints",
                "bootRowBackstop", "kernelSample", "apiHealth")
 HOUSEKEEPING = ("liftSpentAwaiting", "deathSweep", "endOnIdle", "deferralSweep", "autoNudge", "interruptBlock",
                 "persistTickSeen", "persistIntrMarks", "persistSpendTrees", "autoPauseOnLimit", "usagePoll", "autoPauseOnSpend",
@@ -266,6 +267,55 @@ class TheBootRowCarriesBothFirsts(_LabCycles):
         self.assertIn("the first pusher cycle took", err.getvalue())
         self.assertIn("the first housekeeping pass took", err.getvalue())
         self.assertIn("the browser did not wait on it", err.getvalue())
+
+
+class TheBootRowCarriesEachSplitsGcDelta(_LabCycles):
+    """The row's `gc`: each first split's collector delta on its own, `firstCycle` and `firstPass`, never summed (the tallies
+    are process-wide, so a collection inside both windows is in both deltas and a sum would count it twice), absent when
+    neither split has one (review round)."""
+
+    def _row_with(self, cyc, pas):
+        km = self.km
+        km._BOOT_FIRST.update({"pusher": 0.5, "jobs": 0.7})
+        with mock.patch.object(km._PERF_STATS, "first_cycle_split", return_value=cyc), \
+             mock.patch.object(km._PERF_STATS, "first_pass_split", return_value=pas):
+            row = km._boot_health_row()
+        self.assertEqual(self.rows, [row])
+        return row
+
+    def test_both_deltas_ride_the_row_unsummed(self):
+        cyc_gc = {"n0": 3, "n1": 1, "n2": 1, "ms2": 12.5}            # one full collection inside the pusher's window...
+        pas_gc = {"n0": 5, "n1": 1, "n2": 1, "ms2": 12.5}            # ...and inside the jobs pass's, which overlapped it
+        cyc = {"s": 0.5, "t": 1.0, "gc": cyc_gc,
+               "stages": {"push": {"ms": 400.0, "bytes": 0, "hydrated": 0}, "jobs.other": {"ms": 10.0, "bytes": 0, "hydrated": 0}}}
+        pas = {"s": 0.7, "t": 1.2, "gc": pas_gc,
+               "stages": {"jobsPass": {"ms": 700.0, "bytes": 0, "hydrated": 0}, "jobs.other": {"ms": 5.0, "bytes": 0, "hydrated": 0}}}
+        row = self._row_with(cyc, pas)
+        self.assertEqual(row["gc"], {"firstCycle": cyc_gc, "firstPass": pas_gc})
+        self.assertEqual(row["gc"]["firstCycle"]["n2"] + row["gc"]["firstPass"]["n2"], 2,
+                         "the same collection in both windows: a sum would have said two")
+        self.assertEqual(row["stages"]["jobs.other"]["ms"], 15.0, "a stage key both own is still summed; the gc deltas are not")
+        json.dumps(row)
+
+    def test_a_split_without_a_delta_reads_null_beside_the_others(self):
+        cyc = {"s": 0.5, "t": 1.0, "stages": {}, "gc": None}          # closed without an opening mark
+        pas = {"s": 0.7, "t": 1.2, "stages": {}, "gc": {"n0": 2, "n1": 0, "n2": 0, "ms2": 0.0}}
+        row = self._row_with(cyc, pas)
+        self.assertEqual(row["gc"], {"firstCycle": None, "firstPass": {"n0": 2, "n1": 0, "n2": 0, "ms2": 0.0}})
+
+    def test_no_delta_in_either_split_leaves_the_key_off(self):
+        row = self._row_with({"s": 0.5, "t": 1.0, "stages": {}, "gc": None}, None)   # and no jobs pass at all
+        self.assertNotIn("gc", row)
+        self.assertNotIn("stages", row)
+
+    def test_a_driven_boot_carries_the_deltas_from_the_real_splits(self):
+        km = self.km
+        km._JOBS_THREAD_STARTED[0] = True
+        km._pusher_cycle(); km._jobs_cycle()
+        row = self.rows[0]
+        self.assertEqual(set(row["gc"]), {"firstCycle", "firstPass"})
+        for k in ("firstCycle", "firstPass"):
+            self.assertEqual(set(row["gc"][k]), {"n0", "n1", "n2", "ms2"}, k)
 
 
 class TheJobsLoop(_LabCycles):

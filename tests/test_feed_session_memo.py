@@ -16,6 +16,10 @@ was attributed to, beside the card the moved input changes:
     (the override journal), a clear (the session's slice of cleared.jsonl), a live-row change, a transcript
     append, a states append, a names rewrite, the hideFromFeed flag;
   * a peer's verdict re-derives the session whose card reads that peer's store (the peers dependency);
+  * nudge facts re-derive only cards that read the changed node, including foreign node ids; unrelated
+    bookkeeping and undisplayed history do not invalidate, and concurrent writes wait for the next snapshot;
+  * a deferral record (the ledger's `deferred` map: the Stalled section, the Blocked filing) minted or retired
+    for a node re-derives the card that read that exact node id, a foreign-owned id included, and no other;
   * the clock: two builds ten minutes apart derive nothing and differ in `now`, `buildId` and the cards' age
     tint alone (the fold stamps trgb per build; the memo holds nothing clock-derived);
   * the byte bound (FEED_MEMO_BYTES): entries leave oldest first, counted, and the payload stays complete;
@@ -277,6 +281,70 @@ class ColdWarmAndFromScratch(_Board):
         self.assertEqual(d["derived"], 3, d)
         self.assertEqual(_dump(memoized), _dump(scratch),
                          "two served entries beside one derivation must equal three derivations, byte for byte")
+
+
+class HostRegistryProgress(_Board):
+    """Host journal bookkeeping does not change cards; registry content still does."""
+
+    @staticmethod
+    def _publish_registry(sid, record):
+        path = jd.STATE / "sdk" / (sid + ".json")
+        path.parent.mkdir(exist_ok=True)
+        pending = path.with_suffix(".tmp")
+        pending.write_text(json.dumps(record))
+        os.replace(pending, path)
+        return path
+
+    def test_host_progress_replacements_keep_all_sessions_cached_and_match_a_fresh_build(self):
+        record = {"sid": WEB, "name": "web", "spawnedAt": T0}
+        self._publish_registry(WEB, record)
+        before = self._build()
+        for progress in ({"hostAck": {"host": "1:2", "offset": 10}},
+                         {"hostAck": {"host": "1:2", "offset": 20}, "hostLogPos": {"pos": 3}},
+                         {}):
+            with self.subTest(progress=progress):
+                self._publish_registry(WEB, dict(record, **progress))
+                delta, cached = self._delta(self._build)
+                self.assertEqual((delta["derived"], delta["hit"]), (0, 3), delta)
+                self.assertEqual(delta["miss_by"], {})
+                self.assertEqual(_dump(cached), _dump(before))
+                _reset_memo()
+                self.assertEqual(_dump(cached), _dump(self._build()),
+                                 "skipping host bookkeeping must preserve the real feed payload")
+
+    def test_other_registry_content_invalidates_only_its_session(self):
+        record = {"sid": API, "name": "api", "spawnedAt": T0}
+        self._publish_registry(API, record)
+        self._build()
+        for fields in ({"spawnedAt": T0 + 10}, {"bgLedger": {"worker": {"state": "running"}}},
+                       {"futureDisplayField": "changed"}):
+            with self.subTest(fields=fields):
+                record.update(fields)
+                self._publish_registry(API, record)
+                delta, cached = self._delta(self._build)
+                self.assertEqual((delta["derived"], delta["hit"]), (1, 2), delta)
+                self.assertEqual(delta["miss_by"], {"reg": 1})
+                _reset_memo()
+                self.assertEqual(_dump(cached), _dump(self._build()))
+
+    def test_missing_empty_object_and_unreadable_registry_remain_distinct(self):
+        self._build()
+        path = self._publish_registry(WEB, {})
+        delta, _ = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (1, 2), delta)
+        self.assertEqual(delta["miss_by"], {"reg": 1})
+        path.write_text("")
+        delta, _ = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (1, 2), delta)
+        self.assertEqual(delta["miss_by"], {"reg": 1})
+        path.write_text("not json")
+        delta, _ = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (0, 3), delta)
+        self.assertEqual(delta["miss_by"], {}, "both invalid forms have the same unreadable state")
+        path.unlink()
+        delta, _ = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (1, 2), delta)
+        self.assertEqual(delta["miss_by"], {"reg": 1})
 
 
 class EveryInputMovesItsSessionOnly(_Board):
@@ -638,6 +706,158 @@ class ThePostalLogIsKeyedPerSession(_Board):
         self.assertEqual((d["derived"], d["miss_by"]), (2, {"postal": 2}), "tests and web, never api: %r" % d)
         self.assertEqual(km._feed_memo_get(API)[0][km._FEED_MEMO_LABELS.index("postal")][0][0][0], (WEB, API),
                          "api's slice still holds its own pair alone")
+
+
+class PerCardNudgeInputs(_Board):
+    @staticmethod
+    def _nudge_data(nudged, **metadata):
+        path = jd.STATE / "auto-nudge.json"
+        pending = path.with_suffix(".tmp")
+        pending.write_text(json.dumps(dict(enabled=True, nudged=nudged, **metadata)))
+        os.replace(pending, path)
+        # The ledger reader is covered separately. Force this fixture publish visible even when a
+        # filesystem rounds two same-size writes to the same mtime; this test exercises the feed key.
+        km._autonudge_cache.pop(str(path), None)
+
+    @staticmethod
+    def _nudge_event(gid, stamp):
+        with (jd.STATE / "nudge-events.jsonl").open("a") as out:
+            out.write(json.dumps({"gid": gid, "t": stamp}) + "\n")
+
+    def test_count_and_history_changes_rebuild_only_the_card_owner(self):
+        self._build()
+        gid = API + ":g1"
+        self._nudge_data({gid: {"count": 1}})
+        self._nudge_event(gid, NOW - 30)
+        delta, frame = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (1, 2), delta)
+        self.assertEqual(delta["miss_by"], {"nudge": 1})
+        self.assertEqual(self._cards(frame)[gid]["nudged"], {"count": 1, "times": [NOW - 30]})
+        self._nudge_event(gid, NOW - 10)
+        delta, frame = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (1, 2), delta)
+        self.assertEqual(self._cards(frame)[gid]["nudged"]["times"], [NOW - 30, NOW - 10])
+        _reset_memo()
+        self.assertEqual(_dump(frame), _dump(self._build()))
+
+    def test_unrelated_ledger_writes_and_unread_history_keep_entries_cached(self):
+        self._nudge_data({API + ":g1": {"count": 1, "lastTurnId": "s1"}})
+        before = self._build()
+        self._nudge_data({API + ":g1": {"count": 1, "lastTurnId": "s2"}}, pollSeq=2)
+        self._nudge_event(WEB + ":g1", NOW - 10)  # no count: the card does not read this history
+        delta, frame = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (0, 3), delta)
+        self.assertEqual(_dump(frame), _dump(before))
+        _reset_memo()
+        self.assertEqual(_dump(frame), _dump(self._build()))
+
+    def test_failure_state_changes_rebuild_its_card_without_changing_the_count(self):
+        gid = WEB + ":g1"
+        self._nudge_data({gid: {"count": 1}})
+        before = self._build()
+        self.assertFalse(self._cards(before)[gid]["nudgeFailed"])
+        self._nudge_data({gid: {"count": 1, "failed": True, "failedAt": NOW - 20}})
+        delta, frame = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (1, 2), delta)
+        self.assertTrue(self._cards(frame)[gid]["nudgeFailed"])
+        self._nudge_data({gid: {"count": 1, "failed": True, "failedAt": T0 - 1}})
+        delta, _ = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (1, 2), delta)
+
+    def test_history_outside_the_displayed_tail_does_not_invalidate_and_count_removal_does(self):
+        gid = API + ":g1"
+        self._nudge_data({gid: {"count": 12}})
+        stamps = list(range(NOW - 100, NOW - 88))
+        for stamp in stamps:
+            self._nudge_event(gid, stamp)
+        before = self._build()
+        self.assertEqual(self._cards(before)[gid]["nudged"]["times"], stamps[-8:])
+        path = jd.STATE / "nudge-events.jsonl"
+        path.write_text("".join(json.dumps({"gid": gid, "t": stamp}) + "\n"
+                                for stamp in [NOW - 300, *stamps[1:]]))
+        delta, frame = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (0, 3), delta)
+        self.assertEqual(_dump(frame), _dump(before))
+        self._nudge_data({})
+        delta, frame = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (1, 2), delta)
+        self.assertIsNone(self._cards(frame)[gid]["nudged"])
+
+    def test_a_card_with_a_foreign_node_id_tracks_that_exact_id(self):
+        old, foreign = WEB + ":g1", API + ":g9"
+        store = jd.load_goals(WEB)
+        node = store["nodes"].pop(old)
+        node["id"] = foreign
+        store["nodes"][foreign] = node
+        store["status"][foreign] = store["status"].pop(old)
+        jd.save_goals(WEB, store)
+        frame = self._build()
+        self.assertEqual(self._cards(frame)[foreign]["sid"], WEB)
+        self._nudge_data({foreign: {"count": 1}})
+        delta, frame = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (1, 2), delta)
+        self.assertEqual(self._cards(frame)[foreign]["nudged"]["count"], 1)
+        _reset_memo()
+        self.assertEqual(_dump(frame), _dump(self._build()))
+
+    def test_a_deferral_record_for_a_foreign_node_id_re_derives_the_card_that_read_it(self):
+        """The key's `stalls` component follows the exact node ids the entry read, like `nudge`: a deferral
+        record (auto-nudge.json's `deferred` map, what _stalled_goals reads) minted or retired for a node whose id
+        prefix is another session's re-derives the session holding that card, once; a record for a node no entry
+        read re-derives nothing. Red on a session-prefix slice: with the nudge component scoped to its read ids,
+        no board-wide identity covered the ledger any more, and the holding session's entry was served with a
+        frozen or missing Stalled section."""
+        old, foreign = WEB + ":g1", API + ":g9"
+        store = jd.load_goals(WEB)
+        node = store["nodes"].pop(old)
+        node["id"] = foreign
+        store["nodes"][foreign] = node
+        store["status"][foreign] = store["status"].pop(old)
+        jd.save_goals(WEB, store)
+        frame = self._build()
+        self.assertEqual(self._cards(frame)[foreign]["sid"], WEB)
+        self.assertIsNone(self._cards(frame)[foreign]["stalled"])
+        hold = {"why": "waiting on the notes-api list endpoint to land", "at": NOW - 60}
+        self._nudge_data({}, deferred={foreign: hold})          # minted AFTER the entry was memoized
+        delta, frame = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (1, 2), delta)
+        self.assertEqual(delta["miss_by"], {"stalls": 1}, delta)
+        stalled = self._cards(frame)[foreign]["stalled"]
+        self.assertEqual((stalled["why"], stalled["since"]), (hold["why"], hold["at"]))
+        delta, _ = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (0, 3), "the record stands: a hit: %r" % delta)
+        unread = TESTS + ":g7"                                    # a node id no entry read
+        self._nudge_data({}, deferred={foreign: hold, unread: dict(hold, at=NOW - 50)})
+        delta, _ = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (0, 3), "an unread node's record moves no key: %r" % delta)
+        self._nudge_data({}, deferred={unread: dict(hold, at=NOW - 50)})   # the foreign node's record retired
+        delta, frame = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (1, 2), delta)
+        self.assertEqual(delta["miss_by"], {"stalls": 1}, delta)
+        self.assertIsNone(self._cards(frame)[foreign]["stalled"])
+        _reset_memo()
+        self.assertEqual(_dump(frame), _dump(self._build()))
+
+    def test_publish_during_derivation_uses_one_snapshot_then_heals_on_next_build(self):
+        gid = API + ":g1"
+        self._nudge_data({gid: {"count": 1}})
+        self._build()
+        _reset_memo()
+        derive = km._feed_session_entry
+
+        def publish_then_derive(session, ctx):
+            if session["sid"] == API:
+                self._nudge_data({gid: {"count": 2}})
+            return derive(session, ctx)
+
+        with mock.patch.object(km, "_feed_session_entry", side_effect=publish_then_derive):
+            frame = self._build()
+        self.assertEqual(self._cards(frame)[gid]["nudged"]["count"], 1)
+        delta, frame = self._delta(self._build)
+        self.assertEqual((delta["derived"], delta["hit"]), (1, 2), delta)
+        self.assertEqual(self._cards(frame)[gid]["nudged"]["count"], 2)
+        _reset_memo()
+        self.assertEqual(_dump(frame), _dump(self._build()))
 
 
 if __name__ == "__main__":

@@ -50,8 +50,20 @@ class RestoreReplyFlicker(unittest.TestCase):
             jd.save_goal_archive(SID, {"nodes": {}, "status": {}})
         kern._end_goals_pass()                         # never inherit a stuck snapshot from a failed test
         kern._compact_seen.pop(SID, None)
+        # The incident's session is a live one, so discover lists it. This root has no transcript for SID,
+        # and the seed's compaction sweep rules a store no discovered session owns out of the next pass's
+        # snapshot (2026-09-15): without an owner, every test below would read SID live and never touch
+        # the snapshot they are about.
+        self.saved_discover = jd.discover
+        jd.discover = lambda now, window=None, forks=True: [(SID, "/dev/null", None, "web")]
+        # ...and the sweep's liveness read answers nothing here: the owner list is discovered AND live sessions
+        # (2026-09-15), and a real read would build the backends inside this hermetic root for no reason
+        self.saved_live = kern._live_map
+        kern._live_map = lambda: {}
 
     def tearDown(self):
+        jd.discover = self.saved_discover
+        kern._live_map = self.saved_live
         kern._end_goals_pass()
 
     def _seed_archived_completed(self):
@@ -81,6 +93,7 @@ class RestoreReplyFlicker(unittest.TestCase):
         # THE INCIDENT: the pass (and its snapshot) predate the restore; the reply lands mid-pass.
         self._seed_archived_completed()
         kern._begin_goals_pass()                       # snapshot: card still archived
+        self.assertIn(SID, kern._goals_snap[0], "the snapshot holds the store: the punch below lands on it")
         kern._undo_clear()                             # user restores the dismissed card…
         self.assertTrue(self._reply(now=int(time.time()) + 42), "…and replies 42s later")
         mid = kern._feed_goals(SID)

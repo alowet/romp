@@ -2,7 +2,7 @@
 spread over later refreshes; hidden tabs are not built until shown). A hermetic kernel over TWENTY-SEVEN synthetic sessions, the real
 /chat page served from a copy of the built bundle, driven by Playwright. Roads, one browser: (1) the dial: after a reload whose recorded
 reason is a kernel restart the chat pane's first socket dials skeleton=1 beside active=, and after a build reload it does too (any reload
-the reload core fired; the user's ruling that restarts are invisible leaves a changed build as the one reload); (2) the first
+the reload core fired; restarts are invisible and a newer build is offered, so the one reload left is the one the user accepts, 2026-09-16); (2) the first
 refresh: one full session frame, the selected tab's, ahead of the strip's paint, the other tabs as statuses with the strip listing the
 skeleton set; (3) the spread: the visible skeletons fill on later idle callbacks one at a time, and tabs the #only= filter hides stay
 skeletons until the filter shows them; (4) the measurement: time to the selected tab's first row, to the strip's 27 tabs, to every visible
@@ -234,8 +234,8 @@ const siblingAfter = await page.evaluate(([b, api]) => { const asks = window.__s
 await page.waitForFunction(() => document.querySelectorAll("#tabs .tab-skeleton").length === 0, null, { timeout: 60000 }).catch(() => {});
 const siblingFilled = { skel: await page.evaluate(() => document.querySelectorAll("#tabs .tab-skeleton").length), apiLoaded: await page.evaluate((api) => api.filter((id) => { const e = document.querySelector(`#tabs .tab[data-id="${id}"]`); return !!e && !e.classList.contains("tab-skeleton"); }).length, cfg.apiSids) };
 await sibling.close();
-// ROAD 1b: a BUILD reload dials the diet too (the follow-up after PR 1661: restarts are invisible, so the one reload the core fires is a
-// changed build, a fresh page on a kernel that just restarted)
+// ROAD 1b: a BUILD reload dials the diet too (the follow-up after PR 1661: restarts are invisible, and since 2026-09-16 a newer build is
+// offered, so the one reload the core fires is the one the user accepts: a fresh page on a kernel that has the build)
 await page.evaluate(() => { sessionStorage.setItem("romp:reloadReason", JSON.stringify({ reason: "newer build", path: "/chat", t: Date.now() })); });
 await page.reload();
 await page.waitForSelector("#tabs .tab, #tabs [data-sid]", { timeout: 20000 });

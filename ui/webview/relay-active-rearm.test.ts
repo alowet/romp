@@ -59,14 +59,46 @@ test("render.ts re-sends activeTab on romp:hostRelayUp for that host's active ta
   const m = RENDER.match(/window\.addEventListener\("romp:hostRelayUp", \(e\) => \{([\s\S]*?)\n\}\);/);
   assert.ok(m, "the romp:hostRelayUp listener exists");
   assert.match(m![1], /reshipPendingUploads\(\[h\]\)/, "the upload re-ship is still there");
-  assert.match(m![1], /if \(activeTabToReannounce\(activeId, h\)\) notifyActive\(\);/, "the active tab is re-announced through the one activeTab sender (notifyActive → routeOutbound strips the host prefix)");
+  assert.match(m![1], /const st = shownTabForRelay\(\); if \(st && activeTabToReannounce\(st, h\)\) announceActiveToRelay\(st\);/, "this COLUMN's OWN shown tab is re-announced to the relay: a non-focused split column re-arms its own tab, not the page-level active");
+  assert.doesNotMatch(m![1], /activeTabToReannounce\(activeId,/, "base = the bug: the old re-announce read the page-level activeId, which a non-focused column has unset (round three, low c)");
+  assert.match(m![1], /if \(!activeId && !provisionalId\) renderTabs\(\);/, "and re-runs THIS column's strip render on the relay reopen, which re-fires staleActiveFallback for a shown column that still has no active (the host-offline road): base has no such call (round three, low b)");
+});
+
+test("a non-focused split column re-arms its OWN shown tab to the relay only (not the shell), from its own state (the split-board scroll-back wall, 2026-09-15)", () => {
+  // The bug: each column is its own iframe with its own activeId, but a NON-focused column has activeId unset
+  // (focus is arbitrated across columns; setActive forwards a non-held id and returns), so the old re-announce
+  // read the page-level activeId (nothing) and the column's relay stayed no-active, its shown tab skeletoned by
+  // the no-active diet with nothing to re-announce it. The fix reads the column's OWN state (activeId or the
+  // persisted wantActive), filtered to a tab this column holds and shows, so it never announces a want another column holds.
+  // shownTabForRelay's USE is pinned at its call sites (the romp:hostRelayUp and romp:wsup tests above), each with the
+  // base = the bug (the old page-level activeId read); its definition is not separately name-pinned (round three, low c).
+  const m = RENDER.match(/function announceActiveToRelay\(sid: string\): void \{([\s\S]*?)\n\}/);
+  assert.ok(m, "announceActiveToRelay exists");
+  assert.match(m![1], /vscodeApi\.postMessage\(\{ type: "activeTab", id: sid, nonce: \+\+activeTabNonce \}\)/, "posts activeTab for the given sid to the kernel");
+  assert.doesNotMatch(m![1], /window\.parent/, "kernel-only: no shell hop, so a non-focused column does not claim feed focus");
+});
+
+test("a SHOWN column with no active adopts its tab SILENTLY so it always has an active (the fundamental fix; the dial then carries it)", () => {
+  // Red-first is the CALL SITE, base = the bug: at base staleActiveFallback's timer calls the full setActive, which for
+  // a non-focused column forwards a non-held id and RETURNS, leaving the column no-active (the wall); head calls
+  // silentActivate. The body pins below then guard the shape round two asked for (showActive reveals + re-arms; noteMru).
+  assert.match(RENDER, /wantActive = null; silentActivate\(first\); \} \}, 0\);/, "the shown-tab fallback activates silently, keyed on the render event; a column showing nothing activates nothing (the guards above it)");
+  assert.doesNotMatch(RENDER, /wantActive = null; setActive\(first\);/, "base = the bug: the fallback called the full setActive, not the silent adopt (round three, low c red-first)");
+  const m = RENDER.match(/function silentActivate\(id: string\): void \{([\s\S]*?)\n\}/);
+  assert.ok(m, "silentActivate is defined (the extraction guard for the shape pins below)");
+  assert.match(m![1], /noteMru\(id\);/, "enters the recency stack, as setActive opens (low c)");
+  assert.match(m![1], /activeId = id;/, "sets the active");
+  assert.match(m![1], /persistActive\(id\);/, "persists the blob so the next dial carries the shown tab past the guard's timing");
+  assert.match(m![1], /showActive\(\);/, "reveals the transcript on its own, and re-arms the relay via notifyActive (medium 1)");
+  assert.doesNotMatch(m![1], /focusActiveTab\(|navHist|pendingAnchor|landToast|scrollToAnchor/i, "the SILENT part: no focus hop (focusActiveTab) and none of setActive's nav/anchor/landing");
 });
 
 test("render.ts re-sends a LOCAL active tab on romp:wsup, the shim's reconnect event, beside the local re-ship", () => {
   // anchored on the re-ship call: render.ts has other romp:wsup listeners (preview heals, awaitingFull), this is the one
   const m = RENDER.match(/window\.addEventListener\("romp:wsup", \(\) => \{\n  reshipPendingUploads\(\);([\s\S]*?)\n\}\);/);
   assert.ok(m, "the romp:wsup re-ship listener, now with a body");
-  assert.match(m![1], /if \(activeTabToReannounce\(activeId, ""\)\) notifyActive\(\);/, "the local tab is re-announced with the LOCAL host marker");
+  assert.match(m![1], /const st = shownTabForRelay\(\); if \(st && activeTabToReannounce\(st, ""\)\) announceActiveToRelay\(st\);/, "the local socket re-announces this column's OWN shown tab");
+  assert.doesNotMatch(m![1], /activeTabToReannounce\(activeId,/, "base = the bug: the old re-announce read the page-level activeId (round three, low c)");
 });
 
 test("the relay's open dispatches romp:hostRelayUp AFTER flushing queued settings, so a queued setting still precedes the re-announced activeTab", () => {

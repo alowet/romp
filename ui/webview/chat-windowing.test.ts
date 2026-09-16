@@ -144,7 +144,7 @@ test("round two/three code fixes each carry a pin (T386 stage 2, low 1)", () => 
   const win = RENDER.slice(winStart, RENDER.indexOf("\nfunction ", winStart + 1));
   const cTurns = RENDER.slice(RENDER.indexOf("function chatTurns(msg: any)"), RENDER.indexOf("function chatHead(msg: any)") >= 0 ? RENDER.indexOf("function chatHead(msg: any)") : winStart);
   // the socket death clears every in-flight ask's state, not the glyph alone (medium 1)
-  assert.match(RENDER, /function onWireDown\(\): void \{[\s\S]*?gapLoading\.clear\(\); windowAsks\.clear\(\); loadingOlder\.clear\(\);[\s\S]*?hideLandingNotice\(\);/, "the wire's down edge (the socket's or the pane's) clears the page asks, every ask record, the older-ask set and the notice");
+  assert.match(RENDER, /function onWireDown\(\): void \{[\s\S]*?if \(hostOf\(parseGapKey\(k\)\.sid\) === ""\) gapLoading\.delete\(k\);[\s\S]*?windowAsks\.clear\(\); loadingOlder\.clear\(\);[\s\S]*?hideLandingNotice\(\);/, "the wire's down edge (the socket's or the pane's) clears the page asks, every ask record, the older-ask set and the notice");
   // sizeSpacers does not average the gap element (medium 3, round one)
   const pxBlock = RENDER.slice(RENDER.indexOf("if (v.pxPerTurn == null) {"), RENDER.indexOf("if (h > 0 && turns > 0) v.pxPerTurn = h / turns;"));
   assert.match(pxBlock, /if \(c\.classList\.contains\("tx-spacer"\) \|\| c\.classList\.contains\("tx-gap"\) \|\| !c\.classList\.contains\("turn"\)\) continue;/, "the px-per-turn measure skips the gap element and every non-turn child (pinned inside its own block; round four low 3, round five)");
@@ -172,7 +172,7 @@ test("round four and five fixes each carry a pin (T386 stage 2, round five low 1
   assert.doesNotMatch(fill, /heightAbove/, "the view-coordinate tautology is gone");
   assert.match(RENDER, /function turnUnderTop\(v: View, s: Session, items: DisplayItem\[\], turns: number\[\], content: HTMLElement, top: number\): number \| null \{/, "the turn-under-top helper");
   assert.match(RENDER, /function yOfTurn\(v: View, s: Session, items: DisplayItem\[\], turns: number\[\], content: HTMLElement, t: number\): number \| null \{/, "the turn-to-scroll helper");
-  assert.match(RENDER, /gapLoading\.clear\(\); windowAsks\.clear\(\); loadingOlder\.clear\(\);/, "the socket death clears the cancelled mark too (medium 2)");
+  assert.match(RENDER, /if \(hostOf\(parseGapKey\(k\)\.sid\) === ""\) gapLoading\.delete\(k\);[\s\S]*?windowAsks\.clear\(\); loadingOlder\.clear\(\);/, "the socket death clears the cancelled mark too (medium 2)");
   assert.match(RENDER, /const liveLanding = !!landingNoticeSid \|\| Array\.from\(windowAsks\.values\(\)\)\.some\(\(a\) => a\.some\(\(r\) => !r\.cancelled && !!r\.gap\)\);/, "the wsdown toast fires only for a landing the reader had not cancelled (low 1)");
   assert.match(RENDER, /const nospan = !msg\.missing && Array\.isArray\(msg\.events\) && msg\.events\.length > 0 && !Array\.isArray\(msg\.span\);/, "missing is tested first; only a reply with events and no span is an older host (medium 3; round five low 3)");
   assert.match(RENDER, /const preJumpOrigin = rec\.origin;/, "the pre-jump origin is consumed by every window reply (low 2)");
@@ -236,6 +236,10 @@ test("round seven fixes each carry a pin (T386 stage 2): a fault has its own wor
   assert.ok(win.indexOf('landTrail.push("window-stray");') > 0 && win.indexOf('landTrail.push("window-stray");') < win.indexOf("const cancelled = rec.cancelled;"), "…and says so in the trail");
   assert.match(win, /const wasLanding = !cancelled && landingNoticeSid === msg\.id;/, "a cancelled ask's reply leaves the notice to the live ask");
   assert.match(RENDER, /for \(const r of windowAsks\.get\(sid\) \?\? \[\]\) if \(!r\.cancelled && r\.gap && r\.gap\.lo === gap\.lo && r\.gap\.hi === gap\.hi\) return true;/, "gapHasAsk reads the live records");
+  // the redial re-ask (2026-09-15): a gapLoading key parses from the RIGHT (a host-prefixed remote sid stays whole, so the in-flight
+  // guard matches a federated gap), and a redial re-sends every outstanding loadTurns, event-keyed, no timer
+  assert.match(RENDER, /const parts = k\.split\(":"\); const hi = Number\(parts\.pop\(\)\), lo = Number\(parts\.pop\(\)\);\s*\n\s*return \{ sid: parts\.join\(":"\), lo, hi \};/, "a gapLoading key parses from the right: a remote sid keeps its host prefix");
+  assert.match(RENDER, /reaskOutstandingGaps\(Array\.from\(gapLoading\), h\);/, "a relay reopen (romp:hostRelayUp) re-sends that host's outstanding loadTurns");
   assert.doesNotMatch(RENDER, /\b(cancelledLandings|preJumpFrom|pendingWindowNav)\b|const landingGaps\b/, "no per-session slot for a landing's state remains");
   // low 7: the older edge's evidence writers lost their reader with the pill's latch and are off the scroll hot path
   assert.doesNotMatch(RENDER, /olderEvidence|noteOlderEvidence|NAV_KEYS/, "no dead evidence writer on wheel, touch, key or drag");
@@ -251,7 +255,7 @@ test("round nine fixes each carry a pin (T386 stage 2): an older fetch in flight
   assert.match(RENDER, /if \(landedNow \|\| !anchorPendingOlder\) \{ pendingAnchor = null; pendingAnchorKeepY = null; \}/, "the reload restore's caller keeps its arm while an older fetch is pointed at the anchor");
   assert.match(RENDER, /^window\.addEventListener\("romp:wsdown", \(\) => onWireDown\(\)\);$/m, "the socket's down edge runs the one clear");
   assert.match(RENDER, /if \(m\.type === "pipeState"\) \{ if \(!m\.up\) \{ markPendingLost\("connection"\); onWireDown\(\); \} pipeBanner\(!!m\.up, Number\(m\.queued\) \|\| 0\); return; \}/, "…and so does the VS Code pane's pipe-down edge");
-  assert.match(RENDER, /function onWireDown\(\): void \{[\s\S]*?gapLoading\.clear\(\); windowAsks\.clear\(\); loadingOlder\.clear\(\);[\s\S]*?hideLandingNotice\(\);[\s\S]*?pendingAnchor = null; anchorPendingOlder = false;/, "the clear: page asks, every ask record, the older-ask set, the glyphs, the notice, the arm");
+  assert.match(RENDER, /function onWireDown\(\): void \{[\s\S]*?if \(hostOf\(parseGapKey\(k\)\.sid\) === ""\) gapLoading\.delete\(k\);[\s\S]*?windowAsks\.clear\(\); loadingOlder\.clear\(\);[\s\S]*?hideLandingNotice\(\);[\s\S]*?pendingAnchor = null; anchorPendingOlder = false;/, "the clear: page asks, every ask record, the older-ask set, the glyphs, the notice, the arm");
 });
 
 test("round ten fixes each carry a pin (T386 stage 2): a re-attempt waits on its own live ask; the not-rendered path names the state it saw", () => {

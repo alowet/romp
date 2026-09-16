@@ -47,6 +47,8 @@ SID = "11111111-2222-3333-4444-555555555555"
 # and node ids collide across test modules under the shared placeholder (CLAUDE.md, goal-store fixtures).
 GOAL_SID = "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
 TOP_KEYS = {"now", "since", "uptime_s", "log", "process", "pusher", "jobs", "stages_ms", "builds", "sends",   # jobs: the jobs thread's passes
+            "heap",                                        # heap: where the resident size sits at the read, gauges over every content cache (2026-09-15)
+            "gc",                                          # gc: the collector's pauses per generation, from the gc.callbacks hook (2026-09-16)
             "goals", "memos", "judge", "http", "parses",   # parses: cold event-model parses (T323 stage 1)
             "checkpoints",                                 # checkpoints: the folds' checkpoints (T323 stage 3)
             "asmCheckpoint",                               # asmCheckpoint: the assembly documents (T323 stage 4a)
@@ -124,13 +126,15 @@ class Collector(unittest.TestCase):
         self.assertIn("cpu_ms_workers", snap["judge"])
         self.assertEqual(set(snap["goals"]), {"loads", "saves", "writes"}, "read through jd.goal_io_stats")
         # the three identity memos' readers land here (review find, 2026-09-08: they had no consumer)
-        self.assertEqual(set(snap["memos"]), {"pass", "shared", "chain", "nudgeGate", "nudgeWalk", "cleared", "courierSkip", "backref", "captions", "goalArchive", "plannerSkip", "ghostDropped",
+        self.assertEqual(set(snap["memos"]), {"pass", "shared", "chain", "nudgeGate", "nudgeWalk", "convergeDeclined", "sessionsListing", "cleared", "courierSkip", "backref", "captions", "goalArchive", "plannerSkip", "ghostDropped",
                                               "bgTops", "liftGate", "intrMarks", "deadWait", "tickSeen", "statesOverlay", "lanes", "spendTree", "summaryAnchor",
                                               "chatMergeSets", "chatPostal", "chatLedger", "chatFoldTasks",   # the chat build's fixed-cost memos (2026-09-09)
-                                              "outlineProvisional"})   # the Outline's provisional-row ledger memo, parse-free (plans/outline-pane-provisional-row.md, 2026-09-15)
+                                              "outlineProvisional",   # the Outline's provisional-row ledger memo, parse-free (plans/outline-pane-provisional-row.md, 2026-09-15)
+                                              "notices"})   # the notice files' parsed rows (T370, plans/notice-cards.md): bytes against their bound
+        self.assertEqual(set(snap["memos"]["notices"]), {"entries", "bytes", "bound", "hit", "miss", "evicted"}, "the notice memo: occupancy against its bound, and its counters")
         self.assertEqual(set(snap["memos"]["outlineProvisional"]), {"hit", "miss", "bypass_hold", "bypass_empty", "entries"},
                          "the provisional ledger memo: hits and misses on the store object's identity, the two bypasses (a rewind hold, an empty store), and the occupancy")
-        self.assertEqual(set(snap["memos"]["spendTree"]), {"entries", "bytes", "bound", "dirStats", "fileStats", "entryStats", "listings", "loaded", "loadFailed", "written", "swept", "dropped", "dumpSkipped", "evicted", "writeFailed"}, "the spend guard's tree memos against their bound")
+        self.assertEqual(set(snap["memos"]["spendTree"]), {"entries", "bytes", "bound", "served", "dirStats", "fileStats", "entryStats", "listings", "loaded", "loadFailed", "written", "swept", "dropped", "dumpSkipped", "evicted", "writeFailed"}, "the spend guard's tree memos against their bound")
         self.assertEqual(snap["memos"]["spendTree"]["bound"], km.SPEND_GUARD_TREE_MEMO_BYTES)
         self.assertEqual(set(snap["memos"]["summaryAnchor"]), {"entries", "bytes", "bound", "hit", "miss", "evict", "fault"},
                          "the brief line's text-atom landings (T388): occupancy and counters against their bound")
@@ -194,7 +198,9 @@ class Collector(unittest.TestCase):
         the gauge was documented on /perf but never exposed)."""
         st = km.em.asm_index_stats()
         self.assertEqual(set(st), {"cap", "evictions", "materialized", "materializedBy", "materializedByStage", "resident", "restoredTurns",
-                                   "rowDecodes", "userFacts"})
+                                   "rowDecodes", "userFacts", "released", "expired"})   # released, expired: the LRU's weak ownership
+        #                                                                                   (measured 2026-09-15: superseded generations
+        #                                                                                   sat resident at the cap)
         self.assertIsInstance(st["userFacts"], int); self.assertGreaterEqual(st["userFacts"], 0)
 
     def test_the_feed_build_block_carries_the_per_session_card_memo(self):
@@ -529,6 +535,7 @@ class GoalIoCounters(unittest.TestCase):
         for k in ("`pass`", "`shared`", "`chain`", "`intrMarks`", "`statesOverlay`", "`deadWait`"):
             self.assertIn(k, doc)
         self.assertIn("`memos.shared`", doc)
+        self.assertIn("- `heap`:", doc, "the heap block is a documented top-level block (tests/test_perf_heap_block.py pins its keys)")
 
     def test_the_pushers_shared_loads_count_under_memos_shared_not_under_goals_loads(self):
         # `goals.loads` is the writer's loader alone; the pusher's read-only loads ride load_goals_shared and
@@ -562,16 +569,24 @@ class JudgeCpu(unittest.TestCase):
         self.assertEqual(km._PERF_STATS.snapshot()["judge"]["cpu_ms_workers"], jd.judge_worker_cpu_ms())
 
     def test_run_tier_accounts_the_tier_threads_cpu(self):
-        def tier_cpu():
-            j = km._PERF_STATS.snapshot()["judge"]
-            return j["cpu_ms_sum"] - j["cpu_ms_workers"]
-        before = tier_cpu()
-        km._run_tier(lambda: _burn_cpu(0.005))
-        self.assertGreaterEqual(tier_cpu() - before, 4.0)
-        before = tier_cpu()
+        """The shared tier runner (judge.py _run_tier, stage three round two) lands the thread's own CPU in the pass's
+        accounting record under its lock, a raising tier included (the finally); the producer feeds the record's total to
+        /perf's judge.cpu_ms_sum (a source pin on the call)."""
+        jd = km.jd
+        acc = jd._pass_acc()
+        jd._run_tier(lambda: _burn_cpu(0.005), "index", acc)
+        self.assertGreaterEqual(acc["cpuS"] * 1000.0, 4.0); self.assertEqual(acc["failures"], [])
+        before = acc["cpuS"]
         with redirect_stderr(io.StringIO()):
-            km._run_tier(lambda: (_burn_cpu(0.005), (_ for _ in ()).throw(RuntimeError("tier died"))))
-        self.assertGreaterEqual(tier_cpu() - before, 4.0, "a raising tier still accounts (the finally)")
+            jd._run_tier(lambda: (_burn_cpu(0.005), (_ for _ in ()).throw(RuntimeError("tier died"))), "triage", acc)
+        self.assertGreaterEqual((acc["cpuS"] - before) * 1000.0, 4.0, "a raising tier still accounts (the finally)")
+        self.assertEqual(len(acc["failures"]), 1); self.assertIn("RuntimeError: tier died", acc["failures"][0])
+        import inspect
+        self.assertIn('_PERF_STATS.judge_cpu(res["tierCpuS"])', inspect.getsource(km._producer), "the producer feeds the total")
+        self.assertIn('with acc["lock"]:', inspect.getsource(jd._run_tier), "the accumulation takes the lock")
+        before = km._PERF_STATS.snapshot()["judge"]["cpu_ms_sum"]
+        km._PERF_STATS.judge_cpu(0.005)
+        self.assertAlmostEqual(km._PERF_STATS.snapshot()["judge"]["cpu_ms_sum"] - before, 5.0, places=3)
 
 
 class PusherRecords(unittest.TestCase):

@@ -109,10 +109,11 @@ class BannerRaiserPins(unittest.TestCase):
     KERNEL = Path(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read_text()
 
     def test_shim_compares_dv_on_every_keepalive(self):
-        self.assertIn('if(LOADEDV&&msg.dv&&msg.dv>LOADEDV)raiseBuild();', self.KERNEL)
+        self.assertIn('if(LOADEDV&&msg.dv&&msg.dv>LOADEDV)raiseBuild(msg.dv);', self.KERNEL)   # the dv rides in to the reload core, which OFFERS (2026-09-16)
 
     def test_wsfresh_keeps_a_latched_build_prompt(self):
-        self.assertIn("else if(m&&m.romp==='wsFresh'){connStale=false;if(buildStale)show(BUILDMSG);", self.KERNEL)
+        self.assertIn("else if(m&&m.romp==='wsFresh'){connStale=false;paint();}", self.KERNEL)   # the painter shows a standing build offer again (2026-09-16)
+        self.assertIn("else if(offer){box.classList.add('offer');dm.textContent='Not now';show(offer.text);}", self.KERNEL)
 
     def test_dist_seam_is_env_keyed(self):
         self.assertIn('Path(os.environ["ROMP_DIST_DIR"]) if os.environ.get("ROMP_DIST_DIR")', self.KERNEL)

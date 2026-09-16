@@ -522,7 +522,7 @@ class Guard(unittest.TestCase):
         self.assertIn("warnToast(m.text);", handler)
         self.assertNotIn("failProvisional", handler, "never read as an in-flight create's verdict")
         self.assertIn("_spend_tree_list_dir(root, m, set(m[\"dirs\"]))", inspect.getsource(km._spend_window_files), "the tree memo's listing, the walk's rule kept")
-        self.assertIn("_spend_window_files(leaf, since, now)", inspect.getsource(km._spend_window_usd))
+        self.assertIn("_spend_window_files(leaf, since, now, stat=stat)", inspect.getsource(km._spend_window_usd))
 
     def test_the_guard_never_starts_the_price_feed_fetch(self):
         """The cost view refreshes the remote price feed when its cache is stale; the guard runs on the pusher's path in
@@ -543,6 +543,105 @@ class Guard(unittest.TestCase):
         i, j = src.index("_auto_pause_on_spend_limit(now, live_map)"), src.index("_spend_guard_tick(now, live_map)")
         self.assertLess(i, j, "the guard runs in the tick jobs, after the spend-cap pause decision")
         self.assertIn('sys.stderr.write("spend-guard: %s\\n" % traceback.format_exc())', src, "guarded like every job")
+
+
+class StatsOnlyWhileSpending(unittest.TestCase):
+    """plans/spend-guard-events.md: a tree is statted while its session can spend (its row working, or a live subagent or
+    background task in its backend's row), once more on the edge after it stopped, when the nudge prelude's observers
+    marked its files, and once per SPEND_GUARD_TREE_RESCAN_S as the floor; every other pass serves the standing list from
+    the memo with no stat, and a latched idle session clears from the memo as the window slides. A loaded memo with a
+    spread re-stat still to drain is statted, not served, until every file was seen once."""
+    def setUp(self):
+        Guard.setUp(self)                                                 # the tick's seams, without the Guard tests
+        km._SPEND_TREE_CACHE.clear()
+        getattr(km, "_SPEND_CAN_PREV", {}).clear()
+        km._live_scope.files_dirty = None
+        write_jsonl(self.leaf, [assistant(NOW - 100, "msg_a", out_tokens=1000, in_tokens=0)])
+        sub = Path(self.leaf).with_suffix("") / "subagents"
+        write_jsonl(sub / "agent-1.jsonl", [assistant(NOW - 50, "msg_s", out_tokens=1000, in_tokens=0)], mtime=NOW - 50)
+        self.agent = str(sub / "agent-1.jsonl")
+
+    def tearDown(self):
+        km._SPEND_TREE_CACHE.clear()
+        getattr(km, "_SPEND_CAN_PREV", {}).clear()
+        km._live_scope.files_dirty = None
+        Guard.tearDown(self)
+
+    def _tick_row(self, now, row):
+        """One guard pass with the session's live row as given: (directory stats, file stats, served) the pass paid."""
+        s0 = dict(km._SPEND_TREE_STATS)
+        km._spend_guard_tick(now, {SID: row}, sessions=self.sessions, be=self.be, clients=self.clients, prices=PRICES)
+        return tuple(km._SPEND_TREE_STATS.get(k, 0) - s0.get(k, 0) for k in ("dirStats", "fileStats", "served"))
+
+    IDLE = {"state": "waiting", "subagents": [], "bgTasks": []}
+    WORKING = {"state": "working", "subagents": [], "bgTasks": []}
+
+    def test_an_idle_session_is_served_from_the_memo_after_its_first_pass(self):
+        d, f, s = self._tick_row(NOW, self.IDLE)
+        self.assertGreater(d + f, 0, "the first pass lists the tree")
+        d, f, s = self._tick_row(NOW + 1, self.IDLE)
+        self.assertEqual((d, f, s), (0, 0, 1), "idle: no stat, one served: %r" % ((d, f, s),))
+        self.assertEqual(self._tick_row(NOW + 2, self.IDLE), (0, 0, 1))
+
+    def test_a_working_session_is_statted_every_pass(self):
+        self._tick_row(NOW, self.WORKING)
+        d, f, s = self._tick_row(NOW + 1, self.WORKING)
+        self.assertGreater(d, 0, "working: the directories are statted")
+        self.assertEqual(s, 0)
+
+    def test_a_live_subagent_or_background_task_keeps_an_idle_row_statted(self):
+        self._tick_row(NOW, self.IDLE); self._tick_row(NOW + 1, self.IDLE)
+        d, f, s = self._tick_row(NOW + 2, {"state": "waiting", "subagents": [{"agentId": "a1", "type": "Task"}], "bgTasks": []})
+        self.assertGreater(d, 0, "a background agent writes under the tree while the row stands idle")
+        self.assertEqual(s, 0)
+        d, f, s = self._tick_row(NOW + 3, {"state": "waiting", "subagents": [], "bgTasks": [{"id": "t1"}]})
+        self.assertGreater(d, 0, "so does a background task")
+
+    def test_the_edge_from_working_to_idle_is_statted_once_more(self):
+        self._tick_row(NOW, self.WORKING)
+        d, f, s = self._tick_row(NOW + 1, self.IDLE)
+        self.assertGreater(d, 0, "the pass after the turn ended reads the files it wrote as it ended")
+        self.assertEqual(self._tick_row(NOW + 2, self.IDLE), (0, 0, 1), "then the standing list serves")
+
+    def test_a_latched_idle_session_clears_from_the_memo_with_no_stat(self):
+        with mock.patch.object(km, "_spend_ceiling", lambda: 10.0):
+            self._tick_row(NOW, self.IDLE); self._tick_row(NOW + 1, self.IDLE)
+            km._SPEND_GUARD[SID] = {"over": True, "t": NOW, "rate": 100.0}     # latched over the ceiling earlier
+            km._SPEND_TREE_CACHE[self.leaf]["lastStat"] = NOW + 1999           # the floor holds at the clearing pass
+            d, f, s = self._tick_row(NOW + 2000, self.IDLE)                   # the window slid past every row
+        self.assertEqual((d, f, s), (0, 0, 1), "no stat: the clearing is the clock's")
+        self.assertFalse(km._SPEND_GUARD[SID]["over"], "the latch cleared from the rows the memo holds")
+
+    def test_the_floor_re_stats_an_idle_tree_once_per_bound(self):
+        self._tick_row(NOW, self.IDLE); self._tick_row(NOW + 1, self.IDLE)
+        d, f, s = self._tick_row(NOW + 1 + km.SPEND_GUARD_TREE_RESCAN_S, self.IDLE)
+        self.assertGreater(d, 0, "the floor: statted once")
+        self.assertEqual(s, 0)
+        self.assertEqual(self._tick_row(NOW + 2 + km.SPEND_GUARD_TREE_RESCAN_S, self.IDLE), (0, 0, 1))
+
+    def test_a_loaded_memo_is_statted_until_its_re_stat_has_drained(self):
+        self._tick_row(NOW, self.IDLE)
+        m = km._SPEND_TREE_CACHE[self.leaf]
+        m["restat"] = [self.agent]                                        # a memo loaded at boot: every file once before trust
+        d, f, s = self._tick_row(NOW + 1, self.IDLE)
+        self.assertGreater(f, 0, "the drain stats the file")
+        self.assertEqual(s, 0, "not served before the drain is done")
+        self.assertNotIn("restat", m)
+        self.assertEqual(self._tick_row(NOW + 2, self.IDLE), (0, 0, 1))
+
+    def test_a_mark_from_the_nudge_prelude_stats_the_idle_session(self):
+        self._tick_row(NOW, self.IDLE); self._tick_row(NOW + 1, self.IDLE)
+        km._live_scope.files_dirty = ({SID}, False)                       # the pusher's signature saw a transcript under the tree move
+        d, f, s = self._tick_row(NOW + 2, self.IDLE)
+        self.assertGreater(d, 0)
+        km._live_scope.files_dirty = (set(), True)                        # every session marked (a shared log moved)
+        self.assertGreater(self._tick_row(NOW + 3, self.IDLE)[0], 0)
+        km._live_scope.files_dirty = None
+        self.assertEqual(self._tick_row(NOW + 4, self.IDLE), (0, 0, 1))
+
+    def test_served_rides_the_memo_report(self):
+        self._tick_row(NOW, self.IDLE); self._tick_row(NOW + 1, self.IDLE)
+        self.assertIn("served", km._spend_tree_memo_report(), "memos.spendTree.served for the read")
 
 
 if __name__ == "__main__":

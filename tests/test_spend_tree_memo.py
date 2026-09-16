@@ -389,7 +389,7 @@ class SpendTreeMemo(unittest.TestCase):
 
     def test_the_perf_memos_carry_the_reads(self):
         rep = km._spend_tree_memo_report()
-        self.assertEqual(set(rep), {"entries", "bytes", "bound", "dirStats", "fileStats", "entryStats", "listings", "loaded", "loadFailed",
+        self.assertEqual(set(rep), {"entries", "bytes", "bound", "served", "dirStats", "fileStats", "entryStats", "listings", "loaded", "loadFailed",
                                     "written", "swept", "dropped", "dumpSkipped", "evicted", "writeFailed"})
 
 

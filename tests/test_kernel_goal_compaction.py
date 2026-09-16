@@ -40,6 +40,8 @@ def _node(nid, parent, **kw):
 
 class GoalCompactionTest(unittest.TestCase):
     def setUp(self):
+        # the compaction sweep reads liveness for its owner list (2026-09-15): answer nothing, never build a backend here
+        self._saved_live_map, km._live_map = km._live_map, (lambda: {})
         self._saved_state = jd.STATE
         self._td = tempfile.mkdtemp()
         jd._rebind_state(Path(self._td))
@@ -67,6 +69,7 @@ class GoalCompactionTest(unittest.TestCase):
         self.g = g
 
     def tearDown(self):
+        km._live_map = self._saved_live_map
         jd._rebind_state(self._saved_state)   # the judge module is shared process-wide: never leave it on a removed dir
         shutil.rmtree(self._td, ignore_errors=True)
 

@@ -101,6 +101,13 @@ test("a pick of a session another column holds is shown where it lives: the setA
   assert.match(RENDER, /\(window as any\)\.__rompColumnBusy = \(\): boolean => !!provisionalId \|\| failedProvisionals\.size > 0;/);
   assert.match(KERNEL, /function movable\(f,sid\)\{[^\n]*__rompMovableSession/);
   assert.match(KERNEL, /function busy\(f\)\{[^\n]*__rompColumnBusy/);
+  // …and the busy answer's transition to idle, said once (noteColumnIdle; chat-split-exec.test.ts runs it): the shell's reconcile of
+  // another dashboard tab's write passed close()'s busy gate with `keep` and tore a column down over a create in flight; it defers
+  // that close while the page is busy and carries it out on this signal, against a fresh read of the store (tests/test_chat_split.py)
+  assert.match(RENDER, /function noteColumnIdle\(\): void \{\n\s*if \(!COL \|\| provisionalId \|\| failedProvisionals\.size\) return;\n\s*try \{ window\.parent\.postMessage\(\{ romp: "colBusy", busy: false \}, "\*"\); \}/);
+  assert.equal((RENDER.match(/noteColumnIdle\(\);/g) || []).length, 2, "two callers: dropProvisional, and the failed tab's discard in closeTabLocally");
+  assert.ok(KERNEL.includes("if(m.romp==='colBusy'&&m.busy===false){"), "the shell's handler");
+  assert.ok(KERNEL.includes("if(busy(frameOfCol(c.n))){deferred[c.n]=true;"), "the reconcile defers a busy column's close");
   // the ids a colEmpty close sends home are held back on the first column's strip until the kernel's strip omits them
   // (the same closingTabs a ✕ uses), so no tab flashes into that strip on its way out
   assert.match(RENDER, /if \(m\.romp === "closing"\) \{ if \(Array\.isArray\(m\.ids\)\) for \(const id of m\.ids\) \{ if \(typeof id === "string" && id\) closingTabs\.set\(id, Date\.now\(\)\); \} renderTabs\(\); return; \}/);

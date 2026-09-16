@@ -24,9 +24,11 @@ class ProducerPolicy(unittest.TestCase):
 
     def test_triage_runs_always_for_a_live_session_not_browser_gated(self):
         body = self._producer_body()
-        # both tiers are appended together under the live-session guard
-        self.assertIn('args=(jd.run_index,), name="index"', body)
-        self.assertIn('args=(jd.run_triage,), name="triage"', body)
+        # both tiers start together inside the ONE shared pass body (judge.py run_pass), which the producer calls with the gate
+        self.assertIn("res = jd.run_pass(_tiers_may_start(tracking), before_tier=_tier_started)", body)
+        jsrc = Path(os.path.join(os.path.dirname(HERE), "kernel", "judge.py")).read_text()
+        self.assertIn('lambda: run_index(now=now), "index", acc, before_tier), name="index"', jsrc)
+        self.assertIn('lambda: run_triage(now=now), "triage", acc, before_tier), name="triage"', jsrc)
         # the OLD browser+sig gate is gone — triage is no longer conditional on a connected browser
         self.assertNotIn("if browser and sig", body)
         self.assertNotIn("bool(_clients)", body, "the loop no longer branches on whether a browser is connected")
@@ -35,13 +37,16 @@ class ProducerPolicy(unittest.TestCase):
         body = self._producer_body()
         # index + triage appends sit inside ONE guard: _tiers_may_start (a live session, retries not paused, the Task
         # tracking switch on; T404), a predicate executed in tests/test_task_tracking_switch.py
-        guard = re.search(r"if _tiers_may_start\(tracking\):\n(.*?)\n            for t in tiers:", body, re.S)
-        self.assertTrue(guard, "the two tiers are guarded by the single _tiers_may_start(tracking) check")
+        self.assertIn("jd.run_pass(_tiers_may_start(tracking), before_tier=_tier_started)", body, "the predicate's answer is what the shared pass body gets")
         self.assertIn("def _tiers_may_start(tracking=None):", SRC)
         self.assertIn("return bool(tracking) and bool(_live_map()) and not _retry_paused_on()", SRC, "the predicate's three inputs")
+        jsrc = Path(os.path.join(os.path.dirname(HERE), "kernel", "judge.py")).read_text()
+        guard = re.search(r"    if may_start:\n(.*?)\n    frame = begin_pass_frame\(\)", jsrc, re.S)
+        self.assertTrue(guard, "in the shared body the two tiers sit under the one may_start guard")
         block = guard.group(1)
         self.assertIn('name="index"', block)
         self.assertIn('name="triage"', block)
+        self.assertNotIn("def _run_tier(", SRC, "the kernel keeps no copy of the tier runner")
 
     def test_backstop_is_short(self):
         body = self._producer_body()

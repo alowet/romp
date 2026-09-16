@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""T265, the served leg: the dashboard reloads ITSELF on a newer bundle and on a kernel restart, never
-mid-gesture, and the chat reader keeps their place (the user 2026-09-08, superseding their 2026-07-13
-preference for a banner the reader clicks).
+"""The served leg of the reload OFFER (the user 2026-09-16, superseding the 2026-09-08 self-reload, which superseded the
+2026-07-13 banner): the dashboard never reloads itself. A newer build is one persistent line with Reload and Not now; a
+restart onto the same build is invisible beyond the reconnect; the reader keeps their place through the reload they take.
 
-Executed against the REAL page: a hermetic kernel serves the dashboard from a private copy of dist; the
-driver opens it, scrolls the chat transcript to mid-history, and
-  1. holds a pointer button down over the chat pane, then bumps a dist bundle's mtime — the kernel's next
-     keepalive carries a higher `dv` (the authoritative drift signal) — and asserts the page did NOT reload
-     while the button was held (the reload is armed, waiting on the pointer);
-  2. releases the button and asserts the page reloaded, landed the chat tab on the reader's saved position
-     (not the bottom), and left one "Reloaded onto build …" line in the notification center;
-  3. kills the kernel and relaunches it on the same port, a socket reopen against a NEW boot id of the SAME build,
-     and asserts NO reload (invisible restarts, the user 2026-09-14): the board stays on screen, the reader's place
-     holds, the pane's redial lands its fresh frame, and the notification center gains no line. (A changed build's
-     restart reloads once the reconnected pane has its first frame: the node leg, test_dashboard_auto_reload.py.)
-Skips LOUDLY when the extension deps or a playwright browser are absent (CI installs none); the decision code
-itself runs in node in test_dashboard_auto_reload.py regardless. All fixtures synthetic."""
+Executed against the REAL page: a hermetic kernel serves the dashboard from a private copy of dist; the driver opens it,
+scrolls the chat transcript to mid-history, and
+  1. bumps a dist bundle's mtime (the kernel's next keepalive carries a higher `dv`, the authoritative drift signal) and
+     asserts the offer line appears in the shell's banner ("A newer romp build is ready.", Reload, Not now) and the page
+     did NOT reload through three more keepalives; the panes did not move (the banner is fixed);
+  2. clicks Not now, asserts the line is gone and stays gone through later keepalives (the Not now is kept per build),
+     bumps again and asserts a strictly newer build re-offers;
+  3. clicks Reload and asserts the page reloaded once, landed the chat tab on the reader's saved position (not the
+     bottom), left one "Reloaded onto build …" line in the notification center, and settled (no second reload);
+  4. kills the kernel and relaunches it on the same port, a socket reopen against a NEW boot id of the SAME build, and
+     asserts NO reload and NO offer: the board stays, the reader's place holds, the pane's redial lands its fresh frame,
+     the notification center gains no line;
+  5. relaunches with another code identity, a restart onto a CHANGED build, and asserts the offer and no reload; then
+     sends an op the kernel does not know from the chat pane's socket and asserts the offer's wording gains the reason
+     (the unknownOp refusal, an exact event); then accepts and asserts one reload with its line.
+Skips LOUDLY when the extension deps or a playwright browser are absent (CI installs none); the decision code itself runs
+in node in test_dashboard_auto_reload.py regardless. All fixtures synthetic."""
 import json
 import os
 import re
@@ -112,8 +116,16 @@ const info = (fr) => fr.evaluate(() => {
 const notices = () => page.evaluate(() => { try { return JSON.parse(localStorage.getItem("romp:notices") || "[]").filter((n) => n.kind === "reload").map((n) => n.text); } catch (e) { return []; } });
 const probeSet = () => page.evaluate(() => { window.__probe = 1; return 1; });
 const probeAlive = () => page.evaluate(() => window.__probe === 1).catch(() => false);
-const shellWaiting = () => page.evaluate(() => window.__rompReload ? { waiting: window.__rompReload.waiting, owed: window.__rompReload.owed(), fired: window.__rompReload.fired() } : null).catch(() => null);
+const shell = () => page.evaluate(() => window.__rompReload ? { waiting: window.__rompReload.waiting, owed: window.__rompReload.owed(), offered: window.__rompReload.offered(), fired: window.__rompReload.fired() } : null).catch(() => null);
+// the banner as the reader sees it: shown, the offer class, the line, the two buttons
+const banner = () => page.evaluate(() => { const b = document.getElementById("rstale"); if (!b) return null;
+  return { shown: b.classList.contains("show"), offer: b.classList.contains("offer"), text: b.querySelector(".rs-msg").textContent,
+           reload: document.getElementById("rstale-reload").textContent, dismiss: document.getElementById("rstale-dismiss").textContent }; }).catch(() => null);
+const waitOffer = (ms) => page.waitForFunction(() => { const b = document.getElementById("rstale"); return !!b && b.classList.contains("show") && b.classList.contains("offer"); }, null, { timeout: ms }).then(() => true).catch(() => false);
+const paneBox = () => page.evaluate(() => { const f = document.querySelector('iframe[src^="/chat"]'); const r = f.getBoundingClientRect(); return [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]; });
 const bump = (n) => { const t = new Date(Date.now() + n * 60 * 1000); fs.utimesSync(cfg.bumpFile, t, t); };
+const relaunch = (env) => { const k = spawn(cfg.relaunch.cmd, [], { env, detached: true,
+  stdio: ["ignore", fs.openSync(cfg.relaunch.log, "a"), fs.openSync(cfg.relaunch.log, "a")] }); k.unref(); fs.writeSync(1, "KPID:" + k.pid + "\n"); return k; };
 
 // ---- load, scroll to mid-history ----
 await page.goto(cfg.url);
@@ -121,114 +133,91 @@ let fr = await waitChat();
 await page.waitForTimeout(800);
 await fr.evaluate(() => { const c = document.getElementById("content"); c.scrollTop = Math.round(c.scrollHeight * 0.45); });
 await page.waitForTimeout(600);
-const before = await info(fr);
-out.before = before;
+out.before = await info(fr);
+out.paneBefore = await paneBox();
 await probeSet();
 out.noticesBefore = await notices();
+out.bannerBefore = await banner();
 
-// ---- 1. hold the pointer over the chat pane, then bump the bundle: armed, not fired ----
-const box = await (await page.$('iframe[src^="/chat"]')).boundingBox();
-await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-await page.mouse.down();
+// ---- 1. bump the bundle: the offer appears; the page does NOT reload ----
 bump(1);
-// three keepalives (ROMP_WS_KEEPALIVE=2 in the lab env) — plenty for the higher dv to reach the page
-await page.waitForTimeout(6500);
-out.probeWhileHeld = await probeAlive();
-out.shellWhileHeld = await shellWaiting();
-// ---- 2. release: the reload fires; the chat tab lands where the reader was ----
-await page.mouse.up();
-const reloaded = await page.waitForFunction(() => window.__probe !== 1, null, { timeout: 15000 }).then(() => true).catch(() => false);
-out.reloadedOnRelease = reloaded;
-if (!reloaded) await die("no reload after the pointer was released");
+out.offerShown = await waitOffer(15000);                   // one keepalive (ROMP_WS_KEEPALIVE=2 in the lab env) carries the higher dv
+out.bannerOffer = await banner();
+out.paneWithOffer = await paneBox();
+await page.waitForTimeout(6500);                           // three more keepalives: a reload owed would have fired by now
+out.probeAfterOffer = await probeAlive();
+out.shellAfterOffer = await shell();
+out.noticesAfterOffer = await notices();
+
+// ---- 2. Not now: gone, and kept gone through later keepalives; a strictly newer build re-offers ----
+await page.click("#rstale-dismiss");
+out.bannerAfterNotNow = await banner();
+out.notNowKept = await page.evaluate(() => { try { return JSON.parse(localStorage.getItem("romp:reloadNotNow") || "null"); } catch (e) { return null; } });
+await page.waitForTimeout(4500);                           // two keepalives carrying the declined dv
+out.bannerAfterKeepalives = await banner();
+bump(2);
+out.reoffered = await waitOffer(15000);
+out.shellReoffered = await shell();
+
+// ---- 3. Reload: one reload, the reader's place, one line; then the fresh page settles ----
+await probeSet();
+await page.click("#rstale-reload");
+out.reloadedOnClick = await page.waitForFunction(() => window.__probe !== 1, null, { timeout: 15000 }).then(() => true).catch(() => false);
+if (!out.reloadedOnClick) await die("no reload after the Reload click");
 fr = await waitChat();
-// the land is a frame after the build; poll until the position settles off the bottom or 5 s pass
 let after = null;
 for (let i = 0; i < 25; i++) { after = await info(fr); if (after.scrollHeight - after.scrollTop - after.clientHeight > 2 && after.scrollTop > 0) break; await page.waitForTimeout(200); }
 out.after = after;
-out.noticesAfterBuild = await notices();
+out.noticesAfterReload = await notices();
 await probeSet();
-// the fresh page must SETTLE: three more keepalives with no further reload (a page that reloaded onto the
-// current build must not read the same build as drift again)
 await page.waitForTimeout(7000);
-out.settledAfterBuild = await probeAlive();
+out.settledAfterReload = await probeAlive();
+out.bannerAfterReload = await banner();
 
-// ---- 3. a kernel restart of the SAME build: kill + relaunch on the same port → a reopen against a new boot id ----
-// Invisible restarts (the user 2026-09-14): the page must NOT reload; the board stays, the pane redials and lands its
-// fresh frame, the reader's place holds. The shell's checkBoot counts the restart (restarted()) without owing a reload.
+// ---- 4. a kernel restart of the SAME build: kill + relaunch on the same port ----
 const beforeRestart = await info(fr);
 process.kill(cfg.kernelPid, "SIGKILL");
 await page.waitForTimeout(500);
-const k2 = spawn(cfg.relaunch.cmd, [], { env: cfg.relaunch.env, detached: true,
-  stdio: ["ignore", fs.openSync(cfg.relaunch.log, "a"), fs.openSync(cfg.relaunch.log, "a")] });
-k2.unref();
-fs.writeSync(1, "KPID:" + k2.pid + "\n");
+const k2 = relaunch(cfg.relaunch.env);
 out.restartSeen = await page.waitForFunction(() => window.__rompReload && window.__rompReload.restarted() >= 1, null, { timeout: 60000 }).then(() => true).catch(() => false);
-// the chat pane's redial lands its resync frame: the fresh hold clears in the pane's own window
 out.freshAfterRestart = await fr.waitForFunction(() => window.__rompFreshPending === false, null, { timeout: 60000 }).then(() => true).catch(() => false);
-await page.waitForTimeout(7000);                       // three keepalives on the new kernel: a reload owed would have fired by now
+await page.waitForTimeout(7000);                           // three keepalives on the new kernel
 out.probeAfterRestart = await probeAlive();
-out.reloadedOnRestart = !out.probeAfterRestart;
-out.shellAfterRestart = await shellWaiting();
+out.shellAfterRestart = await shell();
+out.bannerAfterRestart = await banner();
 out.afterRestart = await info(fr).catch(() => null);
 out.beforeRestart = beforeRestart;
 out.noticesAfterRestart = await notices();
 
-// ---- 4. build drift AFTER the reconnect (the control): the bundle bumps again; the chat pane's fresh frame has landed, so
-// the reload fires as it did before the reconnect (the round-two review found it held forever behind the Files pane) ----
-await probeSet();
-bump(2);
-out.reloadedOnDriftAfterReconnect = await page.waitForFunction(() => window.__probe !== 1, null, { timeout: 20000 }).then(() => true).catch(() => false);
-if (!out.reloadedOnDriftAfterReconnect) await die("no reload on build drift after the reconnect");
-fr = await waitChat();
-await probeSet();
-out.noticesAfterDrift = await notices();
-
-// ---- 5. a restart onto a CHANGED build: kill + relaunch with another code identity → the reload is owed, held on the chat
-// pane's redial, and fires once its first frame lands, well inside the core's bound ----
-await page.evaluate(() => { const R = window.__rompReload, prev = R.held, prevP = window.__rompPersistForReload;
-  R.held = (b, o) => { try { sessionStorage.setItem("lab:held", JSON.stringify({ b, reason: o.reason })); } catch (e) {} if (prev) prev(b, o); };
-  // at the fire: the chat pane's flag must be down (its frame landed), whether the shell had to hold for it or the pane's redial won the race with the shell's /version poll
-  window.__rompPersistForReload = () => { try { const w = document.querySelector('iframe[src^="/chat"]').contentWindow;
-    sessionStorage.setItem("lab:fire", JSON.stringify({ fresh: w.__rompFreshPending, stamped: !!w.__rompFreshPendingSince })); } catch (e) {} if (prevP) prevP(); }; });
+// ---- 5. a restart onto a CHANGED build: the offer, no reload; an unknown op sharpens its wording; the accept reloads ----
 process.kill(k2.pid, "SIGKILL");
 await page.waitForTimeout(500);
-const k3 = spawn(cfg.relaunch.cmd, [], { env: { ...cfg.relaunch.env, ROMP_CODE_IDENT: "changed-build" }, detached: true,
-  stdio: ["ignore", fs.openSync(cfg.relaunch.log, "a"), fs.openSync(cfg.relaunch.log, "a")] });
-k3.unref();
-fs.writeSync(1, "KPID:" + k3.pid + "\n");
-const t0 = Date.now();
-out.reloadedOnChangedBuild = await page.waitForFunction(() => window.__probe !== 1, null, { timeout: 90000 }).then(() => true).catch(() => false);
-out.changedBuildReloadMs = Date.now() - t0;
-if (!out.reloadedOnChangedBuild) await die("no reload after a restart onto a changed build");
-fr = await waitChat();
-out.heldOnChangedBuild = await page.evaluate(() => { try { return JSON.parse(sessionStorage.getItem("lab:held") || "null"); } catch (e) { return null; } });
-out.chatAtFire = await page.evaluate(() => { try { return JSON.parse(sessionStorage.getItem("lab:fire") || "null"); } catch (e) { return null; } });
+relaunch({ ...cfg.relaunch.env, ROMP_CODE_IDENT: "changed-build" });
+out.offerOnChangedBuild = await waitOffer(60000);
+out.bannerChangedBuild = await banner();
+await page.waitForTimeout(7000);
+out.probeAfterChangedBuild = await probeAlive();
+out.shellAfterChangedBuild = await shell();
 out.noticesAfterChangedBuild = await notices();
-
-// ---- 6. a deploy that changes the dashboard's bundle but no kernel code: the kernel restarts with the same code identity and a
-// newer bundle on disk (the deploy rebuilt dist while the kernel was down). The page must reload exactly once, onto the new
-// bundle, after the chat pane's frame; a same-code restart alone reloads nothing, and the newer bundle is the reason here ----
+// the chat pane asks its kernel for something it does not know: the kernel answers unknownOp on that socket (an exact event)
+await fr.evaluate(() => { window.__rompLocalSend({ type: "labNoSuchOp" }); });
+out.behindWording = await page.waitForFunction(() => { const m = document.querySelector("#rstale .rs-msg"); return !!m && /behind the kernel/.test(m.textContent); }, null, { timeout: 15000 }).then(() => true).catch(() => false);
+out.bannerBehind = await banner();
+out.probeAfterBehind = await probeAlive();
 await probeSet();
-process.kill(k3.pid, "SIGKILL");
-await page.waitForTimeout(500);
-bump(3);                                                   // the deploy's rebuild, while no kernel is up
-const k4 = spawn(cfg.relaunch.cmd, [], { env: { ...cfg.relaunch.env, ROMP_CODE_IDENT: "changed-build" }, detached: true,
-  stdio: ["ignore", fs.openSync(cfg.relaunch.log, "a"), fs.openSync(cfg.relaunch.log, "a")] });
-k4.unref();
-fs.writeSync(1, "KPID:" + k4.pid + "\n");
-const t1 = Date.now();
-out.reloadedOnUiDeploy = await page.waitForFunction(() => window.__probe !== 1, null, { timeout: 90000 }).then(() => true).catch(() => false);
-out.uiDeployReloadMs = Date.now() - t1;
-if (!out.reloadedOnUiDeploy) { out.shellOnUiDeploy = await shellWaiting(); await die("no reload after a deploy that changed the bundle but not the kernel code"); }
+await page.click("#rstale-reload");
+const t0 = Date.now();
+out.reloadedOnAccept = await page.waitForFunction(() => window.__probe !== 1, null, { timeout: 90000 }).then(() => true).catch(() => false);
+out.acceptReloadMs = Date.now() - t0;
+if (!out.reloadedOnAccept) await die("no reload after accepting the changed build's offer");
 fr = await waitChat();
-await probeSet();
-await page.waitForTimeout(7000);                           // three keepalives: the fresh page must settle on the new bundle
-out.settledAfterUiDeploy = await probeAlive();
-out.noticesAfterUiDeploy = await notices();
+out.noticesFinal = await notices();
+out.bannerFinal = await banner();
 fs.writeSync(1, "RESULT:" + JSON.stringify(out) + "\n");
 await browser.close();
 process.exit(0);
 """
+
 
 
 class ServedAutoReload(unittest.TestCase):
@@ -294,7 +283,7 @@ class ServedAutoReload(unittest.TestCase):
             cls.kernel.wait()
         shutil.rmtree(getattr(cls, "lab", ""), ignore_errors=True)
 
-    def test_build_drift_reloads_after_the_gesture_ends_a_same_build_restart_never_reloads_and_a_changed_build_reloads_on_the_chat_panes_frame(self):
+    def test_a_newer_build_is_offered_not_now_is_kept_reload_is_a_click_and_a_same_build_restart_is_invisible(self):
         cfg = os.path.join(self.lab, "cfg.json")
         with open(cfg, "w") as f:
             json.dump({"url": "http://127.0.0.1:%d/?token=%s" % (self.port, self.token),
@@ -325,60 +314,59 @@ class ServedAutoReload(unittest.TestCase):
         self.assertIsNotNone(line, "driver printed no result:\n" + p.stdout[-3000:])
         r = json.loads(line[len("RESULT:"):])
         self.assertNotIn("died", r, "driver aborted early: %r" % r)
+        OFFER = "A newer romp build is ready."
+        BEHIND = "A newer romp build is ready; this page is behind the kernel and some actions fall back to older paths until you reload."
         b, a = r["before"], r["after"]
         self.assertGreater(b["scrollHeight"] - b["scrollTop"] - b["clientHeight"], 200, "the reader was scrolled up before: %r" % b)
-        # 1. armed, not fired, while the pointer was held
-        self.assertTrue(r["probeWhileHeld"], "the page must not reload mid-gesture: %r" % r)
-        self.assertEqual((r["shellWhileHeld"] or {}).get("waiting"), "pointer", "the reload is armed on the held pointer: %r" % r["shellWhileHeld"])
-        self.assertEqual(((r["shellWhileHeld"] or {}).get("owed") or {}).get("reason"), "build", "the owed reason: %r" % r["shellWhileHeld"])
-        # 2. the release fires it, and the chat tab lands where the reader was
-        self.assertTrue(r["reloadedOnRelease"])
-        # keyed on the anchor row, the repo's rule for scroll labs: the restore lands on the anchor turn when the rebuilt DOM has it
-        # (ui/webview/reload-restore.ts), so scrollTop differs whenever the rows above it measure differently after the reload (main
-        # CI read 96 px once on 2026-09-14); when the rebuilt DOM does not have the anchor yet, the restore's other road is the raw
-        # scrollTop, and the first row in view can differ (a CI red of 2026-09-15 compared two row ids). Either road keeps the place.
+        self.assertFalse((r["bannerBefore"] or {}).get("shown"), "nothing to say on a current page: %r" % r["bannerBefore"])
+        # 1. the offer, and no reload
+        self.assertTrue(r["offerShown"], "the higher dv on the keepalive stands the offer: %r" % r)
+        self.assertEqual(r["bannerOffer"], {"shown": True, "offer": True, "text": OFFER, "reload": "Reload", "dismiss": "Not now"}, "the one line, its two buttons")
+        self.assertTrue(r["probeAfterOffer"], "the page must not reload on its own: %r" % r)
+        self.assertIsNone((r["shellAfterOffer"] or {}).get("owed"), "nothing owed: no hold, no backstop: %r" % r["shellAfterOffer"])
+        self.assertEqual(((r["shellAfterOffer"] or {}).get("offered") or {}).get("text"), OFFER)
+        self.assertEqual(r["paneWithOffer"], r["paneBefore"], "the banner is fixed: the panes did not move: %r → %r" % (r["paneBefore"], r["paneWithOffer"]))
+        self.assertEqual(len(r["noticesBefore"]), 0); self.assertEqual(len(r["noticesAfterOffer"]), 0, "an offer writes no notification-center line")
+        # 2. Not now, kept per build; a newer build re-offers
+        self.assertFalse(r["bannerAfterNotNow"]["shown"], "Not now takes the line down: %r" % r["bannerAfterNotNow"])
+        self.assertEqual((r["notNowKept"] or {}).get("dv"), ((r["shellAfterOffer"] or {}).get("offered") or {}).get("dv"), "the declined build is kept in localStorage: %r" % r["notNowKept"])
+        self.assertFalse(r["bannerAfterKeepalives"]["shown"], "the declined build stays quiet through later keepalives: %r" % r["bannerAfterKeepalives"])
+        self.assertTrue(r["reoffered"], "a strictly newer build re-offers: %r" % r)
+        self.assertGreater(((r["shellReoffered"] or {}).get("offered") or {}).get("dv", 0), (r["notNowKept"] or {}).get("dv", 0))
+        # 3. Reload is the user's click: one reload, the reader's place, one line, then quiet
+        self.assertTrue(r["reloadedOnClick"])
         same_row = a["anchor"]["uuid"] == b["anchor"]["uuid"] and abs(a["anchor"]["top"] - b["anchor"]["top"]) <= 60
         same_pixel = abs(a["scrollTop"] - b["scrollTop"]) <= 60
         self.assertTrue(same_row or same_pixel, "the reader's place survives the reload, by the anchor row or by the scroll pixel: %r → %r" % (b, a))
         self.assertGreater(a["scrollHeight"] - a["scrollTop"] - a["clientHeight"], 200, "…and is not the bottom: %r" % a)
         self.assertFalse(a["chipHidden"], "off the bottom, the go-to-bottom chip shows")
-        self.assertEqual(len(r["noticesBefore"]), 0)
-        self.assertEqual(len(r["noticesAfterBuild"]), 1, "one notification-center line per reload: %r" % r["noticesAfterBuild"])
-        self.assertRegex(r["noticesAfterBuild"][0], r"^Reloaded onto build \d+: a newer romp build was served\.$")
-        self.assertTrue(r["settledAfterBuild"], "one reload per drift — the fresh page must not reload again: %r" % r)
-        # 3. a kernel restart of the SAME build is invisible (the user 2026-09-14): seen, counted, never a reload
+        self.assertEqual(len(r["noticesAfterReload"]), 1, "one notification-center line per reload: %r" % r["noticesAfterReload"])
+        self.assertRegex(r["noticesAfterReload"][0], r"^Reloaded onto build \d+: a newer romp build was served\.$")
+        self.assertTrue(r["settledAfterReload"], "one reload per click; the fresh page must not reload again: %r" % r)
+        self.assertFalse(r["bannerAfterReload"]["shown"], "on the current build the line is gone: %r" % r["bannerAfterReload"])
+        # 4. a same-build restart is invisible: seen, counted, no reload, no offer, no line
         self.assertTrue(r["restartSeen"], "the shell saw the new boot id: %r" % r)
-        self.assertFalse(r["reloadedOnRestart"], "a restart of the same build must not reload the page: %r" % r)
+        self.assertTrue(r["probeAfterRestart"], "a restart of the same build must not reload the page: %r" % r)
         self.assertTrue(r["freshAfterRestart"], "the chat pane redialed and landed its fresh frame: %r" % r)
-        self.assertIsNone((r["shellAfterRestart"] or {}).get("owed"), "no reload owed: %r" % r["shellAfterRestart"])
-        self.assertFalse((r["shellAfterRestart"] or {}).get("fired"))
+        self.assertIsNone((r["shellAfterRestart"] or {}).get("owed")); self.assertIsNone((r["shellAfterRestart"] or {}).get("offered"), "no offer: the same build: %r" % r["shellAfterRestart"])
+        self.assertFalse(r["bannerAfterRestart"]["shown"], "no line: %r" % r["bannerAfterRestart"])
         self.assertEqual(len(r["noticesAfterRestart"]), 1, "no new notification-center line: %r" % r["noticesAfterRestart"])
-        # 4. build drift after the reconnect still reloads (the round-two review's control)
-        self.assertTrue(r["reloadedOnDriftAfterReconnect"], "a bundle bump after a reconnect must still reload: %r" % r)
-        self.assertEqual(len(r["noticesAfterDrift"]), 2, "one more line for the drift reload: %r" % r["noticesAfterDrift"])
-        # 5. a restart onto a changed build reloads once the chat pane's redial has its first frame, held on 'fresh' until then
-        self.assertTrue(r["reloadedOnChangedBuild"], "a changed build must reload: %r" % r)
-        self.assertLess(r["changedBuildReloadMs"], 60000, "the chat pane's frame fired it, not the bound: %r" % r)
-        # the reload never fires while the chat pane awaits its frame: either the shell held on 'fresh' until the frame landed, or
-        # the pane's redial and frame beat the shell's /version poll (a small lab's kernel answers both within milliseconds)
-        self.assertEqual(r["chatAtFire"], {"fresh": False, "stamped": True}, "the chat pane's frame had landed when the reload fired: %r" % r)
-        if r["heldOnChangedBuild"] is not None:
-            self.assertEqual(r["heldOnChangedBuild"], {"b": "fresh", "reason": "restart"}, "a hold, when there was one, was the pane's: %r" % r)
-        held_lines = [n for n in r["noticesAfterChangedBuild"] if n.startswith("The dashboard will reload")]
-        self.assertEqual(len(held_lines), 1 if r["heldOnChangedBuild"] else 0, "the held wording once per hold: %r" % r["noticesAfterChangedBuild"])
-        self.assertEqual(len(r["noticesAfterChangedBuild"]) - len(held_lines), 3, "one line for the changed-build reload: %r" % r["noticesAfterChangedBuild"])
-        self.assertRegex(r["noticesAfterChangedBuild"][-1], r"the kernel restarted\.$")
-        # 6. a deploy that changed the bundle but not the kernel code reloads once, onto the new bundle
-        self.assertTrue(r["reloadedOnUiDeploy"], "a newer bundle across a same-code restart must reload once: %r" % r)
-        self.assertLess(r["uiDeployReloadMs"], 90000)
-        self.assertTrue(r["settledAfterUiDeploy"], "one reload per deploy: %r" % r)
-        self.assertEqual(len([n for n in r["noticesAfterUiDeploy"] if n.startswith("Reloaded onto build")]), 4,
-                         "one more reload line: %r" % r["noticesAfterUiDeploy"])
-        self.assertRegex(r["noticesAfterUiDeploy"][-1], r"a newer romp build was served\.$", "the reload names the bundle, not a restart: %r" % r["noticesAfterUiDeploy"])
         br, ar = r["beforeRestart"], r["afterRestart"]
         self.assertIsNotNone(ar, "the chat frame is the same document: %r" % r)
         self.assertLessEqual(abs(ar["scrollTop"] - br["scrollTop"]), 60, "the reader's place held through the restart: %r → %r" % (br, ar))
-
+        # 5. a changed build is offered, an unknown op sharpens the wording, the accept reloads
+        self.assertTrue(r["offerOnChangedBuild"], "a restart onto a changed build stands the offer: %r" % r)
+        self.assertEqual(r["bannerChangedBuild"]["text"], OFFER)
+        self.assertTrue(r["probeAfterChangedBuild"], "…and never reloads by itself: %r" % r)
+        self.assertEqual(((r["shellAfterChangedBuild"] or {}).get("offered") or {}).get("code"), "changed-build", "the offer names the code identity: %r" % r["shellAfterChangedBuild"])
+        self.assertEqual(len(r["noticesAfterChangedBuild"]), 1)
+        self.assertTrue(r["behindWording"], "the kernel's unknownOp refusal sharpened the line: %r" % r)
+        self.assertEqual(r["bannerBehind"]["text"], BEHIND)
+        self.assertTrue(r["probeAfterBehind"], "a refusal never reloads the page: %r" % r)
+        self.assertTrue(r["reloadedOnAccept"]); self.assertLess(r["acceptReloadMs"], 60000, "the accept lands within the fresh bound: %r" % r)
+        self.assertEqual(len(r["noticesFinal"]), 2, "one more line for the accepted reload: %r" % r["noticesFinal"])
+        self.assertRegex(r["noticesFinal"][-1], r"a newer romp build was served\.$")
+        self.assertFalse(r["bannerFinal"]["shown"], "the fresh page is on the served build: %r" % r["bannerFinal"])
 
 if __name__ == "__main__":
     unittest.main()

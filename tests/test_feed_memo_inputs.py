@@ -146,8 +146,6 @@ HELPERS = {
     "_peer_identity": ("sig", ("postal", "peers")),
     "_handoff_peer_identities": ("sig", ("peers",)),
     "jd.load_goals_shared_or_fault": ("sig", ("peers",)),               # an origin sender's store, by the peers deps
-    "_auto_nudge_data": ("sig", ("nudge",)),
-    "_nudge_times": ("sig", ("nudge",)),
     "_session_flag": ("sig", ("hide",)),
     "_card_warn_rows": ("sig", ("debug",)),
     "_cap_switch_offer": ("sig", ("row", "usage", "offer", "auth")),   # authLive, usage.json (recorded), its cap window's crossing, the key on hand
@@ -170,6 +168,8 @@ MODULE_READS = {
 
 # ── the context fields the body reads, field -> (kind, labels or note) ────────────────────────────────────
 CTX = {
+    "nudge_records": ("sig", ("nudge",)),
+    "nudge_times": ("sig", ("nudge",)),
     "now": ("clock", "handed to the placeholders and the stamp reads; every clock-derived output leaves the entry"),
     "live_map": ("sig", ("row",)),                     # tm = live_map.get(fsid): live, perm_state, since
     "cleared": ("sig", ("cleared",)),                  # `nid in cleared` per top (the session's slice)
@@ -470,6 +470,22 @@ class Census(unittest.TestCase):
 
 
 class LabelsAndDocstring(unittest.TestCase):
+    def test_nudge_snapshot_carries_every_record_field_the_card_reads(self):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(km._feed_session_entry)))
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        fields = set()
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Name) and node.id == "nrec" and isinstance(node.ctx, ast.Load)):
+                continue
+            attr = parents[node]
+            call = parents.get(attr)
+            self.assertTrue(isinstance(attr, ast.Attribute) and attr.value is node and attr.attr == "get"
+                            and isinstance(call, ast.Call) and call.func is attr and call.args
+                            and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str),
+                            "every nrec read must name a constant .get key so the snapshot census covers it")
+            fields.add(call.args[0].value)
+        self.assertEqual(set(km._FEED_NUDGE_FIELDS), fields)
+
     def test_the_label_tuple_matches_the_key_builders_documented_component_list_in_order(self):
         self.assertEqual(km._FEED_MEMO_LABELS, _documented_labels(),
                          "the docstring of _feed_session_key lists every component; the tuple must be that list")

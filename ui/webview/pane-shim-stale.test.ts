@@ -24,12 +24,13 @@ import * as vm from "node:vm";
 
 const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
 
-function shimJs(app: string, noStale = false): string {
+function shimJs(app: string, noStale = false, core = ""): string {
   const def = KERNEL.indexOf("def _shim(app, v=0, no_stale=False):");
   assert.ok(def > 0, "the shim renderer exists");
   const start = KERNEL.indexOf('return """', def) + 'return """'.length;
   // the tuple's first slot is the reload core (T265, its own executed test in tests/test_dashboard_auto_reload.py);
-  // an empty core here leaves window.__rompReload undefined, so the shim's raise takes its fallback path. The
+  // an empty core here leaves window.__rompReload undefined, so the shim's raise takes its fallback path; a `core` string
+  // stands in for it where a test drives the shim's side of the offer (2026-09-16). The
   // fourth slot is the stale opt-out the Files page renders with (no_stale=True): a JS boolean literal.
   // The second slot is the chat pane's restart-diet read (PR 1661 round two: emitted for the chat app alone); the harness's apps are not
   // chat, so it substitutes the false the other panes carry, and the dial line compiles against it.
@@ -42,8 +43,8 @@ function shimJs(app: string, noStale = false): string {
   const LABELS: Record<string, string> = { chat: "Chat", timeline: "Sessions", fleet: "Outline", feed: "Feed", files: "Files" };
   const label = LABELS[app] || app.charAt(0).toUpperCase() + app.slice(1);
   const args = slice.includes('var LABEL="%s"')
-    ? ["", "var RESTART_DIET=false;", app, label, "5", noStale ? "true" : "false", app, app]
-    : ["", "var RESTART_DIET=false;", app, "5", noStale ? "true" : "false", app, app];
+    ? [core, "var RESTART_DIET=false;", app, label, "5", noStale ? "true" : "false", app, app]
+    : [core, "var RESTART_DIET=false;", app, "5", noStale ? "true" : "false", app, app];
   let i = 0;
   return slice.replace(/%[sd]/g, () => args[i++]).replace(/%%/g, "%");
 }
@@ -87,7 +88,7 @@ class Harness {
         visibilityState: "visible", getElementById: (id: string) => (id === "romp-stale-self" ? h.liveBar : null),
         // enough of a DOM for a standalone page's bar (selfBar): elements that take children and text, a body that holds ONE
         // bar at a time (the id slot), and removal
-        createElement: () => { const el: any = { style: {}, dataset: {}, children: [] as any[], textContent: "", appendChild(c: any) { el.children.push(c); }, remove() { if (h.liveBar === el) h.liveBar = null; } }; return el; },
+        createElement: () => { const el: any = { style: {}, dataset: {}, children: [] as any[], textContent: "", appendChild(c: any) { el.children.push(c); }, remove() { if (h.liveBar === el) h.liveBar = null; }, get firstChild() { return el.children[0] || null; } }; return el; },
         body: { appendChild: (b: any) => { h.liveBar = b; h.bars.push({ text: (b.children[0] || {}).textContent, kind: b.dataset.kind, buttons: b.children.slice(1).map((c: any) => c.textContent) }); } },
       },
       localStorage: { getItem: () => null, setItem: () => {} },
@@ -561,4 +562,61 @@ test("a standalone page consumes a kept loss record that is not a record, and sh
   const session = new Map<string, string>([["romp:sendsDropped", JSON.stringify({ text: "kept for another path", path: "/feed" })]]);
   const h = new Harness(shimJs("chat"), { standalone: true, session, pathname: "/chat" });
   assert.equal(h.bars.length, 0); assert.equal(session.has("romp:sendsDropped"), true, "a record for another path is kept for it");
+});
+
+// The reload OFFER on a standalone page (the user 2026-09-16: a newer build is offered, never taken; a same-build restart is
+// invisible). The shim installs the reload core's offer hook and renders the one bar, kind "offer", with Reload (the core's
+// accept) and Not now (the core's dismiss); a wording change is written into the standing bar and null takes it down. The
+// frames the core reads ride through the shim: a keepalive's dv (noteDv), an unknownOp refusal (behind, and on to the bundle's
+// degrade path), a reloadRequired (require: the safety valve, the core's alone). The offer yields the one bar slot to the
+// connection prompt and comes back with the resync that retires it. A fake core stands in (the real one runs in
+// tests/test_dashboard_auto_reload.py); its calls are the assertions.
+const FAKE_CORE = `window.__rompReload={calls:[],offer:null,held:null,standing:null,inShell:function(){return false;},offered:function(){return this.standing;},
+noteDv:function(dv){this.calls.push(["noteDv",dv]);},behind:function(){this.calls.push(["behind"]);},require:function(w){this.calls.push(["require",w]);},
+accept:function(){this.calls.push(["accept"]);},dismiss:function(){this.calls.push(["dismiss"]);},announce:function(){},checkBoot:function(){this.calls.push(["checkBoot"]);},ended:function(){}};`;
+test("a standalone page renders the core's offer as its bar with Reload and Not now, hands the core the frames it reads, and the offer yields to the connection prompt and returns", () => {
+  const h = new Harness(shimJs("feed", false, FAKE_CORE), { standalone: true, pathname: "/feed" });
+  const R = h.win.__rompReload;
+  const live = (): any => h.liveBar;   // a fresh read: the strict asserts below narrow the field itself to null after a takedown
+  assert.equal(typeof R.offer, "function", "the shim installed the offer hook on a standalone page");
+  R.offer({ dv: 8, code: "", behind: false, text: "A newer romp build is ready." });
+  assert.deepEqual(h.bars.map((b) => [b.text, b.kind, b.buttons]), [["A newer romp build is ready.", "offer", ["Reload", "Not now"]]]);
+  R.offer({ dv: 8, code: "", behind: true, text: "a sharper line" });
+  assert.equal(live().children[0].textContent, "a sharper line", "a wording change is written into the standing bar");
+  assert.equal(h.bars.length, 1, "no second bar");
+  live().children[2].onclick();                                                       // Not now
+  assert.equal(R.calls.filter((c: any) => c[0] === "dismiss").length, 1, "Not now is the core's dismiss");
+  assert.equal(h.liveBar, null, "the bar went with the decline");
+  R.offer({ dv: 9, code: "", behind: false, text: "again" });
+  const reload = live().children[1];
+  reload.onclick();                                                                   // Reload
+  assert.equal(R.calls.filter((c: any) => c[0] === "accept").length, 1, "Reload is the core's accept: persist, then reload, through its holds");
+  assert.equal([reload.disabled, reload.textContent].join("|"), "true|Reloading\u2026", "acknowledged at once");
+  R.offer(null);
+  assert.equal(h.liveBar, null, "null takes the bar down");
+  // the frames
+  h.ws.open(); h.bundleReady();
+  h.ws.msg({ type: "ka", dv: 9 });
+  assert.equal(JSON.stringify(R.calls.filter((c: any) => c[0] === "noteDv")), JSON.stringify([["noteDv", 9]]), "the keepalive's dv rides in to the core");   // by JSON: the calls live in the sandbox's realm
+  assert.equal(h.kaReachedBundle(), false);
+  h.ws.msg({ type: "unknownOp", op: "labNoSuchOp" });
+  assert.equal(R.calls.filter((c: any) => c[0] === "behind").length, 1, "the refusal sharpens the offer");
+  assert.equal(h.toBundle.filter((m) => m && m.type === "unknownOp").length, 1, "and reaches the bundle's degrade path");
+  h.ws.msg({ type: "reloadRequired", why: "a wire change" });
+  assert.equal(JSON.stringify(R.calls.filter((c: any) => c[0] === "require")), JSON.stringify([["require", "a wire change"]]), "the safety valve is the core's");
+  assert.equal(h.toBundle.filter((m) => m && m.type === "reloadRequired").length, 0, "and never the bundle's");
+  // the one slot: the offer yields to the connection prompt and comes back with the resync
+  R.standing = { dv: 9, code: "", behind: false, text: "again" };
+  R.offer(R.standing);
+  assert.equal(live().dataset.kind, "offer");
+  h.ws.close(); h.runTimers(); h.ws.open();
+  h.ws.msg({ type: "ka", dv: 9 }); h.ws.msg({ type: "ka", dv: 9 });                  // the second keepalive with no resync: the prompt
+  assert.equal(live().dataset.kind, "conn", "the connection prompt took the slot");
+  h.ws.msg({ type: "feed", asks: [] });                                               // the resync retires it
+  assert.ok(live(), "and the offer came back");
+  const back = h.bars[h.bars.length - 1];                                             // the comeback is a bar raised anew: the log's last entry
+  assert.equal(back.kind + "|" + back.text, "offer|again");
+  // a page in the shell installs no hook: the shell's banner speaks
+  const inShell = new Harness(shimJs("feed", false, FAKE_CORE.replace("return false;", "return true;")));
+  assert.equal(inShell.win.__rompReload.offer, null, "in a shell the pane renders no bar of its own");
 });

@@ -144,6 +144,8 @@ class WiringPins(unittest.TestCase):
 
 class SharedViewInBuilds(unittest.TestCase):
     def setUp(self):
+        # the compaction sweep reads liveness for its owner list (2026-09-15): answer nothing, never build a backend here
+        self._saved_live_map, km._live_map = km._live_map, (lambda: {})
         self.td = tempfile.TemporaryDirectory()
         self.saved_state = jd.STATE
         jd._rebind_state(Path(self.td.name))         # clears the cache and lifts any earlier off switch
@@ -167,6 +169,7 @@ class SharedViewInBuilds(unittest.TestCase):
         self.stats0 = jd.shared_store_stats()
 
     def tearDown(self):
+        km._live_map = self._saved_live_map
         for nm, v in self.saved.items():
             setattr(km, nm, v)
         jd.discover = self.saved_discover

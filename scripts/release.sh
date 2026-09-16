@@ -183,18 +183,19 @@ if [ "$current" != "$target" ]; then
         # Every PR on the upstream carries exactly one tier label (docs / fix / feature /
         # major-feature), and a required check holds an unlabeled PR red, so auto-merge would
         # never fire and the release would stall one step after opening it. A version bump is
-        # repo plumbing with no behavior change - but tier 0 (`docs`, renamed from tests-only on
-        # 2026-09-07 with the tier POLICY, a required "Tier policy" check) is documentation ONLY,
-        # and this PR touches VERSION, so wearing tier 0 it is held red by the file check itself -
-        # no approval or seven-day clock applies until it wears another tier. It stays held until
-        # the maintainers decide (relabel it `fix`, or write an explicit allow-list into the policy).
-        # The label below is the tier-0 label AS IT EXISTS upstream today: `gh pr create --label`
-        # resolves the name on the server and fails after the version branch is pushed if it does
-        # not exist, and the rename to `docs` is the maintainers' step. Both checks read `tests-only`
-        # as `docs` in the meantime; switch this line when the label is renamed.
+        # repo plumbing with no behavior change, so it wears tier 0, `docs`: the tier policy treats
+        # docs and fix as ONE tier that merges on green for every author, with no rule on which
+        # files a docs PR may touch (scripts/ci/tier_policy.py, ON_GREEN). The label is resolved on
+        # the server by `gh pr create --label`, so it must be a label the repository HAS: the
+        # pre-rename spelling `tests-only` is now only a body alias, and naming it here failed the
+        # cut of v0.16.0 one step after the version branch was pushed (2026-09-16). The body carries
+        # the same tier as a `Tier:` line, the road a contributor who cannot label uses, so the tier
+        # workflow can apply the label itself should the label name move again.
         pr_url="$("$GH" pr create --repo "$UPSTREAM" --title "VERSION $target" \
-            --label tests-only \
-            --body "Version bump for \`$tag\`, opened by scripts/release.sh.")" \
+            --label docs \
+            --body "Version bump for \`$tag\`, opened by scripts/release.sh.
+
+Tier: docs")" \
             || die "could not open the version PR."
         pr="${pr_url##*/}"
         case "$pr" in

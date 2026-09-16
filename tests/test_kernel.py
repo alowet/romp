@@ -112,6 +112,7 @@ class ViewBuilder(unittest.TestCase):
         km._autonudge_cache.clear()
         km._goals_snap_owned.clear()                   # the memo tests assume no punch state or user-write
         km._user_goal_write.pop(SID, None)             # mark left by another test (both process-global)
+        km._goals_memo_unowned = set()                 # …nor a sweep's unowned ruling: the sids recur across tests
         # sandbox the system-card's global CLAUDE.md to a nonexistent temp path so a real ~/.claude/CLAUDE.md
         # on the dev machine can't leak a "system context" card into these fixtures (the synthetic transcript
         # carries no cwd/model/branch either, so no card is emitted — system-card behavior is tested in
@@ -5388,8 +5389,9 @@ class ViewBuilder(unittest.TestCase):
         # The memo had no cap: every store the directory held stayed decoded in memory between passes (tens
         # of MB on a large board; the PR that added it asked whether that was welcome). The compaction sweep,
         # run after the tiers on the same producer thread, drops the entries of stores no session in the
-        # discover set owns; the price is one decode at the next pass for such a store the pass still lists
-        # (review find, 2026-09-08).
+        # discover set owns (review find, 2026-09-08), and rules them out of the next pass: the first version
+        # let the pass list and decode such a store again, so an orphan store was decoded and evicted every
+        # pass, forever (review find, 2026-09-15; tests/test_goals_pass_unowned.py has the whole cycle).
         other = self._publish_store(self.OTHER_SID, {"rompUuid": self.OTHER_SID, "seq": 0, "nodes": {},
                                                      "placements": {}, "status": {}})
         mine = str(jd.GOALDIR / (SID + ".json"))
@@ -5409,13 +5411,14 @@ class ViewBuilder(unittest.TestCase):
         try:
             km._begin_goals_pass()
             try:
-                self.assertEqual(len(calls), 1, "the price: the evicted store is decoded again next pass")
-                self.assertEqual(km._feed_goals(self.OTHER_SID)["seq"], 0, "…and served as before")
+                self.assertEqual(len(calls), 0, "the sweep's ruling is the pass's skip list: no decode of the unowned store")
+                self.assertNotIn(self.OTHER_SID, km._goals_snap[0], "…and no snapshot entry")
+                self.assertEqual(km._feed_goals(self.OTHER_SID)["seq"], 0, "…so it is served live, as any sid absent from the snapshot")
             finally:
                 km._end_goals_pass()
         finally:
             km._goals_memo_decode = real
-        self.assertEqual(set(km._goals_memo[0]), {mine, str(other)})
+        self.assertEqual(set(km._goals_memo[0]), {mine}, "…and it gets no memo entry either")
 
     # Each component of the memo key is load-bearing on its own, and none of the tests above pins one:
     # they publish by rename AND change the content's length, so every version differs in two components

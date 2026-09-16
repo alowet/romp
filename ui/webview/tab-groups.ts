@@ -613,9 +613,13 @@ export interface StripPlan {
 
 /** The strip PLAN render.ts paints, pure so the rule executes in node tests.
  *  - `phone`: the kernel's phone chat page hides the strip and builds its own session list by scraping
- *    every rendered tab; it has no header to unfold and no switch, so a folded section there made its
- *    sessions unreachable (`archived` starts folded). Sectioning is DESKTOP-ONLY: on the phone layout
- *    the plan is the flat strip, always — every visible id, nothing folded.
+ *    the strip's children in order (kernel.py _CHAT_MOBILE_JS: a heading row per group header, a row per
+ *    tab copy, a divider at the trail). It SECTIONS like the desktop (the user 2026-09-16, whose phone
+ *    listed the sessions in the raw view order while the desktop grouped them by tag: the two must read
+ *    the same), but NOTHING FOLDS there: the picker's heading is a label, not a fold control, and the
+ *    picker is the phone's only switcher, so a folded section there made its sessions unreachable
+ *    (`archived` starts folded). Every member renders under its header, `folded` stays empty, and a pin
+ *    has nothing to show through.
  *  - `pending`: a provisional tab (a create in flight) with the tags the request named. It renders
  *    under every one of them from the first paint — the way the kernel's frame will place it — instead
  *    of landing in the untagged trail and jumping when the frame arrives.
@@ -641,7 +645,7 @@ export function planStrip(visibleIds: readonly string[], unions: readonly TagUni
     u = unions.map((x) => (pending.tags.includes(x.name) && !x.members.includes(pending.id)
       ? { ...x, members: [...x.members, pending.id] } : x));
   }
-  const sectioned = !phone && st.on && anySectioned(visibleIds, u);
+  const sectioned = st.on && anySectioned(visibleIds, u);
   const items: StripItem[] = [];
   const folded = new Set<string>();
   if (!sectioned) {
@@ -650,7 +654,9 @@ export function planStrip(visibleIds: readonly string[], unions: readonly TagUni
   }
   const secs = sectionTabs(visibleIds, u);
   // does this section put a copy of `id` on the strip: open, or folded with the copy pinned through the fold
-  const shows = (sec: TabSection, id: string): boolean => sec.name === null || !isSectionCollapsed(st, sec.name) || isPinned(st, sec, id);
+  // a section's fold as this plan renders it: never the trail's, and never on the phone (above)
+  const foldOf = (sec: TabSection): boolean => !phone && sec.name !== null && isSectionCollapsed(st, sec.name);
+  const shows = (sec: TabSection, id: string): boolean => !foldOf(sec) || isPinned(st, sec, id);
   const holders = activeId !== null ? secs.filter((sec) => sec.ids.includes(activeId)) : [];
   const shownSomewhere = activeId !== null && holders.some((sec) => shows(sec, activeId));
   for (const sec of secs) {
@@ -659,7 +665,7 @@ export function planStrip(visibleIds: readonly string[], unions: readonly TagUni
     // header is the hidden tab's stand-in). No fold is forced open here: the active tab's section folds
     // like any other
     const active = activeId !== null && holders.includes(sec) && (shows(sec, activeId) || (!shownSomewhere && sec === holders[0]));
-    const f = sec.name !== null && isSectionCollapsed(st, sec.name);
+    const f = foldOf(sec);
     const hidden = f ? sec.ids.filter((id) => !isPinned(st, sec, id)) : [];
     items.push({ head: sec, folded: f, active, hidden });
     for (const id of sec.ids) { if (hidden.includes(id)) folded.add(id); else items.push({ id }); }

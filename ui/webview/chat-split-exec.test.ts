@@ -83,6 +83,7 @@ function world(o: { col?: string; sets?: ColSets | null; tabOrderSeen?: boolean;
     const peekId = null; const chatVisible = () => true;
     const setTimeout = (f) => { HOOKS.timers.push(f); return HOOKS.timers.length; };
     const setActive = (id) => { HOOKS.activated.push(id); activeId = id; };
+    const silentActivate = (id) => { HOOKS.activated.push(id); activeId = id; };   // the shown-tab fallback activates SILENTLY (no shell focus hop); this exec tests WHEN it fires
     const drafts = new Map(), composerCitations = new Map(), composerFiles = new Map(); const stagedMsgs = new StagedStack();
     const persistDrafts = () => { HOOKS.persisted++; }; const loadComposerFor = (sid) => { HOOKS.loaded.push(sid); };
   `;
@@ -452,4 +453,82 @@ test("the user's own cross empties the column at once and is named (crossed), so
   b.api.frame([WEB, API, TESTS], T3, { freshHost: "" }, [WEB, API, TESTS]);
   b.api.cross(API); b.api.cross(TESTS);
   assert.deepEqual(b.HOOKS.posts, [{ romp: "colEmpty", gone: [API, TESTS], crossed: [API, TESTS] }], "two crosses: both named");
+});
+
+// THE IDLE SIGNAL. The shell's reconcile of another dashboard tab's write closed a dropped column outright, its `keep`
+// passing close()'s busy gate, so a peer closing a column tore this tab's column down over a create in flight and the
+// queued text died with the document. The shell defers that close now (tests/test_chat_split.py runs it) and waits for
+// {romp:'colBusy', busy:false}: said by noteColumnIdle once per transition to idle, when the create resolves or is dropped
+// with no failed one standing, and when the last failed one is discarded; never from the first column, which does not
+// close. dropProvisional, failProvisional, cancelProvisional and closeTabLocally run as written, over stubs.
+const PROV2 = "new-def456";
+function idleWorld(o: { col?: string; provisionalId?: string | null; failed?: string[] }) {
+  const posts: Record<string, unknown>[] = [];
+  const win = { parent: { postMessage(m: Record<string, unknown>) { posts.push(m); } }, frameElement: { id: "f-chat-" + (o.col || "1") } };
+  const js = requireCjs("esbuild").transformSync(
+    [fn("noteColumnIdle"), fn("dropProvisional"), fn("failProvisional"), fn("cancelProvisional"), fn("closeTabLocally")].join("\n"), { loader: "ts" }).code;
+  const prelude = `
+    const { isProvisionalId } = W;
+    const COL = W.col;
+    let provisionalId = W.provisionalId, provisionalTags = [], pendingNewSession = W.provisionalId ? "api" : null, provisionalTimer = undefined, activeId = null;
+    const provisionalQueue = [], drafts = new Map(), pendingSent = new Map(), closingTabs = new Map(), sessions = new Map(), dismissed = [], confirms = [];
+    const failedProvisionals = new Set(W.failed || []);
+    const document = { getElementById: () => null };
+    const clearTimeout = () => {};
+    const dismissSession = (id) => { dismissed.push(id); };
+    const setActive = (id) => { activeId = id; };
+    const persistDrafts = () => {}; const growComposer = () => {}; const renderTabs = () => {};
+    const showConfirm = (title) => { confirms.push(title); };
+    const vscodeApi = null;
+  `;
+  const epilogue = `
+    return { dropProvisional, failProvisional, closeTabLocally,
+             state: () => ({ provisionalId, failed: [...failedProvisionals], dismissed: dismissed.slice(), confirms: confirms.slice() }) };
+  `;
+  const make = new Function("W", "window", prelude + js + epilogue) as (w: unknown, win: unknown) => {
+    dropProvisional: () => void; failProvisional: (why: string) => void; closeTabLocally: (id: string) => void;
+    state: () => { provisionalId: string | null; failed: string[]; dismissed: string[]; confirms: string[] } };
+  const api = make({ isProvisionalId, col: o.col || "", provisionalId: o.provisionalId ?? null, failed: o.failed || [] }, win);
+  return { api, posts };
+}
+
+test("the idle signal: dropping the create in flight posts colBusy:false once; a failed create keeps the column busy until its discard, which posts it; the first column never posts", () => {
+  const a = idleWorld({ col: "2", provisionalId: PROV });
+  a.api.dropProvisional();
+  assert.deepEqual(a.posts, [{ romp: "colBusy", busy: false }], "the create resolved or was cancelled: idle, said once");
+  a.api.dropProvisional();
+  assert.equal(a.posts.length, 1, "no create to drop: no transition, nothing said");
+  // a failure keeps the text in its tab: the column stays busy until the ✕ discards it
+  const b = idleWorld({ col: "2", provisionalId: PROV });
+  b.api.failProvisional("nothing came back");
+  assert.deepEqual(b.posts, [], "a failed create still holds its text: not idle");
+  assert.deepEqual(b.api.state().failed, [PROV]); assert.equal(b.api.state().confirms.length, 1);
+  b.api.dropProvisional();
+  assert.deepEqual(b.posts, [], "nothing in flight to drop, the failed one standing: nothing said");
+  b.api.closeTabLocally(PROV);
+  assert.deepEqual(b.posts, [{ romp: "colBusy", busy: false }], "its ✕ discards it: idle, said once");
+  assert.deepEqual(b.api.state().failed, []); assert.deepEqual(b.api.state().dismissed, [PROV]);
+  // two failed tabs: idle when the LAST goes
+  const c = idleWorld({ col: "3", failed: [PROV, PROV2] });
+  c.api.closeTabLocally(PROV);
+  assert.deepEqual(c.posts, [], "one failed tab still stands");
+  c.api.closeTabLocally(PROV2);
+  assert.deepEqual(c.posts, [{ romp: "colBusy", busy: false }]);
+  // the ✕ on the create in flight itself: cancelProvisional drops it, one post
+  const d = idleWorld({ col: "2", provisionalId: PROV });
+  d.api.closeTabLocally(PROV);
+  assert.deepEqual(d.posts, [{ romp: "colBusy", busy: false }]);
+  assert.deepEqual(d.api.state().dismissed, [PROV]);
+  // a create dropped while a failed one stands: nothing said
+  const e = idleWorld({ col: "2", provisionalId: PROV2, failed: [PROV] });
+  e.api.dropProvisional();
+  assert.deepEqual(e.posts, [], "the failed tab keeps the column busy");
+  // the first column never closes, so it never says it
+  const f = idleWorld({ col: "", provisionalId: PROV });
+  f.api.dropProvisional();
+  assert.deepEqual(f.posts, []);
+  // a real session's ✕ is not the create's road
+  const g = idleWorld({ col: "2" });
+  g.api.closeTabLocally(API);
+  assert.deepEqual(g.posts, []); assert.deepEqual(g.api.state().dismissed, [API]);
 });

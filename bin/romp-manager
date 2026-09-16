@@ -327,13 +327,18 @@ function spawnKernel(spec) {
     quickCrashes: prev ? prev.quickCrashes : 0,
     startedAt: Date.now(), stopping: false,
     requested: null,          // when restartKernel SIGTERMed this child (exitLine: asked vs not)
-  });
+    inflight: prev && prev.inflight ? 'spawned' : null,   // a restart in flight moves to its second phase: the successor is up,
+    trail: prev ? prev.trail || null : null,              //  not yet answering; a trailing request, if one was kept, fires when it is
+  });                                                     // (the storm gate's history is NOT carried: a completed restart is a fresh record)
+  if (prev && prev.inflight) awaitReady(spec.id, child);
   log(`kernel '${spec.id}' → :${spec.port} (pid ${child.pid})`);
   child.on('error', (e) => log(`kernel '${spec.id}' spawn error: ${e.message}`));
   child.on('exit', (code, sig) => {
     const cur = kernels.get(spec.id);
     if (!cur || cur.child !== child) return;                 // already superseded by a fresh spawn
     if (cur.stopping) { kernels.delete(spec.id); log(exitLine(cur, code, sig, 0).line); return; }
+    cur.inflight = inflightAfterExit(cur.inflight);          // a successor that died booting ends the flight (round two, high 1)
+    if (cur.inflight === null && cur.trail) { cur.trail = null; }   // its trailing restart is moot: the respawn loads the disk as it stands
     cur.restarts++;
     // crash-loop? back off. A healthy run (uptime ≥ QUICK_CRASH_MS) resets the counter.
     cur.quickCrashes = (Date.now() - cur.startedAt) < QUICK_CRASH_MS ? cur.quickCrashes + 1 : 0;
@@ -350,6 +355,62 @@ function spawnKernel(spec) {
 
 // /ensure's worker: return the kernel for `port` if the manager already owns one, else spawn it.
 // This is how a front end (configured for a port) gets a kernel there without owning the process.
+// The successor answers its port: the restart in flight is over (the event the fold keys on). Probed with the
+// same /busy read the quiet window uses; while it does not answer the probe is asked again after READY_PROBE_MS,
+// bounded by the successor's exit (a child that leaves before answering ends the probe, and its exit handler
+// ends the flight). The probe's cadence is the one clock here: the kernel's readiness has no push to the
+// manager yet (its stdout is inherited, not piped), so the port is asked.
+function awaitReady(id, child) {
+  const rec = kernels.get(id);
+  if (!rec || rec.child !== child) return;
+  let acted = false;                                       // fetchBusy fires its callback twice on a timeout (destroy, then the
+  fetchBusy(rec.spec.port, (n) => {                        //  request's own error): one probe, one act, else the probes double
+    if (acted) return;
+    acted = true;
+    const cur = kernels.get(id);
+    if (!cur || cur.child !== child) return;
+    if (n === null) {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      setTimeout(() => awaitReady(id, child), READY_PROBE_MS);
+      return;
+    }
+    cur.inflight = null;
+    const trail = cur.trail;
+    cur.trail = null;
+    fetchVersion(cur.spec.port, (v) => {                   // the kernel's own verdict on EVERY answer, trail or none (round three): its
+      const c2 = kernels.get(id);                          //  booted code identity against the disk (kernel.py _restart_pending). True:
+      if (!c2 || c2.child !== child) return;               //  a restart, since the disk moved after this kernel loaded its code (the
+      const pending = v ? v.restart_pending : null;        //  leaving kernel's pull, a push during the boot); false: a pending trail is
+      if (pending === true) {                              //  current and dropped; unreadable: a pending trail restarts (none is lost),
+        log(`kernel '${id}': the new kernel answers and its disk holds code it does not run; restarting it (${trail || 'successor-behind-disk'})`);
+        restartKernel(id, trail || 'successor-behind-disk');
+        return;
+      }
+      if (!trail) return;
+      if (pending === false) {
+        log(`kernel '${id}': the new kernel answers and runs the disk's code; the trailing restart (${trail}) is current and dropped`);
+        auditNote(c2.spec, 'restart-trailing-current', { trigger: trail, pid: child.pid });
+        return;
+      }
+      log(`kernel '${id}': the new kernel answers (no verdict read); sending the trailing restart (${trail})`);
+      restartKernel(id, trail);
+    });
+  });
+}
+
+// GET /version on a kernel: the JSON body, or null when it did not answer (auth-exempt, polled by every reader).
+function fetchVersion(port, cb) {
+  let done = false;                                        // one answer per ask: a timeout destroys the request, which then errors too
+  const once = (v) => { if (done) return; done = true; cb(v); };
+  const req = http.get({ host: HOST, port, path: '/version', timeout: 5000 }, (res) => {
+    let b = ''; res.on('data', (d) => (b += d));
+    res.on('end', () => { try { once(JSON.parse(b)); } catch { once(null); } });
+  });
+  req.on('timeout', () => { req.destroy(); once(null); });
+  req.on('error', () => once(null));
+}
+const READY_PROBE_MS = Number(process.env.ROMP_READY_PROBE_MS) || 500;   // the probe's retry while the new kernel boots
+
 function ensureKernel(port) {
   const id = idForPort(port);
   const existing = kernels.get(id);
@@ -369,6 +430,26 @@ function restartGate(st, now, opts) {
     return { action: 'coalesce', scheduleIn: minGap - (now - st.last), inStorm, last: st.last, history };
   }
   return { action: 'restart', scheduleIn: 0, inStorm, last: now, history: [...history, now] };
+}
+
+// A restart IN FLIGHT is an event, not a window (2026-09-15: the kernel's own converge and a peer's push
+// asked restart-all three seconds apart, and the second SIGTERM killed a kernel two seconds old). From
+// the SIGTERM until the successor is spawned, a second request changes nothing the successor will not
+// already load from disk: it is FOLDED into the restart in flight. From the spawn until the successor
+// answers its port, the checkout may have moved after the code the successor loaded: the request is
+// kept as ONE trailing restart, sent when the successor is ready. Pure on the record's inflight phase
+// ('signaled' | 'spawned' | null), unit-tested in tests/manager-fold.test.js.
+function inflightGate(phase, trailPending = false) {
+  if (phase === 'signaled') return 'fold';
+  if (phase === 'spawned') return trailPending ? 'restart' : 'trail';   // a second ask during one boot is new information: a
+  return 'restart';                                                      //  person asking twice recovers a hung boot (round two)
+}
+
+// The phase after the kernel's child exited: a successor that dies while booting ('spawned') ends the flight, so the
+// respawn starts clean and the next request restarts; a restart this manager asked for ('signaled') keeps its phase,
+// since the exit IS that restart's first half. Pure on the record's phase.
+function inflightAfterExit(phase) {
+  return phase === 'signaled' ? 'signaled' : null;
 }
 
 const STORM_OPTS = { coalesceMs: RESTART_COALESCE_MS, stormWindowMs: STORM_WINDOW_MS,
@@ -398,9 +479,39 @@ function termThenKill(rec) {
   }, SHUTDOWN_GRACE_MS);
 }
 
+function auditNote(spec, action, extra) {
+  // The manager's own note of a decision that sends no signal (a folded or trailing request): the same
+  // ledger as auditSigterm, an action the kernel's audit walk skips (_NO_RESTART_ACTIONS in kernel.py).
+  try {
+    const root = (spec && spec.stateDir) || STATE_ROOT;
+    fs.mkdirSync(root, { recursive: true });
+    fs.appendFileSync(path.join(root, 'restart-audit.jsonl'),
+      JSON.stringify(Object.assign({ t: Math.floor(Date.now() / 1000), action, kernel: spec.id }, extra || {})) + '\n');
+  } catch (e) { /* a lost note, not a lost decision */ }
+}
+
 function restartKernel(id, trigger = 'restart') {
   const rec = kernels.get(id);
   if (!rec) return false;
+  const fold = inflightGate(rec.inflight, !!rec.trail);
+  if (fold === 'fold') {           // a restart is in flight and its successor is not yet spawned: this request rides it
+    rec.folded = (rec.folded || 0) + 1;
+    log(`kernel '${id}': restart (${trigger}) folded into the one in flight (pid ${rec.child && rec.child.pid} signaled, successor not yet spawned)`);
+    auditNote(rec.spec, 'restart-folded', { trigger, into: rec.child && rec.child.pid });
+    rec.lastAnswer = 'folded';
+    return 'folded';
+  }
+  if (fold === 'trail') {          // the successor is up but not yet answering: one trailing restart once it is
+    rec.trail = trigger;
+    log(`kernel '${id}': restart (${trigger}) kept as one trailing restart until the new kernel (pid ${rec.child && rec.child.pid}) answers`);
+    auditNote(rec.spec, 'restart-trailing', { trigger, after: rec.child && rec.child.pid });
+    rec.lastAnswer = 'trailing';
+    return 'trailing';
+  }
+  if (rec.trail) {                 // a second ask while a trail is pending: the ordinary restart below, the trail consumed by it
+    log(`kernel '${id}': a second restart request (${trigger}) during one boot restarts the new kernel now (the trailing ${rec.trail} rides it)`);
+    rec.trail = null;
+  }
   rec._rs = rec._rs || { last: null, history: [] };
   const g = restartGate(rec._rs, Date.now(), STORM_OPTS);
   rec._rs.last = g.last;
@@ -416,6 +527,8 @@ function restartKernel(id, trigger = 'restart') {
   rec._stormLogged = false;
   rec.stopping = false;          // ensure the exit handler RESPAWNS rather than reaps
   rec.requested = Date.now();    // ...and knows this exit was asked for (exitLine)
+  rec.inflight = 'signaled';     // the restart is in flight from here until the successor answers (inflightGate)
+  rec.lastAnswer = 'restarted';
   auditSigterm(rec.spec, rec.child.pid, 'restart', trigger);   // the row BEFORE the signal: the kernel reads it on SIGTERM
   termThenKill(rec);             // the exit handler spawns a fresh one (romp-serve rebuilds if stale)
   return true;
@@ -423,9 +536,24 @@ function restartKernel(id, trigger = 'restart') {
 
 // Restart EVERY kernel the manager owns — the `romp refresh` action (loops the registry, not just
 // 'main'). Returns the ids it kicked, so the caller can report them.
-function restartAll(trigger = 'restart-all') {
+// The single-kernel /restart answer: restarted, or folded / trailing when the request rode a restart in flight (the
+// same words /restart-all carries in `folded`), read off the record the request just moved.
+function restartAnswer(kid) {
+  const rec = kernels.get(kid);
+  const how = rec && rec.lastAnswer;
+  return Object.assign({ ok: true, restarted: kid }, how && how !== 'restarted' ? { [how]: true } : {});
+}
+
+function restartAll(trigger = 'restart-all', out = null) {
   const ids = [...kernels.keys()];
-  for (const id of ids) restartKernel(id, trigger);
+  const signaled = [], folded = [], trailing = [];
+  for (const id of ids) {
+    const r = restartKernel(id, trigger);
+    if (r === 'folded') folded.push(id);             // rode a restart already in flight (inflightGate)
+    else if (r === 'trailing') trailing.push(id);    // kept for the successor's answer
+    else if (r) signaled.push(id);                   // a SIGTERM went out
+  }
+  if (out) Object.assign(out, { signaled, folded, trailing });   // for the handler's answer; the ids array stays a plain list
   return ids;
 }
 
@@ -443,7 +571,9 @@ function restartAllOrSelf() {
   if (managerStale()) {
     log('WARNING: bin/romp-manager changed since this manager started — respawned kernels inherit STALE manager defaults. Restart the manager to load the new one: Ctrl+C + `romp on`, or `romp-service install`.');
   }
-  return { self: false, ids: restartAll() };
+  const out = {};
+  const ids = restartAll('restart-all', out);
+  return { self: false, ids, signaled: out.signaled, folded: out.folded, trailing: out.trailing };
 }
 
 // ── quiet-window deferral (deploy refreshes) ────────────────────────────────
@@ -818,7 +948,8 @@ function startManager() {
       }
       clearPendingQuiet();                                       // this bounce delivers any pending deploy too
       const r = restartAllOrSelf();                              // `romp refresh` — every kernel
-      return json(200, { ok: true, restarted: r.ids, managerRestart: r.self });
+      return json(200, { ok: true, restarted: r.self ? r.ids : (r.signaled || []), managerRestart: r.self,   // restarted: a signal went out
+                         folded: r.folded || [], trailing: r.trailing || [] });                            // the rest rode a flight
     }
     if (req.method === 'POST' && url.pathname === '/restart') {
       log(`restart '${kid}' requested (${url.searchParams.get('when') === 'quiet' ? 'deferred to quiet window' : 'IMMEDIATE'}) from ${req.socket.remoteAddress || '?'}`);
@@ -829,7 +960,7 @@ function startManager() {
       clearPendingQuiet();                                       // the dashboard ↻ satisfies a pending deploy in passing
       if (!kernels.has(kid)) return json(404, { ok: false, error: `no kernel '${kid}'` });
       if (staleManagerYields(`restarting kernel '${kid}'`)) return json(200, { ok: true, restarted: kid, managerRestart: true });
-      return restartKernel(kid) ? json(200, { ok: true, restarted: kid }) : json(404, { ok: false, error: `no kernel '${kid}'` });
+      return restartKernel(kid) ? json(200, restartAnswer(kid)) : json(404, { ok: false, error: `no kernel '${kid}'` });
     }
     if (req.method === 'POST' && url.pathname === '/stop') {
       if (url.searchParams.has('kernel')) {
@@ -907,7 +1038,8 @@ module.exports = { restartGate, quietGate, quietTick, loadSpecs, specEnv, fileSt
                    quietWindowRow, auditQuietWindow,
                    // the SIGTERM wiring, for tests that seed `kernels` with a stand-in child or point
                    // ROMP_SERVE_BIN at a stand-in launcher
-                   restartKernel, restartAll, restartAllOrSelf, stopKernel, shutdownAll, stopTrigger, spawnKernel, kernels };
+                   restartKernel, restartAll, restartAllOrSelf, stopKernel, shutdownAll, stopTrigger, spawnKernel, kernels,
+                   inflightGate, inflightAfterExit, auditNote, awaitReady, fetchVersion, restartAnswer };
 if (require.main === module) {
   const cmd = process.argv[2];
   // `restart-all` (the `romp refresh` deploy path) bounces IMMEDIATELY by default (T160, the user

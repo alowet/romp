@@ -438,11 +438,13 @@ class KernelRearmWiring(unittest.TestCase):
     def test_producer_consumes_the_health_edge_after_the_tier_join(self):
         import inspect
         src = inspect.getsource(self.km._producer)
-        i_join = src.index("t.join()")
-        i_edge = src.index("consume_judge_recovery")
+        i_join = src.index("res = jd.run_pass(")          # the barrier (t.join()) lives inside the shared pass body since stage three
+        i_edge = src.index("consume_judge_recovery")      #  round two; the body returns only after both tiers joined
         self.assertGreater(i_edge, i_join,
-                           "the edge is consumed AFTER the join — the single-writer window, so the "
+                           "the edge is consumed AFTER the pass body returned (the join inside it): the single-writer window, so the "
                            "re-arm's store writes can't race the judge worker threads")
+        body = inspect.getsource(self.km.jd.run_pass)
+        self.assertLess(body.index("t.join()"), body.index("return {"), "the shared body joins both tiers before it returns")
         seg = src[i_edge:]
         self.assertIn("rearm_failed_summaries", seg[:400], "the consumed edge drives the auto re-arm")
         self.assertIn("auto=True", seg[:400], "the health edge is the era-bounded auto path")

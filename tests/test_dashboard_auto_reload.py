@@ -1,12 +1,17 @@
-"""The dashboard reloads ITSELF on a kernel restart and on a newer served bundle (T265).
+"""The dashboard OFFERS a reload on a newer build and never reloads itself; a restart of the same build is invisible.
 
-The user's ruling of 2026-09-08 supersedes their 2026-07-13 preference for a banner the reader clicks. The reload
-core (kernel.py _RELOAD_CORE_JS, window.__rompReload on every kernel-served page) runs here for REAL: node executes
-the IIFE between its anchors with fakes for document, window, location, sessionStorage and fetch, one process per
-scenario (the core installs once per window), and the scenario reads its state back by name. Pinned alongside:
-the wiring (the shim's raise, the shim's reconnect, the shell's socket, the stale banner's poll and fallback, the
-pages that embed the core) and the remote exclusion (federation drops remote keepalives, so a REMOTE kernel's
-restart or bundle never reaches the core). Synthetic values only."""
+Three rulings, each superseding the last: 2026-07-13 (a banner the reader clicks), 2026-09-08 (T265: the page reloads
+itself on a restart and on a newer bundle, never mid-gesture) and 2026-09-16 (the page never reloads itself: a same-build
+restart owes nothing and says nothing, a newer build is one persistent line with Reload and Not now, Not now is kept per
+build, an unknownOp refusal sharpens the wording, explicit gestures keep their reload, and a kernel that must force a
+reload sends reloadRequired). The reload core (kernel.py _RELOAD_CORE_JS, window.__rompReload on every kernel-served
+page) runs here for REAL: node executes the IIFE between its anchors with fakes for document, window, location,
+sessionStorage, localStorage and fetch, one process per scenario (the core installs once per window), and the scenario
+reads its state back by name; the offer hook's calls are recorded (OFFERS). The idle holds are exercised on an ACCEPTED
+offer (R.accept(), the user's Reload click) or on the forced request. Pinned alongside: the wiring (the shim's raise,
+the shim's reconnect, the shell's socket, the stale banner as the offer's home, the pages that embed the core) and the
+remote exclusion (federation drops remote keepalives, so a REMOTE kernel's restart or bundle never reaches the core).
+Synthetic values only."""
 import json
 import os
 import shutil
@@ -27,7 +32,7 @@ km = load_source("romp_kernel_autoreload", os.path.join(BIN, "romp-kernel"))
 # The browser the core thinks it runs in. `var` at module scope shadows node's globals; the core's own
 # `document.addEventListener` calls land in LISTENERS so a scenario can emit the gesture events by name.
 HARNESS = r"""
-var LISTENERS = {}, STORE = {}, REMOVED = [], FETCHES = [], RELOADS = 0, REFUSE = false, PERSISTED = 0, WLISTENERS = {};
+var LISTENERS = {}, STORE = {}, LOCAL = {}, OFFERS = [], REMOVED = [], FETCHES = [], RELOADS = 0, REFUSE = false, PERSISTED = 0, WLISTENERS = {};
 var SEL = { rangeCount: 0, isCollapsed: true, toString: function () { return ""; } };
 var COMPOSER = { tagName: "TEXTAREA", value: "" };              // the chat composer, one editable among any
 var FOCUSED = true;                                             // document.hasFocus()
@@ -60,6 +65,10 @@ var sessionStorage = {
   setItem: function (k, v) { STORE[k] = v; }, getItem: function (k) { return k in STORE ? STORE[k] : null; },
   removeItem: function (k) { delete STORE[k]; }
 };
+var localStorage = {                                            // the Not now's home: per build, across this browser's pages
+  setItem: function (k, v) { LOCAL[k] = v; }, getItem: function (k) { return k in LOCAL ? LOCAL[k] : null; },
+  removeItem: function (k) { delete LOCAL[k]; }
+};
 var VERSION = null;
 function fetch(u) { FETCHES.push(u); return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve(VERSION); },
   headers: { get: function (k) { return k === "X-Romp-Boot" ? HEALTH_BOOT : null; } } }); }   // ok and status: the core checks them before the body; the boot header: the restart button's poll
@@ -68,21 +77,30 @@ function wemit(t) { (WLISTENERS[t] || []).forEach(function (f) { f({}); }); }
 function tick() { return new Promise(function (r) { setTimeout(r, 0); }); }
 function state() {
   var R = window.__rompReload;
-  return { reloads: RELOADS, fired: R.fired(), owed: R.owed(), waiting: R.waiting, persisted: PERSISTED, removed: REMOVED, refusedFor: R.refusedFor(),
-           stored: STORE["romp:reloaded"] ? JSON.parse(STORE["romp:reloaded"]) : null, fetches: FETCHES.length };
+  return { reloads: RELOADS, fired: R.fired(), owed: R.owed(), offered: R.offered(), waiting: R.waiting, persisted: PERSISTED, removed: REMOVED.slice(), refusedFor: R.refusedFor(),
+           stored: STORE["romp:reloaded"] ? JSON.parse(STORE["romp:reloaded"]) : null, reason: STORE["romp:reloadReason"] ? JSON.parse(STORE["romp:reloadReason"]) : null,
+           notNow: LOCAL["romp:reloadNotNow"] ? JSON.parse(LOCAL["romp:reloadNotNow"]) : null, fetches: FETCHES.length };
 }
 function out(o) { process.stdout.write("RESULT:" + JSON.stringify(o) + "\n"); }
 """
 
 
-def run_core(scenario, v=7, boot="1.1", code="abc1234"):
+OFFER = "A newer romp build is ready."
+BEHIND = "A newer romp build is ready; this page is behind the kernel and some actions fall back to older paths until you reload."
+
+
+def run_core(scenario, v=7, boot="1.1", code="abc1234", local=None):
+    """`local`: what this browser's localStorage holds before the page loads (a Not now from an earlier page)."""
     node = shutil.which("node")
     if not node:
         raise unittest.SkipTest("node not installed")
     d = tempfile.mkdtemp(prefix="reload-core-")
     path = os.path.join(d, "core.js")
     with open(path, "w") as f:
-        f.write(HARNESS + km._reload_core_js(v, boot, code) + "\n(async function(){\n" + scenario + "\n})();\n")
+        f.write(HARNESS + ("LOCAL = %s;\n" % json.dumps({k: json.dumps(v_) for k, v_ in (local or {}).items()}))
+                + km._reload_core_js(v, boot, code)
+                + "\nif(window.__rompReload)window.__rompReload.offer=function(o){OFFERS.push(o);};\n"   # the offer hook, as the shell or a standalone pane installs one
+                + "(async function(){\n" + scenario + "\n})();\n")
     r = subprocess.run([node, path], capture_output=True, text=True, timeout=60)
     shutil.rmtree(d, ignore_errors=True)
     if r.returncode != 0:
@@ -93,15 +111,21 @@ def run_core(scenario, v=7, boot="1.1", code="abc1234"):
 
 
 class ReloadCoreExecuted(unittest.TestCase):
-    def test_a_newer_dv_reloads_at_once_when_idle_and_persists_first(self):
+    def test_a_newer_dv_is_offered_and_the_accepted_offer_reloads_at_once_when_idle_and_persists_first(self):
         s = run_core("""
 var R = window.__rompReload;
 R.noteDv(7); var same = state();          // the page's own build
 R.noteDv(5); var older = state();         // an OLDER token (a rolled-back peer) is not drift
-R.noteDv(8);
-out({ same: same, older: older, after: state() });""")
-        self.assertEqual(s["same"]["reloads"], 0)
-        self.assertEqual(s["older"]["reloads"], 0)
+R.noteDv(8); var offered = state();       // a newer one: the offer, and nothing else (2026-09-16)
+R.accept();                               // the user's Reload
+out({ same: same, older: older, offered: offered, offers: OFFERS, after: state() });""")
+        self.assertEqual(s["same"]["reloads"], 0); self.assertIsNone(s["same"]["offered"])
+        self.assertEqual(s["older"]["reloads"], 0); self.assertIsNone(s["older"]["offered"])
+        o = s["offered"]
+        self.assertEqual(o["reloads"], 0, "a newer build is offered, never taken")
+        self.assertIsNone(o["owed"], "nothing owed: no hold, no backstop, no line")
+        self.assertEqual(o["offered"], {"dv": 8, "code": "", "behind": False, "text": OFFER})
+        self.assertEqual(s["offers"], [{"dv": 8, "code": "", "behind": False, "text": OFFER}, None], "the hook saw the offer, then its retirement at the accept")
         a = s["after"]
         self.assertEqual(a["reloads"], 1)
         self.assertTrue(a["fired"])
@@ -109,58 +133,70 @@ out({ same: same, older: older, after: state() });""")
         self.assertEqual(a["stored"]["detail"], "8")
         self.assertEqual(a["stored"]["from"], 7)
         self.assertEqual(a["stored"]["path"], "/", "the marker names the page that reloaded")
+        self.assertEqual(a["reason"], {"reason": "build", "path": "/", "t": a["reason"]["t"]}, "the durable record for the chat pane's diet is written by the accepted reload")
         self.assertEqual(a["persisted"], 1, "the pane's persist hook ran before the reload")
         self.assertIn(["settings-open", "picker-open"], a["removed"], "the lifted modals close")
 
-    def test_a_restart_is_a_reopen_against_a_new_boot_id_never_a_blip(self):
+    def test_a_restart_is_a_reopen_against_a_new_boot_id_and_the_boot_id_alone_owes_nothing(self):
         s = run_core("""
 var R = window.__rompReload;
 VERSION = { boot: "1.1", dist_ver: 7 }; R.checkBoot(); await tick(); await tick(); var blip = state();
 VERSION = { boot: "2.2", dist_ver: 7 }; R.checkBoot(); await tick(); await tick();
-out({ blip: blip, after: state() });""")
+out({ blip: blip, restarted: R.restarted(), after: state(), offers: OFFERS });""")
         self.assertEqual(s["blip"]["reloads"], 0, "the same kernel answered: a socket blip, not a restart")
         self.assertEqual(s["blip"]["fetches"], 1)
-        self.assertEqual(s["after"]["reloads"], 1)
-        self.assertEqual(s["after"]["stored"]["reason"], "restart")
-        self.assertEqual(s["after"]["stored"]["detail"], "2.2")
+        self.assertEqual(s["restarted"], 1, "the new boot id is a restart, counted")
+        self.assertEqual(s["after"]["reloads"], 0, "and owes nothing by itself (2026-09-16)")
+        self.assertIsNone(s["after"]["owed"]); self.assertIsNone(s["after"]["offered"]); self.assertEqual(s["offers"], [])
 
-    def test_a_restart_with_an_unchanged_build_never_reloads(self):
-        """Invisible restarts (the user 2026-09-14): a new boot id with the SAME code identity is a restart of the code this
-        page already runs; the board stays on screen and the shim's redial carries the diet; no reload is owed."""
+    def test_a_restart_with_an_unchanged_build_never_reloads_and_never_offers(self):
+        """Invisible restarts (the user 2026-09-14, restated 2026-09-16 as the ruling's first point): a new boot id with the
+        SAME code identity and dist_ver is a restart of the build this page already runs; the board stays on screen, the
+        shim's redial carries the diet, no reload is owed, no offer stands, no hold and no line."""
         s = run_core("""
 var R = window.__rompReload;
+var held = 0; R.held = function () { held++; };
 VERSION = { boot: "2.2", dist_ver: 7, code_ident: "abc1234" }; R.checkBoot(); await tick(); await tick();
-out({ after: state(), restarted: R.restarted() });""", code="abc1234")
+VERSION = { boot: "2.2", dist_ver: 7, code_ident: "abc1234" }; R.checkBoot(); await tick(); await tick();   // the poll after the restart
+out({ after: state(), restarted: R.restarted(), offers: OFFERS, held: held, timers: TIMERS.length });""", code="abc1234")
         self.assertEqual(s["after"]["reloads"], 0, "the same build restarted: nothing to reload onto")
-        self.assertIsNone(s["after"]["owed"])
-        self.assertEqual(s["restarted"], 1, "the restart was seen and counted")
+        self.assertIsNone(s["after"]["owed"]); self.assertIsNone(s["after"]["offered"])
+        self.assertEqual(s["offers"], [], "no offer: nothing newer is served")
+        self.assertEqual(s["held"], 0, "no hold, so no notification-center line"); self.assertEqual(s["timers"], 0, "no backstop armed")
+        self.assertEqual(s["restarted"], 1, "the restart was seen and counted once; the poll after it is not another")
 
-    def test_a_restart_with_a_changed_build_reloads_once_the_reconnected_pane_has_its_first_frame(self):
+    def test_a_restart_onto_a_changed_build_is_offered_and_the_accepted_reload_waits_for_the_reconnected_panes_first_frame(self):
         s = run_core("""
 var R = window.__rompReload;
 window.__rompFreshPending = true;                       // the shim's redial is awaiting its resync frame
 window.__rompFreshPendingSince = Date.now();
-VERSION = { boot: "2.2", dist_ver: 7, code_ident: "def5678" }; R.checkBoot(); await tick(); await tick(); var held = state();
+VERSION = { boot: "2.2", dist_ver: 7, code_ident: "def5678" }; R.checkBoot(); await tick(); await tick(); var offered = state();
+R.accept(); var held = state();
 window.__rompFreshPending = false; R.ended(); await tick(); await tick();
-out({ held: held, after: state() });""", code="abc1234")
-        self.assertEqual(s["held"]["reloads"], 0, "owed but held: the reload must land on a warm kernel")
-        self.assertEqual(s["held"]["owed"]["reason"], "restart")
+out({ offered: offered, held: held, after: state() });""", code="abc1234")
+        self.assertEqual(s["offered"]["reloads"], 0, "a changed build is offered, never taken (2026-09-16)")
+        self.assertIsNone(s["offered"]["owed"])
+        self.assertEqual(s["offered"]["offered"], {"dv": 0, "code": "def5678", "behind": False, "text": OFFER}, "the offer names the code identity that changed")
+        self.assertEqual(s["held"]["reloads"], 0, "accepted but held: the reload must land on a warm kernel")
+        self.assertEqual(s["held"]["owed"], {"reason": "build", "detail": "def5678"})
         self.assertEqual(s["held"]["waiting"], "fresh")
         self.assertEqual(s["after"]["reloads"], 1, "the resync frame is the ending event")
-        self.assertEqual(s["after"]["stored"]["reason"], "restart")
-        self.assertEqual(s["after"]["stored"]["detail"], "2.2")
+        self.assertEqual(s["after"]["stored"]["reason"], "build")
+        self.assertEqual(s["after"]["stored"]["detail"], "def5678")
 
-    def test_a_version_without_a_code_identity_still_reloads_on_a_restart(self):
-        # an older kernel's /version (or a fetch that lost the field): the fail-safe is today's reload, never a silent stale page
+    def test_a_version_without_a_code_identity_decides_nothing_on_a_restart(self):
+        # a kernel whose /version carries no identity (one from before 2026-09-14; a body that lost the field) says nothing about
+        # the build: the dist_ver stands alone, and a restart never reloads (2026-09-16; before it the fail-safe was a reload)
         s = run_core("""
 var R = window.__rompReload;
 VERSION = { boot: "2.2", dist_ver: 7 }; R.checkBoot(); await tick(); await tick();
-out({ after: state() });""", code="abc1234")
-        self.assertEqual(s["after"]["reloads"], 1)
-        self.assertEqual(s["after"]["stored"]["reason"], "restart")
+out({ after: state(), restarted: R.restarted(), offers: OFFERS });""", code="abc1234")
+        self.assertEqual(s["after"]["reloads"], 0); self.assertIsNone(s["after"]["offered"]); self.assertEqual(s["offers"], [])
+        self.assertEqual(s["restarted"], 1)
 
     def test_the_fresh_hold_is_read_from_the_panes_the_shell_holds_and_a_pane_that_never_arms_it_holds_nothing(self):
-        """The shell's walk over its panes, executed over two fakes of busyHere: the chat pane holds while its flag stands, the
+        """The shell's walk over its panes, executed over two fakes of busyHere (the reload accepted from the offer the changed build
+        stood): the chat pane holds while its flag stands, the
         other pane never does, and the chat pane's ending event fires the reload. A pin, green at the round-one head: the walk
         existed there. The round-two medium (the shim arming the hold in every pane, the Files page never clearing it) has its
         red in ui/webview/pane-shim-stale.test.ts, which runs the real shim; the fakes here stand in for what that shim does."""
@@ -169,13 +205,13 @@ var R = window.__rompReload;
 var chat = { pending: true, since: Date.now() };
 IFRAMES = [pane(function () { return ''; }),                                                            // a Files pane: nothing to wait for
            pane(function () { return chat.pending && Date.now() - chat.since < 60000 ? 'fresh' : ''; })];  // the chat pane's busyHere, the core's own rule
-VERSION = { boot: "2.2", dist_ver: 7, code_ident: "def5678" }; R.checkBoot(); await tick(); await tick(); var held = state();
+VERSION = { boot: "2.2", dist_ver: 7, code_ident: "def5678" }; R.checkBoot(); await tick(); await tick(); R.accept(); var held = state();
 chat.pending = false; R.ended(); await tick(); await tick();
 out({ held: held, after: state() });""", code="abc1234")
         self.assertEqual(s["held"]["reloads"], 0)
         self.assertEqual(s["held"]["waiting"], "fresh", "the walk found the chat pane's hold")
         self.assertEqual(s["after"]["reloads"], 1, "the chat pane's frame ended it")
-        self.assertEqual(s["after"]["stored"]["detail"], "2.2")
+        self.assertEqual(s["after"]["stored"]["detail"], "def5678", "the record names the build the page lands on")
 
     def test_a_fresh_hold_older_than_the_bound_no_longer_holds_and_the_backstop_runs_the_walk_once_more(self):
         """A frame that never comes must not hold a deploy's reload forever (the round-two review): the hold is read with its
@@ -184,7 +220,7 @@ out({ held: held, after: state() });""", code="abc1234")
         s = run_core("""
 var R = window.__rompReload;
 window.__rompFreshPending = true; window.__rompFreshPendingSince = Date.now();
-VERSION = { boot: "2.2", dist_ver: 7, code_ident: "def5678" }; R.checkBoot(); await tick(); await tick(); var held = state();
+VERSION = { boot: "2.2", dist_ver: 7, code_ident: "def5678" }; R.checkBoot(); await tick(); await tick(); R.accept(); var held = state();
 var armed = TIMERS.map(function (t) { return t.ms; });
 R.tryFire(); var armedAgain = TIMERS.length;                                     // a second walk while held arms no second timer
 window.__rompFreshPendingSince = Date.now() - 60001;                              // the bound passes with the flag still up
@@ -196,11 +232,11 @@ out({ held: held, armed: armed, armedAgain: armedAgain, after: state() });""", c
         self.assertTrue(59000 <= s["armed"][0] <= 60000, "armed for the window's edge, a minute from the stamp: %r" % s["armed"])
         self.assertEqual(s["armedAgain"], 1)
         self.assertEqual(s["after"]["reloads"], 1, "the backstop's walk fired the reload once the hold was older than the bound")
-        self.assertEqual(s["after"]["stored"]["reason"], "restart")
+        self.assertEqual(s["after"]["stored"]["reason"], "build")
         t = run_core("""
 var R = window.__rompReload;
 window.__rompFreshPending = true; window.__rompFreshPendingSince = Date.now() - 60001;   // a stale flag: some earlier redial's, never cleared
-VERSION = { boot: "2.2", dist_ver: 7, code_ident: "def5678" }; R.checkBoot(); await tick(); await tick();
+VERSION = { boot: "2.2", dist_ver: 7, code_ident: "def5678" }; R.checkBoot(); await tick(); await tick(); R.accept();
 out({ after: state(), timers: TIMERS.length });""", code="abc1234")
         self.assertEqual(t["after"]["reloads"], 1, "a flag older than the bound holds nothing")
         self.assertEqual(t["timers"], 0)
@@ -216,15 +252,15 @@ var t0 = Date.now() - 60000;                                                    
 IFRAMES = [pane(function () { return ''; }, 0),                                  // a Files pane
            pane(function () { return 'fresh'; }, t0),                             // the first chat column, its own stamp at the bound
            pane(function () { return 'fresh'; }, t0 + 40000)];                    // the second, dropped 40 s later, inside its own bound
-VERSION = { boot: "2.2", dist_ver: 7, code_ident: "def5678" }; R.checkBoot(); await tick(); await tick();
+VERSION = { boot: "2.2", dist_ver: 7, code_ident: "def5678" }; R.checkBoot(); await tick(); await tick(); R.accept();
 out({ after: state(), timers: TIMERS.length });""", code="abc1234")
         self.assertEqual(s["after"]["reloads"], 1, "the page's bound is the first column's, not the last's")
-        self.assertEqual(s["after"]["stored"]["reason"], "restart")
+        self.assertEqual(s["after"]["stored"]["reason"], "build")
         t = run_core("""
 var R = window.__rompReload;
 var t0 = Date.now() - 30000;
 IFRAMES = [pane(function () { return 'fresh'; }, t0), pane(function () { return 'fresh'; }, t0 + 20000)];
-VERSION = { boot: "2.2", dist_ver: 7, code_ident: "def5678" }; R.checkBoot(); await tick(); await tick(); var held = state();
+VERSION = { boot: "2.2", dist_ver: 7, code_ident: "def5678" }; R.checkBoot(); await tick(); await tick(); R.accept(); var held = state();
 IFRAMES[0].contentWindow.__rompReload.busyHere = function () { return ''; };     // the first column's frame lands
 R.ended(); await tick(); await tick(); var stillHeld = state();
 out({ held: held, stillHeld: stillHeld, timers: TIMERS.length });""", code="abc1234")
@@ -239,7 +275,7 @@ out({ held: held, stillHeld: stillHeld, timers: TIMERS.length });""", code="abc1
 var R = window.__rompReload;
 var chat = { hold: 'fresh' };
 IFRAMES = [pane(function () { return chat.hold; }, Date.now())];
-R.noteDv(8); var first = state();                                              // held on the drop
+R.noteDv(8); R.accept(); var first = state();                                              // held on the drop
 CLOCK += 5000; chat.hold = ''; document.activeElement = COMPOSER; COMPOSER.value = "a draft";
 R.ended(); await tick(); await tick(); var typingHeld = state();               // the frame landed; the draft holds
 CLOCK += 65000; TIMERS.shift().f(); await tick(); await tick();                // the backstop: still typing
@@ -260,7 +296,7 @@ out({ first: first, typingHeld: typingHeld, after: state() });""")
 var R = window.__rompReload;
 IFRAMES = [pane(function () { return 'typing'; }, 0)];
 IFRAMES[0].contentWindow.__rompDiag = function (what, data) { DIAG.push({ what: what, data: data }); };
-R.noteDv(8); var held = state();
+R.noteDv(8); R.accept(); var held = state();
 var armed = TIMERS.map(function (t) { return t.ms; });
 CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick(); var afterOne = { diag: DIAG.slice(), timers: TIMERS.length, state: state() };
 CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick(); var afterTwo = { diag: DIAG.slice(), state: state() };
@@ -284,7 +320,7 @@ out({ held: held, armed: armed, afterOne: afterOne, afterTwo: afterTwo, after: s
 var R = window.__rompReload;
 IFRAMES = [pane(function () { return 'sends'; }, 0)];
 IFRAMES[0].contentWindow.__rompDiag = function (what, data) { DIAG.push({ what: what, data: data }); };
-R.noteDv(8);
+R.noteDv(8); R.accept();
 IFRAMES[0].contentWindow.__rompReload.busyHere = function () { return ''; }; R.ended(); await tick(); await tick();
 CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick();
 out({ diag: DIAG.length, after: state() });""")
@@ -292,14 +328,14 @@ out({ diag: DIAG.length, after: state() });""")
         self.assertEqual(t["diag"], 0, "a hold that ended before the bound files nothing")
 
     def test_a_second_reason_for_the_same_wait_files_no_second_breadcrumb(self):
-        # round four, low 2: a restart arriving while the build reload is held is the same wait, not a new one; the latch clears
-        # only when the owed request itself changes
+        # round four, low 2: a forced request arriving while the accepted reload is held is the same wait, not a new one; the latch
+        # clears only when the owed request itself changes
         u = run_core("""
 var R = window.__rompReload;
 IFRAMES = [pane(function () { return 'typing'; }, 0)];
 IFRAMES[0].contentWindow.__rompDiag = function (what, data) { DIAG.push({ what: what, data: data }); };
-R.noteDv(8); CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick();
-R.request("restart", "2.2"); CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick();
+R.noteDv(8); R.accept(); CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick();
+R.request("required", "a forced request inside the same wait"); CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick();
 out({ diag: DIAG.length, owed: state().owed });""")
         self.assertEqual(u["owed"]["reason"], "build", "the first request stands")
         self.assertEqual(u["diag"], 1, "a second reason for the same wait files no second row")
@@ -309,7 +345,7 @@ out({ diag: DIAG.length, owed: state().owed });""")
         v = run_core("""
 var R = window.__rompReload;
 IFRAMES = [pane(function () { return 'typing'; }, 0)];
-R.noteDv(8); CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick(); var none = DIAG.length;
+R.noteDv(8); R.accept(); CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick(); var none = DIAG.length;
 IFRAMES[0].contentWindow.__rompDiag = function () { throw new Error("a door that throws"); };
 CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick(); var thrown = DIAG.length;
 IFRAMES[0].contentWindow.__rompDiag = function (what, data) { DIAG.push({ what: what, data: data }); };
@@ -329,7 +365,7 @@ var R = window.__rompReload;
 var t0 = Date.now();
 var a = pane(function () { return 'fresh'; }, t0);                              // its frame never comes
 IFRAMES = [a];
-R.noteDv(8); var first = state();
+R.noteDv(8); R.accept(); var first = state();
 document.activeElement = COMPOSER; COMPOSER.value = "a draft that spans the bound";        // the draft begins inside the minute
 CLOCK += 65000; TIMERS.shift().f(); await tick(); await tick(); var afterBound = state();   // the window ended; typing holds
 CLOCK += 5000; var tB = Date.now(); var b = pane(function () { return 'fresh'; }, tB); IFRAMES = [a, b];   // a second column drops now
@@ -351,7 +387,7 @@ out({ first: first, afterBound: afterBound, held: held, fired: fired, sinceB: Da
 var R = window.__rompReload;
 var t0 = Date.now();
 IFRAMES = [pane(function () { return 'fresh'; }, t0)];
-R.noteDv(8);
+R.noteDv(8); R.accept();
 CLOCK += 40000; IFRAMES.push(pane(function () { return 'fresh'; }, Date.now()));   // a second column drops inside the window
 CLOCK += 20000; TIMERS.shift().f(); await tick(); await tick();
 out({ after: state() });""")
@@ -365,7 +401,7 @@ var R = window.__rompReload;
 var t0 = Date.now();
 IFRAMES = [pane(function () { return 'fresh'; }, t0),                                            // column A
            pane(function () { return 'fresh'; }, t0 + 20000, function () { return 'upload'; })];   // column B, an upload in flight
-R.noteDv(8); var held = state();
+R.noteDv(8); R.accept(); var held = state();
 CLOCK += 65000; liveTimers().pop().f(); await tick(); await tick(); var atEdge = state();          // the window's edge
 IFRAMES[1].contentWindow.__rompReload.busyHere = function () { return ''; }; R.ended(); await tick(); await tick();
 out({ held: held, atEdge: atEdge, after: state() });""")
@@ -382,7 +418,7 @@ out({ held: held, atEdge: atEdge, after: state() });""")
 var R = window.__rompReload;
 IFRAMES = [pane(function () { return 'fresh'; }, Date.now())];
 document.activeElement = COMPOSER; COMPOSER.value = "a draft";
-R.noteDv(8);
+R.noteDv(8); R.accept();
 var delays = [];
 for (var i = 0; i < 5; i++) { CLOCK += 65000; var t = liveTimers().pop(); delays.push(t ? t.ms : null); if (t) t.f(); await tick(); await tick(); }
 out({ delays: delays, timers: TIMERS.length, after: state() });""")
@@ -397,7 +433,7 @@ out({ delays: delays, timers: TIMERS.length, after: state() });""")
 var R = window.__rompReload;
 IFRAMES = [{ contentWindow: { __rompReload: { busyHere: function () { throw new Error("detached"); } }, __rompFreshPendingSince: 0 } },
            pane(function () { return 'upload'; }, 0)];
-R.noteDv(8); var held = state();
+R.noteDv(8); R.accept(); var held = state();
 IFRAMES[1].contentWindow.__rompReload.busyHere = function () { return ''; }; R.ended(); await tick(); await tick();
 out({ held: held, after: state() });""")
         self.assertEqual(s["held"]["waiting"], "upload", "the second pane's hold is read past the first pane's throw")
@@ -448,7 +484,7 @@ var R = window.__rompReload;
 var bad = pane(function () { return 'typing'; }, 0); Object.defineProperty(bad.contentWindow, "__rompDiag", { get: function () { throw new Error("detached"); } });
 var good = pane(function () { return ''; }, 0); good.contentWindow.__rompDiag = function (what, data) { DIAG.push({ what: what, data: data }); };
 IFRAMES = [bad, good];
-R.noteDv(8); CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick();
+R.noteDv(8); R.accept(); CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick();
 out({ diag: DIAG.length });""")
         self.assertEqual(s["diag"], 1, "the next pane's door took the row")
 
@@ -459,7 +495,7 @@ var R = window.__rompReload;
 var bad = pane(function () { return 'typing'; }, 0); bad.contentWindow.__rompDiag = function () { throw new Error("a door that throws"); };
 var good = pane(function () { return ''; }, 0); good.contentWindow.__rompDiag = function (what, data) { DIAG.push({ what: what, data: data }); };
 IFRAMES = [bad, good];
-R.noteDv(8); CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick();
+R.noteDv(8); R.accept(); CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick();
 out({ diag: DIAG.length });""")
         self.assertEqual(s["diag"], 1, "the next pane's door took the row on the same pass")
 
@@ -468,7 +504,7 @@ out({ diag: DIAG.length });""")
         s = run_core("""
 var R = window.__rompReload;
 IFRAMES = [pane(function () { return 'typing'; }, 0)];
-R.noteDv(8);
+R.noteDv(8); R.accept();
 CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick();                 // no door yet
 CLOCK += 60000; TIMERS.shift().f(); await tick(); await tick();                 // still none
 IFRAMES[0].contentWindow.__rompDiag = function (what, data) { DIAG.push({ what: what, data: data }); };
@@ -499,39 +535,44 @@ out({ diag: DIAG });""")
         s = run_core("""
 var R = window.__rompReload;
 window.__rompFreshPending = true;                                                  // a flag with no stamp: never a hold
-R.noteDv(8); var unstamped = state();
+R.noteDv(8); R.accept(); var unstamped = state();
 out({ unstamped: unstamped });""")
         self.assertEqual(s["unstamped"]["reloads"], 1, "a flag without a stamp holds nothing")
         t = run_core("""
 var R = window.__rompReload;
 IFRAMES = [pane(function () { return ''; })];
 window.__rompFreshPending = true; window.__rompFreshPendingSince = Date.now();
-R.noteDv(8); var held = state();
+R.noteDv(8); R.accept(); var held = state();
 window.__rompFreshPending = false; R.ended(); await tick(); await tick();
 out({ held: held, after: state() });""")
         self.assertEqual(t["held"]["waiting"], "fresh")
         self.assertEqual(t["held"]["owed"]["reason"], "build")
         self.assertEqual(t["after"]["reloads"], 1)
 
-    def test_restarted_counts_restarts_and_a_second_restart_inside_one_hold_files_the_latest_boot(self):
-        # lows b and c of the round-two review: BOOT re-latches so the polls after a restart do not count again; the record
-        # names the boot the page lands on
+    def test_restarted_counts_restarts_and_one_changed_build_across_two_restarts_is_one_offer(self):
+        # lows b and c of the round-two review: BOOT re-latches so the polls after a restart do not count again; since 2026-09-16
+        # the same changed build seen across two boots is ONE offer (the hook is not called again), and the accepted reload's
+        # record names the build, not a boot
         s = run_core("""
 var R = window.__rompReload;
 R.noteVersion({ boot: "2.2", dist_ver: 7, code_ident: "abc1234" }); R.noteVersion({ boot: "2.2", dist_ver: 7, code_ident: "abc1234" });
 var one = R.restarted();
-R.noteVersion({ boot: "3.3", dist_ver: 7, code_ident: "abc1234" }); var two = R.restarted();
+R.noteVersion({ boot: "3.3", dist_ver: 7, code_ident: "abc1234" }); var two = R.restarted(); var quiet = state();
 window.__rompFreshPending = true; window.__rompFreshPendingSince = Date.now();
 var heldCalls = 0; R.held = function () { heldCalls++; };
-R.noteVersion({ boot: "4.4", dist_ver: 7, code_ident: "def5678" }); R.noteVersion({ boot: "5.5", dist_ver: 7, code_ident: "def5678" });
-var owed = state().owed;
+R.noteVersion({ boot: "4.4", dist_ver: 7, code_ident: "def5678" }); var offersAfterOne = OFFERS.length;
+R.noteVersion({ boot: "5.5", dist_ver: 7, code_ident: "def5678" }); var offersAfterTwo = OFFERS.length; var offered = state();
+R.accept(); var owed = state().owed;
 window.__rompFreshPending = false; R.ended(); await tick(); await tick();
-out({ one: one, two: two, owed: owed, heldCalls: heldCalls, after: state() });""", code="abc1234")
+out({ one: one, two: two, quiet: quiet, offersAfterOne: offersAfterOne, offersAfterTwo: offersAfterTwo, offered: offered, owed: owed, heldCalls: heldCalls, after: state() });""", code="abc1234")
         self.assertEqual(s["one"], 1, "two polls of one restarted kernel count one restart")
         self.assertEqual(s["two"], 2, "a further boot id counts again")
-        self.assertEqual(s["owed"]["detail"], "5.5", "the held request names the latest boot")
-        self.assertEqual(s["heldCalls"], 1, "one wait, announced once: the second restart moves the detail, not the reason (round three, low 2)")
-        self.assertEqual(s["after"]["stored"]["detail"], "5.5")
+        self.assertIsNone(s["quiet"]["offered"], "the same build across two restarts offers nothing")
+        self.assertEqual([s["offersAfterOne"], s["offersAfterTwo"]], [1, 1], "one changed build, one offer, whatever the boot count")
+        self.assertEqual(s["offered"]["offered"]["code"], "def5678"); self.assertEqual(s["offered"]["reloads"], 0)
+        self.assertEqual(s["owed"], {"reason": "build", "detail": "def5678"}, "the accepted request names the build")
+        self.assertEqual(s["heldCalls"], 1, "one wait, announced once")
+        self.assertEqual(s["after"]["stored"]["detail"], "def5678")
 
     def test_both_held_maps_render_the_fresh_wording_when_run(self):
         """The held hooks executed (round three, low 3): the pane's (installed by the shim on a standalone page, rendering into
@@ -582,9 +623,10 @@ process.stdout.write("RESULT:" + JSON.stringify(OUT) + "\\n");
     def test_the_settings_restart_button_hands_the_new_kernels_answer_to_the_reload_core(self):
         """Round three, low 5b: the rail's restart button polled /healthz until a NEW boot id answered and then reloaded the page
         unconditionally, an exception to the ruling. Now the flip drops the splash and hands the decision to the reload core:
-        the same code restarted reloads nothing (the panes redial), a changed build owes the reload as any restart does. The
-        button's function is sliced from the served landing and run over the harness's fetch (a /healthz answering with the
-        boot header, then /version), the core baked beside it."""
+        the same code restarted reloads nothing (the panes redial), a changed build is OFFERED (2026-09-16: the user asked for
+        a restart, not a reload; the ↻ keeps no reload of its own). The button's function is sliced from the served landing
+        and run over the harness's fetch (a /healthz answering with the boot header, then /version), the core baked beside
+        it. tests/test_kernel_refresh_button.py pins the button's source."""
         html = km._landing()
         a = html.index("window.__rompRestart=function(){")
         fn = html[a:html.index("var rf=document.getElementById('rail-refresh');", a)]
@@ -603,16 +645,18 @@ out({ polls: polls, splash: SPLASH, fetches: FETCHES, restarted: R.restarted(), 
         self.assertIn("/version", same["fetches"], "the flip asked the core, which read /version")
         self.assertEqual(same["restarted"], 1, "the core counted the restart")
         self.assertEqual(same["after"]["reloads"], 0, "the same code restarted: the board stays")
-        self.assertIsNone(same["after"]["owed"])
+        self.assertIsNone(same["after"]["owed"]); self.assertIsNone(same["after"]["offered"])
         self.assertEqual(same["splash"][-1], "+gone", "the splash the button raised is dropped when the new kernel answers")
         changed = run_core(fn + """
 var R = window.__rompReload;
 HEALTH_BOOT = "9.9"; VERSION = { boot: "9.9", dist_ver: 7, code_ident: "def5678" };
-window.__rompRestart(); TIMERS.shift().f(); await tick(); await tick(); await tick(); await tick();
-out({ after: state() });""", code="abc1234")
-        self.assertEqual(changed["after"]["reloads"], 1, "a changed build reloads through the core, as any restart does")
-        self.assertEqual(changed["after"]["stored"]["reason"], "restart")
-        self.assertEqual(changed["after"]["stored"]["detail"], "9.9")
+window.__rompRestart(); TIMERS.shift().f(); await tick(); await tick(); await tick(); await tick(); var offered = state();
+R.accept(); await tick();
+out({ offered: offered, after: state() });""", code="abc1234")
+        self.assertEqual(changed["offered"]["reloads"], 0, "a changed build is offered through the core, not taken (2026-09-16)")
+        self.assertEqual(changed["offered"]["offered"]["code"], "def5678"); self.assertIsNone(changed["offered"]["owed"])
+        self.assertEqual(changed["after"]["reloads"], 1, "the user's Reload takes it")
+        self.assertEqual(changed["after"]["stored"], {"reason": "build", "detail": "def5678", "from": 7, "path": "/", "t": changed["after"]["stored"]["t"]})
 
     def test_the_code_identity_changes_with_the_bytes_of_the_kernel_code(self):
         """Low d of the round-two review: a dirty tree reads the same git sha before and after an edit, so the identity the core
@@ -688,16 +732,19 @@ out({ after: state() });""", code="abc1234")
         s = run_core("""
 var R = window.__rompReload;
 R.noteVersion({ boot: "1.1", dist_ver: 7 }); var quiet = state();
-R.noteVersion({ boot: "1.1", dist_ver: 9 });
-out({ quiet: quiet, after: state() });""")
-        self.assertEqual(s["quiet"]["reloads"], 0)
+R.noteVersion({ boot: "1.1", dist_ver: 9 }); var offered = state();
+R.accept();
+out({ quiet: quiet, offered: offered, after: state() });""")
+        self.assertEqual(s["quiet"]["reloads"], 0); self.assertIsNone(s["quiet"]["offered"])
+        self.assertEqual(s["offered"]["offered"]["dv"], 9, "the poll's dist_ver is the same signal as the keepalive's dv")
+        self.assertEqual(s["offered"]["reloads"], 0)
         self.assertEqual(s["after"]["stored"]["reason"], "build")
 
     def test_a_held_pointer_arms_and_the_pointerup_fires(self):
         s = run_core("""
 var R = window.__rompReload;
 emit("pointerdown");
-R.noteDv(8); var held = state();
+R.noteDv(8); R.accept(); var held = state();
 emit("pointerup"); var atOnce = state(); await tick();
 out({ held: held, atOnce: atOnce, after: state() });""")
         self.assertEqual(s["held"]["reloads"], 0)
@@ -709,7 +756,7 @@ out({ held: held, atOnce: atOnce, after: state() });""")
     def test_a_drag_in_flight_arms_and_dragend_fires(self):
         s = run_core("""
 var R = window.__rompReload;
-emit("dragstart"); R.noteDv(8); var held = state(); emit("dragend"); await tick();
+emit("dragstart"); R.noteDv(8); R.accept(); var held = state(); emit("dragend"); await tick();
 out({ held: held, after: state() });""")
         self.assertEqual(s["held"]["waiting"], "drag")
         self.assertEqual(s["held"]["reloads"], 0)
@@ -719,7 +766,7 @@ out({ held: held, after: state() });""")
         s = run_core("""
 var R = window.__rompReload;
 SEL = { rangeCount: 1, isCollapsed: false, toString: function () { return "some words"; } };
-R.noteDv(8); var held = state();
+R.noteDv(8); R.accept(); var held = state();
 SEL = { rangeCount: 1, isCollapsed: true, toString: function () { return ""; } }; emit("selectionchange"); await tick();
 out({ held: held, after: state() });""")
         self.assertEqual(s["held"]["waiting"], "selection")
@@ -730,7 +777,7 @@ out({ held: held, after: state() });""")
         s = run_core("""
 var R = window.__rompReload;
 document.activeElement = COMPOSER; COMPOSER.value = "half a thought";
-R.noteDv(8); var held = state();
+R.noteDv(8); R.accept(); var held = state();
 COMPOSER.value = "half a thought, more"; emit("input"); await tick(); var typing = state();
 COMPOSER.value = ""; emit("input"); await tick();
 out({ held: held, typing: typing, after: state() });""")
@@ -739,7 +786,7 @@ out({ held: held, typing: typing, after: state() });""")
         self.assertEqual(s["after"]["reloads"], 1, "an emptied composer releases it")
         s2 = run_core("""
 var R = window.__rompReload;
-document.activeElement = COMPOSER; COMPOSER.value = "draft"; R.noteDv(8);
+document.activeElement = COMPOSER; COMPOSER.value = "draft"; R.noteDv(8); R.accept();
 document.activeElement = null; emit("focusout"); await tick();
 out({ after: state() });""")
         self.assertEqual(s2["after"]["reloads"], 1, "a blurred composer releases it (the draft is persisted already)")
@@ -747,31 +794,36 @@ out({ after: state() });""")
     def test_a_window_blur_releases_every_hold(self):
         s = run_core("""
 var R = window.__rompReload;
-emit("pointerdown"); emit("dragstart"); R.noteDv(8); var held = state(); wemit("blur"); await tick();
+emit("pointerdown"); emit("dragstart"); R.noteDv(8); R.accept(); var held = state(); wemit("blur"); await tick();
 out({ held: held, after: state() });""")
         self.assertEqual(s["held"]["reloads"], 0)
         self.assertEqual(s["after"]["reloads"], 1)
 
-    def test_a_refused_reload_falls_back_to_the_banner_hook(self):
+    def test_a_refused_reload_puts_the_offer_back(self):
+        # a page whose parent forbids location.reload: the accepted offer returns as an offer (the line with its Reload), the user
+        # may try again, and nothing re-attempts on its own; a strictly newer build is a new offer
         s = run_core("""
 var R = window.__rompReload; var refused = [];
 R.refused = function (o) { refused.push(o); }; REFUSE = true;
-R.noteDv(8); var first = state();
-emit("pointerup"); await tick(); emit("selectionchange"); await tick(); R.noteVersion({ boot: "1.1", dist_ver: 8 }); var again = state(); var shownAfterAgain = refused.length;
-R.noteDv(9); var newer = state();
-out({ refused: refused, first: first, again: again, shownAfterAgain: shownAfterAgain, newer: newer });""")
+R.noteDv(8); R.accept(); var first = state();
+emit("pointerup"); await tick(); emit("selectionchange"); await tick(); R.noteVersion({ boot: "1.1", dist_ver: 8 }); var again = state();
+R.accept(); var retried = state();
+REFUSE = false; R.noteDv(9); var newer = state(); R.accept();
+out({ refused: refused, first: first, again: again, retried: retried, newer: newer, after: state(), offers: OFFERS });""")
         f = s["first"]
         self.assertEqual(f["reloads"], 1, "the reload was attempted")
-        self.assertFalse(f["fired"], "…and stood down when the host threw")
+        self.assertFalse(f["fired"], "…and stood down when the parent threw")
         self.assertEqual(f["waiting"], "refused")
         self.assertEqual(f["refusedFor"], "build:8", "the refusal latches for this build")
         self.assertEqual(f["stored"], None, "no marker and no un-lifted modal for a reload that never happened")
         self.assertEqual(f["removed"], [])
+        self.assertIsNone(f["owed"], "nothing owed any more"); self.assertEqual(f["offered"]["dv"], 8, "the offer is back")
         self.assertEqual(s["refused"][0], {"reason": "build", "detail": "8"})
         self.assertEqual(s["again"]["reloads"], 1, "gesture ends and the poll do not re-attempt the refused build")
-        self.assertEqual(s["shownAfterAgain"], 1, "the banner is shown once for that build")
-        self.assertEqual(s["newer"]["reloads"], 2, "a strictly newer build re-arms and tries again (and is refused again on this host)")
-        self.assertEqual(len(s["refused"]), 2)
+        self.assertEqual(s["retried"]["reloads"], 2, "the user's second Reload tries again (refused again here)")
+        self.assertEqual(s["newer"]["offered"]["dv"], 9, "a strictly newer build is a new offer")
+        self.assertEqual(s["after"]["reloads"], 3); self.assertTrue(s["after"]["fired"])
+        self.assertEqual([o and o["dv"] for o in s["offers"]], [8, None, 8, None, 8, 9, None], "offer, accept; back, accept; back, replaced by 9 in place; accepted")
 
     def test_the_fresh_page_announces_once_from_the_marker(self):
         s = run_core("""
@@ -789,6 +841,11 @@ var R = window.__rompReload;
 STORE["romp:reloaded"] = JSON.stringify({ reason: "build", detail: "9", from: 6, t: 1 });
 out({ first: R.announce(null) });""")
         self.assertEqual(s2["first"], "Reloaded onto build 7: a newer romp build was served.")
+        s2b = run_core("""
+var R = window.__rompReload;
+STORE["romp:reloaded"] = JSON.stringify({ reason: "required", detail: "a wire change", from: 6, t: 1 });
+out({ first: R.announce(null) });""")
+        self.assertEqual(s2b["first"], "Reloaded onto build 7: the kernel asked for a reload (a wire change).", "the safety valve's reload says so")
         s3 = run_core("""
 var R = window.__rompReload;
 STORE["romp:reloaded"] = JSON.stringify({ reason: "build", detail: "9", from: 6, path: "/feed", t: 1 });
@@ -823,22 +880,26 @@ out({ held: held, after: state() });""")
         self.assertEqual(s["held"]["waiting"], "pointer", "a pane's held pointer holds the shell's reload")
         self.assertEqual(s["after"]["reloads"], 1)
         self.assertEqual(s["after"]["persisted"], 11, "the shell and every pane persisted before the reload")
-        # a pane under a same-origin shell forwards: its own core never fires
+        # a pane under a same-origin shell forwards every decision: its proposal, the accept, the dismiss, the behind and the
+        # forced request; its own core never offers and never fires (ONE offer for the top document)
         s2 = run_core("""
 var shellReqs = [];
-window.parent = { __rompReload: { request: function (r, d) { shellReqs.push([r, d]); }, tryFire: function () { shellReqs.push(["tryFire"]); } } };
+window.parent = { __rompReload: { request: function (r, d) { shellReqs.push([r, d]); }, propose: function (dv, code) { shellReqs.push(["propose", dv, code]); },
+  accept: function () { shellReqs.push(["accept"]); }, dismiss: function () { shellReqs.push(["dismiss"]); }, behind: function () { shellReqs.push(["behind"]); },
+  tryFire: function () { shellReqs.push(["tryFire"]); } } };
 var R = window.__rompReload;
-R.noteDv(8); emit("pointerup"); await tick();
-out({ shellReqs: shellReqs, inShell: R.inShell(), after: state() });""")
+R.noteDv(8); R.accept(); R.dismiss(); R.behind(); R.require("a wire change"); emit("pointerup"); await tick();
+out({ shellReqs: shellReqs, inShell: R.inShell(), after: state(), offers: OFFERS });""")
         self.assertTrue(s2["inShell"])
-        self.assertEqual(s2["shellReqs"], [["build", "8"], ["tryFire"]])
+        self.assertEqual(s2["shellReqs"], [["propose", 8, ""], ["accept"], ["dismiss"], ["behind"], ["required", "a wire change"], ["tryFire"]])
         self.assertEqual(s2["after"]["reloads"], 0, "the top document reloads, never the pane alone")
+        self.assertIsNone(s2["after"]["offered"]); self.assertEqual(s2["offers"], [], "the pane's own hook is never called")
 
     def test_a_panes_queued_sends_hold_the_reload_until_its_flush(self):
         s = run_core("""
 var R = window.__rompReload; var queued = 1;
 window.__rompPaneBusy = function () { return queued ? "sends" : ""; };   // the shim: everConnected && queue.length > queuedDiag
-R.noteVersion({ boot: "2.2" }); var held = state();
+R.noteDv(8); R.accept(); var held = state();                            // the offer accepted while the pane's queue holds
 queued = 0; R.ended(); await tick();                                    // the shim's ws.onopen flush
 out({ held: held, after: state() });""")
         self.assertEqual(s["held"]["reloads"], 0, "a prompt typed during the outage sits in the pane's queue: the shell's earlier reopen must not take the page down")
@@ -853,16 +914,16 @@ out({ held: held, after: state() });""")
 var R = window.__rompReload; var held = []; R.held = function (b, o) { held.push([b, o && o.reason]); };
 var busyReason = "upload";
 window.__rompPaneBusy = function () { return busyReason; };
-R.noteVersion({ boot: "2.2" });                       // owed, held on the pane's upload
+R.noteDv(8); R.accept();                              // accepted, held on the pane's upload
 R.ended(); await tick(); R.ended(); await tick();     // re-asks while the same hold stands: no second line
 busyReason = "held-send"; R.ended(); await tick();    // the reason changed: one line for it
 busyReason = ""; R.ended(); await tick();             // idle: fires
 out({ held: held, reloads: RELOADS, waiting: R.waiting });""")
-        self.assertEqual(s["held"], [["upload", "restart"], ["held-send", "restart"]], "once per hold reason, with the owed request")
+        self.assertEqual(s["held"], [["upload", "build"], ["held-send", "build"]], "once per hold reason, with the owed request")
         self.assertEqual(s["reloads"], 1)
         s2 = run_core("""
 var R = window.__rompReload; var held = []; R.held = function (b) { held.push(b); };
-emit("pointerdown"); R.noteVersion({ boot: "2.2" });   // a held pointer: a gesture hold, no line
+emit("pointerdown"); R.noteDv(8); R.accept();           // a held pointer: a gesture hold, no line
 var during = state();
 emit("pointerup"); await tick();
 out({ held: held, during: during, reloads: RELOADS });""")
@@ -874,7 +935,7 @@ out({ held: held, during: during, reloads: RELOADS });""")
         s = run_core("""
 var R = window.__rompReload;
 emit("pointerdown"); emit("pointercancel");       // the touch became a scroll: the browser cancels the pointer, the finger is still down
-R.noteDv(8); var panning = state();
+R.noteDv(8); R.accept(); var panning = state();
 emit("pointerup"); await tick(); var stillPanning = state();   // no pointerup comes for a cancelled pointer, but even one must not release the pan
 emit("touchend"); await tick();
 out({ panning: panning, stillPanning: stillPanning, after: state() });""")
@@ -887,7 +948,7 @@ out({ panning: panning, stillPanning: stillPanning, after: state() });""")
         s = run_core("""
 var R = window.__rompReload;
 SEL = { rangeCount: 1, isCollapsed: false, toString: function () { return "an old highlight"; } };
-FOCUSED = false; R.noteDv(8);
+FOCUSED = false; R.noteDv(8); R.accept();
 out({ after: state() });""")
         self.assertEqual(s["after"]["reloads"], 1, "a highlight left in a pane the user is not in is not a gesture being made")
 
@@ -895,7 +956,7 @@ out({ after: state() });""")
         s = run_core("""
 var R = window.__rompReload;
 var pickerInput = { tagName: "INPUT", type: "text", value: "new-sess" };
-document.activeElement = pickerInput; R.noteDv(8); var held = state();
+document.activeElement = pickerInput; R.noteDv(8); R.accept(); var held = state();
 var sel = { tagName: "SELECT", value: "x" }; document.activeElement = sel; emit("focusout"); await tick();
 out({ held: held, after: state() });""")
         self.assertEqual(s["held"]["waiting"], "typing", "the new-session picker's name box holds like the composer")
@@ -905,13 +966,112 @@ out({ held: held, after: state() });""")
     def test_a_foreign_parent_leaves_the_pane_to_reload_itself(self):
         s = run_core("""
 Object.defineProperty(window, "parent", { get: function () { throw new Error("cross-origin"); } });
-var R = window.__rompReload; R.noteDv(8);
+var R = window.__rompReload; R.noteDv(8); R.accept();
 out({ inShell: R.inShell(), after: state() });""")
         self.assertFalse(s["inShell"])
         self.assertEqual(s["after"]["reloads"], 1, "an iframe in another app reloads itself")
 
 
+class ReloadOfferExecuted(unittest.TestCase):
+    """The ruling of 2026-09-16, executed in the real core."""
+
+    def test_a_same_build_restart_is_silent_and_a_newer_build_is_one_offer_with_no_hold_and_no_timer(self):
+        s = run_core("""
+var R = window.__rompReload;
+var held = 0; R.held = function () { held++; };
+VERSION = { boot: "2.2", dist_ver: 7, code_ident: "abc1234" }; R.checkBoot(); await tick(); await tick(); var restart = state();
+R.noteDv(8); var once = state(); R.noteDv(8); R.noteVersion({ boot: "2.2", dist_ver: 8, code_ident: "abc1234" });   // the keepalives and polls after it
+out({ restart: restart, restarted: R.restarted(), once: once, after: state(), offers: OFFERS, held: held, timers: TIMERS.length });""", code="abc1234")
+        self.assertEqual([s["restart"]["reloads"], s["restart"]["owed"], s["restart"]["offered"], s["restarted"]], [0, None, None, 1], "a same-build restart: counted, nothing else")
+        self.assertEqual(s["once"]["offered"], {"dv": 8, "code": "", "behind": False, "text": OFFER})
+        self.assertEqual(s["offers"], [{"dv": 8, "code": "", "behind": False, "text": OFFER}], "one offer per build, however many readings carry it")
+        self.assertEqual([s["after"]["reloads"], s["after"]["owed"], s["held"], s["timers"]], [0, None, 0, 0], "an offer owes nothing: no reload, no hold, no line, no backstop")
+
+    def test_not_now_is_kept_per_build_and_a_strictly_newer_build_re_offers(self):
+        s = run_core("""
+var R = window.__rompReload;
+R.noteDv(8); R.dismiss(); var declined = state();
+R.noteDv(8); R.noteVersion({ boot: "1.1", dist_ver: 8 }); var still = state();
+R.noteDv(9); var newer = state();
+out({ declined: declined, still: still, newer: newer, offers: OFFERS });""")
+        self.assertIsNone(s["declined"]["offered"]); self.assertEqual(s["declined"]["notNow"], {"dv": 8, "code": ""}, "the Not now is kept, per build, in localStorage")
+        self.assertIsNone(s["still"]["offered"], "the declined build stays quiet through every later reading")
+        self.assertEqual(s["newer"]["offered"]["dv"], 9, "a strictly newer build is new information")
+        self.assertEqual([o and o["dv"] for o in s["offers"]], [8, None, 9])
+        # another page of this browser (a second tab on the same build) reads the kept Not now
+        t = run_core("""
+var R = window.__rompReload;
+R.noteDv(8); var quiet = state(); R.noteDv(9); var offered = state();
+out({ quiet: quiet, offered: offered });""", local={"romp:reloadNotNow": {"dv": 8, "code": ""}})
+        self.assertIsNone(t["quiet"]["offered"], "declined in another tab: quiet here too")
+        self.assertEqual(t["offered"]["offered"]["dv"], 9)
+        # the code identity: declined for one, another re-offers; and a declined build seen with BOTH signals stays declined
+        u = run_core("""
+var R = window.__rompReload;
+R.noteVersion({ boot: "2.2", dist_ver: 8, code_ident: "def5678" }); var both = state(); R.dismiss();
+R.noteVersion({ boot: "2.2", dist_ver: 8, code_ident: "def5678" }); var quiet = state();
+R.noteVersion({ boot: "3.3", dist_ver: 8, code_ident: "ghi9012" }); var other = state();
+out({ both: both, quiet: quiet, other: other, notNow: state().notNow });""", code="abc1234")
+        self.assertEqual(u["both"]["offered"], {"dv": 8, "code": "def5678", "behind": False, "text": OFFER}, "one offer carries both signals")
+        self.assertIsNone(u["quiet"]["offered"]); self.assertEqual(u["notNow"], {"dv": 8, "code": "def5678"})
+        self.assertEqual(u["other"]["offered"]["code"], "ghi9012", "another code identity re-offers")
+        # a malformed Not now record is read as none
+        v = run_core("""
+var R = window.__rompReload; R.noteDv(8); out({ after: state() });""", local={"romp:reloadNotNow": "junk"})
+        self.assertEqual(v["after"]["offered"]["dv"], 8)
+
+    def test_an_unknown_op_refusal_sharpens_the_standing_offers_wording_once_and_latches_for_a_later_one(self):
+        s = run_core("""
+var R = window.__rompReload;
+R.noteDv(8); R.behind(); R.behind(); R.noteDv(8);
+out({ after: state(), offers: OFFERS });""")
+        self.assertEqual([o["text"] for o in s["offers"]], [OFFER, BEHIND], "the wording moves once; a second refusal and the next keepalive repaint nothing")
+        self.assertEqual(s["after"]["offered"], {"dv": 8, "code": "", "behind": True, "text": BEHIND})
+        self.assertEqual(s["after"]["reloads"], 0, "still an offer: a refusal never reloads")
+        t = run_core("""
+var R = window.__rompReload;
+R.behind(); var none = state(); R.noteDv(8);
+out({ none: none, offers: OFFERS });""")
+        self.assertIsNone(t["none"]["offered"], "a refusal alone offers nothing: nothing newer is known")
+        self.assertEqual([o["text"] for o in t["offers"]], [BEHIND], "the offer that comes later wears the reason")
+
+    def test_the_safety_valve_is_a_forced_request_through_the_same_holds(self):
+        s = run_core("""
+var R = window.__rompReload;
+emit("pointerdown"); R.require("a wire change"); var held = state();
+emit("pointerup"); await tick();
+out({ held: held, after: state() });""")
+        self.assertEqual(s["held"]["owed"], {"reason": "required", "detail": "a wire change"})
+        self.assertEqual([s["held"]["reloads"], s["held"]["waiting"]], [0, "pointer"], "forced, yet never mid-gesture")
+        self.assertEqual(s["after"]["reloads"], 1)
+        self.assertEqual(s["after"]["stored"]["reason"], "required"); self.assertEqual(s["after"]["reason"]["reason"], "required")
+
+
 class ReloadWiringPinned(unittest.TestCase):
+    def test_the_panes_and_the_shell_hand_the_kernels_frames_to_the_core(self):
+        # the shim: an unknownOp on THIS page's socket sharpens the offer and goes on to the bundle; a reloadRequired is the safety
+        # valve and never reaches the bundle; the shell's own socket carries the valve too
+        js = km._shim("chat", 5)
+        self.assertIn('if(msg&&msg.type==="reloadRequired"){try{if(window.__rompReload)window.__rompReload.require(msg.why);}catch(e){}return;}', js)
+        self.assertIn('if(msg&&msg.type==="unknownOp"){try{if(window.__rompReload)window.__rompReload.behind();}catch(e){}}', js)
+        self.assertLess(js.index('msg.type==="unknownOp"'), js.index("enqueue(msg);};"), "the refusal is read before the frame is handed on")
+        self.assertIn("else if(m&&m.type==='reloadRequired'){if(window.__rompReload)window.__rompReload.require(m.why);}", km._LANDING_MOBILE_JS)
+        src = open(os.path.join(ROOT, "kernel", "kernel.py")).read()
+        for frame in ('"type": "reloadRequired"', "'type': 'reloadRequired'", "type=\"reloadRequired\""):
+            self.assertNotIn(frame, src, "nothing in the kernel sends the valve today")
+
+    def test_a_standalone_pane_renders_the_offer_as_its_own_bar_with_reload_and_not_now(self):
+        js = km._shim("feed", 5)
+        self.assertIn('window.__rompReload.offer=function(o){var have=document.getElementById("romp-stale-self");var mine=have&&have.dataset.kind==="offer";', js)
+        self.assertIn('if(!o){if(mine)have.remove();return;}if(mine){have.firstChild.textContent=o.text;return;}selfBar(o.text,"offer");};', js,
+                      "null takes the bar down; a wording change is written into the standing bar; else the bar is raised")
+        self.assertIn("!window.__rompReload.inShell()){window.__rompReload.offer=", js, "a standalone page only: in the shell the banner speaks")
+        self.assertIn('x.textContent=(kind==="offer")?"Not now":"Dismiss"', js)
+        self.assertIn('x.onclick=(kind==="offer")?function(){try{window.__rompReload.dismiss();}catch(e){}b.remove();}:function(){b.remove();}', js)
+        self.assertIn('r.onclick=(kind==="offer")?function(){r.disabled=true;r.textContent="Reloading\u2026";try{window.__rompReload.accept();}catch(e){location.reload();}}:function(){location.reload();}', js)
+        self.assertIn('if((have.dataset.kind==="warn"||have.dataset.kind==="offer")&&(kind||"conn")==="conn")have.remove();else return;', js, "the offer yields the one slot to the connection bar")
+        self.assertIn('if(b&&b.dataset.kind==="conn"){b.remove();try{var RO=window.__rompReload;if(RO&&RO.offer&&RO.offered())RO.offer(RO.offered());}catch(e){}}', js, "and returns when it retires")
+
     def test_every_kernel_served_page_embeds_the_core_with_its_build_and_boot(self):
         shim = km._shim("feed", 123)
         self.assertIn("/*reload-core*/", shim)
@@ -928,13 +1088,16 @@ class ReloadWiringPinned(unittest.TestCase):
             finally:
                 km._RELOAD_CORE_JS = km._RELOAD_CORE_JS.replace("window.__rompReload=R;})();", "window.__rompReload=R;})();/*end-reload-core*/", 1)
 
-    def test_the_shim_asks_the_core_on_build_drift_and_on_a_standalone_reconnect(self):
+    def test_the_shim_hands_the_core_its_keepalives_dv_and_asks_on_a_standalone_reconnect(self):
         js = km._shim("chat", 5)
-        self.assertIn('function raiseBuild(){if(buildRaised)return;buildRaised=true;var R=window.__rompReload;\n'
-                      'if(R){R.refused=function(){selfBar("A newer romp build is available.","build");};R.request("build","");}\n'
-                      'else selfBar("A newer romp build is available.","build");}', js)
+        # 2026-09-16: the dv itself goes to the core (noteDv proposes, deduped by build); no request, no refused fallback; the bar of
+        # the core's absence is latched once per page life
+        self.assertIn('function raiseBuild(dv){var R=window.__rompReload;if(R){R.noteDv(dv);return;}', js)
+        self.assertIn('if(buildRaised)return;buildRaised=true;selfBar("A newer romp build is available.","build");}', js)
+        self.assertNotIn('R.request("build","")', js, "the shim requests nothing: a newer build is proposed")
+        self.assertNotIn("R.refused=", js, "no refused fallback: a refused accept puts the offer back (the core)")
         self.assertNotIn('postMessage({romp:"wsStale",build:1}', js, "the build:1 hand-off to the banner is gone")
-        self.assertIn('if(msg&&msg.type==="ka"){if(LOADEDV&&msg.dv&&msg.dv>LOADEDV)raiseBuild();', js, "the keepalive's dv is still the event")
+        self.assertIn('if(msg&&msg.type==="ka"){if(LOADEDV&&msg.dv&&msg.dv>LOADEDV)raiseBuild(msg.dv);', js, "the keepalive's dv is still the event, and rides in")
         self.assertIn("if(window.__rompReload&&!window.__rompReload.inShell())window.__rompReload.checkBoot();", js)
         # the pane's queued sends hold the reload, and the flush is the ending event (review find, 2026-09-08)
         self.assertIn('window.__rompPaneBusy=function(){var q=everConnected&&queue.length>queuedDiag;if(!q){sendsSince=0;return "";}if(!sendsSince)sendsSince=Date.now();return Date.now()-sendsSince<SENDS_HOLD_MS?"sends":"";};', js)
@@ -952,15 +1115,93 @@ class ReloadWiringPinned(unittest.TestCase):
         self.assertIn("if(shellOpened&&window.__rompReload)window.__rompReload.checkBoot();shellOpened=true;", js)
         self.assertIn("if(m&&m.type==='ka'){if(m.dv&&window.__rompReload)window.__rompReload.noteDv(m.dv);}", js)
 
-    def test_the_banner_is_the_refused_fallback_and_the_poll_feeds_the_core(self):
+    def test_the_banner_is_the_offers_home_and_the_poll_feeds_the_core(self):
         js = km._STALE_JS
-        self.assertIn("if(RL){RL.refused=function(){buildStale=true;show(BUILDMSG);};", js)
-        self.assertIn("RL.announce(function(k,t){if(window.__rompNotify)window.__rompNotify(k,t);});}", js)
+        # 2026-09-16: the shell's #rstale box paints the core's offer (the hook), Reload is the core's accept, Not now its dismiss
+        self.assertIn("if(RL){RL.offer=function(o){offer=o||null;rl.disabled=false;rl.textContent='Reload';paint();};", js)
+        self.assertIn("RL.announce(function(k,t){if(window.__rompNotify)window.__rompNotify(k,t);});RL.offer(RL.offered());}", js, "an offer proposed before the hook paints at install")
         self.assertIn("if(RL)RL.noteVersion(v);", js)
-        self.assertIn("if(loaded&&served>loaded&&served!==dismissed){if(!RL)show(BUILDMSG);}", js)
-        self.assertIn("if(m.build){if(RL)RL.request('build','');else{buildStale=true;show(BUILDMSG);}}", js)
-        self.assertIn("if(m&&m.romp==='wsFresh'){connStale=false;if(buildStale)show(BUILDMSG);else box.classList.remove('show');}", js,
-                      "the CONNECTION prompt for a plain reconnect is untouched")
+        self.assertIn("else if(loaded&&served>loaded&&served!==dismissed){buildStale=true;paint();}", js, "the banner's own wording only where the core is absent")
+        self.assertIn("if(m&&m.romp==='wsStale'){if(m.build){if(RL)RL.checkBoot();else buildStale=true;}else connStale=true;paint();}", js,
+                      "an older pane's build:1 asks the core for the authoritative /version reading; a connection stale paints the prompt")
+        self.assertIn("else if(m&&m.romp==='wsFresh'){connStale=false;paint();}", js, "the CONNECTION prompt retires on the resync; the offer, if one stands, paints again")
+        self.assertIn("else if(offer){box.classList.add('offer');dm.textContent='Not now';show(offer.text);}", js, "the offer's own wording, the accent class, Not now")
+        self.assertIn("if(connStale){box.classList.remove('offer');dm.textContent='Dismiss';show(CONNMSG);}", js, "the connection prompt outranks the offer while it stands")
+        self.assertIn("rl.onclick=function(){if(RL&&offer){rl.disabled=true;rl.textContent='Reloading\u2026';RL.accept();}else location.reload();};", js,
+                      "Reload acknowledges at once and is the core's accept; without an offer it is the plain reload of a frozen view")
+        self.assertIn("else if(RL&&offer)RL.dismiss();", js, "Not now is the core's dismiss, kept per build")
+        self.assertNotIn("RL.refused=", js); self.assertNotIn("RL.request(", js)
+        css = km._STALE_CSS
+        self.assertIn("#rstale.offer .rs-reload{background:var(--accent,#9cd2ff);color:var(--accent-fg,#0c1a2e);border-color:transparent}", css, "the offer's action wears the accent")
+        self.assertIn("#rstale button:disabled{opacity:.55;cursor:default}", css)
+        html = km._landing()
+        self.assertIn(":root{--accent:#9cd2ff;--accent-fg:#0c1a2e}", html, "the landing defines the token the rule reads")
+        self.assertIn("body.theme-light{--accent:#C2410C;--accent-fg:#FFF8F2;", html, "and the light theme re-resolves it")
+
+    def test_the_shells_banner_paints_the_offer_and_its_buttons_drive_the_core(self):
+        """_STALE_JS executed over a DOM fake: the core's offer hook paints the line with Not now and the accent class; Reload
+        acknowledges and calls accept (never location.reload while an offer stands); Not now calls dismiss; the connection prompt
+        outranks a standing offer and the offer returns when it retires; an older pane's build:1 asks for /version; with nothing
+        offered the Reload button is the plain reload."""
+        node = shutil.which("node")
+        if not node:
+            raise unittest.SkipTest("node not installed")
+        js = """
+var CALLS = [], RELOADS = 0, classes = {}, LISTEN = {};
+var msg = { textContent: "" }, rl = { textContent: "Reload", disabled: false, onclick: null, tagName: "BUTTON" }, dm = { textContent: "Dismiss", onclick: null, tagName: "BUTTON" };
+var box = { classList: { add: function () { for (var i = 0; i < arguments.length; i++) classes[arguments[i]] = true; }, remove: function () { for (var i = 0; i < arguments.length; i++) delete classes[arguments[i]]; } },
+            querySelector: function () { return msg; }, addEventListener: function () {}, getBoundingClientRect: function () { return { left: 0, top: 0, width: 100, height: 20 }; }, style: {} };
+var document = { getElementById: function (id) { return id === "rstale" ? box : id === "rstale-reload" ? rl : id === "rstale-dismiss" ? dm : null; } };
+var RL = { offer: null, held: null, announce: function () {}, offered: function () { return null; },
+           noteVersion: function (v) { CALLS.push(["noteVersion", v.dist_ver]); }, checkBoot: function () { CALLS.push(["checkBoot"]); },
+           accept: function () { CALLS.push(["accept"]); }, dismiss: function () { CALLS.push(["dismiss"]); } };
+var window = { addEventListener: function (t, f) { (LISTEN[t] = LISTEN[t] || []).push(f); }, __rompNotify: function (k, t) { CALLS.push(["notify", k, t]); }, __rompReload: RL, innerWidth: 800, innerHeight: 600 };
+var location = { reload: function () { RELOADS++; } };
+function fetch() { return { then: function () { return { then: function () { return { "catch": function () {} }; } }; } }; }   /* the poll never answers here */
+function setInterval() {}
+%s
+var OUT = {};
+function snap() { return { text: msg.textContent, shown: !!classes.show, offer: !!classes.offer, dismiss: dm.textContent, reload: rl.textContent, disabled: rl.disabled }; }
+OUT.installed = snap();
+RL.offer({ dv: 8, code: "", behind: false, text: %s });
+OUT.offered = snap();
+RL.offer({ dv: 8, code: "", behind: true, text: %s });
+OUT.behind = snap();
+var message = LISTEN.message[0];
+message({ data: { romp: "wsStale" } }); OUT.connOverOffer = snap();
+message({ data: { romp: "wsFresh" } }); OUT.offerBack = snap();
+message({ data: { romp: "wsStale", build: 1 } }); OUT.buildAsks = { calls: CALLS.slice(), snap: snap() }; message({ data: { romp: "wsFresh" } });
+dm.onclick(); OUT.afterNotNow = { calls: CALLS.slice() };
+RL.offer(null); OUT.retired = snap();
+RL.offer({ dv: 9, code: "", behind: false, text: %s });
+rl.onclick(); OUT.afterReload = { calls: CALLS.slice(), reloads: RELOADS, snap: snap() };
+RL.offer(null);
+rl.onclick(); OUT.plainReload = RELOADS;
+message({ data: { romp: "wsStale" } }); dm.onclick(); OUT.connDismissed = snap();
+process.stdout.write("RESULT:" + JSON.stringify(OUT) + "\\n");
+""" % (km._STALE_JS.replace("__LOADEDVER__", "7"), json.dumps(OFFER), json.dumps(BEHIND), json.dumps(OFFER))
+        d = tempfile.mkdtemp(prefix="stale-banner-")
+        path = os.path.join(d, "stale.js")
+        with open(path, "w") as f:
+            f.write(js)
+        r = subprocess.run([node, path], capture_output=True, text=True, timeout=60)
+        shutil.rmtree(d, ignore_errors=True)
+        self.assertEqual(r.returncode, 0, "node failed:\n" + r.stderr)
+        o = json.loads(next(ln for ln in r.stdout.splitlines() if ln.startswith("RESULT:"))[len("RESULT:"):])
+        self.assertFalse(o["installed"]["shown"], "nothing to say at install")
+        self.assertEqual(o["offered"], {"text": OFFER, "shown": True, "offer": True, "dismiss": "Not now", "reload": "Reload", "disabled": False})
+        self.assertEqual(o["behind"]["text"], BEHIND, "the sharpened wording is written into the standing line")
+        self.assertEqual(o["connOverOffer"]["text"], "romp lost the live connection to the dashboard, so what you see may be stale.")
+        self.assertEqual([o["connOverOffer"]["offer"], o["connOverOffer"]["dismiss"]], [False, "Dismiss"], "the connection prompt outranks the offer")
+        self.assertEqual([o["offerBack"]["text"], o["offerBack"]["offer"], o["offerBack"]["dismiss"]], [BEHIND, True, "Not now"], "the offer returns when the prompt retires")
+        self.assertEqual(o["buildAsks"]["calls"], [["checkBoot"]], "an older pane's build:1 asks the core for the authoritative reading")
+        self.assertEqual(o["afterNotNow"]["calls"], [["checkBoot"], ["dismiss"]], "Not now is the core's dismiss")
+        self.assertFalse(o["retired"]["shown"], "the hook's null takes the line down")
+        self.assertEqual(o["afterReload"]["calls"][-1], ["accept"], "Reload is the core's accept")
+        self.assertEqual(o["afterReload"]["reloads"], 0, "never location.reload while an offer stands: the core persists first")
+        self.assertEqual([o["afterReload"]["snap"]["disabled"], o["afterReload"]["snap"]["reload"]], [True, "Reloading\u2026"], "the click is acknowledged at once")
+        self.assertEqual(o["plainReload"], 1, "with no offer the button is the plain reload of a frozen view")
+        self.assertFalse(o["connDismissed"]["shown"])
 
     def test_a_held_reload_is_told_to_the_notification_center_and_to_a_standalone_panes_bar(self):
         # the shell's stale script installs the `held` hook: the line names what the reload waits for (an upload, a held
@@ -982,11 +1223,16 @@ class ReloadWiringPinned(unittest.TestCase):
         self.assertIn("fetch('/version'", core, "…and /version is the serving kernel's own")
 
     def test_the_superseded_rule_is_recorded_with_both_dates(self):
+        # three rulings by date, each recorded as superseding the one before it (2026-07-13, 2026-09-08, 2026-09-16)
         src = open(os.path.join(ROOT, "kernel", "kernel.py")).read()
-        block = src[src.index("# ── the dashboard reloads ITSELF"):src.index("_RELOAD_CORE_JS = r")]
-        self.assertIn("2026-09-08", block); self.assertIn("2026-07-13", block); self.assertIn("supersedes", block)
+        block = src[src.index("# ── the dashboard OFFERS a reload on a newer build"):src.index("_RELOAD_CORE_JS = r")]
+        self.assertIn("2026-09-16", block); self.assertIn("2026-09-08", block); self.assertIn("2026-07-13", block)
+        self.assertIn("2026-09-16 supersedes 2026-09-08", block); self.assertIn("2026-09-08 (T265) supersedes 2026-07-13", block)
+        self.assertLess(block.index("2026-07-13"), block.index("2026-09-08 (T265) supersedes"), "oldest first")
         ext = open(os.path.join(ROOT, "vscode-extension", "src", "extension.ts")).read()
-        self.assertIn("2026-09-08", ext, "the VS Code exception names the ruling it stands beside")
+        self.assertIn("2026-09-16", ext, "the VS Code exception names the ruling it stands beside")
+        self.assertIn("2026-09-08", ext, "and the one it superseded")
+        self.assertIn("OFFERS the reload", ext)
 
 
 if __name__ == "__main__":

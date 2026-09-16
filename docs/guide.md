@@ -83,11 +83,18 @@ box — the words, the quote chips it was written against and its attachments �
 change it and send it again, or clear the box to drop it. A queued slash command, and a
 notice romp itself queued, carry a **✕** instead: there is nothing to reword, so they just
 cancel. If the session took the message before you pressed, the bubble says so and the
-box is left as it was, so nothing is sent twice. One narrow window: a chat page from
-before an update, still open while the kernel restarts on the new one, presses a pencil
-the new kernel no longer knows as an edit; the bubble reverts and the message stays
-queued. The page reloads itself on the new kernel within moments, which keeps that
-window short.
+box is left as it was, so nothing is sent twice. One case to know about: a chat page
+from before an update, still open on the new kernel. The page never reloads itself. A
+line near the top of the window says a newer romp build is ready, with **Reload** and
+**Not now**: Reload keeps your place, your drafts, your tab and the notification center,
+and Not now keeps the line away for that build (a later build asks again). Until you
+reload, the old page keeps working against the new kernel: reading, sending and switching
+tabs are unaffected, and the one thing that can go differently is an action the new kernel
+no longer knows in the old page's form, which falls back to the older path (a pencil on a
+queued message reverts and the message stays queued). When that happens the line says the
+page is behind the kernel, so you know the reload is what puts it right. A restart of the
+kernel onto the same build changes nothing on screen: the panes reconnect, and no line
+appears.
 
 **Opening a markdown document.** A markdown link in the chat opens in the file viewer,
 rendered, with **Raw** one click away — a path on the session's machine, or a link to a
@@ -215,7 +222,9 @@ reorders the tags on every surface (the timeline's tag table shows the same orde
 a tab into another group, right-click it and pick **Move to <tag>** under **Tags**: one click
 adds that tag and drops the tag of the group you right-clicked it in, leaving its other tags alone. The row's
 **+** adds the tag without moving the tab. **Group tabs by tag**, at the foot of the tag
-button's menu, turns the sections off for this browser. The Sessions pane has the same
+button's menu, turns the sections off for this browser. On a phone the session picker, which stands in
+for the strip, lists the sessions the same way: each under its tag's heading, in the same order, and
+nothing folded (its tag menu has the same switch). The Sessions pane has the same
 sections: **Group by tag** in its Filter menu (off until you turn it on, per browser) lays the
 lanes out one section per tag in the same order, each session under every tag it carries and
 the untagged sessions behind a divider, with the tag's chip, the caret and the count on a row
@@ -487,7 +496,9 @@ host reconnects, a relay down, a session that ended), the pane goes blank: no
 tab is selected, the body names the session that vanished (and says it is
 reconnecting when that is known), and the message box is disabled with no
 session name in it. When that same session's tab returns, the pane goes back
-to it. After a kernel restart the page reloads and remembers the tab you were
+to it. A kernel restart does not reload the page: the panes reconnect and the
+board stays where it was. After a reload (one you take from the newer-build line,
+or your browser's own) the page remembers the tab you were
 on: until that session is listed again the pane stays blank and names it as not
 listed yet, and it never settles on another session meanwhile; if it never
 returns, the blank body stays until you pick a tab (a remembered tab that can
