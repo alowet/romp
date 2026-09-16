@@ -21,7 +21,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
 import { provisionalName, mintProvisionalId, isProvisionalId } from "./provisional";
-import { StagedStack } from "./staged-messages";
+import { StagedStack, quoteReplyBody, stagedPosts, isCitationShape } from "./staged-messages";
 import { takeReloadNotices, keepReloadNotices } from "./reload-notices";
 import { columnHolds } from "./chat-columns";
 import { isSubId } from "./subagent-view";
@@ -41,7 +41,7 @@ const VIEWER = C + "/agent/a1";
 const REQ = { name: "notes", backend: "sdk", dir: "/proj/not-there-yet", host: "" };
 const TYPED = "notes for a session whose folder is not there yet";
 
-type Hooks = { posts: Record<string, unknown>[]; boot: Record<string, unknown>[]; sent: Record<string, unknown>[]; seq: string[]; confirms: string[]; pickers: number; persisted: number; timers: (() => void)[]; cleared: number; toasts: string[]; answered: (string | null)[]; claims: string[]; fired: number };
+type Hooks = { posts: Record<string, unknown>[]; boot: Record<string, unknown>[]; sent: Record<string, unknown>[]; seq: string[]; confirms: string[]; pickers: number; persisted: number; timers: (() => void)[]; cleared: number; toasts: string[]; answered: (string | null)[]; claims: string[]; fired: number; reloadEnded: number };
 type Ship = { name: string; shipId: string; b64?: string };
 type State = { provisionalId: string | null; dirQuestionFor: string | null; failed: string[]; activeId: string | null; drafts: Record<string, string>; sessions: string[]; timer: boolean; why: Record<string, string> };
 type Api = {
@@ -52,7 +52,7 @@ type Api = {
   adopt: (sid: string) => void; orphans: () => string[];
   // round ten: the hand-off's two halves (the real take arrow and adoptSessionState), an upload in flight and its held send, the kernel's ack (the real droppedPath branch)
   take: (sid: string) => any; adoptState: (sid: string, st: unknown) => void; ship: (id: string, name: string, shipId: string, b64?: string) => void; holdSend: (id: string) => void;
-  ships: () => Record<string, Ship[]>; heldSend: () => string[]; ack: (m: Record<string, unknown>) => void;
+  ships: () => Record<string, Ship[]>; heldSend: () => string[]; ack: (m: Record<string, unknown>) => void; shipFail: (name: string, shipId: string) => void;   // shipFail: the FileReader failed on it (round eleven)
   held: { stage: (id: string, text: string, cites?: unknown[]) => void; cite: (id: string, chips?: unknown[]) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown>; drafts: () => Record<string, string> };
   busy: () => boolean; answer: (v: string | null) => void; confirm: () => { title: string; buttons: string[]; key: string | null } | null;
   overlays: () => number; clickButton: (label: string) => boolean; rid: () => string | null;
@@ -67,8 +67,9 @@ const ON_DROPPED = (() => { const i = RENDER.indexOf('if (m.type === "droppedPat
 function world(o: { activeId: string | null; mru: string[]; order: string[]; nextActive: string | null; store?: Record<string, unknown>; session?: Record<string, string>; sets?: Record<string, string[]> | null }): { api: Api; HOOKS: Hooks; store: Record<string, unknown>; session: Record<string, string> } {
   const store: Record<string, unknown> = o.store ?? {};
   const session: Record<string, string> = o.session ?? {};   // the page's sessionStorage (the reload notices ride it)
-  const HOOKS: Hooks = { posts: [], boot: [], sent: [], seq: [], confirms: [], pickers: 0, persisted: 0, timers: [], cleared: 0, toasts: [], answered: [], claims: [], fired: 0 };
-  const win = { parent: { postMessage(m: Record<string, unknown>) { HOOKS.posts.push(m); if (m.romp === "colBusy") HOOKS.seq.push("flip:" + m.busy); } } };
+  const HOOKS: Hooks = { posts: [], boot: [], sent: [], seq: [], confirms: [], pickers: 0, persisted: 0, timers: [], cleared: 0, toasts: [], answered: [], claims: [], fired: 0, reloadEnded: 0 };
+  const win = { parent: { postMessage(m: Record<string, unknown>) { HOOKS.posts.push(m); if (m.romp === "colBusy") HOOKS.seq.push("flip:" + m.busy); } },
+                __rompReload: { ended() { HOOKS.reloadEnded++; } } };   // the reload core's ending-event door, counted (round eleven)
   const js = requireCjs("esbuild").transformSync(
     [lineOpt("columnBusy"), fn("syncColumnBusy"), fn("dropProvisional"), fn("openProvisional"), fn("cancelProvisional"), fn("failProvisional"),
      fn("onCreateDirMissing"), fnOpt("dirWhy"), fnOpt("dismissDirPromptForPicker"), fn("closePicker"), fn("startCreate"), fn("closeConfirm"), fn("closeTabLocally"),
@@ -76,10 +77,14 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
      fn("persistDrafts").replace("function persistDrafts(", "function persistDraftsReal("), fnOpt("restoreFailedProvisionals"),
      fnOpt("bootComposerState"), fnOpt("announceColumnBusy"), lineOpt("retireRid"), fnOpt("finishBoot"), fnOpt("routeCreateReply"), lineOpt("rememberSettled"), fn("resolveProvisionalToExisting"),
      fn("adoptProvisional"), fnOpt("moveProvisionalState"), fn("orphanStateSids"), lineOpt("heldHere"),
-     fnOpt("mergeCitations"), fn("addPendingShip"), fn("shipSafeName"), fn("shipOwner"), fn("retirePendingShip"), fn("endReloadHoldIfIdle"), fn("addComposerFile"), fnOpt("adoptShips"), fn("adoptSessionState"), TAKE, ON_DROPPED].join("\n"),
+     fnOpt("mergeCitations"), fn("addPendingShip"), fn("shipSafeName"), fn("shipOwner"), fn("retirePendingShip"), fn("endReloadHoldIfIdle"), fn("addComposerFile"), fn("adoptSessionState"), TAKE, ON_DROPPED,
+     fnOpt("shipFailed"), fnOpt("sendHeldFor"), fn("flushStaged"), fn("routeUserMessage"), fn("noteOrphanState")].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
-    const { provisionalName, mintProvisionalId, isProvisionalId, isSubId, columnHolds, StagedStack, HOOKS, STORE, takeReloadNotices } = W;
+    const { provisionalName, mintProvisionalId, isProvisionalId, isSubId, columnHolds, StagedStack, HOOKS, STORE, takeReloadNotices, quoteReplyBody, stagedPosts, isCitationShape } = W;
+    let tabOrderSeen = true;   // the board has been heard: the orphan offer speaks (round eleven)
+    const lastSent = new Map(), draftStartedAt = new Map(); const hostIsDown = () => false; const previewKind = (p) => (/\.(png|jpe?g|gif|webp)$/i.test(String(p)) ? "img" : "file");
+    const ephemeralWarnToast = (t) => { HOOKS.toasts.push(t); };
     const COL = "2"; let colSets = W.sets;   // this page: a later column, whose set the shell answers (round nine: the orphan enumeration reads it)
     const claimSession = (sid) => { HOOKS.claims.push(sid); }; const mintQid = () => "q-1"; const registerOptimistic = () => {};
     const renderComposerChips = () => {}; const renderComposerFiles = () => {}; const renderStagedStrip = () => {};
@@ -151,6 +156,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       ships: () => Object.fromEntries([...pendingShips].map(([k, v]) => [k, v.map((p) => ({ name: p.name, shipId: p.shipId, ...(p.b64 ? { b64: p.b64 } : {}) }))])),
       heldSend: () => [...sendOnShip],
       ack: (m) => onDroppedPath(m),                              // the kernel's droppedPath, through the real branch
+      shipFail: (name, shipId) => shipFailed(name, shipId, name + " could not be read, so it was not attached — try again."),   // the reader's failure path (round eleven)
       route: (m) => (typeof routeCreateReply === "function" ? routeCreateReply(m).kind : "?"),
       // (each persists, as the page's own staging / citing / attaching does)
       held: { stage: (id, text, cites) => { stagedMsgs.push(id, { text, cites: cites || [] }); persistDrafts(); }, cite: (id, chips) => { composerCitations.set(id, chips || [{ title: "a card", itemId: "g1" }]); persistDrafts(); }, attach: (id) => { composerFiles.set(id, ["/tmp/a.png"]); persistDrafts(); },
@@ -162,7 +168,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
     };
   `;
   const make = new Function("W", "window", prelude + js + epilogue) as (w: unknown, win: unknown) => Api;
-  const api = make({ provisionalName, mintProvisionalId, isProvisionalId, isSubId, columnHolds, StagedStack, HOOKS, STORE: store, SESSION: session, takeReloadNotices, sets: o.sets === undefined ? { "2": [C] } : o.sets, activeId: o.activeId, mru: o.mru, order: o.order, nextActive: o.nextActive, wantActiveGone: null }, win);
+  const api = make({ provisionalName, mintProvisionalId, isProvisionalId, isSubId, columnHolds, StagedStack, HOOKS, STORE: store, SESSION: session, takeReloadNotices, quoteReplyBody, stagedPosts, isCitationShape, sets: o.sets === undefined ? { "2": [C] } : o.sets, activeId: o.activeId, mru: o.mru, order: o.order, nextActive: o.nextActive, wantActiveGone: null }, win);
   return { api, HOOKS, store, session };
 }
 const flips = (h: Hooks, busy: boolean) => h.posts.filter((p) => p.romp === "colBusy" && p.busy === busy).length;
@@ -580,23 +586,74 @@ test("round ten: an upload in flight on the pending tab is the new session's aft
   assert.deepEqual(w.api.ships(), {}); assert.deepEqual(w.api.heldSend(), []); assert.equal(w.HOOKS.fired, 1, "the held send fired — the real session is the active tab"); assert.deepEqual(w.HOOKS.toasts, []);
 });
 
-test("round ten: resolved to a session shown in another pane, the upload in flight travels with the state — the receiving pane re-ships the bytes, its ack attaches the file there, the held send fires there; bytes not yet read are announced lost, never a chip pulsing forever", () => {
+test("round eleven: an upload never crosses documents — a create resolved to a session shown elsewhere with two uploads in flight holds the column; the unread one fails → the held send is cancelled loudly and the words stay the real session's draft; the read one acks → busy false last, the hand-off carries the completed file and the draft, nothing re-sent", () => {
   const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {}, sets: { "2": [] } });   // a held column
+  w.api.startCreate(REQ); const id = w.api.state().provisionalId!;
+  w.api.ship(id, SHIP.name, SHIP.shipId, SHIP.b64); w.api.ship(id, "late.png", "s2"); w.api.holdSend(id); w.api.type(TYPED);   // two uploads, one still unread; "Wait for the upload"
+  w.api.resolveTo(A);
+  assert.equal(w.api.busy(), true, "busy: an upload of this document is in flight"); assert.equal(flips(w.HOOKS, false), 0, "no flip: the column stays held");
+  assert.deepEqual(Object.keys(w.api.ships()), [A], "the chips are the real session's"); assert.equal(w.api.ships()[A].length, 2); assert.deepEqual(w.api.heldSend(), [A]);
+  w.api.shipFail("late.png", "s2");   // the FileReader failed on the unread one
+  assert.deepEqual(w.api.heldSend(), [], "the held send is cancelled: it would go short of an attachment"); assert.equal(w.HOOKS.fired, 0);
+  assert.ok(w.HOOKS.toasts.some((t) => /late\.png .*NOT sent/.test(t)), "said: " + JSON.stringify(w.HOOKS.toasts));
+  assert.equal(w.api.held.drafts()[A], TYPED, "the words stay the real session's draft"); assert.equal(w.api.busy(), true, "still busy: the other ship's ack is owed"); assert.equal(flips(w.HOOKS, false), 0);
+  w.api.ack({ type: "droppedPath", path: "drops/1700000000000-photo.png", shipId: "s1" });
+  assert.deepEqual(w.api.held.files()[A], ["drops/1700000000000-photo.png"], "the completed file, under the real sid"); assert.equal(w.HOOKS.fired, 0);
+  assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "sendMessage" || m.type === "askFollowUp"), [], "nothing sent: the hold was cancelled");
+  assert.equal(w.api.busy(), false); assert.equal(flips(w.HOOKS, false), 1); assert.deepEqual(last(w.HOOKS), { romp: "colBusy", busy: false }, "the flip, last");
+  assert.ok(w.HOOKS.seq.lastIndexOf("persist") < w.HOOKS.seq.lastIndexOf("flip:false"), "persisted before the flip");
+  assert.ok(w.HOOKS.posts.some((p) => p.romp === "orphanState" && (p.sids as string[]).includes(A)), "the completed file under an unshown session is offered to the pane that shows it");
+  const st = w.api.take(A);
+  assert.deepEqual(st, { draft: TYPED, citations: [], files: ["drops/1700000000000-photo.png"], staged: [] }, "the hand-off's exact fields: no upload, no held send");
+  assert.deepEqual(w.HOOKS.sent.filter((m) => m.type === "dropFile"), [], "no upload re-sent, ever");
+  // the receiving pane ignores an upload or a held-send field an older page might still send: never a chip, never a hold, never a re-ship
+  const r = receiving(); r.api.adoptState(A, { ...st, ships: [{ name: "x.png", shipId: "s9", b64: "QUJD" }], heldSend: true });
+  assert.deepEqual(r.api.ships(), {}); assert.deepEqual(r.api.heldSend(), []); assert.deepEqual(r.HOOKS.sent.filter((m) => m.type === "dropFile"), []);
+  assert.deepEqual(r.api.held.files()[A], ["drops/1700000000000-photo.png"]); assert.equal(r.api.held.drafts()[A], TYPED);
+});
+
+test("round eleven: the held send fires BY SID from a document that does not show the tab, once every ship it waited on completed — the draft, the acked file on its trailing line, to the real session; the stores empty; nothing left to hand over", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {}, sets: { "2": [] } });
   w.api.startCreate(REQ); const id = w.api.state().provisionalId!;
   w.api.ship(id, SHIP.name, SHIP.shipId, SHIP.b64); w.api.holdSend(id); w.api.type(TYPED);
   w.api.resolveTo(A);
-  assert.deepEqual(w.api.ships(), { [A]: [SHIP] }); assert.deepEqual(w.api.heldSend(), [A]); assert.ok(w.api.orphans().includes(A));
+  assert.equal(w.api.state().activeId, null, "the held column shows no tab"); assert.equal(w.api.busy(), true);
+  w.api.ack({ type: "droppedPath", path: "drops/1700000000001-photo.png", shipId: "s1" });
+  const sent = w.HOOKS.sent.filter((m) => m.type === "sendMessage");
+  assert.deepEqual(sent.map((m) => ({ id: m.id, text: m.text, paths: m.paths })), [{ id: A, text: TYPED + "\ndrops/1700000000001-photo.png", paths: ["drops/1700000000001-photo.png"] }], "one message, to A by sid, the attachment on its trailing line");
+  assert.equal(w.HOOKS.fired, 0, "not the box's send: the tab is not shown here"); assert.deepEqual(w.HOOKS.toasts, []);
+  assert.equal(w.api.held.drafts()[A], undefined); assert.equal(w.api.held.files()[A], undefined); assert.deepEqual(w.api.heldSend(), []);
+  assert.equal(w.api.busy(), false); assert.deepEqual(last(w.HOOKS), { romp: "colBusy", busy: false }, "the flip, last"); assert.equal(w.api.take(A), null, "nothing left to hand over");
+});
+
+test("round eleven: in ONE document (adoption: the column stays) two uploads on the pending tab — the first ack does not fire the held send, the last does, both files with it; a failure cancels the hold and the later ack sends nothing", () => {
+  const w = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {} });
+  w.api.startCreate(REQ); const id = w.api.state().provisionalId!;
+  w.api.ship(id, "a.png", "s1", "QUJD"); w.api.ship(id, "b.png", "s2", "QUJD"); w.api.holdSend(id); w.api.type(TYPED);
+  w.api.adopt(X);
+  assert.equal(w.api.busy(), true, "busy: the acks are owed to this document"); assert.equal(flips(w.HOOKS, false), 0);
+  w.api.ack({ type: "droppedPath", path: "drops/1-a.png", shipId: "s1" });
+  assert.equal(w.HOOKS.fired, 0, "one ship still pending"); assert.deepEqual(w.api.held.files()[X], ["drops/1-a.png"]); assert.equal(w.api.busy(), true);
+  w.api.ack({ type: "droppedPath", path: "drops/2-b.png", shipId: "s2" });
+  assert.equal(w.HOOKS.fired, 1, "the last ack fires the box's send (the tab is active here)"); assert.deepEqual(w.api.held.files()[X], ["drops/1-a.png", "drops/2-b.png"], "both files on the strip for it");
+  assert.equal(w.api.busy(), false); assert.equal(flips(w.HOOKS, false), 1); assert.deepEqual(last(w.HOOKS), { romp: "colBusy", busy: false });
+  const v = world({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {} });
+  v.api.startCreate(REQ); const idv = v.api.state().provisionalId!;
+  v.api.ship(idv, "a.png", "s1", "QUJD"); v.api.ship(idv, "b.png", "s2"); v.api.holdSend(idv); v.api.type(TYPED);
+  v.api.adopt(X);
+  v.api.shipFail("b.png", "s2");
+  assert.deepEqual(v.api.heldSend(), [], "cancelled at the failure"); assert.ok(v.HOOKS.toasts.some((t) => /NOT sent/.test(t)));
+  v.api.ack({ type: "droppedPath", path: "drops/1-a.png", shipId: "s1" });
+  assert.equal(v.HOOKS.fired, 0, "the surviving ack sends nothing"); assert.deepEqual(v.api.held.files()[X], ["drops/1-a.png"]); assert.equal(v.api.held.drafts()[X], TYPED, "the words kept as the draft");
+  assert.equal(v.api.busy(), false);
+});
+
+test("round eleven: the take tells the reload core when it empties a box that held words (the typing hold's ending event), and says nothing when the box was empty", () => {
+  const w = receiving(); w.api.type("half a thought");
   const st = w.api.take(A);
-  assert.deepEqual(st.ships, [SHIP], "the entry travels, bytes and all"); assert.equal(st.heldSend, true); assert.equal(st.draft, TYPED);
-  assert.deepEqual(w.api.ships(), {}, "gone from the closing page"); assert.deepEqual(w.api.heldSend(), []);
-  const r = receiving(); r.api.adoptState(A, st);
-  assert.deepEqual(r.HOOKS.sent.filter((m) => m.type === "dropFile"), [{ type: "dropFile", name: "photo.png", b64: "QUJD", shipId: "s1", id: A }], "re-shipped to A's kernel: the reconnect re-ship's frame");
-  assert.deepEqual(r.api.ships(), { [A]: [SHIP] }); assert.deepEqual(r.api.heldSend(), [A]); assert.equal(r.api.held.drafts()[A], TYPED);
-  r.api.ack({ type: "droppedPath", path: "drops/1700000000001-photo.png", shipId: "s1" });
-  assert.deepEqual(r.api.held.files()[A], ["drops/1700000000001-photo.png"]); assert.equal(r.HOOKS.fired, 1, "the held send fires in the pane that shows A"); assert.deepEqual(r.api.ships(), {});
-  const q = receiving(); q.api.adoptState(A, { ships: [{ name: "late.png", shipId: "s2" }], heldSend: true });   // the FileReader had not finished when the source page went
-  assert.deepEqual(q.api.ships(), {}); assert.deepEqual(q.api.heldSend(), [], "a hold with nothing to wait on is not armed");
-  assert.equal(q.HOOKS.toasts.length, 2, "said twice — the upload lost, the message not sent: " + JSON.stringify(q.HOOKS.toasts)); assert.match(q.HOOKS.toasts[0], /late\.png .*attach it again/); assert.match(q.HOOKS.toasts[1], /not sent/);
+  assert.equal(st.draft, "half a thought"); assert.equal(w.api.composer(), ""); assert.equal(w.HOOKS.reloadEnded, 1, "told once: the box that held the typing hold was emptied");
+  const v = receiving();
+  assert.equal(v.api.take(A), null); assert.equal(v.HOOKS.reloadEnded, 0, "an empty box held nothing: nothing to end");
 });
 
 test("round ten: flavours never mix in a carry — a goal chip keeps the list and the quotes stage as context, whichever side held them; quotes stack; two goals: the arriving one, said; the receiving pane's adopt follows the same rule", () => {

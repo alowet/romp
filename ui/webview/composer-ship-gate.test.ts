@@ -29,11 +29,13 @@ test("the held send fires on the LAST ack — event-based — and a nack cancels
   assert.match(RENDER, /if \(owner && \(sendOnShip\.has\(owner\) \|\| gateOpen\) && !\(pendingShips\.get\(owner\) \|\| \[\]\)\.length\) \{/,
     "the deciding event is the last pending ship retiring — for a held send AND an open gate dialog");
   assert.match(RENDER, /if \(owner === activeId\) fireHeldSend\(\);/);
-  assert.match(RENDER, /the held message was not sent; review it there/,
-    "a mid-hold tab switch surfaces instead of sending a background composer");
+  assert.match(RENDER, /if \(owner === activeId\) fireHeldSend\(\);\n\s*else sendHeldFor\(owner\);/,
+    "a held send whose tab is not shown here goes BY SID from this document (round eleven): the ack rides this socket, so a held column whose create resolved to a session shown elsewhere sends from here");
+  assert.match(RENDER, /function sendHeldFor\(sid: string\): void \{[\s\S]{0,1600}flushStaged\(sid, text \? \{ text, cites, imgPaths: attached\.filter\(\(p\) => previewKind\(p\) === "img"\), paths: attached \} : undefined\);/,
+    "…built from the stores the way deliver builds from the box, through the one routing owner");
   assert.match(RENDER, /const held = !!owner && sendOnShip\.delete\(owner\);/,
     "a failed save cancels the hold — it must not fire without the file it waited for");
-  assert.match(RENDER, /\+ \(held \|\| gateWasOpen \? " Your message was NOT sent\." : ""\)/);
+  assert.match(RENDER, /warnToast\(why \+ \(held \|\| gateWasOpen \? " Your message was NOT sent — it stays as this session's draft\." : ""\)\);/, "the failure's toast says the held message did not go, and where the words are (shipFailed, round eleven)");
 });
 
 test("the OPEN gate dialog resolves itself on the last ack: closes and sends, no click needed", () => {

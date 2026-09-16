@@ -59,7 +59,7 @@ import { hotkeyCommandId, loadTabKeys, rememberTabKey, forgetTabKey, goneTabKeys
 import { notePendingFlag, dropPendingFlag, applyFrameFlags, type PendingFlags, type SessionFlag } from "./flag-pending";   // the per-session view flags' pending guard (review 2026-09-14)
 import { DEFAULT_CHORDS } from "./commands";
 import { NavHistory } from "./nav-history";
-import { StagedStack, quoteReplyBody, stagedPosts, type StagedMsg } from "./staged-messages";
+import { StagedStack, quoteReplyBody, stagedPosts, type StagedMsg, isCitationShape } from "./staged-messages";
 import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, isKernelEchoUuid, newPending, mintQid, reconcilePending, queuedCopyToHide, dropPending, bareGroupLabel, sentAtLabel, pendingBody } from "./send-pending";
 import { reconcileHeld, heldAsQueued, type HeldCopy, type HeldQueued, type HeldMemory } from "./queued-held";
 import { rescindedComposerState } from "./queued-rescind";   // a queued message's edit pulls it back into the composer (T373)
@@ -8182,17 +8182,21 @@ const PROVISIONAL_WAIT_MS = 90_000;
 // The shell's two questions before it moves a tab or closes a column (the chat split; _LANDING_SPLIT_JS moveTab and
 // close, review finds 2026-09-11): whether an id is a session a column can hold (a create in flight and a sub-agent
 // viewer are this page's own, never the store's, though both carry data-id on the strip), and whether this column has
-// a create in flight, or a failed one still holding its text, that would die with the document. Shape checks and a flag
-// read: any column's page answers for any id.
+// a create in flight, a failed one still holding its text, or an upload whose ack is owed to this document (round eleven), that
+// would die with the document. Shape checks and a flag read: any column's page answers for any id.
 (window as any).__rompMovableSession = (sid: unknown): boolean => typeof sid === "string" && !!sid && !isProvisionalId(sid) && !isSubId(sid) && !settings.tabsLocked;   // …and nothing moves while the tabs are locked (T395)
 // the REASON behind the answer above (T395 round one): the shell's refusal toast names the padlock for a lock, and says
 // "only an open session" for the rest, instead of one line for both
 (window as any).__rompMoveRefusal = (sid: unknown): string => typeof sid !== "string" || !sid || isProvisionalId(sid) || isSubId(sid) ? "not-open" : settings.tabsLocked ? "locked" : "";
-// THE TWO FACTS "a create is in flight here" reads: a provisional tab (a folder question keeps it, see dirQuestionFor) and a
-// failed one still holding its text. ONE reader — the shell's question, the flip below and the emptiness report
-// (noteColumnEmptiness) all read this, so they can never disagree (round four: the emptiness report read the facts on its
-// own and posted colEmpty from under a folder question).
-function columnBusy(): boolean { return !!provisionalId || failedProvisionals.size > 0; }
+// THE THREE FACTS "this document holds something that would die with it" reads: a provisional tab (a folder question keeps
+// it, see dirQuestionFor), a failed one still holding its text, and an UPLOAD IN FLIGHT (round eleven, 2026-09-16): the
+// kernel's ack rides the socket of the document that shipped the bytes, so an upload never crosses documents — pendingShips,
+// under any sid this document holds state for, a just-settled real sid included, holds the column until the ack (droppedPath,
+// shipId-matched) or the ship's own failure path ends it; no timer beyond the ship path's own. The hand-off that follows the
+// flip then carries the COMPLETED file with the other files. ONE reader — the shell's question, the flip below and the
+// emptiness report (noteColumnEmptiness) all read this, so they can never disagree (round four: the emptiness report read
+// the facts on its own and posted colEmpty from under a folder question).
+function columnBusy(): boolean { return !!provisionalId || failedProvisionals.size > 0 || pendingShips.size > 0; }
 (window as any).__rompColumnBusy = (): boolean => columnBusy();
 // …and the shell hears the answer CHANGE (2026-09-15): a column another dashboard's write dropped is HELD by the shell
 // while this page is busy — closing it would kill the create's queued text and draft with the document — and closed the
@@ -8315,7 +8319,8 @@ function moveProvisionalState(fromId: string, toId: string): void {
   // …and an UPLOAD still in flight (round ten): its pending chip, its held send and its open gate are the real session's now, so the
   // ack — droppedPath, echoing the shipId — attaches the saved path under the real sid and releases the send THERE, never under the
   // retired id (retirePendingShip found the chip under new-*, addComposerFile put the file there, and the held send waited on a tab
-  // that no longer existed). The bytes stay retained in the entry: a reconnect re-ships them as before.
+  // that no longer existed). The bytes stay retained in the entry: a reconnect re-ships them as before. This is a re-key within ONE
+  // document; an upload never crosses documents (round eleven) — it holds the column instead (columnBusy).
   const ships = pendingShips.get(fromId);
   if (ships && ships.length) { pendingShips.set(toId, [...(pendingShips.get(toId) ?? []), ...ships]); pendingShips.delete(fromId); }
   if (sendOnShip.delete(fromId)) sendOnShip.add(toId);
@@ -16272,6 +16277,7 @@ function addPendingShip(id: string | null, name: string, shipId: string): void {
   pendingShips.set(id, list);
   persistDrafts();   // the NAMES ride the draft store so a reload can say what it lost (T215)
   if (id === activeId) renderComposerFiles(id);
+  syncColumnBusy();   // the column is busy while the ack is owed (round eleven): closed under it, the ack would die with the document
 }
 
 // The sid holding a given shipId (null if none): the ack handler's stray-duplicate gate — an ack
@@ -16308,6 +16314,22 @@ function retirePendingShip(key: string, shipId?: string): string | null {
     return id;
   }
   return null;
+}
+
+// A ship that FAILED (round eleven, 2026-09-16) — the kernel could not save it (dropSaveFailed), the file could not be read, or it
+// encoded to nothing: the chip goes, and a send HELD on this session's uploads is cancelled LOUDLY, never fired short of an
+// attachment — the held send fires only when EVERY ship it waited on completed (before this the read failures retired the chip
+// alone, and the last surviving ack sent the message missing a file). The words stay where they are: the box, or the draft under
+// the real sid, which travels with the hand-off. The flip comes LAST: the upload's hold on the column ends with its chip.
+function shipFailed(key: string, shipId: string | undefined, why: string): void {
+  const owner = retirePendingShip(key, shipId) || activeId;
+  const held = !!owner && sendOnShip.delete(owner);    // a held send must not fire without the file it waited for
+  const gateWasOpen = shipGateSid === owner;
+  if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }   // the question is moot — but a failed save never auto-sends
+  endReloadHoldIfIdle();
+  warnToast(why + (held || gateWasOpen ? " Your message was NOT sent — it stays as this session's draft." : ""));
+  if (owner && owner === activeId) renderComposerFiles(owner);   // the held-send button state clears with the hold
+  syncColumnBusy();
 }
 
 // Re-ship the retained payloads whose ack socket just came back. That socket died with the acks
@@ -16490,7 +16512,7 @@ function bootComposerState(): void {
       // each value is a LIST of chips; a pre-stack state (before 2026-08-04) stored a single object — wrap it
       const list: Citation[] = [];
       for (const c of (Array.isArray(v) ? v : [v]) as any[]) {   // either flavor restores: goal (itemId) or quote (quote [+ uuid])
-        if (c && typeof c.title === "string" && (typeof c.itemId === "string" || typeof c.quote === "string"))
+        if (isCitationShape(c))   // the one shape check (staged-messages.ts): a staged item's context is held to it too (round eleven)
           list.push({ itemId: typeof c.itemId === "string" ? c.itemId : undefined, title: c.title,
                       quote: typeof c.quote === "string" ? c.quote : undefined,
                       uuid: typeof c.uuid === "string" ? c.uuid : null,
@@ -16606,6 +16628,28 @@ function flushStaged(sid: string, typed?: { text: string; cites?: Citation[]; im
   for (const p of stagedPosts(run, typed)) routeUserMessage(sid, p.text, p.cites as Citation[] | undefined, p.imgPaths, p.paths);
   if (run.length) { persistDrafts(); renderStagedStrip(sid); }
   return run.length;
+}
+
+// A send HELD on uploads (sendOnShip) whose last ship acked while this document does not SHOW the tab (round eleven, 2026-09-16):
+// the message goes to the kernel BY SID, built from the session's stores — the draft, the attached files (the one just acked
+// among them, on the trailing line as a typed send carries them), the citation chips, the staged run — exactly as sendComposer's
+// deliver builds it from the box, and the stores empty as a send empties them. Before this the ack toasted "review it there" and
+// left the message unsent; a held column whose create resolved to a session shown elsewhere had no tab to review it on. Deliver's
+// guards hold here too: a host down or a tab with no session behind it is refused, and the words stay the draft, which travels.
+function sendHeldFor(sid: string): void {
+  if (!vscodeApi) return;
+  const typed = (drafts.get(sid) ?? "").trim();
+  const attached = composerFiles.get(sid) || [];
+  const text = attached.length ? (typed ? typed + "\n" : "") + attached.map((p) => (/\s/.test(p) ? '"' + p + '"' : p)).join(" ") : typed;
+  if (!text && !stagedMsgs.count(sid)) return;
+  if (hostIsDown(sid) || isProvisionalId(sid)) { ephemeralWarnToast("The message held for the upload was not sent — the session isn't reachable. It stays as that session's draft."); return; }
+  const cites = composerCitations.get(sid);
+  if (text) lastSent.set(sid, text);
+  flushStaged(sid, text ? { text, cites, imgPaths: attached.filter((p) => previewKind(p) === "img"), paths: attached } : undefined);
+  if (cites) composerCitations.delete(sid);
+  if (attached.length) composerFiles.delete(sid);
+  drafts.delete(sid); draftStartedAt.delete(sid);
+  persistDrafts();
 }
 
   // every exit path re-places the name overlay: a row above the textarea coming or going moves the box's first line
@@ -16924,6 +16968,7 @@ function renderComposerFilesInner(id: string | null): void {
       }
       endReloadHoldIfIdle();   // after the settle above cleared the gate: the dismissed last chip ends the hold (T272)
       renderComposerFiles(id);
+      syncColumnBusy();   // LAST (round eleven): the upload's hold on the column ends with its chip
     });
     box.appendChild(x);
     strip.appendChild(box);
@@ -17222,30 +17267,28 @@ const sessionMru: string[] = [];
 // they are current), not this page's snapshot from its last render: a held column's kernel frames may not have landed since
 // the hold, and its snapshot would still call the member the peer moved away "shown here" — and drop its draft.
 (window as any).__rompOrphanStateSids = (): string[] => { colSets = readColSets(); if (activeId) stashActiveDraft(activeId); return orphanStateSids(); };   // the box's live text counts: stashed first, so an active tab this column no longer lists is in the list
-(window as any).__rompTakeSessionState = (sid: string): { draft: string; citations: Citation[]; files: string[]; staged: StagedMsg[]; ships: PendingShip[]; heldSend: boolean } | null => {
+(window as any).__rompTakeSessionState = (sid: string): { draft: string; citations: Citation[]; files: string[]; staged: StagedMsg[] } | null => {
   if (typeof sid !== "string" || !sid) return null;
   const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
+  const boxHeld = sid === activeId && !!ta && !!ta.value.trim();   // the box holds words: the reload core's `typing` hold stands on it (editing())
   if (sid === activeId && ta) { if (ta.value) drafts.set(sid, ta.value); else drafts.delete(sid); }
   const draft = drafts.get(sid) ?? "", citations = composerCitations.get(sid) ?? [], files = composerFiles.get(sid) ?? [], staged = stagedMsgs.takeAll(sid);
-  // …and an UPLOAD still in flight for it (round ten): the ack rides THIS document's socket and dies with it, so the entry — name,
-  // shipId, the retained bytes — travels, and the receiving pane re-ships the bytes the way the reconnect re-ship does (a duplicate
-  // file in drops/ is an orphan, never attached; the shipId-matched ack retires the chip there). A send HELD on it travels as the
-  // fact; an open ship-gate dialog dies with the document unanswered — a gate nobody answered never auto-sends (the nack rule)
-  const ships = pendingShips.get(sid) ?? [], heldSend = sendOnShip.delete(sid);
-  drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid); pendingShips.delete(sid);
-  const gateWasOpen = shipGateSid === sid;
-  if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }
-  if (ships.length || gateWasOpen) endReloadHoldIfIdle();   // ONLY when a hold left with the state: the core's ended() re-tries an owed reload, and a plain tab move must not fire one
+  drafts.delete(sid); composerCitations.delete(sid); composerFiles.delete(sid);
   if (sid === activeId) { if (ta) { ta.value = ""; growComposer(ta); } renderComposerChips(sid); renderComposerFiles(sid); renderStagedStrip(sid); }
+  // the typing hold's ENDING event (round eleven, 2026-09-16): the core hears a draft cleared by typing ('input') or a blur, never a
+  // box emptied from here — an owed reload then waited for the minute's backstop. Told exactly when the take emptied a box that
+  // held words, the way the 'input' event would have. No upload travels (round eleven): its ack rides this document's socket, so a
+  // ship of this document holds the column instead (columnBusy) and its reload hold ends on its own ack or failure.
+  if (boxHeld) { try { (window as any).__rompReload?.ended?.(); } catch { /* no core (the VS Code webview) */ } }
   persistDrafts();
-  if (!draft && !citations.length && !files.length && !staged.length && !ships.length && !heldSend) return null;
-  return { draft, citations, files, staged, ships, heldSend };
+  if (!draft && !citations.length && !files.length && !staged.length) return null;
+  return { draft, citations, files, staged };
 };
 // …and the TARGET page's half: what the source held, into the maps (joined onto anything already here, never over
 // it), persisted, and into the box when the tab is active. The shell posts it on a new column's load or at once.
 function adoptSessionState(sid: unknown, state: unknown): void {
   if (typeof sid !== "string" || !sid || !state || typeof state !== "object") return;
-  const st = state as { draft?: unknown; citations?: unknown; files?: unknown; staged?: unknown; ships?: unknown; heldSend?: unknown };
+  const st = state as { draft?: unknown; citations?: unknown; files?: unknown; staged?: unknown };
   if (typeof st.draft === "string" && st.draft) drafts.set(sid, [drafts.get(sid) ?? "", st.draft].filter(Boolean).join("\n\n"));
   if (Array.isArray(st.files) && st.files.length) {
     const paths = (st.files as unknown[]).filter((p): p is string => typeof p === "string" && !!p);
@@ -17253,33 +17296,13 @@ function adoptSessionState(sid: unknown, state: unknown): void {
   }
   if (Array.isArray(st.staged) && st.staged.length) stagedMsgs.appendAll(sid, st.staged);   // every item the source's stack held, a context-only one included (round ten; restore() dropped those)
   if (Array.isArray(st.citations) && st.citations.length) mergeCitations(sid, st.citations as Citation[]);   // after the stack: the flavour rule (round ten), never a mixed list
-  const shipped = Array.isArray(st.ships) && st.ships.length ? adoptShips(sid, st.ships as unknown[]) : 0;   // the uploads still in flight, re-shipped from here (round ten)
-  if (st.heldSend === true) {
-    if (shipped) sendOnShip.add(sid);   // the hold waits on a chip of its own here — armed with none it would wait forever (the ✕ rule)
-    else warnToast("The message held for an upload was not sent — the upload did not survive its column closing. Review it on that tab.");
-  }
+  // NO upload arrives here, and no held send is ever armed here (round eleven, 2026-09-16): an upload's ack rides the socket of the
+  // document that shipped it, so that document holds its column until the ack (columnBusy) and hands the COMPLETED file with the
+  // other files; a send held on it fires there, by sid (sendHeldFor). A `ships` or `heldSend` field from an older page is ignored:
+  // re-shipping doubled the file on the kernel, a page-local shipId could collide with one here, and a hold armed on the survivors
+  // sent the message short of the attachment that had not.
   persistDrafts();
   if (activeId === sid) loadComposerFor(sid);
-}
-// The uploads a closing pane handed over with a session's state (round ten): each entry that still has its bytes becomes a pending
-// chip here under the same shipId and re-ships them to the owning kernel — the reconnect re-ship's frame, byte for byte
-// (reshipPendingUploads) — so the ack lands on THIS document's socket and retires exactly that chip. One whose FileReader had not
-// finished when the source page went (no bytes yet) cannot be re-sent from here: said loudly, never a chip that pulses forever.
-// Returns how many chips were added. Never persists: adoptSessionState does, once.
-function adoptShips(sid: string, items: readonly unknown[]): number {
-  let n = 0;
-  for (const it of items) {
-    const p = it as { name?: unknown; shipId?: unknown; b64?: unknown };
-    if (!p || typeof p !== "object" || typeof p.name !== "string" || typeof p.shipId !== "string" || !p.shipId) continue;
-    if (shipOwner(p.shipId)) continue;   // adopted twice: the chip is already here
-    if (typeof p.b64 !== "string" || !p.b64) { warnToast(p.name + " was still being read when its column closed, so it was not attached — attach it again."); continue; }
-    const list = pendingShips.get(sid) || [];
-    list.push({ name: p.name, shipId: p.shipId, b64: p.b64 });
-    pendingShips.set(sid, list); n++;
-    if (vscodeApi) vscodeApi.postMessage({ type: "dropFile", name: p.name, b64: p.b64, shipId: p.shipId, id: sid });
-  }
-  if (n && sid === activeId) renderComposerFiles(sid);
-  return n;
 }
 function noteMru(id: string): void {
   const i = sessionMru.indexOf(id);
@@ -19013,6 +19036,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       cbox.dispatchEvent(new Event("input"));   // the draft listener persists it
       if (previewKind(m.path) === "img") cmtShippedImgs.push(m.path);   // the echo's thumbnail ride
       cbox.focus();
+      syncColumnBusy();   // LAST (round eleven): the upload's hold on the column ends with its chip
       return;
     }
     const owner = retirePendingShip(m.path, ackShip) || activeId;      // the chip this ack answers names the OWNING composer (no-op for pickFile, which never ships)
@@ -19021,27 +19045,23 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     // the answer to the question it asks, so it closes itself and the send fires — no click needed
     const gateOpen = shipGateSid === owner;
     if (owner && (sendOnShip.has(owner) || gateOpen) && !(pendingShips.get(owner) || []).length) {
-      // the LAST ship landed — the event the held send was waiting for (the user 2026-08-16)
+      // the LAST ship landed — the event the held send was waiting for (the user 2026-08-16), and every ship it waited on
+      // completed (a failure cancels the hold the moment it happens, shipFailed)
       sendOnShip.delete(owner);
       if (gateOpen) { shipGateSid = null; closeConfirm(null); }
       if (owner === activeId) fireHeldSend();
-      else warnToast("attachments finished uploading on another tab — the held message was not sent; review it there.");
+      else sendHeldFor(owner);   // BY SID (round eleven): the tab need not be shown here — a held column whose create resolved to a session shown elsewhere
       endReloadHoldIfIdle();   // the ending event follows the release: the held send has been posted
     }
+    if (owner && !heldHere(owner)) noteOrphanState();   // the file landed under a session this column does not show (a moved tab, a resolved create): offered to the pane that does, now (round eleven)
+    syncColumnBusy();   // LAST: the upload's hold on the column ends with its chip — the file is under its sid, a held send has gone
   } else if (m.type === "dropSaveFailed" && typeof m.name === "string") {
     // the kernel could not SAVE the shipped bytes — clear the pending chip and say so loudly,
     // never leave dots pulsing over a file that is not coming (fail loudly, don't degrade silently)
     const nackShip = typeof m.shipId === "string" && m.shipId ? m.shipId : undefined;
     if (nackShip && !shipOwner(nackShip)) return;   // duplicate nack for a chip already settled — the
     //                                                 first one warned; a re-warn would double the toast
-    const owner = retirePendingShip(m.name, nackShip) || activeId;
-    const held = !!owner && sendOnShip.delete(owner);    // a held send must not fire without the file it waited for
-    const gateWasOpen = shipGateSid === owner;
-    if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }   // the question is moot — but a failed save never auto-sends
-    endReloadHoldIfIdle();
-    warnToast(m.name + " couldn't be saved on the kernel, so it was not attached — try again."
-              + (held || gateWasOpen ? " Your message was NOT sent." : ""));
-    if (owner && owner === activeId) renderComposerFiles(owner);   // the held-send button state clears with the hold
+    shipFailed(m.name, nackShip, m.name + " couldn't be saved on the kernel, so it was not attached — try again.");
   }
   // an EDITOR highlight (VS Code host, onDidChangeTextEditorSelection — the user 2026-07-13) seeds the
   // same quote chip a transcript highlight does, labeled + wrapped with its file:lines origin (m.src).
@@ -20368,7 +20388,7 @@ function shipFileToHost(f: File, sidAt: string | null = activeId) {
   const reader = new FileReader();
   reader.onload = () => {
     const b64 = String(reader.result || "").split(",")[1] || "";
-    if (!b64 || !vscodeApi) { retirePendingShip(name, shipId); return; }
+    if (!b64 || !vscodeApi) { shipFailed(name, shipId, name + " could not be read, so it was not attached — try again."); return; }   // a held send must not fire short of it (round eleven)
     const entry = sid ? (pendingShips.get(sid) || []).find((p) => p.shipId === shipId) : undefined;
     if (entry) entry.b64 = b64;   // retained until the ack — the reconnect re-ship needs the bytes (T215)
     const msg: { type: string; name: string; b64: string; shipId: string; id?: string } =
@@ -20376,7 +20396,7 @@ function shipFileToHost(f: File, sidAt: string | null = activeId) {
     if (sid) msg.id = sid;   // the owning session → the owning kernel
     vscodeApi.postMessage(msg);
   };
-  reader.onerror = () => retirePendingShip(name, shipId);   // an unreadable file must not leave a stuck chip
+  reader.onerror = () => shipFailed(name, shipId, name + " could not be read, so it was not attached — try again.");   // an unreadable file must not leave a stuck chip, nor a held send that fires without it (round eleven)
   reader.readAsDataURL(f);
 }
 

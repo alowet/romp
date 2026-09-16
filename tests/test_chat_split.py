@@ -294,7 +294,7 @@ class SplitSourcePins(unittest.TestCase):
         # last listed member would leave and where a column is closed by hand (a reconcile of another tab's write is not)
         for needle in ["function movable(f,sid){", "function busy(f){", "function loaded(f){",
                        "var why=refusal(src,sid);if(why==='locked')return notify(LOCKED);if(why||!movable(src,sid))return notify('Only an open session can be moved between columns.');",
-                       "var BUSY='A session is still being created in this column.';",
+                       "var BUSY='A session is still being created in this column, or an upload from it is still in flight.';",
                        "var se2=entry(from);if(se2&&se2.ids.length===1&&busy(src))return notify(BUSY);",
                        "if(!keep&&busy(f)){notify(BUSY);return;}"]:
             self.assertIn(needle, split, needle)
@@ -1032,12 +1032,12 @@ class SplitExecutes(unittest.TestCase):
         # resolving frees it (another dashboard tab's write is neither refused nor obeyed at once: it is HELD, the next test)
         b = self.out["busy"]
         self.assertIsNone(b["home"], "the move that would empty the column is refused")
-        self.assertEqual(b["notify"], [["warn", "A session is still being created in this column."]])
+        self.assertEqual(b["notify"], [["warn", "A session is still being created in this column, or an upload from it is still in flight."]])
         self.assertEqual(b["ids"], ["f-chat", "f-chat-2"]); self.assertEqual(b["stored"], {"v": 2, "cols": [{"n": 2, "ids": [API]}]})
         self.assertEqual(b["saves"], 0); self.assertEqual(b["taken"], [], "nothing was taken from the page: refused before the hand-off")
         c = b["cross"]
         self.assertEqual(c["ids"], ["f-chat", "f-chat-2"], "the cross is refused too: the column would die with the create")
-        self.assertEqual(c["notify"], [["warn", "A session is still being created in this column."]] * 2)
+        self.assertEqual(c["notify"], [["warn", "A session is still being created in this column, or an upload from it is still in flight."]] * 2)
         self.assertEqual(c["unregister"], []); self.assertEqual(c["taken"], [])
         self.assertEqual(b["palette"], {"ids": ["f-chat", "f-chat-2"], "notify": 3}, "…and the palette's close")
         t = b["twoMembers"]
@@ -1098,7 +1098,7 @@ class SplitExecutes(unittest.TestCase):
         self.assertEqual(mi["sets"], {"2": [TESTS]})
         self.assertEqual(mi["after"], {"ids": ["f-chat", "f-chat-2"], "stored": {"v": 2, "cols": [{"n": 2, "ids": [TESTS]}]}, "sets": {"2": [TESTS]}, "unregister": []}, "…and the flip keeps it")
         x = h["cross"]
-        self.assertEqual(x["ids"], ["f-chat", "f-chat-2"]); self.assertEqual(x["notify"], [["warn", "A session is still being created in this column."]], "the user's own cross is refused with the line")
+        self.assertEqual(x["ids"], ["f-chat", "f-chat-2"]); self.assertEqual(x["notify"], [["warn", "A session is still being created in this column, or an upload from it is still in flight."]], "the user's own cross is refused with the line")
         self.assertEqual(x["then"], {"ids": ["f-chat"], "notify": 1}, "…and the flip closes it, saying nothing more")
 
     def test_an_emptiness_report_from_under_a_create_in_flight_holds_the_column_instead_of_refusing_it(self):

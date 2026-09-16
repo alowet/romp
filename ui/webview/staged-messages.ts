@@ -12,6 +12,15 @@
 
 export interface StagedMsg { text: string; cites: unknown[] }
 
+/** The shape of a citation chip the composer makes (render.ts Citation: a GOAL chip carries itemId, a QUOTE chip carries
+ *  quote, both a title) — the one check the composer's persisted-chip restore applies (bootComposerState) and, since round
+ *  eleven (2026-09-16), the one a staged item's context is held to on restore() and appendAll(): a row whose context is
+ *  junk (null, a bare string, an object with neither) and whose text is empty is nothing, and is dropped. */
+export function isCitationShape(c: unknown): boolean {
+  return !!c && typeof c === "object" && typeof (c as { title?: unknown }).title === "string"
+    && (typeof (c as { itemId?: unknown }).itemId === "string" || typeof (c as { quote?: unknown }).quote === "string");
+}
+
 /** The outgoing body for QUOTE citations (the user 2026-07-13): the highlighted text rides ahead of the
  *  typed message as a markdown quote block, so the agent knows exactly which part is being replied to.
  *  Also what the chip's audit preview shows: one function, no drift. Stacked chips (the user 2026-08-04)
@@ -137,7 +146,7 @@ export class StagedStack {
     let n = 0;
     for (const m of items) {
       if (!m || typeof m !== "object" || typeof (m as any).text !== "string") continue;
-      const cites: unknown[] = Array.isArray((m as any).cites) ? (m as any).cites : [];
+      const cites: unknown[] = (Array.isArray((m as any).cites) ? (m as any).cites : []).filter(isCitationShape);   // the context, by the composer's own shape (round eleven)
       if (!(m as any).text && !cites.length) continue;
       l.push({ text: (m as any).text, cites }); n++;
     }
@@ -147,13 +156,14 @@ export class StagedStack {
 
   /** Hydrate from a persisted shape; junk entries are dropped, never a crash. A CONTEXT-ONLY item (no words, quotes)
    *  is not junk (round ten, 2026-09-15: the composer has staged those since 2026-08-23, and this dropped them at the
-   *  next reload); an item with neither words nor context is. */
+   *  next reload); an item with neither words nor context is — and context is held to the composer's own citation
+   *  shape (round eleven: `{text:"", cites:[null]}` came back as an item with nothing in it). */
   restore(saved: unknown): void {
     if (!saved || typeof saved !== "object") return;
     for (const [sid, v] of Object.entries(saved as Record<string, unknown>)) {
       const list: StagedMsg[] = [];
       for (const m of Array.isArray(v) ? v : []) {
-        const cites: unknown[] = m && Array.isArray((m as any).cites) ? (m as any).cites : [];
+        const cites: unknown[] = (m && Array.isArray((m as any).cites) ? (m as any).cites : []).filter(isCitationShape);
         if (m && typeof (m as any).text === "string" && ((m as any).text || cites.length))
           list.push({ text: (m as any).text, cites });
       }

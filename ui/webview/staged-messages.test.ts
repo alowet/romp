@@ -230,3 +230,13 @@ test("stagedPosts invariants over every shape: stage order across the posts, eac
     for (const p of posts) if ((p.cites || []).some((c: any) => c && c.itemId)) assert.ok(p.text.endsWith("on the card") || p.text.endsWith("typed words"), JSON.stringify(p));
   }
 });
+
+test("restore() and appendAll() hold a staged item's context to the composer's citation shape (round eleven): `{text:\"\", cites:[null]}` is nothing and is dropped; junk context is filtered off a kept row", () => {
+  const rows = [{ text: "", cites: [null] }, { text: "", cites: ["junk", { quote: "no title" }, 7] }, { text: "", cites: [{ title: "t", quote: "kept" }] }, { text: "words", cites: [null, { title: "card", itemId: "g1" }, { nope: 1 }] }];
+  const r = new StagedStack();
+  r.restore({ a: rows });
+  assert.deepEqual(r.list("a"), [{ text: "", cites: [{ title: "t", quote: "kept" }] }, { text: "words", cites: [{ title: "card", itemId: "g1" }] }], "restore: two rows kept, their context filtered");
+  const s = new StagedStack();
+  assert.equal(s.appendAll("a", rows), 2);
+  assert.deepEqual(s.list("a"), r.list("a"), "appendAll: the same rule");
+});

@@ -100,7 +100,7 @@ test("a pick of a session another column holds is shown where it lives: the setA
   assert.match(RENDER, /\(window as any\)\.__rompMovableSession = \(sid: unknown\): boolean => typeof sid === "string" && !!sid && !isProvisionalId\(sid\) && !isSubId\(sid\) && !settings\.tabsLocked;/);   // …and no while the tabs are locked (T395)
   // ONE reader for the two facts (round four, 2026-09-15): the shell's question, the flip and the emptiness report read
   // columnBusy(); a folder question keeps the provisional TAB, so it is busy by provisionalId alone — no third fact
-  assert.match(RENDER, /function columnBusy\(\): boolean \{ return !!provisionalId \|\| failedProvisionals\.size > 0; \}\n\(window as any\)\.__rompColumnBusy = \(\): boolean => columnBusy\(\);/);
+  assert.match(RENDER, /function columnBusy\(\): boolean \{ return !!provisionalId \|\| failedProvisionals\.size > 0 \|\| pendingShips\.size > 0; \}\n\(window as any\)\.__rompColumnBusy = \(\): boolean => columnBusy\(\);/);
   assert.match(RENDER, /function noteColumnEmptiness\(ids: readonly string\[\]\): void \{\n\s*if \(!COL \|\| !colSets \|\| !tabOrderSeen\) return;\n(?:\s*\/\/[^\n]*\n)*\s*if \(columnBusy\(\)\) return;/, "the emptiness report reads the one reader");
   assert.ok(!/\b(pendingCarry|dirQuestion|abandonDirQuestion)\b/.test(RENDER), "no document-local carry keyed to no session");
   // …and the state a closing page hands over never names a synthetic id (a create in flight, a sub-agent viewer)
@@ -222,10 +222,13 @@ test("drafts travel with a moved tab: the source hands over what it holds, synch
   // the composer's text is stashed first when the tab is active, then the four slices persistDrafts writes leave the maps
   assert.match(take, /if \(sid === activeId && ta\) \{ if \(ta\.value\) drafts\.set\(sid, ta\.value\); else drafts\.delete\(sid\); \}/);
   assert.match(take, /const draft = drafts\.get\(sid\) \?\? "", citations = composerCitations\.get\(sid\) \?\? \[\], files = composerFiles\.get\(sid\) \?\? \[\], staged = stagedMsgs\.takeAll\(sid\);/);
-  // round ten: the upload in flight and its held send travel too; an open gate dies unanswered (never an auto-send)
-  assert.match(take, /const ships = pendingShips\.get\(sid\) \?\? \[\], heldSend = sendOnShip\.delete\(sid\);\n  drafts\.delete\(sid\); composerCitations\.delete\(sid\); composerFiles\.delete\(sid\); pendingShips\.delete\(sid\);\n  const gateWasOpen = shipGateSid === sid;\n  if \(gateWasOpen\) \{ shipGateSid = null; closeConfirm\(null\); \}\n  if \(ships\.length \|\| gateWasOpen\) endReloadHoldIfIdle\(\);/, "the reload hold ends only when a hold left with the state — a plain move must not poke the core (it re-tries an owed reload)");
-  assert.match(take, /persistDrafts\(\);/);
-  assert.match(take, /if \(!draft && !citations\.length && !files\.length && !staged\.length && !ships\.length && !heldSend\) return null;\n  return \{ draft, citations, files, staged, ships, heldSend \};/, "null when nothing was held");
+  assert.match(take, /drafts\.delete\(sid\); composerCitations\.delete\(sid\); composerFiles\.delete\(sid\);\n/);
+  // round eleven: no upload travels (its ack rides this document's socket — the column stays busy instead), and the take tells the
+  // reload core exactly when it emptied a box that held words: the typing hold's ending event, as the 'input' event would have
+  assert.ok(!take.includes("pendingShips") && !take.includes("sendOnShip") && !take.includes("shipGateSid"), "the take carries no upload and no held send");
+  assert.match(take, /const boxHeld = sid === activeId && !!ta && !!ta\.value\.trim\(\);/);
+  assert.match(take, /if \(boxHeld\) \{ try \{ \(window as any\)\.__rompReload\?\.ended\?\.\(\); \} catch \{[^\n]*\} \}\n  persistDrafts\(\);/, "told after the box is emptied, before the store is written");
+  assert.match(take, /if \(!draft && !citations\.length && !files\.length && !staged\.length\) return null;\n  return \{ draft, citations, files, staged \};/, "null when nothing was held; four fields, exactly");
   // an active tab's box is emptied: the re-point that follows must not re-stash the moved text here
   assert.match(take, /if \(sid === activeId\) \{ if \(ta\) \{ ta\.value = ""; growComposer\(ta\); \}/);
   // the target: into the maps, persisted, and into the box when the tab is active
@@ -233,9 +236,20 @@ test("drafts travel with a moved tab: the source hands over what it holds, synch
   assert.match(adopt, /persistDrafts\(\);\n\s*if \(activeId === sid\) loadComposerFor\(sid\);/);
   // round ten: the stack whole, then the chips under the flavour rule, then the uploads re-shipped and the held send armed only with a chip to wait on
   assert.match(adopt, /stagedMsgs\.appendAll\(sid, st\.staged\);[^\n]*\n  if \(Array\.isArray\(st\.citations\) && st\.citations\.length\) mergeCitations\(sid, st\.citations as Citation\[\]\);/);
-  assert.match(adopt, /const shipped = Array\.isArray\(st\.ships\) && st\.ships\.length \? adoptShips\(sid, st\.ships as unknown\[\]\) : 0;/);
-  assert.match(adopt, /if \(st\.heldSend === true\) \{\n    if \(shipped\) sendOnShip\.add\(sid\);/);
-  assert.match(adopt, /if \(vscodeApi\) vscodeApi\.postMessage\(\{ type: "dropFile", name: p\.name, b64: p\.b64, shipId: p\.shipId, id: sid \}\);/, "the re-ship: the reconnect re-ship's frame");
+  // round eleven: no upload arrives, no held send is armed, nothing is re-shipped — adoptShips and the re-ship frame are gone
+  assert.ok(!RENDER.includes("function adoptShips("), "adoptShips is gone");
+  assert.ok(!adopt.includes("pendingShips") && !adopt.includes("sendOnShip.add") && !adopt.includes('"dropFile"'), "adoptSessionState touches no upload store, arms no hold and posts no dropFile");
+  // round eleven: the third busy fact and its ending events — the flip is the LAST act of every ship transition
+  assert.match(RENDER, /function columnBusy\(\): boolean \{ return !!provisionalId \|\| failedProvisionals\.size > 0 \|\| pendingShips\.size > 0; \}/, "three facts, one reader");
+  assert.match(RENDER, /if \(id === activeId\) renderComposerFiles\(id\);\n  syncColumnBusy\(\);[^\n]*\n\}\n/, "addPendingShip: busy while the ack is owed");
+  assert.match(RENDER, /if \(owner === activeId\) fireHeldSend\(\);\n      else sendHeldFor\(owner\);[^\n]*\n      endReloadHoldIfIdle\(\);[^\n]*\n    \}\n    if \(owner && !heldHere\(owner\)\) noteOrphanState\(\);[^\n]*\n    syncColumnBusy\(\);[^\n]*\n  \} else if \(m\.type === "dropSaveFailed"/, "the ack: the held send fires by sid when the tab is not shown; a completed file under an unshown sid is offered; the flip last");
+  assert.match(RENDER, /shipFailed\(m\.name, nackShip, m\.name \+ " couldn't be saved on the kernel, so it was not attached — try again\."\);/, "the nack goes through the one failure path");
+  assert.equal((RENDER.match(/shipFailed\(name, shipId, name \+ " could not be read, so it was not attached — try again\."\)/g) || []).length, 2, "both reader failures too");
+  assert.match(RENDER, /function shipFailed\(key: string, shipId: string \| undefined, why: string\): void \{\n  const owner = retirePendingShip\(key, shipId\) \|\| activeId;\n  const held = !!owner && sendOnShip\.delete\(owner\);[\s\S]*?\n  syncColumnBusy\(\);\n\}/, "a failed ship cancels the held send and flips last");
+  assert.match(RENDER, /renderComposerFiles\(id\);\n      syncColumnBusy\(\);[^\n]*\n    \}\);/, "the ✕ on a pending chip flips last");
+  assert.match(RENDER, /cbox\.focus\(\);\n      syncColumnBusy\(\);[^\n]*\n      return;/, "the comment box's ack flips last");
+  assert.match(RENDER, /function sendHeldFor\(sid: string\): void \{\n  if \(!vscodeApi\) return;\n  const typed = \(drafts\.get\(sid\) \?\? ""\)\.trim\(\);\n  const attached = composerFiles\.get\(sid\) \|\| \[\];/, "the held send by sid builds from the stores");
+  assert.ok(KERNEL.includes("var BUSY='A session is still being created in this column, or an upload from it is still in flight.';"), "the shell's refusal names an upload too");
   assert.match(RENDER, /if \(m\.romp === "adopt"\) \{ adoptSessionState\(m\.sid, m\.state\); return; \}/, "the shell's message lands in the same relay as chatNav");
 });
 

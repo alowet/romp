@@ -69,7 +69,7 @@ function world(o: { col?: string; sets?: ColSets | null; tabOrderSeen?: boolean;
   const win = { parent: PARENT, frameElement: me };
   const js = requireCjs("esbuild").transformSync(
     [line("heldHere"), line("tabInView"), line("columnBusy"), fn("forwardToOwner"), fn("claimSession"), fn("noteColumnEmptiness"),
-     fn("orphanStateSids"), fn("noteOrphanState"), fn("staleActiveFallback"), fn("adoptSessionState"), fn("mergeCitations"), fn("adoptShips"), fn("shipOwner")].join("\n"), { loader: "ts" }).code;
+     fn("orphanStateSids"), fn("noteOrphanState"), fn("staleActiveFallback"), fn("adoptSessionState"), fn("mergeCitations"), fn("shipOwner")].join("\n"), { loader: "ts" }).code;
   const prelude = `
     const { columnHolds, columnEmptiness, isProvisionalId, isSubId, StagedStack, HOOKS } = W;
     const COL = W.col;
@@ -348,6 +348,7 @@ function stripWorld(o: { col: string; sets: ColSets | null; wantActive?: string 
     const COL = W.col;
     let colSets = W.sets, tabOrderSeen = false, activeId = null, provisionalId = null, wantActive = W.wantActive, vanishedId = null;
     const failedProvisionals = new Set(); let colEmptyPosted = false; let boardLive = new Set(); const hostsSeen = new Set();
+    const pendingShips = new Map();   // the third busy fact (round eleven): no upload in flight in these worlds
     const readColSets = () => W.shell.sets;
     const syncTabKeysWithStrip = () => {};   // per-tab hot keys (2026-09-10): none in these worlds
     const peekId = null; const chatVisible = () => true;
