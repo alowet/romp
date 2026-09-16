@@ -1037,7 +1037,7 @@ function citeInComposer() {
   const endLine = sel.end.character === 0 && sel.end.line > sel.start.line ? sel.end.line : sel.end.line + 1;
   const text = citeText(ed.document.uri.fsPath, sel.start.line + 1, endLine, !sel.isEmpty);
   openPanel(true);
-  toWebview({ type: "droppedPath", path: text });
+  toWebview({ type: "droppedPath", path: text, picked: true });   // `picked`: a picker-style frame — no upload behind it, so the page never matches it to a pending ship (round sixteen)
 }
 
 async function openSessionWorktree() {
@@ -1126,7 +1126,7 @@ async function pickFileForComposer(p: vscode.WebviewPanel) {
     title: "Attach file — inserts its path into the message",
   });
   if (!picks?.length) return;
-  for (const uri of picks) p.webview.postMessage({ type: "droppedPath", path: uri.fsPath });
+  for (const uri of picks) p.webview.postMessage({ type: "droppedPath", path: uri.fsPath, picked: true });   // `picked`: the page attaches it to the active composer and never reads it as an upload's ack (round sixteen)
 }
 
 // External deep-link: vscode://romp.romp-chat-view/open?session=<id>&anchor=<uuid>.

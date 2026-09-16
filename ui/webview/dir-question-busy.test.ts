@@ -58,6 +58,7 @@ type Api = {
   strip: (ids: string[]) => void; detach: (host: string) => void; wsdown: () => void; wsup: () => void;
   setSets: (sets: Record<string, string[]>) => void; reclaim: () => void;   // round thirteen: the shell's sets as they stand, and renderTabs's reclaim of the handed-off marker
   heading: (sid: string) => string;   // round fourteen: the held strip's heading, its count
+  legacyFor: (name: string) => string | undefined;   // round sixteen: the ship a legacy (untagged) answer names, by the saved name
   draft: (sid: string, text: string) => void;   // round fifteen: a session's draft, written as the box's stash would
   held: { stage: (id: string, text: string, cites?: unknown[]) => void; cite: (id: string, chips?: unknown[]) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown>; drafts: () => Record<string, string> };
   busy: () => boolean; answer: (v: string | null) => void; confirm: () => { title: string; buttons: string[]; key: string | null } | null;
@@ -89,7 +90,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
      fnOpt("mergeCitations"), fn("addPendingShip"), fn("shipSafeName"), fn("shipOwner"), fn("retirePendingShip"), fn("endReloadHoldIfIdle"), fn("addComposerFile"), fn("adoptSessionState"), TAKE, ON_DROPPED,
      fnOpt("shipFailed"), fnOpt("sendHeldFor"), fn("flushStaged"), fn("routeUserMessage"), fn("noteOrphanState"),
      fnOpt("shipRecord"), fnOpt("retainShipBytes"), fnOpt("failShipsOfHost"), fnOpt("columnBusyWhy"), fnOpt("askCloseUpload"), fnOpt("abandonPendingUploads"), fn("reshipPendingUploads"), fn("noteColumnEmptiness"),
-     fnOpt("composerShips"), lineOpt("reclaimHandedOff"), fnOpt("soleShip"), fnOpt("uploadingHeading"),
+     fnOpt("composerShips"), lineOpt("reclaimHandedOff"), fnOpt("legacyShipFor"), fnOpt("uploadingHeading"),
      winLine("__rompSessionBusy"), winLine("__rompColumnBusyWhy")].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
@@ -179,6 +180,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       wsdown: () => { wsIsUp = false; }, wsup: () => { wsIsUp = true; reshipPendingUploads(); },   // the shim's edges, as the page's listeners read them
       setSets: (s) => { colSets = s; }, reclaim: () => reclaimHandedOff(),   // what renderTabs does first: reads the sets, reclaims the marker for a sid shown here again
       heading: (sid) => uploadingHeading(sid),
+      legacyFor: (name) => { const p = legacyShipFor(name); return p ? p.shipId : undefined; },   // what the nack branch does with an untagged name (round sixteen)
       draft: (sid, text) => { drafts.set(sid, text); persistDrafts(); },
       route: (m) => (typeof routeCreateReply === "function" ? routeCreateReply(m).kind : "?"),
       // (each persists, as the page's own staging / citing / attaching does)
@@ -733,11 +735,11 @@ test("round twelve: the ack is routed by the SHIP — a composer upload lands on
   w.api.ack({ type: "droppedPath", path: "drops/2-shot.png", shipId: "s2" });
   assert.equal(w.api.comment(), "a note drops/2-shot.png ", "a comment's upload lands in the box"); assert.deepEqual(w.api.held.files()[X], ["drops/1-photo.png"]);
   w.api.ship(X, "old.png", "s3", "QUJD");
-  w.api.ack({ type: "droppedPath", path: "drops/3-old.png" });   // an older kernel: no ship id echoed — exactly one ship pending, the composer's: it is that ship's (round fourteen)
-  assert.equal(w.api.comment(), "a note drops/2-shot.png ", "the sole pending ship is the composer's: the untagged ack is its"); assert.deepEqual(w.api.held.files()[X], ["drops/1-photo.png", "drops/3-old.png"]);
-  w.api.ship(X, "p.png", "s4", "QUJD"); w.api.ship(X, "q.png", "s5", "QUJD", "comment");   // two pending: the untagged reading is main's — the open box is the comment's
-  w.api.ack({ type: "droppedPath", path: "drops/4-p.png" });
-  assert.equal(w.api.comment(), "a note drops/2-shot.png drops/4-p.png ", "several pending, no ship to read: an open box is the comment's, as on main");
+  w.api.ack({ type: "droppedPath", path: "drops/3-old.png" });   // an older kernel: no ship id echoed — matched by the saved name to the composer's ship (round sixteen)
+  assert.equal(w.api.comment(), "a note drops/2-shot.png ", "a legacy ack matched to the composer's ship is the composer's, box open or not"); assert.deepEqual(w.api.held.files()[X], ["drops/1-photo.png", "drops/3-old.png"]); assert.equal(w.api.ships()[X], undefined, "…and retires it");
+  w.api.ship(X, "q.png", "s5", "QUJD", "comment");
+  w.api.ack({ type: "droppedPath", path: "drops/5-nomatch.png" });   // matched to nothing: main's reading — the open box is the comment's
+  assert.equal(w.api.comment(), "a note drops/2-shot.png drops/5-nomatch.png ", "no ship named: an open box is the comment's, as on main"); assert.deepEqual(w.api.ships()[X].map((p) => p.shipId), ["s5"], "nothing retired");
   w.api.closeComment();
 });
 
@@ -868,34 +870,52 @@ test("round fifteen: an UNTAGGED droppedPath (the VS Code picker) for the active
   assert.deepEqual(w.api.held.files()[A], ["/synthetic/picked-for-A.txt"], "A's strip untouched by B's release"); assert.deepEqual(w.api.heldSend(), []);
 });
 
-test("round fifteen: an untagged ack is routed by the ACTIVE session's own sole ship's kind, and retires nothing — a sole composer ship: the composer, the box untouched; a sole comment ship with the box open: the box; none or several: main's box-open reading", () => {
-  const w = receiving(); w.api.openComment("note ");
-  w.api.ship(A, "a.png", "a1", "QUJD");
-  w.api.ack({ type: "droppedPath", path: "drops/1-a.png" });
-  assert.deepEqual(w.api.held.files()[A], ["drops/1-a.png"], "the sole ship is the composer's: the composer"); assert.equal(w.api.comment(), "note ", "the box untouched");
-  assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["a1"], "untagged: nothing retired — the chip waits for its own tagged ack");
-  w.api.ack({ type: "droppedPath", path: "drops/1-a.png", shipId: "a1" });
-  assert.equal(w.api.ships()[A], undefined, "the tagged ack retires it"); assert.deepEqual(w.api.held.files()[A], ["drops/1-a.png"], "the same file attaches once");
-  w.api.ship(A, "c.png", "c1", "QUJD", "comment");
-  w.api.ack({ type: "droppedPath", path: "drops/2-c.png" });
-  assert.equal(w.api.comment(), "note drops/2-c.png ", "the sole ship is the comment's: the box");
-  w.api.ship(A, "d.png", "d1", "QUJD");   // two pending now
-  w.api.ack({ type: "droppedPath", path: "drops/3-x.png" });
-  assert.equal(w.api.comment(), "note drops/2-c.png drops/3-x.png ", "several pending: main's reading, the open box is the comment's");
-  assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["c1", "d1"], "and still nothing retired by an untagged answer");
-  w.api.closeComment();
-  const v = receiving(); v.api.ship(B, "b.png", "b1", "QUJD");   // B's ship, A active: an untagged ack is never B's
-  v.api.ack({ type: "droppedPath", path: "drops/9-picked.png" });
-  assert.deepEqual(v.api.held.files()[A], ["drops/9-picked.png"]); assert.deepEqual(v.api.ships()[B].map((p) => p.shipId), ["b1"]);
+test("round sixteen: an untagged, un-picked frame is a LEGACY kernel's ack — matched by the saved name to the ship it answers, wherever that ship lives, and settled as a tagged ack would be", () => {
+  // (a) the active session's own upload: the chip retired, the held send fires
+  const w = receiving(); w.api.ship(A, "photo.png", "a1", "QUJD"); w.api.holdSend(A); w.api.type(TYPED);
+  w.api.ack({ type: "droppedPath", path: "drops/1700000000000-photo.png" });
+  assert.equal(w.api.ships()[A], undefined, "the chip is retired"); assert.deepEqual(w.api.held.files()[A], ["drops/1700000000000-photo.png"]); assert.equal(w.HOOKS.fired, 1, "the held send fires"); assert.equal(w.api.busy(), false);
+  // (b) no active tab, one matching pending ship: attached to its owner and settled — the held send goes by sid, nothing silent
+  const v = world({ activeId: null, mru: [], order: [A, B], nextActive: null, store: {}, sets: { "2": [] } });
+  v.api.draft(A, "A words waiting"); v.api.ship(A, "photo.png", "a1", "QUJD"); v.api.holdSend(A);
+  v.api.ack({ type: "droppedPath", path: "drops/1-photo.png" });
+  assert.deepEqual(v.HOOKS.sent.filter((m) => m.type === "sendMessage").map((m) => ({ id: m.id, text: m.text })), [{ id: A, text: "A words waiting\ndrops/1-photo.png" }], "settled: A's held send goes with A's file");
+  assert.equal(v.api.ships()[A], undefined); assert.equal(v.api.busy(), false); assert.ok(!v.HOOKS.toasts.some((t) => /no session is open/.test(t)));
+  // (c) no active tab, no match: said, nothing retired, nothing attached
+  const u = world({ activeId: null, mru: [], order: [A, B], nextActive: null, store: {}, sets: { "2": [] } });
+  u.api.ship(A, "other.png", "o1", "QUJD");
+  u.api.ack({ type: "droppedPath", path: "drops/1-photo.png" });
+  assert.ok(u.HOOKS.toasts.some((t) => /1-photo\.png arrived, but no session is open/.test(t)), "said: " + JSON.stringify(u.HOOKS.toasts)); assert.deepEqual(u.api.ships()[A].map((p) => p.shipId), ["o1"], "nothing retired"); assert.equal(u.api.held.files()[A], undefined);
+  // (g) two pending ships with the same sanitised name: the OLDEST match
+  const g = receiving(); g.api.ship(A, "photo.png", "p1", "QUJD"); g.api.ship(A, "photo.png", "p2", "QUJD");
+  g.api.ack({ type: "droppedPath", path: "drops/2-photo.png" });
+  assert.deepEqual(g.api.ships()[A].map((p) => p.shipId), ["p2"], "the oldest match retired, the later one waits for its own ack");
+  // a legacy ack for another session's ship, A active: it is that ship's, not A's
+  const o = receiving(); o.api.ship(B, "b.png", "b1", "QUJD");
+  o.api.ack({ type: "droppedPath", path: "drops/3-b.png" });
+  assert.deepEqual(o.api.held.files()[B], ["drops/3-b.png"]); assert.equal(o.api.held.files()[A], undefined); assert.equal(o.api.ships()[B], undefined);
 });
 
-test("round fifteen: an UNTAGGED failure fails only the active session's sole ship; with none, it is said and nothing is touched — another session's hold stands", () => {
-  const w = receiving();
-  w.api.ship(B, "b.png", "b1", "QUJD"); w.api.holdSend(B);
-  w.api.shipFail("whatever.png", undefined as unknown as string);   // an older kernel's nack: no shipId; A has no ship
-  assert.ok(w.HOOKS.toasts.some((t) => /whatever\.png could not be read/.test(t)), "said"); assert.deepEqual(w.api.ships()[B].map((p) => p.shipId), ["b1"], "B's record stands"); assert.deepEqual(w.api.heldSend(), [B], "B's hold stands");
-  w.api.ship(A, "a.png", "a1", "QUJD"); w.api.holdSend(A);
-  w.api.shipFail("a.png", undefined as unknown as string);   // A's sole ship: the untagged failure is its
+test("round sixteen: a PICKED frame (the extension's 📎 / editor handoff, the kernel's native dialog) stands for no upload — it lands on the active composer only, retires nothing, releases nothing, and is said when no session is open", () => {
+  // (d) a composer pick while a comment ship for the same session is pending (its popover closed): the pick is the composer's
+  const w = receiving(); w.api.ship(A, "doc.txt", "c1", "QUJD", "comment");
+  w.api.ack({ type: "droppedPath", path: "/synthetic/doc.txt", picked: true });
+  assert.deepEqual(w.api.held.files()[A], ["/synthetic/doc.txt"], "the pick, on the active composer"); assert.deepEqual(w.api.ships()[A].map((p) => p.shipId), ["c1"], "the comment's ship untouched — though its name matches"); assert.deepEqual(w.HOOKS.toasts, []);
+  // (e) no active tab: said, nothing placed
+  const v = world({ activeId: null, mru: [], order: [A, B], nextActive: null, store: {}, sets: { "2": [] } }); v.api.ship(A, "doc.txt", "c1", "QUJD");
+  v.api.ack({ type: "droppedPath", path: "/synthetic/doc.txt", picked: true });
+  assert.ok(v.HOOKS.toasts.some((t) => /doc\.txt was picked, but no session is open/.test(t))); assert.equal(v.api.held.files()[A], undefined); assert.deepEqual(v.api.ships()[A].map((p) => p.shipId), ["c1"]);
+  // (f) the round-fifteen probe with the pick tagged: A active, B's sole ship and held send — B untouched, nothing sent
+  const f = receiving(); f.api.draft(B, "B words waiting"); f.api.ship(B, "b.png", "b1", "QUJD"); f.api.holdSend(B);
+  f.api.ack({ type: "droppedPath", path: "/synthetic/b.png", picked: true });   // even a pick whose NAME matches B's upload
+  assert.deepEqual(f.api.held.files()[A], ["/synthetic/b.png"]); assert.equal(f.api.held.files()[B], undefined); assert.deepEqual(f.api.ships()[B].map((p) => p.shipId), ["b1"]); assert.deepEqual(f.api.heldSend(), [B]);
+  assert.deepEqual(f.HOOKS.sent.filter((m) => m.type === "sendMessage"), []);
+});
+
+test("round sixteen: a legacy (untagged) nack is matched by name and fails that ship under its kind's rule; matched to nothing, it is said and nothing is touched", () => {
+  const w = receiving(); w.api.ship(A, "a.png", "a1", "QUJD"); w.api.holdSend(A); w.api.ship(B, "b.png", "b1", "QUJD"); w.api.holdSend(B);
+  w.api.shipFail("nobody.png", undefined as unknown as string);   // no ship of that name
+  assert.ok(w.HOOKS.toasts.some((t) => /nobody\.png could not be read/.test(t))); assert.deepEqual(w.api.heldSend(), [A, B], "both holds stand"); assert.equal(Object.keys(w.api.ships()).length, 2);
+  w.api.shipFail("a.png", w.api.legacyFor("a.png") as string);   // resolved by name, as the nack branch resolves it
   assert.equal(w.api.ships()[A], undefined, "A's ship failed"); assert.deepEqual(w.api.heldSend(), [B], "A's hold cancelled, B's stands");
-  assert.ok(w.HOOKS.toasts.some((t) => /a\.png could not be read.*NOT sent/.test(t)));
 });

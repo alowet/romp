@@ -21,6 +21,7 @@ const MAIN = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", 
 const COMMANDS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "commands.ts"), "utf8");
 const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
 const FED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "federation.ts"), "utf8");   // the detach event (round twelve)
+const EXT = fs.readFileSync(path.resolve(process.cwd(), "src", "extension.ts"), "utf8");   // the picker-style producers (round sixteen)
 
 test("the pane asks the shell which column holds a session, acts only when it is its own, and hands a consumed reveal to the owner once", () => {
   // the arbitration: the shell's __rompChatTarget names the frame; no shell (standalone, VS Code) → always ours
@@ -258,7 +259,7 @@ test("drafts travel with a moved tab: the source hands over what it holds, synch
   assert.ok(KERNEL.includes("if(sessionBusyAnywhere(sid))return notify(UPLOADING);"), "moveTab asks every column document per session (round thirteen)");
   assert.ok(KERNEL.includes("if(!keep&&busy(f)){if(busyWhy(f)==='upload-unshown'){try{f.contentWindow.postMessage({romp:'askCloseUpload'},'*');}catch(e){}return;}notify(BUSY);return;}"), "the close asks the page when an unshown session's upload is the only hold");
   assert.match(RENDER, /if \(m\.romp === "askCloseUpload"\) \{ askCloseUpload\(\); return; \}/);
-  assert.match(RENDER, /const ship = ackShip \? shipRecord\(ackShip\) : soleShip\(\);[^\n]*\n[\s\S]{0,900}if \(ship \? ship\.kind === "comment" : !!cbox\) \{/, "the ack is routed by the ship's kind; a legacy ack keeps the old reading; a comment's ship never reaches the composer (round thirteen)");
+  assert.match(RENDER, /const ship = ackShip \? shipRecord\(ackShip\) : null;[^\n]*\n[\s\S]{0,900}if \(ship \? ship\.kind === "comment" : !!cbox\) \{/, "the ack is routed by the ship's kind; an ack naming no ship keeps the old reading; a comment's ship never reaches the composer (round thirteen)");
   assert.match(RENDER, /\} else warnToast\(\(m\.path\.split\("\/"\)\.pop\(\) \|\| "The comment's attachment"\) \+ " arrived after its comment was closed, so it was not attached — attach it again with the comment\."\);\n      syncColumnBusy\(\);[^\n]*\n      return;/, "the popover gone: retired, said by name, never the composer's");
   assert.match(RENDER, /function composerShips\(sid: string \| null\): PendingShip\[\] \{/); assert.match(RENDER, /if \(retired && \(sendOnShip\.has\(retired\) \|\| gateOpen\) && !composerShips\(retired\)\.length\) \{/, "the composer's own ships release a held send");
   assert.match(RENDER, /const shipping = composerShips\(activeId\)\.length;/); assert.match(RENDER, /if \(id && !composerShips\(id\)\.length\) \{/);
@@ -266,16 +267,27 @@ test("drafts travel with a moved tab: the source hands over what it holds, synch
   assert.ok(KERNEL.includes("function sessionBusyAnywhere(sid){var fs=frames();for(var i=0;i<fs.length;i++){if(sessionBusy(fs[i],sid))return true;}return false;}") && KERNEL.includes("if(sessionBusyAnywhere(sid))return notify(UPLOADING);"), "the move guard asks every column document");
   // round fourteen: a comment's failure never touches the composer's hold; the heading counts the composer's ships; an untagged ack or
   // nack reads the sole pending ship when there is exactly one, else keeps main's box-open reading
-  assert.match(RENDER, /function shipFailed\(key: string, shipId: string \| undefined, why: string\): void \{\n(?:\s*\/\/[^\n]*\n)*\s*const rec = shipId \? shipRecord\(shipId\) : soleShip\(\);\n\s*if \(!shipId && !rec\) \{ warnToast\(why\); return; \}[^\n]*\n\s*const failedId = shipId \|\| rec!\.shipId;[^\n]*\n\s*if \(rec && rec\.kind === "comment"\) \{\n\s*const cOwner = retirePendingShip\(key, failedId\) \|\| activeId;\n\s*endReloadHoldIfIdle\(\);\n\s*warnToast\(why\);/, "a comment's failure: retired and said, the composer's hold untouched");
+  assert.match(RENDER, /function shipFailed\(key: string, shipId: string \| undefined, why: string\): void \{\n(?:\s*\/\/[^\n]*\n)*\s*if \(!shipId\) \{ warnToast\(why\); return; \}[^\n]*\n\s*const rec = shipRecord\(shipId\);\n\s*const failedId = shipId;\n\s*if \(rec && rec\.kind === "comment"\) \{\n\s*const cOwner = retirePendingShip\(key, failedId\) \|\| activeId;\n\s*endReloadHoldIfIdle\(\);\n\s*warnToast\(why\);/, "a comment's failure: retired and said, the composer's hold untouched");
   assert.match(RENDER, /function uploadingHeading\(sid: string \| null\): string \{\n  const n = composerShips\(sid\)\.length;/); assert.match(RENDER, /lbl\.textContent = uploadingHeading\(id\);/);
-  assert.match(RENDER, /const ship = ackShip \? shipRecord\(ackShip\) : soleShip\(\);/); assert.match(RENDER, /if \(ship \? ship\.kind === "comment" : !!cbox\) \{/, "the untagged reading with none or several pending: main's — an open comment box is the comment's ack");
+  assert.match(RENDER, /const ship = ackShip \? shipRecord\(ackShip\) : null;/); assert.match(RENDER, /if \(ship \? ship\.kind === "comment" : !!cbox\) \{/, "an ack naming no ship (a legacy one matched to none): main's — an open comment box is the comment's ack");
   // round fifteen: untagged answers are inert beyond the active session — the sole ship is the ACTIVE session's, an untagged answer
   // retires nothing and lands on the active composer, only a tagged ack that retired a composer ship releases a held send, and an
   // untagged failure fails only the active session's sole ship
-  assert.match(RENDER, /function soleShip\(\): PendingShip \| null \{\n  const list = activeId \? pendingShips\.get\(activeId\) : undefined;\n  return list && list\.length === 1 \? list\[0\] : null;\n\}/);
+  // round sixteen: three producers, three routes — picked frames land on the active composer only; a legacy (untagged, un-picked) ack is
+  // matched by the saved name (legacyShipFor, oldest first) and settled as a tagged one; soleShip is gone
+  assert.ok(!RENDER.includes("function soleShip("), "soleShip is gone");
+  assert.match(RENDER, /function legacyShipFor\(key: string\): PendingShip \| null \{\n  const k = "-" \+ shipSafeName\(key\.split\("\/"\)\.pop\(\) \|\| key\);\n  for \(const list of pendingShips\.values\(\)\) for \(const p of list\) if \(k\.endsWith\("-" \+ shipSafeName\(p\.name\)\)\) return p;\n  return null;\n\}/);
+  assert.match(RENDER, /const picked = m\.picked === true;[^\n]*\n    let ackShip = [^\n]*\n    if \(ackShip && !shipOwner\(ackShip\)\) return;[\s\S]{0,400}if \(!ackShip && !picked\) \{ const legacy = legacyShipFor\(m\.path\); if \(legacy\) ackShip = legacy\.shipId; \}/);
+  assert.match(RENDER, /if \(picked\) \{[^\n]*\n      if \(!activeId\) \{ warnToast\([^\n]*was picked, but no session is open in this column to attach it to\."\); return; \}\n      addComposerFile\(activeId, m\.path\); return;\n    \}/, "a picked frame: the active composer only, never a record, never a release");
+  assert.match(RENDER, /if \(!owner\) \{ warnToast\([^\n]*arrived, but no session is open in this column to attach it to\."\); syncColumnBusy\(\); return; \}/, "never silent");
+  assert.match(RENDER, /if \(!nackShip\) \{ const legacy = legacyShipFor\(m\.name\); if \(legacy\) nackShip = legacy\.shipId; \}/);
+  assert.match(RENDER, /function shipFailed\(key: string, shipId: string \| undefined, why: string\): void \{\n(?:\s*\/\/[^\n]*\n)*\s*if \(!shipId\) \{ warnToast\(why\); return; \}/);
+  assert.match(EXT, /toWebview\(\{ type: "droppedPath", path: text, picked: true \}\);/); assert.match(EXT, /p\.webview\.postMessage\(\{ type: "droppedPath", path: uri\.fsPath, picked: true \}\);/, "the extension's two picker-style producers carry the tag");
+  assert.ok(KERNEL.includes('_reply(c, {"type": "droppedPath", "path": fp, "picked": True})'), "the kernel's native dialog carries it too");
+  assert.ok(KERNEL.includes('ack = {"type": "droppedPath", "path": fp}'), "the upload's ack does not: it is the one kernel ack");
   assert.match(RENDER, /function retirePendingShip\(key: string, shipId\?: string\): string \| null \{\n(?:\s*\/\/[^\n]*\n)*\s*if \(!shipId\) return null;/, "untagged: nothing retired"); assert.ok(!RENDER.includes("list.splice(i >= 0 ? i : 0, 1);"), "the oldest-first fallback is gone");
-  assert.match(RENDER, /const retired = retirePendingShip\(m\.path, ackShip\);[^\n]*\n    const owner = retired \|\| activeId;[^\n]*\n    addComposerFile\(owner, m\.path\);/); assert.match(RENDER, /if \(retired && \(sendOnShip\.has\(retired\) \|\| gateOpen\) && !composerShips\(retired\)\.length\) \{/, "a held send fires only from a tagged ack that retired its owner's composer ship");
-  assert.match(RENDER, /if \(!shipId && !rec\) \{ warnToast\(why\); return; \}/); assert.match(RENDER, /const failedId = shipId \|\| rec!\.shipId;/);
+  assert.match(RENDER, /const retired = retirePendingShip\(m\.path, ackShip\);[^\n]*\n    const owner = retired \|\| activeId;[^\n]*\n    if \(!owner\) \{ warnToast\([^\n]*\n    addComposerFile\(owner, m\.path\);/); assert.match(RENDER, /if \(retired && \(sendOnShip\.has\(retired\) \|\| gateOpen\) && !composerShips\(retired\)\.length\) \{/, "a held send fires only from a tagged ack that retired its owner's composer ship");
+  assert.match(RENDER, /const failedId = shipId;/);
   assert.match(RENDER, /filePicker\.dataset\.for = "composer";/); assert.match(RENDER, /cmtFilePicker\.dataset\.for = "comment";/, "the two hidden file inputs on body are told apart by name, not by order (a served driver picked the comment's)");
   assert.match(RENDER, /shipFileToHost\(f, sid, "comment"\)/, "the comment clip ships as a comment");
   assert.match(RENDER, /window\.addEventListener\("romp:hostDetached", \(e\) => \{/); assert.match(FED, /new CustomEvent\("romp:hostDetached", \{ detail: \{ host \} \}\)/, "closeRemote says the detach");

@@ -63731,7 +63731,7 @@ class Handler(BaseHTTPRequestHandler):
                 def _pf(c=client):                                # 📎 → native dialog (blocks) → insert the picked path
                     fp = _pick_file()
                     if fp:
-                        _reply(c, {"type": "droppedPath", "path": fp})
+                        _reply(c, {"type": "droppedPath", "path": fp, "picked": True})   # a picker's answer, not an upload's ack: the page never matches it to a pending ship (round sixteen)
                 threading.Thread(target=_pf, daemon=True).start()
         elif msg and msg.get("type") == "dirComplete":
             # Inline path completion for the new-session directory field. Answered by the kernel that will

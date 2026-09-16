@@ -16321,14 +16321,16 @@ function shipRecord(shipId: string): PendingShip | null {
   for (const list of pendingShips.values()) { const p = list.find((x) => x.shipId === shipId); if (p) return p; }
   return null;
 }
-// The ACTIVE session's one pending ship, when it has exactly one (round fourteen, scoped in round fifteen): an UNTAGGED ack or nack —
-// an older kernel echoes no shipId; the VS Code composer picker's droppedPath carries none and made no ship — can only be about the
-// active session's own upload, so only that ship's kind routes it; with none or several, the untagged reading stays main's (an open
-// comment box is the comment's ack, else the composer's). Never another session's record: read document-wide, the picker's answer
-// for A retired B's upload and sent B's held message with A's path.
-function soleShip(): PendingShip | null {
-  const list = activeId ? pendingShips.get(activeId) : undefined;
-  return list && list.length === 1 ? list[0] : null;
+// A LEGACY kernel's ack or nack (before v0.15.0's shipId echo, 2026-09-01; a federated host updates only by an explicit `romp update`,
+// so one still on v0.14 answers untagged) names no ship: it is matched to a pending ship by the SAVED NAME — shipSafeName mirrors the
+// kernel's saved-name sanitizer, so drops/<ms>-<safe name> ends with the ship's own name — across every session this document holds.
+// Several matches take the OLDEST (the kernel answers a connection's dropFiles in order: main's fallback, scoped to name matches).
+// A frame that carries `picked` (the extension's 📎 and editor handoff, the kernel's native dialog) never comes here: a picker's
+// answer stands for no upload and must match none — read as one, the pick for A retired B's upload and sent B's words (round sixteen).
+function legacyShipFor(key: string): PendingShip | null {
+  const k = "-" + shipSafeName(key.split("/").pop() || key);
+  for (const list of pendingShips.values()) for (const p of list) if (k.endsWith("-" + shipSafeName(p.name))) return p;
+  return null;
 }
 // The COMPOSER's pending ships for a session (round thirteen): what its send gate counts, what a send held on its uploads waits
 // for, what the ✕ on its last chip settles. A comment's upload for the same session is none of the composer's business — counted
@@ -16405,9 +16407,9 @@ function shipFailed(key: string, shipId: string | undefined, why: string): void 
   // held send, its open gate and its chips are not touched (before this any failed ship of the sid cancelled the composer's hold,
   // so a comment's late failure left the composer's message unsent when its own file landed). An untagged failure (an older
   // kernel's nack, no shipId) reads the sole pending ship when there is exactly one, else it is the composer's, as on main.
-  const rec = shipId ? shipRecord(shipId) : soleShip();
-  if (!shipId && !rec) { warnToast(why); return; }   // untagged, and the active session has no sole ship: said, nothing touched (round fifteen)
-  const failedId = shipId || rec!.shipId;              // untagged: the active session's sole ship is the one that failed
+  if (!shipId) { warnToast(why); return; }   // untagged and matched to no pending ship by name (a legacy nack, dropSaveFailed): said, nothing touched (rounds fifteen, sixteen)
+  const rec = shipRecord(shipId);
+  const failedId = shipId;
   if (rec && rec.kind === "comment") {
     const cOwner = retirePendingShip(key, failedId) || activeId;
     endReloadHoldIfIdle();
@@ -19163,15 +19165,24 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
   }
   // The upload's ack is ROUTED BY THE SHIP (round twelve, 2026-09-16): a comment's upload lands in the open comment box, a composer's
   // never does, box open or not — before this any open box took the composer's ack (the path into the box, the chip retired, the held
-  // send left armed, the column's hold released), so a held column closed with the message unsent and unsaid. A legacy ack with no
-  // shipId (an older kernel) keeps the old reading: an open box is the comment's.
+  // send left armed, the column's hold released), so a held column closed with the message unsent and unsaid.
+  // THREE producers, three routes (round sixteen): a PICKED frame (the extension's 📎 and editor handoff, the kernel's native dialog —
+  // `picked`) stands for no upload: it lands on the active composer, retires nothing, releases nothing, and is said when no session
+  // is open here. A TAGGED ack (shipId) is its ship's, wherever that ship lives. An untagged, un-picked frame is a LEGACY kernel's
+  // ack (before v0.15.0): matched to a pending ship by the saved name (legacyShipFor) and then settled exactly as a tagged one;
+  // matched to none, it lands on the active composer as on main (an open comment box is the comment's), and is said when no
+  // session is open here — never silent.
   else if (m.type === "droppedPath" && typeof m.path === "string") {   // host-saved drop/paste/pick → a thumbnail, not path text (the user 2026-08-04)
-    const ackShip = typeof m.shipId === "string" && m.shipId ? m.shipId : undefined;
-    if (ackShip && !shipOwner(ackShip)) return;   // a duplicate of a ship already retired (a reconnect
-    //                                               re-ship raced the original ack) — attaching it again
-    //                                               would double the file on whatever tab is active (T215)
-    const ship = ackShip ? shipRecord(ackShip) : soleShip();   // the ack's route (see above); an untagged ack with exactly one ship pending is that ship's (round fourteen)
+    const picked = m.picked === true;   // three producers, three routes: see above the branch (round sixteen)
+    let ackShip = typeof m.shipId === "string" && m.shipId ? m.shipId : undefined;
+    if (ackShip && !shipOwner(ackShip)) return;   // a duplicate of a ship already retired (a reconnect re-ship raced the original ack): dropped, never attached again (T215)
+    if (!ackShip && !picked) { const legacy = legacyShipFor(m.path); if (legacy) ackShip = legacy.shipId; }
+    const ship = ackShip ? shipRecord(ackShip) : null;   // the ack's route (see above)
     const cbox = document.getElementById("cmt-pop")?.querySelector(".cmt-input") as HTMLTextAreaElement | null;
+    if (picked) {   // a pick: the active composer only (see above)
+      if (!activeId) { warnToast((m.path.split("/").pop() || "The picked file") + " was picked, but no session is open in this column to attach it to."); return; }
+      addComposerFile(activeId, m.path); return;
+    }
     if (ship ? ship.kind === "comment" : !!cbox) {
       retirePendingShip(m.path, ackShip);   // a comment's upload: the box, or — the popover gone — said by name, NEVER the composer (round thirteen)
       if (cbox) {
@@ -19183,8 +19194,9 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       syncColumnBusy();   // LAST (round eleven): the upload's hold on the column ends with its chip
       return;
     }
-    const retired = retirePendingShip(m.path, ackShip);   // the chip this TAGGED ack answers names the OWNING composer; an untagged answer (the picker, an older kernel) retires nothing (round fifteen)
-    const owner = retired || activeId;                    // …and lands on the ACTIVE session's composer, as the picker always did
+    const retired = retirePendingShip(m.path, ackShip);   // the chip this ack answers — tagged, or a legacy ack matched by name — names the OWNING composer
+    const owner = retired || activeId;                    // …an ack matched to no ship lands on the ACTIVE session's composer, as on main; none → said (round sixteen)
+    if (!owner) { warnToast((m.path.split("/").pop() || "The file") + " arrived, but no session is open in this column to attach it to."); syncColumnBusy(); return; }
     addComposerFile(owner, m.path);
     // an OPEN ship-gate dialog counts as a held send (the user 2026-08-19): the upload finishing is
     // the answer to the question it asks, so it closes itself and the send fires — no click needed.
@@ -19205,9 +19217,10 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
   } else if (m.type === "dropSaveFailed" && typeof m.name === "string") {
     // the kernel could not SAVE the shipped bytes — clear the pending chip and say so loudly,
     // never leave dots pulsing over a file that is not coming (fail loudly, don't degrade silently)
-    const nackShip = typeof m.shipId === "string" && m.shipId ? m.shipId : undefined;
+    let nackShip = typeof m.shipId === "string" && m.shipId ? m.shipId : undefined;
     if (nackShip && !shipOwner(nackShip)) return;   // duplicate nack for a chip already settled — the
     //                                                 first one warned; a re-warn would double the toast
+    if (!nackShip) { const legacy = legacyShipFor(m.name); if (legacy) nackShip = legacy.shipId; }   // a legacy kernel's untagged nack: the ship it names by name (round sixteen); none → said only (shipFailed)
     shipFailed(m.name, nackShip, m.name + " couldn't be saved on the kernel, so it was not attached — try again.");
   }
   // an EDITOR highlight (VS Code host, onDidChangeTextEditorSelection — the user 2026-07-13) seeds the

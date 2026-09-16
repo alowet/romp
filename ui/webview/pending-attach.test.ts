@@ -40,7 +40,7 @@ test("the strip renders pending chips (name + pulsing dots) and shows even with 
 
 test("the droppedPath ack retires the chip it answers, then attaches the thumbnail", () => {
   assert.match(RENDER, /const retired = retirePendingShip\(m\.path, ackShip\);[^\n]*\n    const owner = retired \|\| activeId;/);
-  assert.match(RENDER, /retirePendingShip\(m\.path, ackShip\)[\s\S]{0,300}addComposerFile\(owner, m\.path\)/,
+  assert.match(RENDER, /const retired = retirePendingShip\(m\.path, ackShip\);[^\n]*\n    const owner = retired \|\| activeId;[\s\S]{0,400}addComposerFile\(owner, m\.path\)/,
     "the ack attaches to the composer that SHIPPED the file (the 2026-08-16 wrong-tab attach)");
 });
 
@@ -51,7 +51,10 @@ test("ack↔chip matching is by the echoed shipId alone: an untagged answer reti
   // … but the name match and the oldest-first fallback are GONE: an answer with no shipId (the VS Code picker, an older kernel) retired a
   // record it was not about — another session's upload, whose held send then went with the picked path
   assert.match(RENDER, /function retirePendingShip\(key: string, shipId\?: string\): string \| null \{\n(?:\s*\/\/[^\n]*\n)*\s*if \(!shipId\) return null;/);
-  assert.ok(!RENDER.includes("list.splice(i >= 0 ? i : 0, 1);") && !RENDER.includes('k.endsWith("-" + shipSafeName(p.name))'), "no fallback of any kind");
+  assert.ok(!RENDER.includes("list.splice(i >= 0 ? i : 0, 1);"), "no oldest-first fallback in retirePendingShip");
+  // …the saved-name match lives in legacyShipFor alone (round sixteen): an untagged, UN-PICKED frame is a legacy kernel's ack and names its ship by
+  // the saved name; a picker's frame carries `picked` and is never matched
+  assert.match(RENDER, /function legacyShipFor\(key: string\): PendingShip \| null \{/); assert.equal((RENDER.match(/k\.endsWith\("-" \+ shipSafeName\(p\.name\)\)/g) || []).length, 1, "one name match, in legacyShipFor");
 });
 
 test("a failed kernel save is NACKED and surfaces loudly — never a silent stuck chip", () => {
