@@ -74,6 +74,18 @@ class CreateSessionAckFast(unittest.TestCase):
         self.assertIs(who, asker, "…selected on the ASKING window alone (the per-viewer rule)")
         self.assertEqual(reveal, {"type": "focus", "id": sid})
 
+    def test_the_success_focus_names_the_request_that_asked_for_it(self):
+        # round six (2026-09-15): the page's request id rides the spawn path into the focus that lands the new tab, so a page
+        # that replaced the create meanwhile tells the late focus apart (render.ts createReplyIsStale); none sent, none echoed
+        asker = {"app": "chat", "wid": "win-A"}
+        sid, _ = km._create_sdk_session("newsesh", "/tmp", client=asker, rid="c-req-9")
+        _, _, reveal = next(e for e in self.events if e[0] == "reveal")
+        self.assertEqual(reveal, {"rid": "c-req-9", "type": "focus", "id": sid})
+        self.events.clear()
+        km._create_sdk_session("newsesh2", "/tmp", client=asker)
+        _, _, reveal = next(e for e in self.events if e[0] == "reveal")
+        self.assertEqual(reveal, {"type": "focus", "id": sid}, "an older page sends no id: the focus is as it was")
+
     def test_createsession_handler_has_no_inline_push(self):
         # source pin: the whole createSession dispatch block (both the already-running reopen and the
         # SDK-create branch) wakes the pusher instead of building synchronously
@@ -134,6 +146,12 @@ class TagsLandBeforeTheDirectPush(unittest.TestCase):
         self.assertEqual(self.at_push.get(sid), ["alpha", "beta"],
                          "inherited + named tags are in the store BEFORE the direct push, not a cycle later")
         self.assertEqual(sorted(extra["tags"]), ["alpha", "beta"], "and the ack echoes the same names")
+
+    def test_a_codex_create_s_success_focus_names_the_request_too(self):
+        reveals = []
+        km._reveal_chat_for = lambda c, m: reveals.append(m)   # (tearDown restores the real one)
+        sid, _ = km._create_codex_session("codexchild", "/tmp", client={"app": "chat", "wid": "win-A"}, rid="c-req-10")
+        self.assertEqual(reveals, [{"rid": "c-req-10", "type": "focus", "id": sid}])
 
     def test_a_codex_child_is_in_its_parents_tag_and_the_named_one_when_its_tab_is_pushed(self):
         sid, extra = km._create_codex_session_inner("child2", "/tmp", parent=self.PARENT, tags=("beta",))

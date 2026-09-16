@@ -85,8 +85,9 @@ test("the focus handler retires the provisional QUIETLY when the kernel answered
     "…and never dropped: it joins that session's draft (nothing typed is ever just lost)");
   assert.match(res, /if \(activeId === realId && ta\) \{ ta\.value = drafts\.get\(realId\) \?\? ""; growComposer\(ta\); \}/,
     "the reselect may already sit on the real tab (setActive then early-returns): the box is filled here too");
-  // the warn that follows a tagged request finds no create pending → the toast path, unchanged
-  assert.match(RENDER, /if \(provisionalId\) failProvisional\(m\.text\); else warnToast\(m\.text\);/);
+  // the warn that follows a tagged request finds no create pending → the toast path, unchanged — EXECUTED in
+  // dir-question-busy.test.ts (round six: a rid reply with no create pending is main's, never stale)
+  assert.match(RENDER, /if \(provisionalId\) \{ failProvisional\(m\.text\); return; \}[\s\S]*?warnToast\(m\.text\);\n\}/);
 });
 
 test("creating a session opens the provisional tab instead of a modal", () => {
@@ -129,7 +130,7 @@ test("adoption flushes the held messages FOR REAL and carries the draft across",
 });
 
 test("a failed create says so in a dialog, in the kernel's own words — ON the failed thread", () => {
-  assert.match(RENDER, /if \(provisionalId\) failProvisional\(m\.text\); else warnToast\(m\.text\);/);
+  assert.match(RENDER, /if \(provisionalId\) \{ failProvisional\(m\.text\); return; \}[\s\S]*?warnToast\(m\.text\);\n\}/);
   assert.match(RENDER, /showConfirm\("Couldn't start " \+ name,/);
   assert.match(RENDER, /What you typed is in this tab's message box\./,
     "losing the text would be the one unrecoverable part");
@@ -159,7 +160,7 @@ test("the silent-failure backstop is long, because it is no longer what you wait
 });
 
 test("closing a provisional tab aborts the pending spawn; a FAILED one is a plain local discard", () => {
-  assert.match(RENDER, /if \(id === provisionalId\) cancelProvisional\(\);\s*\n\s*else \{ failedProvisionals\.delete\(id\); failedWhy\.delete\(id\); dismissSession\(id, "close"\); syncColumnBusy\(\); \}/);   // …its reason goes with it (round five)   // …and the shell hears the column is no longer busy (a held drop of it applies; chat-split.test.ts)
+  assert.match(RENDER, /if \(id === provisionalId\) cancelProvisional\(\);\s*\n\s*else \{ failedProvisionals\.delete\(id\); failedWhy\.delete\(id\); failedInfo\.delete\(id\); dismissSession\(id, "close"\); syncColumnBusy\(\); \}/);   // …its reason goes with it (round five)   // …and the shell hears the column is no longer busy (a held drop of it applies; chat-split.test.ts)
   assert.match(RENDER, /vscodeApi\.postMessage\(\{ type: "cancelCreate", name \}\)/);
   // the kernel never knew a provisional id — the dead-tab ✕ must not post closeTab for one
   assert.match(RENDER, /if \(!isProvisionalId\(id\)\) vscodeApi\.postMessage\(\{ type: "closeTab", id \}\);/);

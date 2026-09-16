@@ -349,7 +349,7 @@ test("the picker's Tags row is live for every offered backend, and the create al
   assert.doesNotMatch(sync, /classList\.toggle\("disabled"/);
   assert.match(RENDER, /const tags = Array\.from\(tgWrap\.querySelectorAll<HTMLElement>\("\.picker-be-opt\.sel"\)\)\.map\(\(x\) => x\.dataset\.tag \|\| ""\)\.filter\(Boolean\);/,
     "the create handler sends the selected chips for every backend");
-  assert.match(KERNEL, /_create_codex_session\(nm, cwd, client=client,\s+parent=psid or "", tags=ctags\)/,
+  assert.match(KERNEL, /_create_codex_session\(nm, cwd, client=client,\s+parent=psid or "", tags=ctags, rid=_rid\.get\("rid"\)\)/,
     "the premise: the kernel's createSession op applies tags on a Codex create");
   assert.match(RENDER, /beWrap\.addEventListener\("click", \(\) => \{ syncPickerAuth\(\); syncPickerTags\(\); \}\);/, "re-painted on every backend toggle");
   assert.match(RENDER, /:not\(\.picker-host\):not\(\.picker-auth\):not\(\.picker-tags\) \.picker-be-opt\.sel/, "a selected tag chip never reads as the backend pick");

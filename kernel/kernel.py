@@ -16088,7 +16088,7 @@ def _apply_new_session_prefs(sid, body):
     return out
 
 
-def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None, env=None, parent="", tags=()):
+def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None, env=None, parent="", tags=(), rid=None):
     """The SDK create door — POST /new and the WS createSession op both land here, so neither can skip
     the claim. `nm` is claimed (kind create) and verified against a live snapshot taken under the claim,
     outside the claims lock; the create runs under the claim and the name is released once the
@@ -16101,12 +16101,12 @@ def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None, env=None, par
         return "", {"error": refusal, "nameTaken": True}
     try:
         return _create_sdk_session_inner(nm, cwd, auth=auth, prefs=prefs, client=client, env=env,
-                                         parent=parent, tags=tags)
+                                         parent=parent, tags=tags, rid=rid)
     finally:
         _release_name(nm)
 
 
-def _create_sdk_session_inner(nm, cwd, auth="", prefs=None, client=None, env=None, parent="", tags=()):
+def _create_sdk_session_inner(nm, cwd, auth="", prefs=None, client=None, env=None, parent="", tags=(), rid=None):
     """Create + open a new SDK-backed session, ACK-FAST (the user 2026-07-14, who asked why it took so long
     to open a new SDK session). spawn() is file writes and connect() is threaded (~0.4s to a booting
     CLI) — the 7-10s the user waited was the handler's inline _push_all(): a new session invalidates the
@@ -16151,13 +16151,15 @@ def _create_sdk_session_inner(nm, cwd, auth="", prefs=None, client=None, env=Non
         extra.update(_tag_ack(sid, parent, tags))
     _sdk().connect(sid)    # eager-connect so the model lists immediately, not only after the 1st message
     if client is not None:
-        _reveal_chat_for(client, {"type": "focus", "id": sid})
+        # the asker's request id rides the focus (round six, 2026-09-15): a page that replaced this create meanwhile tells
+        # the late focus apart and leaves its pending tab in front (render.ts createReplyIsStale); none sent, none echoed
+        _reveal_chat_for(client, {**({"rid": rid} if rid else {}), "type": "focus", "id": sid})
     _mark_views_dirty()
     _push_session_now(sid)   # the tab the user is staring at, ahead of the woken cycle
     return sid, extra
 
 
-def _create_codex_session(nm, cwd, client=None, parent="", tags=()):
+def _create_codex_session(nm, cwd, client=None, parent="", tags=(), rid=None):
     """The Codex create door — the same claim contract as _create_sdk_session (both doors land here):
     `nm` claimed (kind create) and verified against a live snapshot taken under the claim, outside the
     lock, released once spawn has the row in the Codex registry and the shared names/ entry (the next
@@ -16167,12 +16169,12 @@ def _create_codex_session(nm, cwd, client=None, parent="", tags=()):
     if refusal:
         return "", {"error": refusal, "nameTaken": True}
     try:
-        return _create_codex_session_inner(nm, cwd, client=client, parent=parent, tags=tags)
+        return _create_codex_session_inner(nm, cwd, client=client, parent=parent, tags=tags, rid=rid)
     finally:
         _release_name(nm)
 
 
-def _create_codex_session_inner(nm, cwd, client=None, parent="", tags=()):
+def _create_codex_session_inner(nm, cwd, client=None, parent="", tags=(), rid=None):
     """Create + open a new Codex-backed session — the same ACK-FAST shape as _create_sdk_session
     (focus first, dirty-mark wake, one direct push; never a synchronous fleet build here). spawn()
     starts the app-server thread, touches the materialized transcript (so discover() lists it
@@ -16199,7 +16201,7 @@ def _create_codex_session_inner(nm, cwd, client=None, parent="", tags=()):
         # like _create_sdk_session/_fork_session: a client-less caller (POST /new — a headless
         # `romp new`) reveals to NOBODY; None fell through to the legacy every-window broadcast,
         # the retired chats-kept-jumping bug (the adversarial check, 2026-08-19)
-        _reveal_chat_for(client, {"type": "focus", "id": sid})
+        _reveal_chat_for(client, {**({"rid": rid} if rid else {}), "type": "focus", "id": sid})   # the asker's request id rides along (round six; see _create_sdk_session_inner)
     _mark_views_dirty()
     _push_session_now(sid)
     return sid, extra
@@ -26718,7 +26720,7 @@ def _flag_type_note(field, v):
     return "'%s' is %s, not a boolean" % (field, _json_type_name(v))
 
 
-def _refuse_ws_flag(client, op, err, field="", value=None):
+def _refuse_ws_flag(client, op, err, field="", value=None, extra=None):
     """A WS frame carried a flag that is not a boolean: one stderr line, and a `warn` frame -- the frame
     the dispatcher answers a malformed request with (a bad session name, a failed login step) -- on the
     delivering socket. The frame carries `err` with its bounded echo of the value (the sender sees what
@@ -26729,7 +26731,7 @@ def _refuse_ws_flag(client, op, err, field="", value=None):
     frame those pages repaint from."""
     sys.stderr.write("romp-kernel: refused %s: %s\n" % (op, _flag_type_note(field, value)))
     if client and callable(client.get("send")):
-        _reply(client, {"type": "warn", "text": "%s: %s" % (op, err)})
+        _reply(client, {**(extra or {}), "type": "warn", "text": "%s: %s" % (op, err)})   # `extra`: fields the op wants echoed (a create's request id)
 
 
 def _parse_send_body(raw):
@@ -63437,7 +63439,7 @@ class Handler(BaseHTTPRequestHandler):
                 # "that folder doesn't exist" dialog and chose to make it (see createDirMissing below).
                 mk, ferr = _as_bool(msg.get("mkdir"), "mkdir")
                 if ferr:
-                    _refuse_ws_flag(client, msg["type"], ferr, "mkdir", msg.get("mkdir"))
+                    _refuse_ws_flag(client, msg["type"], ferr, "mkdir", msg.get("mkdir"), extra=_rid)   # the one refusal that left the create's replies (round six): it names the request too
                     return
                 cwd, derr = _resolve_create_dir(msg.get("dir"), create=mk)
                 live = _live_names(_live_map())
@@ -63489,7 +63491,7 @@ class Handler(BaseHTTPRequestHandler):
                         # `parent` is accepted for API symmetry with /new — applied before the first
                         # push, so the new tab lands sectioned under its group (see _create_sdk_session)
                         _sid, extra = _create_sdk_session(nm, cwd, auth=(a if lg.parse_pick(a)[0] else ""),
-                                                          client=client, parent=psid or "", tags=ctags)
+                                                          client=client, parent=psid or "", tags=ctags, rid=_rid.get("rid"))
                         if not _sid:
                             # a name taken or being registered since the live check above (the claim
                             # inside _create_sdk_session ruled): there is nothing to focus yet, so the
@@ -63507,7 +63509,7 @@ class Handler(BaseHTTPRequestHandler):
                             # parent/tags land like the SDK arm's: the tag store keys on the registry
                             # sid, so a Codex child sections under its group from its first frame
                             _sid, extra = _create_codex_session(nm, cwd, client=client,
-                                                                parent=psid or "", tags=ctags)
+                                                                parent=psid or "", tags=ctags, rid=_rid.get("rid"))
                         except Exception as e:
                             # the generic dispatcher handler logs to stderr only — the picker's
                             # "Opening…" cue got no answer (the r28 verification). stderr FIRST:

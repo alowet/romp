@@ -8125,10 +8125,19 @@ let dirQuestionFor: string | null = null;
 // of being read against whatever tab is current. A reply WITHOUT one (an older kernel) is read as today: the current create's.
 let provisionalRid: string | null = null;
 function mintRid(): string { return "c-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
-function createReplyIsStale(m: { rid?: unknown }): boolean { return typeof m.rid === "string" && m.rid !== provisionalRid; }
+// Stale ONLY while a DIFFERENT create is pending (round six): with none pending, a reply that names a request takes main's
+// path — a namesake's "tags were not changed" after the focus settled the tab, a tagError after the session's own frame
+// adopted it, a host's late authoritative reason after the backstop failed the tab (onCreateWarn refines that tab's reason).
+function createReplyIsStale(m: { rid?: unknown }): boolean { return typeof m.rid === "string" && provisionalRid !== null && m.rid !== provisionalRid; }
 // the reason a create failed, by its failed tab (failProvisional): the tab's own placeholder shows it, so a failure said
 // quietly (the picker opened over its prompt, an unrelated dialog replacing it) is still explained where the text is
 const failedWhy = new Map<string, string>();
+// …and what else a failed tab needs to come back after a reload (round six, 2026-09-15): its name, the folder it named, and
+// the request it waited on (a late reply naming it refines the reason). persistDrafts writes {name, dir, why, rid} by id
+// beside the drafts; restoreFailedProvisionals rebuilds the tabs at boot. Before this the failed set lived in memory alone:
+// a refresh — or the VS Code pipe's webview rebuild on reconnect — dropped the tab and left its text orphaned in the drafts
+// under an id nothing could show, against the tab's own promise that its ✕ is what discards the text.
+const failedInfo = new Map<string, { name: string; dir: string; rid: string | null }>();
 // Provisional tabs whose create FAILED (the user 2026-08-08): the tab — and whatever was typed into
 // it — STAYS, foregrounded, with the failure dialog on top. It used to be torn down and the held text
 // dumped into whichever tab happened to be active, polluting an unrelated thread's draft. The set keys
@@ -8271,11 +8280,12 @@ function resolveProvisionalToExisting(realId: string): void {
 // reading another thread silently rewrote that thread's draft.
 function failProvisional(why: string, quiet = false): void {
   if (!provisionalId) return;
-  const id = provisionalId;
+  const id = provisionalId, rid = provisionalRid;   // the request the tab waited on: a late reply naming it may still refine the reason (onCreateWarn)
   dirQuestionFor = null;             // whatever question it had is over: the tab is a failed create now
   provisionalRid = null;             // …and no request is pending for it
   failedWhy.set(id, why);            // the tab's placeholder says why, dialog or no dialog
   const name = pendingNewSession || "that session";
+  failedInfo.set(id, { name, dir: lastCreate?.dir ?? "", rid });   // persisted with the drafts: the tab comes back after a reload
   // retire the create MACHINERY only — dropProvisional() would dismiss the tab too
   provisionalId = null;
   pendingNewSession = null;
@@ -8940,7 +8950,12 @@ function onCreateDirMissing(m: any): void {
 // it needed to be read. Unless it answers a create the user has since superseded (its rid names the old request): ignored.
 function onCreateWarn(m: { text: string; rid?: unknown }): void {
   if (createReplyIsStale(m)) return;
-  if (provisionalId) failProvisional(m.text); else warnToast(m.text);
+  if (provisionalId) { failProvisional(m.text); return; }
+  // no create pending: main's path, the toast. And a warn naming a FAILED tab's request — the backstop failed it on a generic
+  // reason, the host's own reason arrives late — makes that reason the tab's (its placeholder shows it at its next build,
+  // persisted with the tab), so the authoritative detail is not lost to the timeout's wording (round six)
+  if (typeof m.rid === "string") for (const [id, info] of failedInfo) if (info.rid === m.rid && failedProvisionals.has(id)) { failedWhy.set(id, m.text); persistDrafts(); }
+  warnToast(m.text);
 }
 // the reason a dismissed folder question leaves on its failed tab (the dialog adds where the text is, as for any failed create)
 function dirWhy(dir: string): string {
@@ -16287,12 +16302,43 @@ function endReloadHoldIfIdle(): void {
 // that remembers the active tab — and reload it at startup. restoreActiveDraftOnce() drops the active tab's
 // draft back into the box ONE time after load, and only when the box is empty, so it never clobbers live typing.
 // Citations persist alongside drafts (same lifecycle: survive reload + tab switch, cleared on send/dismiss).
+// FAILED CREATES SURVIVE A RELOAD (round six, 2026-09-15). The failed tab promises that its ✕ is what discards the text
+// (pane-placeholder.ts start-failed), yet the failed set lived in memory alone: a refresh — or the VS Code pipe's webview
+// rebuild on reconnect — dropped the tab, left its text orphaned under a new-* id in the persisted drafts, and lost the
+// reason. This rebuilds every recorded failed tab at boot — the tab (closed, in the strip's order), its reason, its draft
+// (restored with the others above) — busy for the shell as before; the tab the page was on comes back to the front once the
+// page has booted. A new-* draft with NO record — a create still pending when the page died, or an older build's leftover
+// — can be reached by nothing and is dropped here, once, as it was lost the moment the document went.
+function restoreFailedProvisionals(): void {
+  const saved = ((vscodeApi?.getState?.() || {}) as any).failed;
+  if (saved && typeof saved === "object") {
+    for (const [id, rec] of Object.entries(saved as Record<string, any>)) {
+      if (!isProvisionalId(id) || !rec || typeof rec !== "object") continue;
+      const name = typeof rec.name === "string" && rec.name ? rec.name : "a session";
+      sessions.set(id, { id, name, color: null, events: [], status: { state: "closed", sinceEpoch: Date.now() } });
+      if (!order.includes(id)) order.push(id);
+      failedProvisionals.add(id);
+      if (typeof rec.why === "string" && rec.why) failedWhy.set(id, rec.why);
+      failedInfo.set(id, { name, dir: typeof rec.dir === "string" ? rec.dir : "", rid: typeof rec.rid === "string" ? rec.rid : null });
+    }
+  }
+  let dropped = false;
+  for (const k of [...drafts.keys()]) if (isProvisionalId(k) && !failedProvisionals.has(k)) { drafts.delete(k); dropped = true; }
+  for (const k of [...composerCitations.keys()]) if (isProvisionalId(k) && !failedProvisionals.has(k)) { composerCitations.delete(k); dropped = true; }
+  for (const k of [...composerFiles.keys()]) if (isProvisionalId(k) && !failedProvisionals.has(k)) { composerFiles.delete(k); dropped = true; }
+  if (dropped) persistDrafts();
+  if (wantActiveGone && failedProvisionals.has(wantActiveGone)) { const failedTab = wantActiveGone; wantActiveGone = null; setTimeout(() => { if (!activeId) setActive(failedTab); }, 0); }   // the failed tab the page was on, back in front once booted
+}
 function persistDrafts(): void {
   try {
     vscodeApi?.setState?.({ ...(vscodeApi.getState?.() || {}), drafts: Object.fromEntries(drafts),
                             citations: Object.fromEntries(composerCitations),
                             files: Object.fromEntries(composerFiles),
                             staged: stagedMsgs.entries(),
+                            // the FAILED creates, by their tab's id (round six): the tab comes back after a reload with its
+                            // reason and its draft, and its ✕ — the one discard — takes this record with the draft
+                            failed: Object.fromEntries([...failedProvisionals].map((id) => [id, { name: failedInfo.get(id)?.name ?? sessions.get(id)?.name ?? "", dir: failedInfo.get(id)?.dir ?? "",
+                                                                                                    why: failedWhy.get(id) ?? "", rid: failedInfo.get(id)?.rid ?? null }])),
                             // NAMES of ships still awaiting their ack — never the bytes. A reload
                             // cannot resurrect the upload (the payload dies with the page), so the
                             // next load reads these to say LOUDLY what was lost (T215; the VS Code
@@ -16324,6 +16370,7 @@ try {
       }
       if (list.length) composerCitations.set(k, list);
     }
+  restoreFailedProvisionals();   // the failed creates, back with their reason and their draft (round six); orphan new-* drafts dropped
   // Ships that were still awaiting their ack when the page died (persistDrafts's shipsInFlight): the
   // payload died with the page, so the upload is LOST — say so loudly with the re-attach affordance
   // spelled out, and clear the record so the toast fires once, not on every future load (T215). This
@@ -18160,7 +18207,7 @@ function closeTabLocally(id: string): void {
   // (and the kernel never knew the id): its ✕ is a plain local discard — tab, draft, and all.
   if (isProvisionalId(id)) {
     if (id === provisionalId) cancelProvisional();
-    else { failedProvisionals.delete(id); failedWhy.delete(id); dismissSession(id, "close"); syncColumnBusy(); }   // the text went with the discard: a held drop of this column applies now
+    else { failedProvisionals.delete(id); failedWhy.delete(id); failedInfo.delete(id); dismissSession(id, "close"); syncColumnBusy(); }   // the text went with the discard (dismissSession persists: the record goes with it): a held drop of this column applies now
     return;
   }
   dismissSession(id, "close");
@@ -18493,6 +18540,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     glossaries.set(m.id, m as GlossaryIndex);
     relinkTerms(m.id);
   }
+  else if (m.type === "focus" && createReplyIsStale(m)) { /* a create's success focus arriving after the user replaced that create (round six): nobody's — the pending one keeps the front. A focus without a request id (an older kernel) is read as ever, below */ }
   else if (m.type === "focus" && !focusIsOurs(m.id)) {
     // another chat column's (split screen): the shell named the column that holds the session. A consumed parked
     // push-tap reveal rides `own` (the kernel sent it to THIS one client, _consume_pending_reveal): it is handed to

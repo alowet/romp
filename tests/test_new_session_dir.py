@@ -216,6 +216,9 @@ class CreateSessionDirFork(_Wire):
         self.assertEqual(r["type"], "createDirMissing"); self.assertNotIn("rid", r, "an older page: no id sent, none echoed")
         r = self.send({"type": "createSession", "name": "web", "dir": target, "backend": "sdk", "rid": "x" * 81})
         self.assertNotIn("rid", r, "an id of an unexpected shape is not echoed")
+        # round six: the malformed-mkdir refusal was the one direct reply that left the create's replies — it names the request too
+        r = self.send({"type": "createSession", "name": "web", "dir": self.tmp, "backend": "sdk", "mkdir": "yes", "rid": "c-req-3"})
+        self.assertEqual(r["type"], "warn"); self.assertTrue(r["text"].startswith("createSession: ")); self.assertEqual(r["rid"], "c-req-3")
 
     def test_a_missing_directory_asks_instead_of_warning_into_the_void(self):
         target = os.path.join(self.tmp, "not", "yet")
