@@ -8276,9 +8276,26 @@ function dropProvisional(): { queued: string[]; draft: string } {
 // The real session arrived: move everything the provisional tab was holding onto it and focus it. The
 // queued messages send FOR REAL here — they were never sent before, because there was no session to send
 // them to; the dashed bubbles you saw were this client saying "received", not the kernel.
+// EVERYTHING the provisional tab held travels to the real session when a create settles (round nine, 2026-09-15): not only
+// the queued text and the plain draft dropProvisional returns, but the staged messages (in order, each with its citations),
+// the unsent citation chips and the attached files — moved BEFORE dismissSession deletes the provisional's maps, and keyed
+// under the real sid BEFORE the flip, so a column another dashboard dropped hands them to the pane that shows the session
+// (__rompOrphanStateSids → close()'s transfer, which carries all four stores). Before this a settlement kept the plain draft
+// alone: the chips and files were deleted with the tab, and the staged stack stayed under the retired id until the boot
+// sweep dropped it. Appended, never over what the real session already holds.
+function moveProvisionalState(fromId: string, toId: string): void {
+  const cites = composerCitations.get(fromId);
+  if (cites && cites.length) { composerCitations.set(toId, [...(composerCitations.get(toId) ?? []), ...cites]); composerCitations.delete(fromId); }
+  const files = composerFiles.get(fromId);
+  if (files && files.length) { composerFiles.set(toId, [...(composerFiles.get(toId) ?? []), ...files]); composerFiles.delete(fromId); }
+  const staged = stagedMsgs.takeAll(fromId);
+  if (staged.length) stagedMsgs.restore({ [toId]: [...stagedMsgs.list(toId), ...staged] });
+}
+
 function adoptProvisional(realId: string): void {
   claimSession(realId);                    // a session created from a later column belongs to that column (the chat split): claimed BEFORE the switch, so setActive shows it here
   rememberSettled(provisionalRid, realId); // the request settled here: its follow-ups (a tagError) are toasts for this session, never the next create's verdict (routeCreateReply)
+  if (provisionalId) moveProvisionalState(provisionalId, realId);   // the staged messages, chips and files, before the tab's maps go (dropProvisional → dismissSession)
   const { queued, draft } = dropProvisional();
   if (draft) drafts.set(realId, draft);    // set BEFORE the switch — setActive fills the box from drafts
   setActive(realId);
@@ -8287,7 +8304,8 @@ function adoptProvisional(realId: string): void {
     vscodeApi?.postMessage({ type: "sendMessage", id: realId, text, qid });
     registerOptimistic(realId, text, undefined, qid);       // …and the bubble carries over to the tab that now owns it, under the same id
   }
-  if (draft) { persistDrafts(); const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null; if (ta) growComposer(ta); }
+  persistDrafts();   // whatever moved (round nine), draft or not
+  if (draft) { const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null; if (ta) growComposer(ta); }
   syncColumnBusy();                        // LAST: the session is claimed and listed here, its text with it
 }
 
@@ -8301,8 +8319,10 @@ function adoptProvisional(realId: string): void {
 // struck-through dead tab), and an untagged one waited 90 s for the backstop to say the same.
 function resolveProvisionalToExisting(realId: string): void {
   rememberSettled(provisionalRid, realId);         // settled on the running session: its follow-ups ("tags were not changed") are toasts (routeCreateReply)
+  if (provisionalId) moveProvisionalState(provisionalId, realId);   // the staged messages, chips and files go to the running session too — keyed under it before the flip below hands them on
   const { queued, draft } = dropProvisional();     // …and the 90 s backstop goes with it
   const held = [...queued, draft].filter(Boolean).join("\n\n");
+  persistDrafts();   // whatever moved (round nine), text or not
   if (held) {
     drafts.set(realId, [drafts.get(realId) ?? "", held].filter(Boolean).join("\n\n"));   // BEFORE the switch — setActive fills the box from drafts
     persistDrafts();
@@ -8311,6 +8331,7 @@ function resolveProvisionalToExisting(realId: string): void {
     const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
     if (activeId === realId && ta) { ta.value = drafts.get(realId) ?? ""; growComposer(ta); }
   }
+  if (activeId === realId) { renderComposerChips(realId); renderComposerFiles(realId); renderStagedStrip(realId); }   // the box already on the real tab: what moved shows now
   // LAST: the text is on the running session's draft in THIS document. A column another dashboard dropped closes on this
   // flip, and the running session is shown elsewhere (the first column, or the column that lists it) — so the shell's
   // close() hands the document's state for it there (__rompOrphanStateSids), the way a listed member's travels

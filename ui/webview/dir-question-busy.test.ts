@@ -23,6 +23,8 @@ import { createRequire } from "node:module";
 import { provisionalName, mintProvisionalId, isProvisionalId } from "./provisional";
 import { StagedStack } from "./staged-messages";
 import { takeReloadNotices, keepReloadNotices } from "./reload-notices";
+import { columnHolds } from "./chat-columns";
+import { isSubId } from "./subagent-view";
 
 const requireCjs = createRequire(__filename);
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
@@ -39,33 +41,38 @@ const VIEWER = C + "/agent/a1";
 const REQ = { name: "notes", backend: "sdk", dir: "/proj/not-there-yet", host: "" };
 const TYPED = "notes for a session whose folder is not there yet";
 
-type Hooks = { posts: Record<string, unknown>[]; boot: Record<string, unknown>[]; sent: Record<string, unknown>[]; seq: string[]; confirms: string[]; pickers: number; persisted: number; timers: (() => void)[]; cleared: number; toasts: string[]; answered: (string | null)[] };
+type Hooks = { posts: Record<string, unknown>[]; boot: Record<string, unknown>[]; sent: Record<string, unknown>[]; seq: string[]; confirms: string[]; pickers: number; persisted: number; timers: (() => void)[]; cleared: number; toasts: string[]; answered: (string | null)[]; claims: string[] };
 type State = { provisionalId: string | null; dirQuestionFor: string | null; failed: string[]; activeId: string | null; drafts: Record<string, string>; sessions: string[]; timer: boolean; why: Record<string, string> };
 type Api = {
   startCreate: (req: typeof REQ, mkdir?: boolean) => void; onCreateDirMissing: (m: Record<string, unknown>) => void; closePicker: (abandon?: boolean) => void;
   openPicker: () => void; cancelProvisional: () => void; closeTabLocally: (id: string) => void;
   onCreateWarn: (m: { text: string; rid?: unknown }) => void; showConfirm: (title: string, detail: string, buttons: { label: string; value: string }[], cb: (v: string | null) => void) => void;
   stale: (m: { rid?: unknown }) => boolean; fireTimers: () => number; settle: () => void; resolveTo: (sid: string) => void; route: (m: { rid?: unknown }) => string;
-  held: { stage: (id: string, text: string) => void; cite: (id: string) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown> };
+  adopt: (sid: string) => void; orphans: () => string[];
+  held: { stage: (id: string, text: string, cites?: unknown[]) => void; cite: (id: string) => void; attach: (id: string) => void; staged: () => Record<string, unknown[]>; citations: () => Record<string, unknown>; files: () => Record<string, unknown>; drafts: () => Record<string, string> };
   busy: () => boolean; answer: (v: string | null) => void; confirm: () => { title: string; buttons: string[]; key: string | null } | null;
   overlays: () => number; clickButton: (label: string) => boolean; rid: () => string | null;
   type: (t: string) => void; composer: () => string; picker: () => { open: boolean; search: string; dir: string }; state: () => State;
 };
 
-function world(o: { activeId: string | null; mru: string[]; order: string[]; nextActive: string | null; store?: Record<string, unknown>; session?: Record<string, string> }): { api: Api; HOOKS: Hooks; store: Record<string, unknown>; session: Record<string, string> } {
+function world(o: { activeId: string | null; mru: string[]; order: string[]; nextActive: string | null; store?: Record<string, unknown>; session?: Record<string, string>; sets?: Record<string, string[]> | null }): { api: Api; HOOKS: Hooks; store: Record<string, unknown>; session: Record<string, string> } {
   const store: Record<string, unknown> = o.store ?? {};
   const session: Record<string, string> = o.session ?? {};   // the page's sessionStorage (the reload notices ride it)
-  const HOOKS: Hooks = { posts: [], boot: [], sent: [], seq: [], confirms: [], pickers: 0, persisted: 0, timers: [], cleared: 0, toasts: [], answered: [] };
+  const HOOKS: Hooks = { posts: [], boot: [], sent: [], seq: [], confirms: [], pickers: 0, persisted: 0, timers: [], cleared: 0, toasts: [], answered: [], claims: [] };
   const win = { parent: { postMessage(m: Record<string, unknown>) { HOOKS.posts.push(m); if (m.romp === "colBusy") HOOKS.seq.push("flip:" + m.busy); } } };
   const js = requireCjs("esbuild").transformSync(
     [lineOpt("columnBusy"), fn("syncColumnBusy"), fn("dropProvisional"), fn("openProvisional"), fn("cancelProvisional"), fn("failProvisional"),
      fn("onCreateDirMissing"), fnOpt("dirWhy"), fnOpt("dismissDirPromptForPicker"), fn("closePicker"), fn("startCreate"), fn("closeConfirm"), fn("closeTabLocally"),
      fn("showConfirm"), fnOpt("onCreateWarn"), lineOpt("createReplyIsStale"), lineOpt("mintRid"),
      fn("persistDrafts").replace("function persistDrafts(", "function persistDraftsReal("), fnOpt("restoreFailedProvisionals"),
-     fnOpt("bootComposerState"), fnOpt("announceColumnBusy"), lineOpt("retireRid"), fnOpt("finishBoot"), fnOpt("routeCreateReply"), lineOpt("rememberSettled"), fn("resolveProvisionalToExisting")].join("\n"),
+     fnOpt("bootComposerState"), fnOpt("announceColumnBusy"), lineOpt("retireRid"), fnOpt("finishBoot"), fnOpt("routeCreateReply"), lineOpt("rememberSettled"), fn("resolveProvisionalToExisting"),
+     fn("adoptProvisional"), fnOpt("moveProvisionalState"), fn("orphanStateSids"), lineOpt("heldHere")].join("\n"),
     { loader: "ts" }).code;
   const prelude = `
-    const { provisionalName, mintProvisionalId, isProvisionalId, StagedStack, HOOKS, STORE, takeReloadNotices } = W;
+    const { provisionalName, mintProvisionalId, isProvisionalId, isSubId, columnHolds, StagedStack, HOOKS, STORE, takeReloadNotices } = W;
+    const COL = "2"; let colSets = W.sets;   // this page: a later column, whose set the shell answers (round nine: the orphan enumeration reads it)
+    const claimSession = (sid) => { HOOKS.claims.push(sid); }; const mintQid = () => "q-1"; const registerOptimistic = () => {};
+    const renderComposerChips = () => {}; const renderComposerFiles = () => {}; const renderStagedStrip = () => {};
     const sessionStorage = { getItem: (k) => (k in W.SESSION ? W.SESSION[k] : null), setItem: (k, v) => { W.SESSION[k] = String(v); }, removeItem: (k) => { delete W.SESSION[k]; } };
     let provisionalId = null, provisionalTags = [], pendingNewSession = null, provisionalTimer = undefined, dirQuestionFor = null, pendingCarry = "", dirQuestion = false;
     let columnBusyTold = false, lastCreate = null, pickMode = false, activeId = W.activeId, confirmCb = null, confirmKey = null, provisionalRid = null;
@@ -124,10 +131,12 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
       stale: (m) => (typeof createReplyIsStale === "function" ? createReplyIsStale(m) : false),
       settle: () => { dropProvisional(); syncColumnBusy(); },   // a settlement that is not a cancel (the focus / the session's frame adopting): the request is NOT superseded
       resolveTo: (sid) => resolveProvisionalToExisting(sid),     // the real settlement onto a running session (remembers the request as settled)
+      adopt: (sid) => adoptProvisional(sid),                     // the real settlement onto the session the create made
+      orphans: () => orphanStateSids(),                          // what this page would hand the shell at a close (the sids it holds state for and does not show)
       route: (m) => (typeof routeCreateReply === "function" ? routeCreateReply(m).kind : "?"),
       // (each persists, as the page's own staging / citing / attaching does)
-      held: { stage: (id, text) => { stagedMsgs.push(id, { text, cites: [] }); persistDrafts(); }, cite: (id) => { composerCitations.set(id, [{ title: "a card", itemId: "g1" }]); persistDrafts(); }, attach: (id) => { composerFiles.set(id, ["/tmp/a.png"]); persistDrafts(); },
-              staged: () => stagedMsgs.entries(), citations: () => Object.fromEntries(composerCitations), files: () => Object.fromEntries(composerFiles) },
+      held: { stage: (id, text, cites) => { stagedMsgs.push(id, { text, cites: cites || [] }); persistDrafts(); }, cite: (id) => { composerCitations.set(id, [{ title: "a card", itemId: "g1" }]); persistDrafts(); }, attach: (id) => { composerFiles.set(id, ["/tmp/a.png"]); persistDrafts(); },
+              staged: () => stagedMsgs.entries(), citations: () => Object.fromEntries(composerCitations), files: () => Object.fromEntries(composerFiles), drafts: () => Object.fromEntries(drafts) },
       fireTimers: () => { const t = HOOKS.timers.splice(0); for (const f of t) f(); return t.length; },
       type: (t) => { EL["composer-input"].value = t; }, composer: () => EL["composer-input"].value,
       picker: () => ({ open: EL.picker.style.display !== "none", search: EL["picker-search"].value, dir: EL["picker-dir"].value }),
@@ -135,7 +144,7 @@ function world(o: { activeId: string | null; mru: string[]; order: string[]; nex
     };
   `;
   const make = new Function("W", "window", prelude + js + epilogue) as (w: unknown, win: unknown) => Api;
-  const api = make({ provisionalName, mintProvisionalId, isProvisionalId, StagedStack, HOOKS, STORE: store, SESSION: session, takeReloadNotices, activeId: o.activeId, mru: o.mru, order: o.order, nextActive: o.nextActive, wantActiveGone: null }, win);
+  const api = make({ provisionalName, mintProvisionalId, isProvisionalId, isSubId, columnHolds, StagedStack, HOOKS, STORE: store, SESSION: session, takeReloadNotices, sets: o.sets === undefined ? { "2": [C] } : o.sets, activeId: o.activeId, mru: o.mru, order: o.order, nextActive: o.nextActive, wantActiveGone: null }, win);
   return { api, HOOKS, store, session };
 }
 const flips = (h: Hooks, busy: boolean) => h.posts.filter((p) => p.romp === "colBusy" && p.busy === busy).length;
@@ -468,4 +477,43 @@ test("round eight: at boot the lost-upload notice comes before the replay of the
   assert.equal(w.HOOKS.toasts.length, 2, "both said: " + JSON.stringify(w.HOOKS.toasts));
   assert.match(w.HOOKS.toasts[0], /was still uploading when this page reloaded/, "the loss first"); assert.equal(w.HOOKS.toasts[1], "what the last page was saying", "…then the replay");
   assert.equal(session["romp:reloadNotices"], undefined, "consumed once");
+});
+
+// ---- round nine ----
+const X = "11111111-2222-3333-4444-555555555510";   // the session the create makes
+const CARD = { title: "a card", itemId: "g1" };
+// a create in flight with everything a provisional tab can hold: a staged message carrying a citation, an unsent citation chip, an attached file, a plain draft
+function laden(o: Parameters<typeof world>[0]) {
+  const w = world(o); w.api.startCreate(REQ); const id = w.api.state().provisionalId!;
+  w.api.held.stage(id, "staged while opening", [CARD]); w.api.held.cite(id); w.api.held.attach(id); w.api.type(TYPED);
+  return { w, id };
+}
+const nothingUnder = (w: ReturnType<typeof world>, id: string) => {
+  assert.equal(w.api.held.staged()[id], undefined, "no staged text under the retired id"); assert.equal(w.api.held.citations()[id], undefined); assert.equal(w.api.held.files()[id], undefined); assert.equal(w.api.held.drafts()[id], undefined);
+  for (const k of ["staged", "citations", "files", "drafts"]) assert.equal(((w.store as any)[k] || {})[id], undefined, k + ": nothing under the retired id on disk");
+};
+
+test("round nine: adoption carries the staged message (with its citation), the unsent chip and the attached file to the new session — nothing stays under the retired id, the store rewritten", () => {
+  const { w, id } = laden({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {} });
+  w.api.adopt(X);
+  assert.deepEqual(w.api.held.staged()[X], [{ text: "staged while opening", cites: [CARD] }], "the staged message, its citation with it");
+  assert.deepEqual(w.api.held.citations()[X], [CARD], "the unsent chip");
+  assert.deepEqual(w.api.held.files()[X], ["/tmp/a.png"], "the attached file"); assert.equal(w.api.held.drafts()[X], TYPED, "the plain draft, as before");
+  nothingUnder(w, id);
+  assert.deepEqual((w.store.staged as any)[X], [{ text: "staged while opening", cites: [CARD] }], "on disk under the real sid"); assert.deepEqual((w.store.files as any)[X], ["/tmp/a.png"]);
+  assert.deepEqual(w.HOOKS.claims, [X]); assert.equal(w.api.busy(), false);
+});
+
+test("round nine: resolution to a session shown in ANOTHER pane keys the moved state under it BEFORE the flip, and the hand-off enumerates that sid — the receiving pane gets all four", () => {
+  const { w, id } = laden({ activeId: C, mru: [C], order: [A, B, C], nextActive: null, store: {}, sets: { "2": [] } });   // a HELD column (a peer dropped it): its set is empty
+  w.api.resolveTo(A);   // the kernel's focus: "notes" is A, running, shown in the first column
+  assert.deepEqual(w.api.held.staged()[A], [{ text: "staged while opening", cites: [CARD] }]); assert.deepEqual(w.api.held.citations()[A], [{ title: "a card", itemId: "g1" }]); assert.deepEqual(w.api.held.files()[A], ["/tmp/a.png"]); assert.equal(w.api.held.drafts()[A], TYPED);
+  nothingUnder(w, id);
+  assert.ok(w.api.orphans().includes(A), "the hand-off enumerates A: this page holds A's state and does not show A"); assert.ok(!w.api.orphans().some((s) => s.startsWith("new-")), "…and never the retired id");
+  assert.deepEqual(w.HOOKS.posts[w.HOOKS.posts.length - 1], { romp: "colBusy", busy: false }, "the flip, last");
+  assert.ok(w.HOOKS.seq.lastIndexOf("persist") < w.HOOKS.seq.lastIndexOf("flip:false"), "persisted (the moved state under A) before the flip that lets the shell close and transfer");
+  // the next boot over the same store: the sweep finds nothing under a provisional id, and A's entries stand
+  const r = world({ activeId: null, mru: [], order: [A, B, C], nextActive: null, store: w.store, sets: { "2": [] } });
+  assert.deepEqual(r.api.held.staged()[A], [{ text: "staged while opening", cites: [CARD] }]); assert.deepEqual(r.api.held.files()[A], ["/tmp/a.png"]);
+  assert.equal(Object.keys((r.store.staged as any) || {}).filter((k) => k.startsWith("new-")).length, 0); assert.equal(Object.keys((r.store.drafts as any) || {}).filter((k) => k.startsWith("new-")).length, 0);
 });

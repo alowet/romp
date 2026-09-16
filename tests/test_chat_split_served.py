@@ -754,8 +754,14 @@ await waitFn(() => { const d = document.getElementById("f-chat-2").contentDocume
 // a REAL create named "web" (A's name): openProvisional runs synchronously — a busy column, a live composer
 await fr14.evaluate(() => { const sb = document.getElementById("picker-search"); sb.value = "web"; sb.dispatchEvent(new Event("input", { bubbles: true })); document.getElementById("picker-new-btn").click(); });
 await waitFn(() => { const f = document.getElementById("f-chat-2"); try { return !!f.contentWindow.__rompColumnBusy(); } catch (e) { return false; } }, null, "step 14: no create in flight in column 2");
+// a message STAGED on the pending tab (Ctrl+Enter empties the box into the staged strip), then the plain text typed after it
+// (round nine: everything a pending tab holds travels to the session the create resolves to)
+const STAGED14 = "staged while the session was opening";
+await fr14.evaluate((text) => { const ta = document.getElementById("composer-input"); ta.value = text; ta.dispatchEvent(new Event("input", { bubbles: true })); }, STAGED14);
+await fr14.locator("#composer-input").press("Control+Enter");
+await waitFn(() => { const f = document.getElementById("f-chat-2"); const d = f && f.contentDocument; const s = d && d.getElementById("composer-staged"); return !!s && s.style.display !== "none" && /staged while the session was opening/.test(s.textContent || ""); }, null, "step 14: the message never staged on the pending tab");
 await fr14.evaluate((text) => { const ta = document.getElementById("composer-input"); ta.value = text; ta.dispatchEvent(new Event("input", { bubbles: true })); }, TYPED14);   // typed into the provisional tab's box
-out.s14 = { frame: f14, typed: TYPED14, before: await shell() };
+out.s14 = { frame: f14, typed: TYPED14, staged: STAGED14, before: await shell() };
 // the peer removes column 2 (its storage event, over a store without the column): the column is busy → the reconcile HOLDS it
 await page.evaluate(() => { const v = JSON.stringify({ v: 2, cols: [] }); localStorage.setItem("romp-chat-cols", v); window.dispatchEvent(new StorageEvent("storage", { key: "romp-chat-cols", newValue: v })); });
 await page.evaluate(() => new Promise((r) => setTimeout(r, 150)));   // the storage event's own task
@@ -766,6 +772,7 @@ await page.evaluate((sidA) => document.getElementById("f-chat-2").contentWindow.
 out.s14.colGone = await page.waitForFunction(() => !document.getElementById("chat-pane-2") && !document.getElementById("gv-chat-2"), null, { timeout: T }).then(() => true).catch(() => false);
 await clickTab("f-chat", cfg.sidA); await waitActive("f-chat", cfg.sidA);
 out.s14.composer1 = await composerIn("f-chat");
+out.s14.staged1 = await page.evaluate(() => { const d = document.getElementById("f-chat").contentDocument; const s = d && d.getElementById("composer-staged"); return s ? { sid: s.dataset.sid || null, shown: s.style.display !== "none", text: s.textContent || "" } : null; });   // the receiving pane's staged strip
 out.s14.after = await shell();
 out.s14.blob2Drafts = await page.evaluate(() => { try { return JSON.parse(localStorage.getItem("romp-vscode-state-chat:2") || "{}").drafts || {}; } catch (e) { return null; } });
 // ---- step 15 (round four, 2026-09-15): the FOLDER QUESTION keeps the provisional TAB; a held column stands under it; dismissed → a failed tab; its ✕ → the close ----
@@ -1285,6 +1292,8 @@ class ServedChatSplit(unittest.TestCase):
         self.assertTrue(s["colGone"], "the create resolved to the running session and the held column closed: %r" % s)
         self.assertEqual(s["after"]["frameIds"], ["f-chat"]); self.assertEqual(json.loads(s["after"]["cols"]), {"v": 2, "cols": []})
         self.assertIn(s["typed"], s["composer1"] or "", "the typed text is in A's composer in column 1, the pane that shows A: %r" % s["composer1"])
+        st = s.get("staged1") or {}
+        self.assertEqual(st.get("sid"), SID_A, "round nine: the message staged on the pending tab is on A's staged strip in the pane that shows A: %r" % st); self.assertTrue(st.get("shown")); self.assertIn(s["staged"], st.get("text", ""))
         self.assertFalse((s["blob2Drafts"] or {}).get(SID_A), "…and not stranded in column 2's blob: %r" % s["blob2Drafts"])
 
     def test_15_the_folder_question_keeps_the_provisional_tab_and_a_held_column_stands_under_it_until_the_tab_is_discarded(self):

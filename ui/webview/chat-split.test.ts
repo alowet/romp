@@ -116,8 +116,8 @@ test("a pick of a session another column holds is shown where it lives: the setA
   // inside dropProvisional it ran ahead of resolveProvisionalToExisting's drafts.set and the text died with the document)
   const drop = RENDER.slice(RENDER.indexOf("function dropProvisional("), RENDER.indexOf("function adoptProvisional("));
   assert.ok(!drop.includes("syncColumnBusy("), "dropProvisional never flips: its caller does, once the text it returns has a home");
-  assert.match(RENDER, /if \(draft\) \{ persistDrafts\(\);[^\n]*\n  syncColumnBusy\(\);[^\n]*\n\}/, "adoptProvisional: after the claim and the drafts");
-  assert.match(RENDER, /if \(activeId === realId && ta\) \{ ta\.value = drafts\.get\(realId\) \?\? ""; growComposer\(ta\); \}\n  \}\n(?:\s*\/\/[^\n]*\n)*\s*syncColumnBusy\(\);\n\}/, "resolveProvisionalToExisting: after the text is on the running session's draft");
+  assert.match(RENDER, /\n  persistDrafts\(\);[^\n]*\n  if \(draft\) \{ const ta[^\n]*\n  syncColumnBusy\(\);[^\n]*\n\}/, "adoptProvisional: after the claim, the move and the drafts — persisted whatever moved (round nine), then the flip");
+  assert.match(RENDER, /if \(activeId === realId && ta\) \{ ta\.value = drafts\.get\(realId\) \?\? ""; growComposer\(ta\); \}\n  \}\n  if \(activeId === realId\) \{ renderComposerChips\(realId\); renderComposerFiles\(realId\); renderStagedStrip\(realId\); \}[^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*syncColumnBusy\(\);\n\}/, "resolveProvisionalToExisting: after the text is on the running session's draft and what moved (round nine) is shown on the real tab");
   assert.match(RENDER, /postMessage\(\{ type: "cancelCreate", name \}\);\n  syncColumnBusy\(\);/, "cancelProvisional: last");
   // the folder question keeps the provisional TAB (round four; dir-question-busy.test.ts runs the whole flow): no drop, the
   // backstop stood down, the prompt keyed to the create; the retry keeps the tab; a dismissal makes it a failed create; the
@@ -155,6 +155,10 @@ test("a pick of a session another column holds is shown where it lives: the setA
   assert.match(RENDER, /function onCreateWarn\(m: \{ text: string; rid\?: unknown \}\): void \{\n  const route = routeCreateReply\(m\);/);
   assert.match(dirq, /const route = routeCreateReply\(m\);/); assert.match(dirq, /if \(route\.kind !== "current" && route\.kind !== "pending"\) return;/);
   assert.match(RENDER, /rememberSettled\(provisionalRid, realId\);[\s\S]*?rememberSettled\(provisionalRid, realId\);/, "both settlements remember the request");
+  // round nine: both settlements move the provisional's staged messages, chips and files to the real session BEFORE dropProvisional
+  // dismisses the tab (whose close deletes those maps), keyed under the real sid before the flip hands them on
+  assert.match(RENDER, /function moveProvisionalState\(fromId: string, toId: string\): void \{/);
+  assert.equal((RENDER.match(/\n  if \(provisionalId\) moveProvisionalState\(provisionalId, realId\);[^\n]*\n  const \{ queued, draft \} = dropProvisional\(\);/g) || []).length, 2, "adoptProvisional and resolveProvisionalToExisting alike, before the drop");
   assert.match(RENDER, /pendingCreate = \{ id, name: display, dir: req\.dir, rid \};/); assert.match(RENDER, /pending: pendingCreate,/);
   assert.match(RENDER, /for \(const k of Object\.keys\(stagedMsgs\.entries\(\)\)\) if \(isProvisionalId\(k\) && !failedProvisionals\.has\(k\)\) \{ stagedMsgs\.takeAll\(k\); dropped = true; \}/);
   assert.match(RENDER, /function announceColumnBusy\(\): void \{\n  columnBusyTold = columnBusy\(\);/);
