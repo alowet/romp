@@ -8135,7 +8135,10 @@ const PROVISIONAL_WAIT_MS = 90_000;
 // while this page is busy — closing it would kill the create's queued text and draft with the document — and closed the
 // moment the create lands, is cancelled, resolves to a running session, or a failed one's tab is discarded
 // (_LANDING_SPLIT_JS reconcile). That moment is this message, posted from every write of the two facts the answer reads,
-// only when the answer flipped; no timer anywhere.
+// only when the answer flipped; no timer anywhere. The flip says MORE than "the create settled": the shell closes the held
+// column on it, and close() hands the document's state to the sessions' owners — so it is the LAST act of every settling
+// path, after that path's last write of the text (round two, 2026-09-15: posted from inside dropProvisional it ran ahead of
+// resolveProvisionalToExisting's drafts.set, and the typed text died with the document).
 let columnBusyTold = false;
 function syncColumnBusy(): void {
   const busy = !!provisionalId || failedProvisionals.size > 0;
@@ -8189,8 +8192,7 @@ function dropProvisional(): { queued: string[]; draft: string } {
     pendingSent.delete(id);                // the optimistic bubbles belong to a tab that is going away
     dismissSession(id, "close");           // drops it from sessions/order/views and reselects
   }
-  syncColumnBusy();                        // the create settled (landed, cancelled, or resolved to a running session): a held drop of this column applies now
-  return { queued, draft };
+  return { queued, draft };                // no syncColumnBusy here: the caller flips, once the text it returns has a home
 }
 
 // The real session arrived: move everything the provisional tab was holding onto it and focus it. The
@@ -8207,6 +8209,7 @@ function adoptProvisional(realId: string): void {
     registerOptimistic(realId, text, undefined, qid);       // …and the bubble carries over to the tab that now owns it, under the same id
   }
   if (draft) { persistDrafts(); const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null; if (ta) growComposer(ta); }
+  syncColumnBusy();                        // LAST: the session is claimed and listed here, its text with it
 }
 
 // The create RESOLVED TO A RUNNING SESSION: the kernel answered it by focusing the session that already
@@ -8220,13 +8223,18 @@ function adoptProvisional(realId: string): void {
 function resolveProvisionalToExisting(realId: string): void {
   const { queued, draft } = dropProvisional();     // …and the 90 s backstop goes with it
   const held = [...queued, draft].filter(Boolean).join("\n\n");
-  if (!held) return;
-  drafts.set(realId, [drafts.get(realId) ?? "", held].filter(Boolean).join("\n\n"));   // BEFORE the switch — setActive fills the box from drafts
-  persistDrafts();
-  // dropProvisional's reselect may already have landed on the real tab (it was the previously active
-  // one): setActive then early-returns, so fill the box here rather than leave the text in the map only
-  const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
-  if (activeId === realId && ta) { ta.value = drafts.get(realId) ?? ""; growComposer(ta); }
+  if (held) {
+    drafts.set(realId, [drafts.get(realId) ?? "", held].filter(Boolean).join("\n\n"));   // BEFORE the switch — setActive fills the box from drafts
+    persistDrafts();
+    // dropProvisional's reselect may already have landed on the real tab (it was the previously active
+    // one): setActive then early-returns, so fill the box here rather than leave the text in the map only
+    const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
+    if (activeId === realId && ta) { ta.value = drafts.get(realId) ?? ""; growComposer(ta); }
+  }
+  // LAST: the text is on the running session's draft in THIS document. A column another dashboard dropped closes on this
+  // flip, and the running session is shown elsewhere (the first column, or the column that lists it) — so the shell's
+  // close() hands the document's state for it there (__rompOrphanStateSids), the way a listed member's travels
+  syncColumnBusy();
 }
 
 // A create that FAILED. The kernel's own words are the message wherever it gave any (a bad name, an
@@ -8250,7 +8258,6 @@ function failProvisional(why: string): void {
   const held = [...queued, draft].filter(Boolean).join("\n\n");
   pendingSent.delete(id);            // the dashed "received" bubbles fold into the held text instead
   failedProvisionals.add(id);
-  syncColumnBusy();                  // still busy (the failed tab holds the text): no flip, said for the invariant — every write of the two facts
   const s = sessions.get(id);
   // "closed" gives the tab the dead treatment (struck label, plain ✕) — but the composer stays LIVE
   // for a failed provisional (the read-only exemption below), since the held text must stay editable
@@ -8265,6 +8272,7 @@ function failProvisional(why: string): void {
   showConfirm("Couldn't start " + name,
     why + (held ? "\n\nWhat you typed is in this tab's message box." : ""),
     [{ label: "OK", value: "ok" }], () => { /* the tab keeps the text until its ✕ discards both */ });
+  syncColumnBusy();                  // still busy (the failed tab holds the text): no flip, said for the invariant — every write of the two facts
 }
 
 // The ✕ on a provisional tab: tell the kernel to abort the pending spawn too, so a slow-but-successful
@@ -8273,6 +8281,7 @@ function cancelProvisional(): void {
   const name = pendingNewSession;
   dropProvisional();
   if (name && vscodeApi) vscodeApi.postMessage({ type: "cancelCreate", name });
+  syncColumnBusy();                        // LAST: nothing to hand anywhere — the ✕ discarded the text with the tab
 }
 
 // Bring this pane FORWARD in the shell. On mobile only one pane is on screen at a time, so a jump the
@@ -8857,6 +8866,7 @@ function onCreateDirMissing(m: any): void {
   // session that is about to exist, not to whatever tab we happen to fall back to.
   const held = dropProvisional();
   pendingCarry = [...held.queued, held.draft].filter(Boolean).join("\n\n");
+  syncColumnBusy();   // after the carry is written. (The folder question itself is not a busy state the shell reads — a held column closes here as it always did)
   const req = lastCreate;
   showConfirm("That folder isn't there",
     createDirPrompt(String(m.name), (m.status || null) as DirStatus | null, String(m.dir || "")),
@@ -16935,6 +16945,13 @@ const sessionMru: string[] = [];
 // its citations, attachments and staged messages — leaves this page's maps and blob in the same call and is returned,
 // so the target's adopt is the only copy. null when nothing was held. An active tab's box is emptied here: the
 // re-point that follows the move must not re-stash the moved text under a session this column no longer shows.
+// …and WHICH sessions this page holds state for without showing them (orphanStateSids): the shell reads it when it closes
+// this column, so a draft for a session shown elsewhere — the running session a create resolved to, a reused number's blob —
+// travels to that session's column instead of dying with the document (round two, 2026-09-15). A listed member's state
+// travels by the shell's own list; this is the rest. Judged against the shell's sets AS THEY STAND (the shell is asking, so
+// they are current), not this page's snapshot from its last render: a held column's kernel frames may not have landed since
+// the hold, and its snapshot would still call the member the peer moved away "shown here" — and drop its draft.
+(window as any).__rompOrphanStateSids = (): string[] => { colSets = readColSets(); return orphanStateSids(); };
 (window as any).__rompTakeSessionState = (sid: string): { draft: string; citations: Citation[]; files: string[]; staged: StagedMsg[] } | null => {
   if (typeof sid !== "string" || !sid) return null;
   const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;

@@ -58197,12 +58197,12 @@ _LANDING_COLLAPSE_JS = """
 # the others stand down — render.ts focusIsOurs.
 _LANDING_SPLIT_JS = """
 (function(){
-var CK='romp-chat-cols',MAX=4,cols=[];   // cols: the later columns in ROW order, each {n: the column number, ids: the sessions it holds}; MAX counts the first column too
+var CK='romp-chat-cols',MAX=4,cols=[],held={};   // cols: the later columns in ROW order, each {n: the column number, ids: the sessions it holds}; MAX counts the first column too. held: column numbers a reconcile could not close for a busy document (see reconcile)
 var BK='romp-vscode-state-chat:';   // a column's state blob (the shim's SK for /chat?col=N): its activeId is the shim's ?active= connect hint and render.ts's wantActive
 var row=document.querySelector('.row'),gva=document.getElementById('gv-a');
 if(!row||!gva)return;
 function mobile(){var b=document.getElementById('mtabs');try{return !!b&&getComputedStyle(b).display!=='none';}catch(e){return false;}}
-function save(){try{localStorage.setItem(CK,JSON.stringify({v:2,cols:cols.filter(function(c){return c.ids.length;}).map(function(c){return {n:c.n,ids:c.ids.slice()};})}));}catch(e){}}   // no empty entry (read()'s shape): a column a reconcile HOLDS is mounted but unlisted
+function save(){try{localStorage.setItem(CK,JSON.stringify({v:2,cols:cols.filter(function(c){return !held[c.n];}).map(function(c){return {n:c.n,ids:c.ids.slice()};})}));}catch(e){}}   // byte for byte the write the split always made, less a HELD column (mounted, unlisted: the store dropped it); nothing else is filtered, an entry emptied mid-move included
 function paneId(n){return 'chat-pane-'+n;}function frameId(n){return 'f-chat-'+n;}
 function idx(n){for(var i=0;i<cols.length;i++){if(cols[i].n===n)return i;}return -1;}
 function entry(n){var i=idx(n);return i<0?null:cols[i];}
@@ -58241,6 +58241,10 @@ function seedFor(c){var st=null;try{st=JSON.parse(localStorage.getItem(BK+c.n)||
 // column) or at once (an open one). null when the source held nothing or has no such function (an older page).
 function take(f,sid){try{var t=f&&f.contentWindow&&f.contentWindow.__rompTakeSessionState;return typeof t==='function'?(t(sid)||null):null;}catch(e){return null;}}
 function adopt(f,sid,state){if(!f||!state)return;try{f.contentWindow.postMessage({romp:'adopt',sid:sid,state:state},'*');}catch(e){}}
+// the sessions a page holds state for WITHOUT showing them (render.ts orphanStateSids): a closing column hands those over
+// too — a draft for the running session a create resolved to, a reused number's blob — else they die with the document.
+// [] from an older page without the function.
+function orphans(f){try{var o=f&&f.contentWindow&&f.contentWindow.__rompOrphanStateSids,l=typeof o==='function'?o():null;return Array.isArray(l)?l.filter(function(s){return typeof s==='string'&&!!s;}):[];}catch(e){return [];}}
 // Two questions a page answers before the shell moves a tab or closes a column (review finds 2026-09-11). movable: the
 // id is a session a column can hold — a create in flight (a provisional tab) and a sub-agent viewer are the page's own,
 // never the store's, yet both carry data-id and the palette's DOM read can name them (a column opened on an id the
@@ -58296,7 +58300,7 @@ var tn=Number(to);if(tn!==1&&!entry(tn))return null;
 var tf=frameOfCol(tn);if(!tf)return null;
 if(tn===from)return tf;   // already there: nothing moves
 var se2=entry(from);if(se2&&se2.ids.length===1&&busy(src))return notify(BUSY);   // its last listed member leaving would close it over a create in flight
-var st=take(src,sid),emptied=unlist(sid);if(tn!==1)entry(tn).ids.push(sid);save();
+var st=take(src,sid),emptied=unlist(sid);if(tn!==1){entry(tn).ids.push(sid);delete held[tn];}save();   // a member ends a hold: the column is listed again
 adopt(tf,sid,st);try{tf.contentWindow.postMessage({type:'focus',id:sid},'*');}catch(e){}   // a plain focus: the target is the owner now, so its own gate takes it
 if(emptied)close(emptied);   // the origin's last member left: it closes (the ring lands on the target below, not on the origin's neighbour)
 try{tf.contentWindow.focus();}catch(e){}return tf;}
@@ -58308,7 +58312,11 @@ try{tf.contentWindow.focus();}catch(e){}return tf;}
 function close(n,keep){var i=idx(n);if(i<0)return;
 var f=document.getElementById(frameId(n)),home=document.getElementById('f-chat');
 if(!keep&&busy(f)){notify(BUSY);return;}   // a create in flight would die with the document (its queued text with it)
-if(f&&home)cols[i].ids.forEach(function(sid){adopt(home,sid,take(f,sid));});
+if(f&&home){cols[i].ids.forEach(function(sid){adopt(home,sid,take(f,sid));});
+// …and the state the page holds for sessions it does NOT show goes to each one's owner — the column that lists it, when
+// its page can hear the message, else the first column (whose page offers it on, orphanState) — instead of dying with the
+// document: the running session a create resolved to while the column was held has its text here (round two, 2026-09-15)
+orphans(f).forEach(function(sid){if(cols[i].ids.indexOf(sid)>=0)return;var t=frameOfCol(ownerOf(sid));adopt(t&&t!==f&&loaded(t)?t:home,sid,take(f,sid));});}
 var left=i>0?paneId(cols[i-1].n):'chat-pane';   // the column on its left: takes the ring below, and the width first
 cols.splice(i,1);if(!keep)save();
 var p=document.getElementById(paneId(n)),g=document.getElementById('gv-chat-'+n);
@@ -58327,7 +58335,7 @@ window.__rompCloseSplit=function(n){if(n===undefined)closeFocused();else close(N
 window.__rompChatSets=function(){return mobile()?null:sets();};   // null on the phone: the one chat shows everything
 // a session CREATED from a later column's plus button belongs to that column: the page claims the real id when its
 // provisional resolves; a session an entry already lists is never stolen
-window.__rompClaimSession=function(sid,col){var n=Number(col),e=entry(n);if(typeof sid!=='string'||!sid||!e||ownerOf(sid)!==1)return false;e.ids.push(sid);save();return true;};
+window.__rompClaimSession=function(sid,col){var n=Number(col),e=entry(n);if(typeof sid!=='string'||!sid||!e||ownerOf(sid)!==1)return false;e.ids.push(sid);delete held[n];save();return true;};   // a member ends a hold: the column is listed again
 window.__rompChatFrames=frames;window.__rompChatFrameIds=function(){return frames().map(function(f){return f.id;});};
 window.__rompChatPaneOf=function(fid){return fid==='f-chat'?'chat-pane':(String(fid).indexOf('f-chat-')===0?paneId(String(fid).slice(7)):null);};
 window.__rompLastChatPane=lastPane;window.__rompColOf=colOf;window.__rompFrameOfWin=frameOfWin;window.__rompChatTarget=target;
@@ -58413,8 +58421,9 @@ return {cols:out,migrated:migrated};}
 // the write is a peer's act, not this user's, and nothing is refused — the close completes by itself. Should the create
 // LAND first, the page claims the session for the column (__rompClaimSession lists it and writes the store, the path
 // every create takes) and the store names the column again, so the flip's reconcile keeps it. A page that reloads
-// while a hold is pending loses nothing a close would not have: the document, and the create with it, is gone.
-var held={};   // column numbers a reconcile could not close for a busy document: each close waits on its page's colBusy flip
+// while a hold is pending loses nothing a close would not have: the document, and the create with it, is gone. `held`
+// (declared with cols: save() reads it) is recomputed by every reconcile, and a member gained meanwhile (a claim, a move
+// into the column) ends a hold early — the column is listed again, and save() writes it like any other.
 function reconcile(next){var of=function(n){for(var i=0;i<next.length;i++){if(next[i].n===n)return next[i];}return null;};
 held={};cols.filter(function(c){return !of(c.n);}).forEach(function(c){if(busy(frameOfCol(c.n)))held[c.n]=true;else close(c.n,true);});
 cols=cols.map(function(c){var d=of(c.n);return {n:c.n,ids:d?d.ids.slice():[]};});   // what stands, in row order: the store's members, a held column's none

@@ -43,7 +43,11 @@ driver run walks the whole story in order, each step landing in its own assertio
      cross, closes the column and B is on column 1's strip at once, no toast;
  13. a column another dashboard's write dropped while its page is BUSY (a create in flight) is held, not closed under the
      create: it stands, unlisted, nothing written, no notice; the page's colBusy flip closes it, pane and gutter, the
-     store untouched (2026-09-15; the busy answer and its flip are set by hand — no create is spawned).
+     store untouched (2026-09-15; the busy answer and its flip are set by hand — no create is spawned);
+ 14. the REAL client path (round two): a real provisional create in column 2 (its busy flag, its composer); a peer's removal
+     of column 2 lands as a storage event, so the busy column is held; the create resolves to the existing "web" via the
+     focus the shell hops into a column, and the text typed into the provisional tab ends up in A's composer in column 1,
+     which shows A, and column 2 is closed, its blob holding no draft for A.
 Skips LOUDLY when the extension deps or a playwright browser are absent (CI installs none). Synthetic only:
 placeholder sids, invented notes-api prompt text, no real session data."""
 import json
@@ -726,6 +730,38 @@ const fr13 = await (await page.$("#f-chat-2")).contentFrame();
 await fr13.evaluate(() => { window.__rompColumnBusy = () => false; window.parent.postMessage({ romp: "colBusy", busy: false }, "*"); });   // the create settled
 out.s13.colGone = await page.waitForFunction(() => !document.getElementById("chat-pane-2") && !document.getElementById("gv-chat-2"), null, { timeout: T }).then(() => true).catch(() => false);
 out.s13.after = await shell(); out.s13.notesAfter = await page.evaluate(() => window.__notes13.slice()); out.s13.ms = Date.now() - t13;
+// ---- step 14 (round two, 2026-09-15): a REAL provisional create in a held column, resolving to an existing session, keeps the text ----
+// The real client P1 path: a real provisional create in column 2 (openProvisional, a live busy flag and composer), a peer's
+// removal of the column (its storage event, the only way a peer write is seen here), and the create resolving to an EXISTING
+// session — delivered as the focus the shell hops into a column (kernel.py moveTab/forwardToOwner: postMessage {type:"focus"}),
+// which render.ts's real handler turns into resolveProvisionalToExisting. The kernel is not asked to resolve it (the lab's
+// sessions are named but not live, so a create of "web" would not focus-resolve there); its async answer to the create lands
+// after provisionalId is already cleared and is harmless. Before the fix the flip ran ahead of the text's write and close()
+// handed over listed members only, so the text died in column 2's blob.
+const TYPED14 = "notes for the web session, typed before it was found running";
+const f14 = await page.evaluate((sid) => { const f = window.__rompMoveTab(sid, "new"); return f ? f.id : null; }, cfg.sidC);   // column 2 holds C; A ("web") stays in column 1
+await waitTabs("f-chat-2", [cfg.sidC]);   // the board is in: column 2's tabMeta now names every session, "web" (A) among them
+holdCol2 = true;   // from here, column 2's server→client frames are parked at the wire, so the kernel's async answer to the create below cannot race the resolve (it is discarded when the column closes)
+const fr14 = await (await page.$("#f-chat-2")).contentFrame();
+await page.evaluate(() => document.getElementById("f-chat-2").contentWindow.postMessage({ type: "openPicker" }, "*"));
+await waitFn(() => { const d = document.getElementById("f-chat-2").contentDocument; const p = d && d.getElementById("picker"); return !!p && p.style.display !== "none"; }, null, "step 14: column 2's picker never opened");
+// a REAL create named "web" (A's name): openProvisional runs synchronously — a busy column, a live composer
+await fr14.evaluate(() => { const sb = document.getElementById("picker-search"); sb.value = "web"; sb.dispatchEvent(new Event("input", { bubbles: true })); document.getElementById("picker-new-btn").click(); });
+await waitFn(() => { const f = document.getElementById("f-chat-2"); try { return !!f.contentWindow.__rompColumnBusy(); } catch (e) { return false; } }, null, "step 14: no create in flight in column 2");
+await fr14.evaluate((text) => { const ta = document.getElementById("composer-input"); ta.value = text; ta.dispatchEvent(new Event("input", { bubbles: true })); }, TYPED14);   // typed into the provisional tab's box
+out.s14 = { frame: f14, typed: TYPED14, before: await shell() };
+// the peer removes column 2 (its storage event, over a store without the column): the column is busy → the reconcile HOLDS it
+await page.evaluate(() => { const v = JSON.stringify({ v: 2, cols: [] }); localStorage.setItem("romp-chat-cols", v); window.dispatchEvent(new StorageEvent("storage", { key: "romp-chat-cols", newValue: v })); });
+await page.evaluate(() => new Promise((r) => setTimeout(r, 150)));   // the storage event's own task
+out.s14.held = await shell(); out.s14.heldBusy = await page.evaluate(() => { try { return !!document.getElementById("f-chat-2").contentWindow.__rompColumnBusy(); } catch (e) { return null; } });
+// the create resolves to the running "web" (A): the shell's focus hop, which render.ts resolves to the existing session,
+// attaches the typed text to A's draft, then flips; the shell closes the held column and close() hands the text to A's owner
+await page.evaluate((sidA) => document.getElementById("f-chat-2").contentWindow.postMessage({ type: "focus", id: sidA }, "*"), cfg.sidA);
+out.s14.colGone = await page.waitForFunction(() => !document.getElementById("chat-pane-2") && !document.getElementById("gv-chat-2"), null, { timeout: T }).then(() => true).catch(() => false);
+await clickTab("f-chat", cfg.sidA); await waitActive("f-chat", cfg.sidA);
+out.s14.composer1 = await composerIn("f-chat");
+out.s14.after = await shell();
+out.s14.blob2Drafts = await page.evaluate(() => { try { return JSON.parse(localStorage.getItem("romp-vscode-state-chat:2") || "{}").drafts || {}; } catch (e) { return null; } });
 } catch (e) { out.lateError = String((e && e.stack) || e); }
 out.ms = Date.now() - out.t0;
 fs.writeSync(1, "RESULT:" + JSON.stringify(out) + "\n");
@@ -1163,6 +1199,28 @@ class ServedChatSplit(unittest.TestCase):
         self.assertEqual(a["frameIds"], ["f-chat"]); self.assertNotIn("gv-chat-2", a["rowKids"]); self.assertNotIn("chat-pane-2", a["rowKids"])
         self.assertEqual(a["sets"], {}); self.assertEqual(json.loads(a["cols"]), {"v": 2, "cols": []}, "the store is untouched: the peer's write was the truth")
         self.assertEqual(s["notesAfter"], [], "…and still no notice")
+
+    def test_14_a_real_create_in_a_held_column_that_resolves_to_a_running_session_keeps_the_typed_text(self):
+        """Round two (2026-09-15). The first fix posted the busy flip from inside dropProvisional, ahead of
+        resolveProvisionalToExisting's write of the typed text onto the running session, and the shell's close() handed over
+        listed members' state only — a held column lists none — so the text was stranded in column 2's blob when the shell
+        closed the column. Now the flip is each settling path's last act, and close() hands the page's state for sessions it
+        does not show to their owners (the first column, for A). The create and its text are real; the peer's removal is its
+        storage event (the only way a peer write is observed here), and the resolve-to-existing is the focus the shell hops
+        into a column — the kernel is not asked to resolve, since the lab's sessions are named but not live."""
+        r = self._r()
+        self.assertNotIn("lateError", r, "step 14 raised: %s" % r.get("lateError"))
+        s = r["s14"]
+        self.assertEqual(s["frame"], "f-chat-2")
+        self.assertEqual(s["before"]["frameIds"], ["f-chat", "f-chat-2"])
+        h = s["held"]
+        self.assertTrue(s["heldBusy"], "the create is in flight in column 2 when the peer's write lands")
+        self.assertEqual(h["frameIds"], ["f-chat", "f-chat-2"], "held: the column stands under the peer's write: %r" % h)
+        self.assertEqual(h["sets"], {"2": []}, "unlisted"); self.assertEqual(json.loads(h["cols"]), {"v": 2, "cols": []}, "the peer's write, untouched")
+        self.assertTrue(s["colGone"], "the create resolved to the running session and the held column closed: %r" % s)
+        self.assertEqual(s["after"]["frameIds"], ["f-chat"]); self.assertEqual(json.loads(s["after"]["cols"]), {"v": 2, "cols": []})
+        self.assertIn(s["typed"], s["composer1"] or "", "the typed text is in A's composer in column 1, the pane that shows A: %r" % s["composer1"])
+        self.assertFalse((s["blob2Drafts"] or {}).get(SID_A), "…and not stranded in column 2's blob: %r" % s["blob2Drafts"])
 
     def test_per_tab_hot_keys_switch_to_the_column_holding_the_session_and_the_split_cycles(self):
         # the user 2026-09-10: a hot key per tab (set from its menu; the keycap on the tab is the T379 widget, reading the same

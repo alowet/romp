@@ -106,9 +106,20 @@ test("a pick of a session another column holds is shown where it lives: the setA
   // the two facts the answer reads, only when it flipped (tests/test_chat_split.py runs the hold and both of its ends)
   assert.match(RENDER, /let columnBusyTold = false;\nfunction syncColumnBusy\(\): void \{\n\s*const busy = !!provisionalId \|\| failedProvisionals\.size > 0;\n\s*if \(busy === columnBusyTold\) return;\n\s*columnBusyTold = busy;\n\s*try \{ if \(window\.parent && window\.parent !== window\) window\.parent\.postMessage\(\{ romp: "colBusy", busy \}, "\*"\); \}/);
   assert.match(RENDER, /\n  provisionalId = id;\n  syncColumnBusy\(\);/, "openProvisional: busy now");
-  assert.match(RENDER, /dismissSession\(id, "close"\);[^\n]*\n  \}\n  syncColumnBusy\(\);[^\n]*\n  return \{ queued, draft \};\n\}/, "dropProvisional: the create settled (landed, cancelled, resolved to a running session)");
-  assert.match(RENDER, /\n  failedProvisionals\.add\(id\);\n  syncColumnBusy\(\);/, "failProvisional: still busy, said for the invariant");
+  // the flip is the LAST act of every settling path, after that path's last write of the text (round two, 2026-09-15: from
+  // inside dropProvisional it ran ahead of resolveProvisionalToExisting's drafts.set and the text died with the document)
+  const drop = RENDER.slice(RENDER.indexOf("function dropProvisional("), RENDER.indexOf("function adoptProvisional("));
+  assert.ok(!drop.includes("syncColumnBusy("), "dropProvisional never flips: its caller does, once the text it returns has a home");
+  assert.match(RENDER, /if \(draft\) \{ persistDrafts\(\);[^\n]*\n  syncColumnBusy\(\);[^\n]*\n\}/, "adoptProvisional: after the claim and the drafts");
+  assert.match(RENDER, /if \(activeId === realId && ta\) \{ ta\.value = drafts\.get\(realId\) \?\? ""; growComposer\(ta\); \}\n  \}\n(?:\s*\/\/[^\n]*\n)*\s*syncColumnBusy\(\);\n\}/, "resolveProvisionalToExisting: after the text is on the running session's draft");
+  assert.match(RENDER, /postMessage\(\{ type: "cancelCreate", name \}\);\n  syncColumnBusy\(\);/, "cancelProvisional: last");
+  assert.match(RENDER, /pendingCarry = \[\.\.\.held\.queued, held\.draft\]\.filter\(Boolean\)\.join\("\\n\\n"\);\n  syncColumnBusy\(\);/, "the folder question: after the carry");
+  assert.match(RENDER, /discards both \*\/ \}\);\n  syncColumnBusy\(\);[^\n]*\n\}/, "failProvisional: still busy, said for the invariant, last");
   assert.match(RENDER, /else \{ failedProvisionals\.delete\(id\); dismissSession\(id, "close"\); syncColumnBusy\(\); \}/, "a failed tab's discard: the text went with it");
+  // …and the shell's close() takes the state the page holds for sessions it does not show, judged against the shell's current sets
+  assert.match(RENDER, /\(window as any\)\.__rompOrphanStateSids = \(\): string\[\] => \{ colSets = readColSets\(\); return orphanStateSids\(\); \};/);
+  assert.ok(KERNEL.includes("orphans(f).forEach(function(sid){if(cols[i].ids.indexOf(sid)>=0)return;var t=frameOfCol(ownerOf(sid));adopt(t&&t!==f&&loaded(t)?t:home,sid,take(f,sid));});"));
+  assert.ok(KERNEL.includes("cols:cols.filter(function(c){return !held[c.n];}).map("), "save() omits a HELD column only: every other write is byte for byte the split's own");
   assert.ok(KERNEL.includes("if(busy(frameOfCol(c.n)))held[c.n]=true;else close(c.n,true);"), "the reconcile holds a busy column instead of closing it");
   assert.ok(KERNEL.includes("m.romp!=='colBusy'||m.busy||mobile())return;var c=Number(colOf(e.source));if(!c||!held[c])return;var r=read();if(!r.migrated)reconcile(r.cols);"), "…and completes the close on the flip, against the store as it stands then");
   // the ids a colEmpty close sends home are held back on the first column's strip until the kernel's strip omits them

@@ -47,6 +47,11 @@ TESTS = "11111111-2222-3333-4444-555555555503"
 X = "11111111-2222-3333-4444-555555555509"
 
 
+def raw(cols):
+    """the store's raw string for these entries, byte for byte as the split's JSON.stringify writes it"""
+    return json.dumps({"v": 2, "cols": cols}, separators=(",", ":"))
+
+
 class SplitSourcePins(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -255,8 +260,13 @@ class SplitSourcePins(unittest.TestCase):
     def test_the_partition_s_functions_exist_and_the_owner_lookup_reads_no_pane_s_dom(self):
         split = km._LANDING_SPLIT_JS
         # the store's shape and its one-shot migration
-        self.assertIn("JSON.stringify({v:2,cols:cols.filter(function(c){return c.ids.length;}).map(function(c){return {n:c.n,ids:c.ids.slice()};})})", split,
-                      "the store never lists a column with no members (read()'s shape): a column a reconcile holds is mounted but unlisted")
+        self.assertIn("JSON.stringify({v:2,cols:cols.filter(function(c){return !held[c.n];}).map(function(c){return {n:c.n,ids:c.ids.slice()};})})", split,
+                      "byte for byte the write the split always made, less a HELD column only (never an entry filtered for being empty: the "
+                      "move path's first write lists the emptied origin with no ids, as on main — StoreBytes pins every write)")
+        self.assertIn("var CK='romp-chat-cols',MAX=4,cols=[],held={};", split, "held is declared with cols: save() reads it")
+        # a member gained ends a hold early (the column is listed again): the claim of a created session, a move into the column
+        self.assertIn("e.ids.push(sid);delete held[n];save();return true;", split)
+        self.assertIn("if(tn!==1){entry(tn).ids.push(sid);delete held[tn];}save();", split)
         self.assertIn("if(Array.isArray(raw)){migrated=true;", split, "a v1 array of numbers is read once more…")
         self.assertIn("if(r0.migrated)save();", split, "…and written back in the new shape")
         # the three pure readers, the sets the pages read, the one mutation, the claim
@@ -308,6 +318,11 @@ class SplitSourcePins(unittest.TestCase):
         self.assertIn("if(t&&t!==sf&&loaded(t))adopt(t,sid,take(sf,sid));", split)
         # a closing column's width goes to the column on its left before its key is dropped (the halving's twin)
         cl = split[split.index("function close(n,keep){"):split.index("function closeFocused(){")]
+        # a closing column hands over the state its page holds for sessions it does NOT show too (round two, 2026-09-15): to
+        # the column that lists each, when its page can hear it, else the first column — never left to die with the document
+        self.assertIn("function orphans(f){", split)
+        self.assertIn("orphans(f).forEach(function(sid){if(cols[i].ids.indexOf(sid)>=0)return;var t=frameOfCol(ownerOf(sid));adopt(t&&t!==f&&loaded(t)?t:home,sid,take(f,sid));});", cl)
+        self.assertLess(cl.index("orphans(f).forEach("), cl.index("cols.splice(i,1);"), "taken while the entry still stands (ownerOf reads cols)")
         self.assertIn("if(window.__rompSplitShrink)window.__rompSplitShrink(left,paneId(n));", cl)
         self.assertLess(cl.index("__rompSplitShrink(left,paneId(n))"), cl.index("__rompUnregisterPane(paneId(n))"))
         self.assertLess(cl.index("var left=i>0?paneId(cols[i-1].n):'chat-pane';"), cl.index("cols.splice(i,1);"))
@@ -335,7 +350,8 @@ let SEQ = [];             // the order of the shell's side effects across stubs 
 let UNMOVABLE = new Set(); // ids the pages answer "not a session a column can hold" for (a create in flight, a viewer)
 let LOCKED_SIDS = new Set(); // ids whose page answers 'locked' (the tab lock, T395): the toast names the gear's menu (T405)
 let BUSY = {};            // frame id → whether that page reports a create in flight
-global.localStorage = { getItem: (k) => (k in STORE ? STORE[k] : null), setItem: (k, v) => { STORE[k] = String(v); CALLS.sets.push(k); SEQ.push('set:' + k); }, removeItem: (k) => { delete STORE[k]; } };
+let WRITES = [];          // every write of romp-chat-cols, its bytes, in order
+global.localStorage = { getItem: (k) => (k in STORE ? STORE[k] : null), setItem: (k, v) => { STORE[k] = String(v); CALLS.sets.push(k); SEQ.push('set:' + k); if (k === 'romp-chat-cols') WRITES.push(String(v)); }, removeItem: (k) => { delete STORE[k]; } };
 let BODY_CLASSES = new Set(['po-chat', 'po-feed', 'po-timeline']);
 let FOCUSED = 'f-chat';   // what the shell's focus script would report as the column last worked in
 let MOBILE = false;       // whether #mtabs is displayed (the phone layout)
@@ -373,6 +389,11 @@ function mkEl(tag) {
       __rompMovableSession(sid) { return !UNMOVABLE.has(sid) && !LOCKED_SIDS.has(sid); },
       __rompMoveRefusal(sid) { return LOCKED_SIDS.has(sid) ? 'locked' : UNMOVABLE.has(sid) ? 'not-open' : ''; },
       __rompColumnBusy() { return !!BUSY[el.id]; },
+      // the sids this page holds state for and does not show (render.ts orphanStateSids, judged against the shell's sets):
+      // for a later column, not in its set; for the first, in no set
+      __rompOrphanStateSids() { const sets = window.__rompChatSets() || {}; const col = el.getAttribute('data-col') || '';
+        const shown = (s) => col ? (sets[col] || []).includes(s) : !Object.keys(sets).some((k) => (sets[k] || []).includes(s));
+        return Object.keys(TAKE[el.id] || {}).filter((s) => !shown(s)); },
     };
     el.contentDocument = { querySelector(sel) { return (sel === '#tabs .tab.active[data-id]' && el._active) ? { getAttribute: () => el._active } : null; } };
   }
@@ -405,7 +426,7 @@ global.__rompColGone = (c) => CALLS.colGone.push(c);
 global.__rompFocusedChatId = () => FOCUSED;
 function boot(store, mobile) {
   STORE = Object.assign({}, store || {}); MOBILE = !!mobile; BYID = {}; WL = {}; TAKE = {}; FOCUSED = 'f-chat'; BODY_CLASSES = new Set(['po-chat', 'po-feed', 'po-timeline']);
-  SEQ = []; UNMOVABLE = new Set(); LOCKED_SIDS = new Set(); BUSY = {};
+  SEQ = []; UNMOVABLE = new Set(); LOCKED_SIDS = new Set(); BUSY = {}; WRITES = [];
   for (const k in CALLS) CALLS[k] = [];
   ROW = mkEl('div'); ROW.className = 'row';
   const cp = mkEl('div'); cp.id = 'chat-pane'; const fc = mkEl('iframe'); fc.id = 'f-chat'; cp.appendChild(fc); ROW.appendChild(cp);
@@ -608,11 +629,15 @@ out.held.savedMeanwhile = { stored: cols(), sets: window.__rompChatSets(), ids: 
 STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [{ n: 4, ids: [WEB] }] }); STORE['romp-vscode-state-chat:4'] = JSON.stringify({ activeId: WEB });
 window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
 out.held.moved = { ids: ids(), order: order(), sets: window.__rompChatSets(), notify: CALLS.notify.length, unregister: CALLS.unregister.slice() };
-// the create is cancelled (or resolves to a running session): the page's flip completes the close, against the store as it stands
+// the create is cancelled (or resolves to a running session): the page's flip completes the close, against the store as it stands.
+// The page holds state for sessions it does not show — the running session the create resolved to (WEB, which the peer put
+// in column 4), and one nobody lists (X): a held column lists nothing, so the close hands THOSE over, each to its owner
+TAKE['f-chat-2'] = { [WEB]: { draft: 'typed for web before it was found running', citations: [], files: [], staged: [] }, [X]: { draft: 'for x', citations: [], files: [], staged: [] } };
 BUSY['f-chat-2'] = false; CALLS.sets = []; CALLS.taken = []; CALLS.posted = [];
 msg({ romp: 'colBusy', busy: false }, 'f-chat-2');
 out.held.closed = { ids: ids(), order: order(), sets: window.__rompChatSets(), notify: CALLS.notify.slice(), saves: saves(), unregister: CALLS.unregister.slice(), colGone: CALLS.colGone.slice(),
-                    stored: STORE['romp-chat-cols'], taken: CALLS.taken.slice(), adopted: CALLS.posted.filter((p) => p.m && p.m.romp === 'adopt'), focused: CALLS.focus.slice(-1) };
+                    stored: STORE['romp-chat-cols'], taken: CALLS.taken.slice(), adopted: CALLS.posted.filter((p) => p.m && p.m.romp === 'adopt'), focused: CALLS.focus.slice(-1),
+                    left: Object.keys(TAKE['f-chat-2']) };
 // …the create LANDS a session while the column is held: the page claims it for the column, the store lists the column again
 // (the write every create makes), and the flip's reconcile keeps it
 boot({ 'romp-chat-cols': JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB] }] }) }, false);
@@ -634,6 +659,15 @@ window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
 BUSY['f-chat-2'] = false;
 msg({ romp: 'colBusy', busy: false }, 'f-chat-2');
 out.held.relisted = { ids: ids(), sets: window.__rompChatSets(), saves: saves(), unregister: CALLS.unregister.slice() };
+// …a tab the user moves INTO a held column ends the hold too: the column has a member, the store lists it again, the flip keeps it
+boot({ 'romp-chat-cols': JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB] }] }) }, false);
+BUSY['f-chat-2'] = true; CALLS.sets = []; CALLS.unregister = [];
+STORE['romp-chat-cols'] = JSON.stringify({ v: 2, cols: [] });
+window.dispatchEvent({ type: 'storage', key: 'romp-chat-cols' });
+window.__rompMoveTab(TESTS, 2);
+out.held.movedInto = { stored: cols(), sets: window.__rompChatSets() };
+BUSY['f-chat-2'] = false; msg({ romp: 'colBusy', busy: false }, 'f-chat-2');
+out.held.movedInto.after = { ids: ids(), stored: cols(), sets: window.__rompChatSets(), unregister: CALLS.unregister.slice() };
 // …and the user's OWN cross on a held column is refused with the line, as on any busy column; the flip then closes it
 boot({ 'romp-chat-cols': JSON.stringify({ v: 2, cols: [{ n: 2, ids: [WEB] }] }) }, false);
 BUSY['f-chat-2'] = true; CALLS.notify = [];
@@ -679,6 +713,39 @@ msg({ romp: 'orphanState', sids: [API] }, 'f-chat-2');
 out.orphan.unloaded = { posted: CALLS.posted.slice(), taken: CALLS.taken.slice(), left: Object.keys(TAKE['f-chat-2']) };
 msg({ romp: 'orphanState', sids: [API] });   // from no chat column: nothing
 out.orphan.unknown = CALLS.posted.length;
+// Q) THE STORE'S BYTES (round two, 2026-09-15): save() writes what the split always wrote, write for write and byte for byte —
+//    a move's first write lists the emptied origin with no ids and its second omits it — less only a HELD column
+boot({}, false);
+window.__rompMoveTab(API, 'new'); window.__rompMoveTab(TESTS, 'new'); window.__rompMoveTab(API, 3); window.__rompMoveTab(TESTS, 1);
+crossOf('f-chat-3').fire('click', { stopPropagation() {} });
+out.bytes = { moves: WRITES.slice() };
+boot({}, false);
+window.__rompMoveTab(API, 'new'); window.__rompMoveTab(TESTS, 2);
+msg({ romp: 'colEmpty', gone: [TESTS] }, 'f-chat-2'); msg({ romp: 'colEmpty', gone: [API] }, 'f-chat-2');
+out.bytes.prune = WRITES.slice();
+// R) STATE FOR SESSIONS A CLOSING PAGE DOES NOT SHOW travels at any close (round two, 2026-09-15): the cross on a column whose
+//    page holds a draft for a session another column lists and one nobody lists; an owner whose page cannot hear it yet is
+//    stood in for by the first column (which offers it on); an older page without the list hands over its members alone
+boot({}, false);
+window.__rompMoveTab(API, 'new'); window.__rompMoveTab(WEB, 'new');   // columns 2 (API) and 3 (WEB)
+TAKE['f-chat-2'] = { [API]: { draft: 'a', citations: [], files: [], staged: [] }, [WEB]: { draft: 'w', citations: [], files: [], staged: [] }, [X]: { draft: 'x', citations: [], files: [], staged: [] } };
+CALLS.posted = []; CALLS.taken = [];
+crossOf('f-chat-2').fire('click', { stopPropagation() {} });
+out.orphanClose = { adopted: CALLS.posted.filter((p) => p.m && p.m.romp === 'adopt'), taken: CALLS.taken.slice(), left: Object.keys(TAKE['f-chat-2'] || {}), ids: ids(), stored: cols() };
+boot({}, false);
+window.__rompMoveTab(API, 'new'); window.__rompMoveTab(WEB, 'new');
+delete BYID['f-chat-3'].contentWindow.__rompTakeSessionState;   // column 3's bundle has not evaluated: it cannot hear an adopt yet
+TAKE['f-chat-2'] = { [WEB]: { draft: 'w', citations: [], files: [], staged: [] } };
+CALLS.posted = [];
+crossOf('f-chat-2').fire('click', { stopPropagation() {} });
+out.orphanClose.unloaded = CALLS.posted.filter((p) => p.m && p.m.romp === 'adopt');
+boot({}, false);
+window.__rompMoveTab(API, 'new');
+delete BYID['f-chat-2'].contentWindow.__rompOrphanStateSids;   // an older page: no list
+TAKE['f-chat-2'] = { [API]: { draft: 'a', citations: [], files: [], staged: [] }, [X]: { draft: 'x', citations: [], files: [], staged: [] } };
+CALLS.posted = [];
+crossOf('f-chat-2').fire('click', { stopPropagation() {} });
+out.orphanClose.older = CALLS.posted.filter((p) => p.m && p.m.romp === 'adopt');
 // O) a closing column's width goes to the column on its left, measured before its key is dropped
 boot({}, false);
 window.__rompMoveTab(API, 'new'); window.__rompMoveTab(TESTS, 'new');
@@ -970,7 +1037,6 @@ class SplitExecutes(unittest.TestCase):
         # `keep`, so a peer moving a busy column's last member (or closing the column) killed the create's queued text with
         # the document. Now the column is HELD — mounted, unlisted, nothing written, no toast (a peer's act, nothing refused)
         # — and the page's colBusy flip is the event: the store is read again and reconciled
-        raw = lambda cols: json.dumps({"v": 2, "cols": cols}, separators=(",", ":"))   # the store's raw string, as JSON.stringify writes it
         h = self.out["held"]
         self.assertEqual(h["ids"], ["f-chat", "f-chat-2", "f-chat-3"], "the busy column stands")
         self.assertEqual(h["order"], ["chat-pane", "gv-chat-2", "chat-pane-2", "gv-chat-3", "chat-pane-3", "gv-a", "fleet-pane", "gv-b", "feed-pane"], "pane and gutter, in its place")
@@ -992,7 +1058,14 @@ class SplitExecutes(unittest.TestCase):
         self.assertEqual(c["order"], ["chat-pane", "gv-chat-4", "chat-pane-4", "gv-a", "fleet-pane", "gv-b", "feed-pane"], "pane and gutter gone")
         self.assertEqual(c["sets"], {"4": [WEB]}); self.assertEqual(c["unregister"], ["chat-pane-3", "chat-pane-2"]); self.assertEqual(c["colGone"], ["3", "2"])
         self.assertEqual(c["saves"], 0); self.assertEqual(c["stored"], raw([{"n": 4, "ids": [WEB]}]), "the store is untouched: the peer's write was the truth")
-        self.assertEqual(c["notify"], []); self.assertEqual(c["taken"], []); self.assertEqual(c["adopted"], [], "an unlisted column has nothing to hand home")
+        self.assertEqual(c["notify"], [])
+        # round two (2026-09-15): the page's state for sessions it does not show travels at the close — the running session the
+        # create resolved to goes to the column that lists it now, a session nobody lists to the first column — not to the grave
+        st = lambda d: {"draft": d, "citations": [], "files": [], "staged": []}
+        self.assertEqual(c["taken"], [["f-chat-2", WEB, True], ["f-chat-2", X, True]], "taken from the closing page, though it lists nothing")
+        self.assertEqual(c["adopted"], [{"id": "f-chat-4", "m": {"romp": "adopt", "sid": WEB, "state": st("typed for web before it was found running")}},
+                                        {"id": "f-chat", "m": {"romp": "adopt", "sid": X, "state": st("for x")}}])
+        self.assertEqual(c["left"], [], "nothing stays behind in the dying document")
         self.assertEqual(c["focused"], ["f-chat"], "the ring lands on the column to its left")
         l = h["landed"]
         self.assertEqual(l["held"], {"ids": ["f-chat", "f-chat-2"], "sets": {"2": []}, "targetWeb": "f-chat", "saves": 0})
@@ -1005,9 +1078,43 @@ class SplitExecutes(unittest.TestCase):
         self.assertEqual(a["notify"], []); self.assertEqual(a["unregister"], [])
         r = h["relisted"]
         self.assertEqual(r, {"ids": ["f-chat", "f-chat-2"], "sets": {"2": [TESTS]}, "saves": 0, "unregister": []}, "a peer listing the column again ends the hold; the flip changes nothing")
+        mi = h["movedInto"]
+        self.assertEqual(mi["stored"], {"v": 2, "cols": [{"n": 2, "ids": [TESTS]}]}, "a tab moved into a held column ends the hold: the write lists the column")
+        self.assertEqual(mi["sets"], {"2": [TESTS]})
+        self.assertEqual(mi["after"], {"ids": ["f-chat", "f-chat-2"], "stored": {"v": 2, "cols": [{"n": 2, "ids": [TESTS]}]}, "sets": {"2": [TESTS]}, "unregister": []}, "…and the flip keeps it")
         x = h["cross"]
         self.assertEqual(x["ids"], ["f-chat", "f-chat-2"]); self.assertEqual(x["notify"], [["warn", "A session is still being created in this column."]], "the user's own cross is refused with the line")
         self.assertEqual(x["then"], {"ids": ["f-chat"], "notify": 1}, "…and the flip closes it, saying nothing more")
+
+    def test_the_store_s_bytes_are_the_split_s_own_write_for_write_less_only_a_held_column(self):
+        # round two (2026-09-15): the first fix filtered EMPTY entries out of every write, which changed ordinary bytes — a move
+        # of a column's last member into another wrote the final arrangement twice where main wrote the emptied origin first
+        # ({"n":2,"ids":[]}) and then the final value. Every write of the ordinary paths is pinned here to main's bytes (this
+        # test passes at ea91a228 and fails at dd16af75); only a held column is ever left out
+        b = self.out["bytes"]
+        self.assertEqual(b["moves"], [raw([{"n": 2, "ids": [API]}]),
+                                      raw([{"n": 2, "ids": [API]}, {"n": 3, "ids": [TESTS]}]),
+                                      raw([{"n": 2, "ids": []}, {"n": 3, "ids": [TESTS, API]}]),   # the move's first write: the origin, emptied, still listed
+                                      raw([{"n": 3, "ids": [TESTS, API]}]),                       # its second: the origin closed
+                                      raw([{"n": 3, "ids": [API]}]),                              # a member home from a column of two
+                                      raw([])],                                                   # the cross
+                         "the move path, write for write")
+        self.assertEqual(b["prune"], [raw([{"n": 2, "ids": [API]}]), raw([{"n": 2, "ids": [API, TESTS]}]), raw([{"n": 2, "ids": [API]}]), raw([])], "the emptiness path, write for write")
+
+    def test_state_a_closing_page_holds_for_sessions_it_does_not_show_travels_to_their_owners(self):
+        # round two (2026-09-15): close() handed over the LISTED members' state only, so a draft the page held for a session
+        # shown elsewhere died with the document — the running session a create resolved to while the column was held (the
+        # HELD test above runs that case). Any close hands the rest over too: to the column that lists the session when its page
+        # can hear it, else to the first column, which offers it on (orphanState)
+        st = lambda d: {"draft": d, "citations": [], "files": [], "staged": []}
+        o = self.out["orphanClose"]
+        self.assertEqual(o["adopted"], [{"id": "f-chat", "m": {"romp": "adopt", "sid": API, "state": st("a")}},        # the member, home as ever
+                                        {"id": "f-chat-3", "m": {"romp": "adopt", "sid": WEB, "state": st("w")}},      # shown in column 3: there
+                                        {"id": "f-chat", "m": {"romp": "adopt", "sid": X, "state": st("x")}}])        # nobody lists it: the first column
+        self.assertEqual(o["taken"], [["f-chat-2", API, True], ["f-chat-2", WEB, True], ["f-chat-2", X, True]])
+        self.assertEqual(o["left"], [], "the dying page keeps nothing"); self.assertEqual(o["ids"], ["f-chat", "f-chat-3"]); self.assertEqual(o["stored"], {"v": 2, "cols": [{"n": 3, "ids": [WEB]}]})
+        self.assertEqual(o["unloaded"], [{"id": "f-chat", "m": {"romp": "adopt", "sid": WEB, "state": st("w")}}], "an owner whose page cannot hear it yet: the first column stands in and offers it on")
+        self.assertEqual(o["older"], [{"id": "f-chat", "m": {"romp": "adopt", "sid": API, "state": st("a")}}], "an older page without the list: its members alone, as before")
 
     def test_a_column_closed_for_emptiness_tells_the_first_column_which_ids_are_on_their_way_home(self):
         # the kernel may still list a member closed from its own cross for a push or two, and the first column would draw
