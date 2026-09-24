@@ -1595,7 +1595,22 @@ that reads one without asking fails loudly rather than seeing an empty
 message, and a serializer reaching a pre-cut turn's atoms is refused (a dump
 goes through `plain_tree`). A document written without the parsed tree (the
 exit path past its budget) carries no `turns` section and restores the atoms
-as before, until the next settle rewrites it with one. A compaction after the document demotes to a
+as before, until the next settle rewrites it with one. An entry built by a
+whole parse is re-seated on the document written from it at its next parse
+(2026-09-24): the restore road reads the document and the tail, so the folds
+after it walk the tail alone instead of the whole history, and the chat renders
+from the cut; the tail share then demotes the re-seated entry to the whole
+parse that lets the settle advance the cut, and the entry stays held to the
+share through a restore after a descent (an api_error spur, a rewind in the
+tail). An entry whose document's tail already meets the share, whose leaf's
+document a restore just refused, or whose history still holds a postal
+author waiting on the log, stays whole, and its document is rewritten only
+once the tail reaches the share or a compaction lands. Such an entry loses
+the churn bound at a descent, deliberately: the restore that serves it after
+the descent carries no bound, as every restore did before, so its cut waits
+for the next whole parse; held to the share, an entry kept whole for an open
+turn's tail would parse the history whole again at every descent.
+A compaction after the document demotes to a
 whole parse as before, and the next settle writes a new document; a rewrite
 under the cut's guard, a shrunk or moved file, another session, other inputs,
 a wrong version, a corrupt or unprovable document, or a document past 16 MB
@@ -2480,7 +2495,10 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   `rewrite` when the leaf's record entry was replaced by a from-zero read
   under a new generation, `nonleaf` when a lineage file moved or grew,
   `inputs`, `recs-gone`, `no-leaf-slot`, `empty-graph`, `uuid-known`,
-  `boundary`, `summary`, `promptid`, `skill-link`, `ts`, `kept`),
+  `boundary`, `summary`, `promptid`, `skill-link`, `ts`, `kept`, and
+  `reseat`, a whole entry whose own document the settle or the converge
+  pass has written, re-seated on it by the restore road, where it lands
+  here only when that restore refused the document),
   `full:noDocument`, `full:noDir` (no checkpoint directory), `full:refused` (a document that stood but did not verify,
   its fallback reason counted), `bypass` (a pending cut armed on the session)
   and `fallback`; the same block rides `asmCheckpoint.parse` on GET /perf,

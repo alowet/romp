@@ -4829,10 +4829,12 @@ _TS_REPAIRED_SEEN = set()    # record uuids already counted in ts-repair — dis
 
 
 _ASM_DEMOTE_TL = threading.local()   # the calling thread's last demotion reason: what _assemble reads to pick the road after it
-_ASM_RESTORE_AFTER_DEMOTE = ("descent", "rewrite", "nonleaf")   # the demotions the document still stands for (T402): the tail
-#                                   moved (a spur, a rewind, a fork), the leaf's record entry was replaced, a lineage file moved; the
-#                                   load's own checks refuse a document that no longer fits. Every other reason (a new boundary or
-#                                   summary in the tail, a prompt id, a skill link, a stamp out of order, ...) keeps the whole parse.
+_ASM_RESTORE_AFTER_DEMOTE = ("descent", "rewrite", "nonleaf", "reseat")   # the demotions the document still stands for (T402): the
+#                                   tail moved (a spur, a rewind, a fork), the leaf's record entry was replaced, a lineage file moved; the
+#                                   load's own checks refuse a document that no longer fits. `reseat` (2026-09-24) is a whole entry whose
+#                                   own document now stands (asm_checkpoint_write): re-seated on it, the folds after walk the tail alone.
+#                                   Every other reason (a new boundary or summary in the tail, a prompt id, a skill link, a stamp out of
+#                                   order, ...) keeps the whole parse.
 
 
 def _asm_demote(reason):
@@ -4874,9 +4876,10 @@ def _asm_serve(entry):
             dict(entry["st"].get("skill_loads") or {}), list(entry.get("preTurns") or []))
 
 
-def _asm_full(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human):
+def _asm_full(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human, keep_whole=False):
     """Full parse + a fresh cache entry — the same steps atoms() runs, inlined so the entry keeps
-    the carry (st) the emit actually used; later folds continue from it."""
+    the carry (st) the emit actually used; later folds continue from it. `keep_whole`: a restore just
+    refused this leaf's document, so the entry is never re-seated on the one written from it (keepWhole)."""
     ad = FileAdapter(candidate_files, leaf_path, resume_links=links)
     ad.sdk_human = sdk_human
     st = _emit_state()
@@ -4890,6 +4893,8 @@ def _asm_full(key, leaf_path, candidate_files, links, rompuuid, postal_index, sd
              "cands": tuple(str(f) for f in candidate_files), "links": dict(links or {}),
              "recs": dict(ad._src_keys), "n_qatts": len(ad.qatts), "prefix": [],
              "path": str(leaf_path)}   # as handed: the reader's key for the same leaf (asm_whole_entries hands it back)
+    if keep_whole:
+        entry["keepWhole"] = True
     with _ASM_LOCK:
         gone = [_ASM_CACHE.pop(key, None)]
         while len(_ASM_CACHE) >= _ASM_CACHE_MAX:
@@ -4939,10 +4944,13 @@ def _asm_gates(entry, leaf_path, candidate_files, links):
     leaf_stem = Path(leaf_path).stem
     files = [f for f in candidate_files if Path(f).stem != leaf_stem] + [Path(leaf_path)]
     delta = leaf_recs = None
-    if entry.get("docPre") is not None and entry.get("prefix"):
+    if entry.get("docPre") is not None and (entry.get("prefix") or entry.get("reseated")):
         # a RESTORED entry: its cut advances only through a whole parse (the pre-cut records are lazy rows, not in hand), so
         # when the tail past the document's cut has grown to the share the entry is demoted here and the settle that follows
-        # the whole parse writes the new cut (stage one b's churn bound; a compaction in the tail demotes below as before)
+        # the whole parse writes the new cut (stage one b's churn bound; a compaction in the tail demotes below as before).
+        # A RE-SEATED entry (2026-09-24) is held to it whatever its document's form: the whole entry it replaced carried this
+        # bound in the writer, and a turns-section restore leaves `prefix` empty, so the test on `prefix` alone would freeze
+        # the re-seated leaf's cut for the rest of the process
         try:
             tail_now = os.stat(leaf_path).st_size - int(entry.get("docCutOff") or 0)
         except OSError:
@@ -6218,7 +6226,8 @@ def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason
     the tree (the whole file would be the tail), a cut that would not split the chronological order the fold's gate
     needs (garbled stamps), or a document past the cap; each counted under asmCheckpoint.skipped, and appended to
     `reason_out` when a list is given (the converge pass reads its refusal there; T376 review). `who` names the caller
-    in the blip line (the settle, the converge pass), said once per leaf and reason."""
+    in the blip line (the settle, the converge pass), said once per leaf and reason. An entry it wrote from is marked for
+    re-seat: the next parse restores the entry from this document (2026-09-24)."""
     cp = _asm_ckpt_file(leaf_path)
     if cp is None:
         return False
@@ -6679,6 +6688,20 @@ def asm_checkpoint_write(leaf_path, rompuuid, sdk_human=False, tree=None, reason
                 _ASM_CKPT_REFUSED.pop(_rk, None)
         entry["docTurns"] = bool(turns_doc)              # the turns section was written (T323 stage 4c)
         entry["docNoTurns"] = _tree_key(tree) if (tree is not None and not turns_doc) else None   # …or this tree yields none
+        _leaf_f = files.get(Path(leaf_path).stem) or {}
+        _tail = int(_leaf_f.get("size") or 0) - int((_leaf_f.get("cut") or [0])[0])
+        _st = entry.get("st") or {}
+        entry["reseat"] = (not entry.get("keepWhole") and _tail * _ASM_TAIL_SHARE < max(1, int(cut_off_total))
+                           and not (_st.get("postal_miss_rec") or _st.get("postal_miss_att")))
+        #                                                   the next parse re-seats this entry on the document (_assemble, 2026-09-24): a
+        #                                                   whole entry kept folding the whole history for the life of the process. Not
+        #                                                   when a restore refused the leaf's document (keepWhole), nor when the tail
+        #                                                   past this cut already meets the churn bound's share: the restored entry would
+        #                                                   demote at its first fold (tailShare) and, under a turn that stays open, the
+        #                                                   whole parse would write the same cut again, a loop of whole parses. Nor while
+        #                                                   a postal marker is unresolved: the document carries the provisional author and
+        #                                                   no heal state, so the whole entry heals the atom when the log catches up and a
+        #                                                   re-seat would freeze it (review low 1); the rewrite after the heal marks it
         with _ASM_CKPT_LOCK:
             _ASM_CKPT_STATS["written"] += 1
         return True
@@ -7128,19 +7151,20 @@ def _tail_chains_onto_the_document(leaf_path, doc, assume_childless=False):
     return True
 
 
-def _asm_restore(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human):
+def _asm_restore(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human, reseated=False):
     """_asm_restore_inner timed whole: asmCheckpoint.restoreMs.total lands on every return (a served entry or a refusal)."""
     _t0 = time.perf_counter()
     try:
-        return _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human)
+        return _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human, reseated=reseated)
     finally:
         _restore_ms("total", _t0)
 
 
-def _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human):
+def _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human, reseated=False):
     """The entry restored from the leaf's assembly checkpoint, served; None when there is none or it does not verify.
     The pre-cut turns come from the document as lazy atoms; the tail is read from the cut and parsed through an
-    adapter seeded with the pre-cut graph facts and the carried emit state; the prefix's identity is proven."""
+    adapter seeded with the pre-cut graph facts and the carried emit state; the prefix's identity is proven. `reseated`:
+    the restore re-seats a whole entry on the document written from it (the entry carries the churn bound, _asm_gates)."""
     if _asm_refusal_stands(leaf_path):
         _asm_stat("restore:refusedStanding")             # refused for the tail's shape at this very stat: no proof, no rewrite (round two)
         return None
@@ -7218,6 +7242,8 @@ def _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_
                  "path": str(leaf_path)}                   # as handed: the reader's key for the same leaf
         #        docPre: the pre-cut bytes over the lineage; docCutOff: the leaf's cut offset. The fold's gate demotes this entry
         #        to a whole parse when the tail past the cut reaches the share (tailShare), so the settle rewrites the cut
+        if reseated:
+            entry["reseated"] = True
     except Exception as e:                                     # noqa: BLE001 — a document the code cannot use is a fallback
         _asm_ckpt_note(leaf_path, "restore", repr(e)[:120]); return None
     _LAZY_FILES[str(rompuuid)] = _source_files(doc["files"])
@@ -7433,9 +7459,18 @@ def _assemble(leaf_path, candidate_files, links, rompuuid, postal_index, sdk_hum
                 if entry is not None:
                     _ASM_CACHE.pop(key, None)
                     _ASM_CACHE[key] = entry       # a served entry is a USED entry (LRU touch)
+            keep_whole = False                    # set when a restore refused a document: the whole parse below keeps its entry whole
             if entry is not None:
                 _ASM_DEMOTE_TL.reason = None
                 got = _asm_gates(entry, leaf_path, candidate_files, links)
+                if got is not None and entry.get("reseat"):
+                    # A WHOLE entry whose own document now stands (2026-09-24): the settle or the converge pass wrote it from this
+                    # entry, which then kept every record and atom for the life of the process, so every fold re-ran the graph
+                    # passes over the whole history and copied every atom (at 150 MB, an order of magnitude over a fold of the
+                    # restored entry) and the chat's render floor stayed at turn 0. A delta the gates pass is re-seated instead: the
+                    # restore road reads the document and the tail from its cut, and the folds after it walk the tail alone. A
+                    # delta the gates demote keeps its own road and its own reason
+                    got = _asm_demote("reseat")
                 if got is not None:
                     delta, leaf_recs = got
                     _asm_heal(entry, rompuuid, postal_index)
@@ -7461,17 +7496,30 @@ def _assemble(leaf_path, candidate_files, links, rompuuid, postal_index, sdk_hum
                     # every restore over a document, this one and the boot's, first asks whether the tail CHAINS onto it
                     # (_tail_chains_onto_the_document); a rewind into the pre-cut interior, a /clear fork, a system spur
                     # anchored before the cut or an orphan parent refuses to the whole parse, as before (rounds one and two)
-                    served = _asm_restore(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human)
+                    # the churn bound rides every restore of an entry that was re-seated or marked for it, whatever demoted it
+                    # (an api_error spur or a rewind in the tail demotes for descent, a moved lineage file for nonleaf): a
+                    # restore without the flag leaves a turns-section entry with no churn gate (`prefix` empty), so its cut
+                    # froze for the rest of the process (review of 2026-09-24, medium 1). An entry kept whole (its tail at the
+                    # share, a refused document, a postal author waiting) carries no flag and restores without the bound, as
+                    # every entry did before: held to the share there, an open turn's entry would parse whole at every descent
+                    served = _asm_restore(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human,
+                                          reseated=_why == "reseat" or bool(entry.get("reseat") or entry.get("reseated")))
                     if served is not None:
                         _asm_stat("restore"); _asm_stat("restore:afterDemote")
                         _mode("restore")
                         return served
+                    # a re-seat the restore did not serve is not tried again for the entry the whole parse builds, whatever the
+                    # refusal (else every settle would write a document and every miss after it refuse it and parse whole); nor is
+                    # any entry whose parse follows a refusal that left the document standing (the chain proof, a standing mark:
+                    # the same tail refuses the next document too). Either way the entry stays whole and folds, as before the re-seat
+                    keep_whole = _why == "reseat" or asm_document_stands(leaf_path)
             elif _CKPT_DIR_FN is not None:
                 served = _asm_restore(key, leaf_path, candidate_files, links, rompuuid, postal_index, sdk_human)
                 if served is not None:
                     _asm_stat("restore")
                     _mode("restore")
                     return served
+                keep_whole = asm_document_stands(leaf_path)   # a boot's refusal that left the document standing: as above
             # A full parse names its road (T398): an entry the gates DEMOTED (the g:<reason> beside it: the leaf's record
             # entry replaced by a from-zero read, a lineage file moved), a leaf with NO document file, a document that
             # stood but was REFUSED at the restore (its fallback reason counted beside), or no checkpoint directory at all.
@@ -7489,7 +7537,7 @@ def _assemble(leaf_path, candidate_files, links, rompuuid, postal_index, sdk_hum
             _asm_stat("full:" + why)
             _mode("full")
             return _asm_full(key, leaf_path, candidate_files, links, rompuuid,
-                             postal_index, sdk_human)
+                             postal_index, sdk_human, keep_whole=keep_whole)
     except Exception as e:
         _asm_stat("fallback")
         _mode("fallback")

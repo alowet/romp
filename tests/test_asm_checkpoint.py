@@ -1192,9 +1192,9 @@ class SettledCut(Harness):
 
     def test_the_standing_document_holds_until_the_tail_reaches_the_share_or_a_compaction_lands(self):
         """Correction 2, the churn bound: with the entry standing (no restart), a settled turn appended past the cut leaves
-        the document as it is (`written`: the tail is under an eighth of the pre-cut bytes); once the tail past the standing
-        cut reaches the share the settle rewrites the document with a later cut; a compaction landing past the cut rewrites
-        at once."""
+        the document as it is (the tail is under an eighth of the pre-cut bytes; since 2026-09-24 the parse after the write
+        re-seats the entry on the document, so the writer finds it `restored`); once the tail past the standing cut reaches
+        the share the settle rewrites the document with a later cut; a compaction landing past the cut rewrites at once."""
         base = compacting_variant([G.uline(NOW - 3600, "hello " * 2000, "u1", None), G.aline(NOW - 3595, "hi " * 4000, "a1", "u1", stop="end_turn")], "churn")
         recs = base + _turns_after(base, "churn", 2)
         path, whole, wrote = self._written_and_equal("churn", recs)
@@ -1205,7 +1205,10 @@ class SettledCut(Harness):
         recs = recs + _turns_after(recs, "small", 1)
         pp = Path(path); pp.write_text("".join(json.dumps(r) + "\n" for r in recs))
         self.parse(path); em._ASM_CKPT_STATS["skipped"] = {}
-        self.assertFalse(self.doc(path)); self.assertEqual(em.asm_checkpoint_stats()["skipped"], {"written": 1}, "%s" % em.asm_checkpoint_stats()["skipped"])
+        # `restored`, not `written`: the parse re-seated the whole entry on its own document (2026-09-24), which stands for it.
+        # The writer's churn hold for an entry that stays WHOLE (the `written` skip this line pinned before) is pinned in
+        # test_asm_reseat's ARefusedReseatStaysWhole, on entries a refusal keeps whole
+        self.assertFalse(self.doc(path)); self.assertEqual(em.asm_checkpoint_stats()["skipped"], {"restored": 1}, "%s" % em.asm_checkpoint_stats()["skipped"])
         self.assertEqual(len(_doc(path)["records"]), n0, "the document is the one written before")
         # the tail grows to the share: the settle rewrites with a later cut
         tail = os.path.getsize(path) - pre
