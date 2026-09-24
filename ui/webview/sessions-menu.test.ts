@@ -74,7 +74,7 @@ test("the menu's rows: Rename first, Delete second and marked danger; the danger
   const at = (m: string) => fn.indexOf(m);
   assert.ok(at('label: "Rename"') < at("addRestartRow(menu, sid,") && at("addRestartRow(menu, sid,") < at('label: "Delete"'),
     "Rename, Restart session, Delete");
-  assert.match(fn, /working: restartInterrupts\(sessionRow\(sid\)\?\.status\?\.state\)/, "a working session confirms first; an idle one restarts with no dialog");
+  assert.match(fn, /state: sessionRow\(sid\)\?\.status\?\.state,/, "the row reads the session's state: a working session confirms first, an idle one restarts with no dialog");
   assert.match(fn, /titles: openTopTitles\(\(sessionRow\(sid\)\?\.ledger\?\.tree \|\| \[\]\) as any\)/, "the confirm names the open tops, as Delete's does");
   assert.match(fn, /post: \(\) => vscodeApi\?\.postMessage\(\{ type: "restartSession", id: sid \}\)/, "one op, the session's id and nothing else");
   assert.match(fn, /onClose: \(\) => \{ if \(!document\.hasFocus\(\)\) return; const h = headOf\(sid\); if \(h\) h\.focus\(\{ preventScroll: true \}\); \}/,

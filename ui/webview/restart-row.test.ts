@@ -3,7 +3,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
-import { restartInterrupts, restartConfirmTitle } from "./restart-row";
+import { addRestartRow, restartInFlight, restartInterrupts, restartConfirmTitle, settleRestart, RESTART_INTERRUPTS } from "./restart-row";
 import { restartConfirmDetail, RESTART_LABEL, RESTART_BUSY_LABEL, RESTART_STANDING } from "./clear-confirm";
 
 // "Restart session" (the user 2026-09-23): ONE action that relaunches a session's own CLI process in place,
@@ -38,14 +38,32 @@ const OPEN_TOP = "Wire the notes-api health route";
 
 // ── the pure halves, executed ────────────────────────────────────────────────────────────────────
 
-test("a restart interrupts a session that is working, compacting or waiting on background work it dispatched — and nothing else", () => {
-  for (const st of ["working", "compacting", "awaitingBg"]) assert.equal(restartInterrupts(st), true, st + " costs something");
-  for (const st of ["ready", "opening", "blocked", "retrying", "", null, undefined]) assert.equal(restartInterrupts(st), false, String(st) + " costs nothing");
+// Every chip state, named: the kernel's chip derivation (_session_chip, and build_session's `opening`) as status-chip.ts's
+// ChipState spells it. The two lists below must cover the union between them, so a state added there fails here as
+// well as in the typecheck (RESTART_INTERRUPTS is `satisfies Record<ChipState, boolean>`).
+const CHIP_STATES = (fs.readFileSync(path.join(UI, "status-chip.ts"), "utf8").match(/export type ChipState = ([^;]+);/) || ["", ""])[1]
+  .split("|").map((t) => t.trim().replace(/^"|"$/g, "")).filter(Boolean);
+const COSTS = ["working", "compacting", "needsInput", "awaiting", "retrying", "awaitingBg"];
+const FREE = ["interrupting", "clearing", "blocked", "ready", "idle", "closed", "opening"];
+
+test("every chip state has a decided answer, and a restart interrupts exactly the ones with a turn in flight (working, compacting, paused on a prompt, riding an API retry) or background work it dispatched", () => {
+  assert.ok(CHIP_STATES.length >= 13, "the ChipState union was read from status-chip.ts: " + CHIP_STATES.join(", "));
+  assert.deepEqual([...COSTS, ...FREE].sort(), [...CHIP_STATES].sort(), "this test names every chip state once");
+  assert.deepEqual(Object.keys(RESTART_INTERRUPTS).sort(), [...CHIP_STATES].sort(), "…and so does the map: one decision per state");
+  // needsInput and retrying moved across on 2026-09-24: both are chip states for a turn that is still open, which the
+  // relaunch cuts (this list once pinned retrying as costing nothing); awaiting is needsInput's legacy name
+  for (const st of COSTS) assert.equal(restartInterrupts(st), true, st + " costs something");
+  // interrupting: a Stop already asked the turn to end and a restart sends nothing more; clearing: as it always was
+  for (const st of FREE) assert.equal(restartInterrupts(st), false, st + " costs nothing");
+  for (const st of ["", null, undefined, "toString"]) assert.equal(restartInterrupts(st), false, String(st) + " is no state: no dialog");
 });
+
+const QUESTION = /the question it is asking you goes away with it/;
 
 test("the confirm names what the click interrupts, and what it keeps; with no open card it still says both", () => {
   const bare = restartConfirmDetail([]);
   assert.match(bare, /turn it is running now is cut off/);
+  assert.doesNotMatch(bare, /question/, "a session not waiting on you is asked nothing, so the dialog names no question");
   assert.ok(bare.endsWith(RESTART_STANDING), "…and what survives it, the standing sentence");
   const one = restartConfirmDetail([OPEN_TOP]);
   assert.match(one, /^It is working on 1 open card: Wire the notes-api health route\./);
@@ -56,13 +74,166 @@ test("the confirm names what the click interrupts, and what it keeps; with no op
   for (const s of [bare, one]) assert.doesNotMatch(s, /\bkill|\bdestroy|\bdelete/i, "a restart is not an ending: the copy never says one");
 });
 
+test("the confirm for a session waiting on your answer to a prompt says the question goes away with the turn, in plain words", () => {
+  const bare = restartConfirmDetail([], true);
+  assert.equal(bare, "The turn it is running now is cut off, and the question it is asking you goes away with it. " + RESTART_STANDING);
+  const one = restartConfirmDetail([OPEN_TOP], true);
+  assert.match(one, /^It is working on 1 open card: Wire the notes-api health route\. The turn it is running now is cut off, and the question it is asking you goes away with it\. /);
+  assert.ok(one.endsWith(RESTART_STANDING), "…and still says what the restart keeps");
+});
+
+// ── the gesture in each session state, executed over an element stand-in ─────────────────────────
+// Both menus hand the row `state: <the session's status.state>` (pinned for the chat strip below, for the Sessions
+// pane in sessions-menu.test.ts), and the row decides from it. Here that runs for real, the module's own row and its
+// own click handler, once per chip state (every one in the two lists above), and the click is read the way the user
+// meets it: a dialog first, or the op at once. The post-merge review of the restart row
+// (2026-09-24) found two states with a turn in flight restarting with no dialog: a session paused on a permission
+// or picker prompt (needsInput) and one riding an API auto-retry (retrying). The relaunch's interrupt cut the
+// turn in both, and a pending permission question went with it. The stand-in is installed for the build alone,
+// so nothing else in this file sees a document.
+
+class StubEl {
+  parentNode: StubEl | null = null;
+  children: StubEl[] = [];
+  className = "";
+  title = "";
+  tabIndex = 0;
+  onScreen = false;                                  // the card's root: a row under it is connected
+  private text = "";
+  private attrs = new Map<string, string>();
+  private clicks: Array<(ev: unknown) => void> = [];
+  constructor(public tagName: string) {}
+  get isConnected(): boolean { for (let n: StubEl | null = this; n; n = n.parentNode) if (n.onScreen) return true; return false; }
+  get textContent(): string { return this.text + this.children.map((c) => c.textContent).join(""); }
+  set textContent(v: string) { this.text = String(v); this.children = []; }
+  appendChild(c: StubEl): StubEl { c.parentNode = this; this.children.push(c); return c; }
+  setAttribute(k: string, v: string): void { this.attrs.set(k, String(v)); }
+  getAttribute(k: string): string | null { return this.attrs.get(k) ?? null; }
+  removeAttribute(k: string): void { this.attrs.delete(k); }
+  hasAttribute(k: string): boolean { return this.attrs.has(k); }
+  addEventListener(type: string, f: (ev: unknown) => void): void { if (type === "click") this.clicks.push(f); }
+  click(): void { for (const f of this.clicks) f({ stopPropagation() { /* nothing above the card */ } }); }
+  querySelector(sel: string): StubEl | null {        // ".a-class", all restart-row.ts asks of a row
+    const want = sel.replace(/^\./, "");
+    for (const c of this.children) {
+      if (c.className.split(/\s+/).includes(want)) return c;
+      const d = c.querySelector(sel);
+      if (d) return d;
+    }
+    return null;
+  }
+}
+
+interface RestartMenu {
+  open: () => StubEl;                                // the menu opened on the session: a fresh card on screen, and its row
+  confirms: Array<{ title: string; detail: string }>;
+  posts: number;
+  answer: (v: string | null) => void;                // the open dialog's verdict: "restart", or null for Cancel
+}
+
+/** The session's menu, for a session in `state`: each open() builds the row on a fresh card that is on screen, the way
+ *  both menus build it. What the stand-in stands for, and where it stops: a click on a session that confirms first
+ *  closes the card before the dialog opens (pick() calls closeContextMenu, which removes the page's open menu). The
+ *  stand-in card is not the page's registered menu, so the dialog takes it off screen here instead, and after the
+ *  dialog the only place the restart can show is a card opened again, which is what these tests read. */
+function restartMenu(state: string | null | undefined): RestartMenu {
+  let pending: ((v: string | null) => void) | null = null;
+  const m: RestartMenu = {
+    confirms: [], posts: 0,
+    answer: (v) => { const cb = pending; pending = null; assert.ok(cb, "no dialog is open to answer"); cb!(v); },
+    open: () => {
+      const g = globalThis as any;
+      const had = Object.prototype.hasOwnProperty.call(g, "document"), prev = g.document;
+      g.document = { createElement: (tag: string) => new StubEl(tag.toUpperCase()) };
+      try {
+        const card = new StubEl("DIV");
+        card.onScreen = true;
+        return addRestartRow(card as unknown as HTMLElement, SID, {
+          name: "web",
+          state,
+          titles: [OPEN_TOP],
+          confirm: (title, detail, _buttons, cb) => {
+            card.onScreen = false;                   // the card is gone by the time the dialog is up (closeContextMenu)
+            m.confirms.push({ title, detail });
+            pending = cb;
+          },
+          post: () => { m.posts++; },
+        }) as unknown as StubEl;
+      } finally {
+        if (had) g.document = prev; else delete g.document;
+      }
+    },
+  };
+  return m;
+}
+
+const labelOf = (row: StubEl): string => row.querySelector(".ctx-item-label")!.textContent;
+
+/** A click on a session in `state` asks first; Cancel posts nothing and leaves nothing latched; the dialog's own button
+ *  posts the op once, and a card opened again shows the restart in flight and takes no second one. */
+function confirmsFirst(state: string, why: string, question = false): void {
+  try {
+    const m = restartMenu(state);
+    m.open().click();
+    assert.equal(m.confirms.length, 1, state + " (" + why + "): the click must confirm first, but it restarted with no dialog");
+    assert.equal(m.posts, 0, state + ": the click alone posts nothing");
+    assert.equal(m.confirms[0].title, "Restart “web”?");
+    assert.match(m.confirms[0].detail, /The turn it is running now is cut off/, state + ": the confirm says what the click costs");
+    if (question) assert.match(m.confirms[0].detail, QUESTION, state + ": …and that the question it is asking you goes away with it");
+    else assert.doesNotMatch(m.confirms[0].detail, /question/, state + ": it is asking you nothing, so the confirm names no question");
+    m.answer(null);
+    assert.equal(m.posts, 0, state + ": Cancel leaves the session, and whatever it is waiting on, as it was");
+    const again = m.open();
+    assert.equal(labelOf(again), RESTART_LABEL, state + ": after Cancel the menu offers the restart as before");
+    again.click();
+    assert.equal(m.confirms.length, 2, state + ": a second click asks again");
+    m.answer("restart");
+    assert.equal(m.posts, 1, state + ": the dialog's Restart posts the op once");
+    assert.equal(restartInFlight(SID), true, state + ": …and the restart is in flight for this session");
+    const reopened = m.open();
+    assert.equal(labelOf(reopened), RESTART_BUSY_LABEL, state + ": a card opened again shows Restarting…");
+    assert.equal(reopened.getAttribute("aria-disabled"), "true", state + ": …and the row is disabled");
+    reopened.click();
+    assert.equal(m.confirms.length, 2, state + ": a click on it asks nothing more");
+    assert.equal(m.posts, 1, state + ": …and posts nothing more");
+  } finally {
+    settleRestart(SID);
+  }
+}
+
+test("a session PAUSED ON A PERMISSION OR PICKER PROMPT (needsInput) confirms first: its turn is in flight, and a restart cuts it and the question it is asking", () => {
+  confirmsFirst("needsInput", "a turn waiting on the user's answer to a prompt", true);
+  confirmsFirst("awaiting", "the same prompt under the legacy name an older remote kernel sends", true);
+});
+
+test("a session RIDING AN API AUTO-RETRY (retrying) confirms first: the retry runs inside an open turn, which a restart cuts", () => {
+  confirmsFirst("retrying", "a turn still open while the API call is retried");
+});
+
+test("the stand-in reads both outcomes: every other state with a turn in flight or background work asks first; a session with nothing running restarts at once", () => {
+  for (const st of COSTS.filter((s) => s !== "needsInput" && s !== "awaiting" && s !== "retrying")) confirmsFirst(st, "a state that costs something");
+  for (const st of [...FREE, "", null, undefined]) {
+    try {
+      const m = restartMenu(st);
+      const row = m.open();
+      row.click();
+      assert.equal(m.confirms.length, 0, String(st) + ": nothing more is cut, so no dialog");
+      assert.equal(m.posts, 1, String(st) + ": the click posts the op at once");
+      assert.equal(labelOf(row), RESTART_BUSY_LABEL, String(st) + ": …and the row, still on its card, latches in place");
+      assert.equal(row.getAttribute("aria-disabled"), "true");
+    } finally {
+      settleRestart(SID);
+    }
+  }
+});
+
 // ── the chat strip's half, and the kernel's: source pins ─────────────────────────────────────────
 
 test("the chat tab menu builds the SAME row from the same module, resolved by id and never off the node under the cursor", () => {
-  assert.match(RENDER, /import \{ addRestartRow, restartInterrupts, settleRestart \} from "\.\/restart-row";/);
+  assert.match(RENDER, /import \{ addRestartRow, settleRestart \} from "\.\/restart-row";/);
   const menu = RENDER.slice(RENDER.indexOf("function showTabMenu("), RENDER.indexOf("ctxMenuEl = showMenuCard(menu,"));
   assert.match(menu, /addRestartRow\(menu, id, \{/);
-  assert.match(menu, /working: restartInterrupts\(st\?\.state\)/, "the same predicate both menus read");
+  assert.match(menu, /state: st\?\.state,/, "the session's own state, handed to the row, which decides from it as for the Sessions pane");
   assert.match(menu, /titles: openTopTitles\(ledgers\.get\(id\)\?\.tree\)/);
   assert.match(menu, /post: \(\) => \{ vscodeApi\?\.postMessage\(\{ type: "restartSession", id \}\); \}/, "one op, the id alone");
   assert.doesNotMatch(menu, /addRestartRow\(menu, id, \{[\s\S]*?\}\);[\s\S]*addRestartRow/, "built once");

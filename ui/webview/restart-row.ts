@@ -17,6 +17,7 @@
 //     shows the latched row too, and a settled sid restores a row only while its node is still connected.
 import { addMenuItem, closeContextMenu, ConfirmButton } from "./ctx-menu";
 import { RESTART_LABEL, RESTART_BUSY_LABEL, RESTART_SUBLINE, RESTART_BUSY_SUBLINE, restartConfirmDetail } from "./clear-confirm";
+import type { ChipState } from "./status-chip";
 
 const inFlight = new Set<string>();                 // sids this page has asked to restart and not heard back about
 const latched = new Map<string, HTMLElement>();     // …and the row showing it, while that card is still up
@@ -33,12 +34,27 @@ export function settleRestart(sid: string): void {
   if (row && row.isConnected) dress(row, false);
 }
 
-/** Does restarting a session in this state interrupt anything? `working` and `compacting` are the chat's
- *  own reading of a turn in flight; `awaitingBg` is a session that is idle itself while background work it
- *  dispatched runs on — and that work is retired with the client it belongs to (the reconnect's
- *  _drop_live_work), so it is interrupted too. Every other state costs nothing and takes no dialog. */
+/** Does restarting a session in each chip state interrupt anything? One entry per state of the kernel's chip
+ *  (_session_chip, and build_session's `opening`), so a state added to ChipState fails to compile here until someone
+ *  decides what a restart costs in it. The allow-list this replaced read every state it did not name as free, which
+ *  is how a prompt and an API retry restarted with no dialog (the post-merge review of the restart row, 2026-09-24).
+ *  A restart cuts the running turn: the relaunch interrupts it and the fresh CLI comes up at its end. */
+export const RESTART_INTERRUPTS = {
+  working: true, compacting: true,  // the chat's own reading of a turn in flight
+  needsInput: true,                 // a turn paused on a permission or picker prompt, which the chip ranks above working; the question goes with it
+  awaiting: true,                   // needsInput's legacy name, which an older remote kernel still sends: the same prompt
+  retrying: true,                   // a turn still open while an API call is auto-retried, also ranked above working
+  awaitingBg: true,                 // idle itself, but the background work it dispatched is retired with the client it belongs to (the reconnect's _drop_live_work)
+  interrupting: false,              // a Stop already asked that turn to end: a restart sends nothing more (SdkSession.interrupt with climb=False) and the fresh CLI comes up when it ends
+  clearing: false,                  // a /clear in flight: restarts with no dialog, as it always did; what that costs is not measured
+  blocked: false, ready: false, idle: false, closed: false,   // no turn running
+  opening: false,                   // the CLI is still starting, before its first turn
+} satisfies Record<ChipState, boolean>;
+
+/** The dialog's rule, read off RESTART_INTERRUPTS. A name the map lacks (no state yet, or one an older or newer remote
+ *  kernel sends that this page does not know) takes no dialog, as before. */
 export function restartInterrupts(state: string | null | undefined): boolean {
-  return state === "working" || state === "compacting" || state === "awaitingBg";
+  return !!state && (RESTART_INTERRUPTS as Record<string, boolean>)[state] === true;
 }
 
 /** The confirm's title, the End dialog's shape. */
@@ -58,7 +74,8 @@ function dress(row: HTMLElement, busy: boolean): void {
 
 export interface RestartRowCtx {
   name: string;                 // the session as the user calls it, for the confirm's title
-  working: boolean;             // a turn in flight or queued → confirm first; idle → straight through
+  state: string | null | undefined;   // its chip state as the menu read it: restartInterrupts decides the dialog, and a
+                                      //  session waiting on your answer to a prompt hears that the question goes too
   titles: string[];             // its open tops, named in the confirm as the End dialog names them
   icon?: HTMLElement | null;    // the menu's drawn icon, where that menu draws them
   confirm: (title: string, detail: string, buttons: ConfirmButton[], cb: (v: string | null) => void) => void;
@@ -67,6 +84,8 @@ export interface RestartRowCtx {
 
 /** Append the Restart session row to `menu` for `sid`. */
 export function addRestartRow(menu: HTMLElement, sid: string, ctx: RestartRowCtx): HTMLElement {
+  const working = restartInterrupts(ctx.state);         // a turn in flight or background work → confirm first; else straight through
+  const asking = ctx.state === "needsInput" || ctx.state === "awaiting";   // …and one waiting on your answer loses the question
   const go = (row: HTMLElement) => {
     inFlight.add(sid);
     if (row.isConnected) { latched.set(sid, row); dress(row, true); }   // the acknowledgement, before the kernel round trip
@@ -80,11 +99,11 @@ export function addRestartRow(menu: HTMLElement, sid: string, ctx: RestartRowCtx
     keepOpen: true,             // the row acts in place: the card stays up under the latched label
     pick: (r) => {
       if (restartInFlight(sid)) return;                 // already asked (the aria-disabled row's belt)
-      if (!ctx.working) { go(r); return; }              // idle: no dialog for a click that costs nothing
+      if (!working) { go(r); return; }                  // idle: no dialog for a click that costs nothing
       // it is working: the dialog IS this click's acknowledgement, so the card goes first rather than
       // sitting under the overlay's dim (the Sessions pane's Delete order)
       closeContextMenu();
-      ctx.confirm(restartConfirmTitle(ctx.name), restartConfirmDetail(ctx.titles), RESTART_BUTTONS,
+      ctx.confirm(restartConfirmTitle(ctx.name), restartConfirmDetail(ctx.titles, asking), RESTART_BUTTONS,
         (v) => { if (v === "restart") go(r); });        // Cancel, Escape, the backdrop: nothing posted
     },
   });

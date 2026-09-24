@@ -198,8 +198,11 @@ session as dead.
 
 If the session is idle, the restart happens with no dialog; the menu row reads
 **Restarting…** until the kernel answers, then goes back. If it is working — a
-turn in flight, a compaction, or background work it dispatched — Romp confirms
-first, naming its open cards and saying that the running turn is cut off. The
+turn in flight (including one paused on a permission or picker prompt, or
+retrying the API), a compaction, or background work it dispatched — Romp confirms
+first, naming its open cards and saying that the running turn is cut off; for a
+session waiting on your answer to a prompt, it also says that the question goes
+away with the turn. The
 turn is interrupted and the relaunch follows at that turn's end, so the program
 is never torn down from under a live turn. Work the old process was running,
 its subagents and its background tasks, ends with it. A message you had queued
