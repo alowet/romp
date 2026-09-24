@@ -16,6 +16,7 @@ import tempfile
 import unittest
 from unittest import mock
 from romp_load import load_source
+from tests.needs_row_fixture import populated_ask   # noqa: E402  the shared fixture, a package module (romp_load put the checkout root on the path for a direct run)
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
@@ -149,6 +150,8 @@ class ChatNotices(unittest.TestCase):
              "board": "feed", "category": "needs_input", "column": "needs_input", "blocked": None},
             {"itemId": g5, "sid": SID, "text": "the judges cannot read this session", "live": True, "t": 107, "board": "feed", "category": "needs_input", "column": "needs_input",
              "blocked": {"state": "judgeAuth", "mode": "key", "login": "", "what": "romp can't analyze this session: the API key its judges bill is being refused"}},
+            populated_ask(SID),   # every card field DISTINCT and non-None but blocked (tests/needs_row_fixture.py): a contributor's post-merge note on PR 2124 ran seven
+                                  # single-edit mutants of the row builder past a fixture populating five fields
         ]}
         rows = rows_fn(frame)
         self.assertEqual(sorted(rows), sorted([SID, "22222222-2222-3333-4444-000000000902"]), "rows per session, only sessions with one")
@@ -164,9 +167,19 @@ class ChatNotices(unittest.TestCase):
         self.assertEqual(rows[SID], [
             {"itemId": g1, "kind": "goal", "title": "which database does the suite target?", "body": "Postgres or SQLite: the fixtures differ", "cont": True, "t": 100, **card_fields(frame["asks"][0])},
             {"itemId": g4, "kind": "goal", "title": "a dead session's question", "body": "", "cont": False, "t": 105, **card_fields(frame["asks"][5])},
-            {"itemId": g5, "kind": "goal", "title": "the judges cannot read this session", "body": "romp can't analyze this session: the API key its judges bill is being refused", "cont": False, "fix": "credential", "t": 107}],
+            {"itemId": g5, "kind": "goal", "title": "the judges cannot read this session", "body": "romp can't analyze this session: the API key its judges bill is being refused", "cont": False, "fix": "credential", "t": 107},
+            {"itemId": SID + ":g6", "kind": "goal", "title": "which port do the fixtures own?", "body": frame["asks"][8]["blockSummary"], "cont": True, "t": 108, **card_fields(frame["asks"][8])}],
             "the judge's questions in the frame's order: a working card, a live-block card, the placeholder and the notice card stay out; "
             "no brief yet reads as an empty line; Continue only on a live session; the judges' credential refusal is a row whose action is the fix")
+        full = rows[SID][3]   # the populated ask's row, field by field: a field set to None, or read from the wrong key, names itself here
+        for f in CARD_FIELDS:
+            want = tree_of(frame["asks"][8]["tree"]) if f == "tree" else frame["asks"][8][f]
+            self.assertEqual(full[f], want, "the row's %s is the card's (the tree through the projection, its tint and modal fields dropped)" % f)
+            if f != "blocked":
+                self.assertIsNotNone(full[f], "premise: the fixture populates %s" % f)
+        self.assertIsNone(full["blocked"], "a plain row's live block is None by construction (the credential floor builds the fix row; every other live block is a hard stop and takes no row)")
+        self.assertEqual(len({repr(frame["asks"][8][f]) for f in CARD_FIELDS if f != "blocked" and not isinstance(frame["asks"][8][f], bool)}), len([f for f in CARD_FIELDS if f != "blocked" and not isinstance(frame["asks"][8][f], bool)]),
+                         "premise: every non-boolean value is distinct, so a read from the wrong key shows")
         self.assertEqual(km._NEEDS_ROW_CARD_FIELDS, CARD_FIELDS, "the kernel's list of the card's fields on the row, the one the chat signature keys")
         self.assertEqual(km._NEEDS_ROW_TREE_FIELDS, TREE_FIELDS, "the kernel's projection of a tree node onto the builder's fields")
         self.assertTrue(km._hard_stop_card(frame["asks"][2]) and not km._hard_stop_card(frame["asks"][0]), "a hard stop is a card with a live-block object")
@@ -174,11 +187,11 @@ class ChatNotices(unittest.TestCase):
         km._feed_needs_rows[0] = rows
         km.post_notice(SID, "m1", "New message from api", "hello", producer="postal", actions=_held("m1"), needs_you=True, dismiss_on_action=True, now=100, t=100)
         box = km._chat_notices(SID)
-        self.assertEqual([(r["itemId"], r["kind"]) for r in box], [(g1, "goal"), (g4, "goal"), (g5, "goal"), ("notice:%s:m1:1" % SID, "notice")], "goal rows first, then the notices")
-        for r in box[:3]:
+        self.assertEqual([(r["itemId"], r["kind"]) for r in box], [(g1, "goal"), (g4, "goal"), (g5, "goal"), (SID + ":g6", "goal"), ("notice:%s:m1:1" % SID, "notice")], "goal rows first, then the notices")
+        for r in box[:4]:
             self.assertNotIn("t", r, "the unkeyed time never rides the wire (the third review of PR 1967): %r" % sorted(r))
             self.assertEqual(set(r) - {"fix"} - set(CARD_FIELDS), {"itemId", "kind", "title", "body", "cont"}, "the row's face, the card's fields it carries since the row carries what the card carries (plans/needs-you.md), and nothing else")
-        self.assertEqual(box[0]["title"], "which database does the suite target?"); self.assertEqual(box[3]["actions"], _held("m1"))
+        self.assertEqual(box[0]["title"], "which database does the suite target?"); self.assertEqual(box[4]["actions"], _held("m1"))
         self.assertEqual((box[2]["fix"], box[2]["cont"]), ("credential", False), "the credential row: the fix as its action, no Continue")
         km._feed_needs_rows[0] = {}
         self.assertEqual([r["kind"] for r in km._chat_notices(SID)], ["notice"], "a frame that re-filed the goals drops their rows")

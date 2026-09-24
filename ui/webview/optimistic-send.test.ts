@@ -53,6 +53,10 @@ test("a transcript-resetting /clear registers its optimistic bubble and ends it 
   // the boundary is passed to the reconcile from the upsert via clearBoundarySeen (a new clear card, or a
   // transcript-turn fork that catches the solo small-session /clear); the executed detection is pinned in send-pending.test.ts
   assert.match(RENDER, /const clearBoundary = [\s\S]*?clearBoundarySeen\(prev \? \(prev\.events as TailEvent\[\]\) : undefined, msg\.events as TailEvent\[\]\)\);\s*\n\s*reconcileOptimistic\(s, clearBoundary\);/);
+  // the !keepResident BELT, pinned as its own conjunct: a kept-resident frame (an empty/overlay-only build, a
+  // desync refusal that held the prior events) must NOT read as a clear boundary and end a /clear entry that
+  // never ran. Without this pin, deleting `&& !keepResident` leaves the suite green.
+  assert.match(RENDER, /const clearBoundary = !!\(existed && !keepResident\s*\n\s*&& clearBoundarySeen\(/);
   // isClearCmd is the same predicate the /clear confirm and the kernel's _is_clear_cmd read (clear-confirm.ts).
   // Its EXECUTED verification (that routeUserMessage's routing gates on it) is staged-list-cap.test.ts's lifted
   // routing test, which imports isClearCmd; here it is a source pin.

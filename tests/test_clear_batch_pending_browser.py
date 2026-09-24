@@ -17,16 +17,17 @@ records, which the kernel lands and renders through its real parse path). So the
 Ready pill, the clear boundary card and every retirement come from the kernel itself.
 
 What the real kernel path shows (and the first, injected cut could not): the FOUR report elements appear
-together WHILE the clear runs (the `mid` snapshot, held there by a small fake-SDK delay), the "Clearing
+together WHILE the clear runs (the `mid` snapshot, held there by the gate the fake SDK waits on), the "Clearing
 conversation…" row, the dashed /clear chip, and the message's dashed pending bubble. Once the clear has
 run, the fresh-episode arrives as a full `session` frame that REPLACES the view, so the "Clearing
 conversation…" row and the message's pending bubble are dropped by that replacement and the message lands
 as its own row: those two are UNREPRODUCED as PERSISTENT rows here (the after-assertions guard that they
-are gone). The element that PERSISTS at the base is the /clear, dressed "sending…": the CLIENT's own
-optimistic bubble (it lands no record, so reconcilePending never retired it) and the kernel's own /clear
-echo. The fix ends both: the client keeps the /clear bubble but retires it at the CLEAR BOUNDARY (the
-fresh episode), and the kernel retires its echo by the taken copy's qid. `clearTextAnywhere` is the
-reliable regression signal: RED at the base (the /clear rides the settled conversation), green after.
+are gone). At the base the /clear PERSISTS, dressed "sending…": the CLIENT's own optimistic bubble and the
+kernel's own /clear echo. The fix ends both: the client retires the /clear bubble at the CLEAR BOUNDARY
+(the fresh episode) and the kernel retires its echo by the taken copy's qid, while the CLI-shaped fixture
+writes the /clear's command-name record so it LANDS as a command row. `clearStuck` is the reliable
+regression signal: it matches only the two STUCK forms (the optimistic chip, the kernel echo), never the
+landed command row, so it is RED at the base (a stuck /clear rides on) and green after.
 SYNTHETIC fixtures only; skips LOUDLY without the extension deps or a browser.
 """
 import json
@@ -39,6 +40,12 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+
+# Hermetic state BEFORE any romp-code load below: romp modules resolve their state root at import
+# time and only pytest runs conftest's floor, so a bare unittest or script run would otherwise write
+# REAL ~/.local/state/romp (test_state_isolation_order.py is the ratchet).
+os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
+os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel exports it to its sessions; it outranks the XDG floor
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -92,7 +99,7 @@ const qids = await page.evaluate((msg) => ({
 }), cfg.msg);
 
 // the IN-FLIGHT state (the report's starting point): the "Clearing conversation…" row is up and the
-// message is a dashed pending bubble, WHILE the clear is still running (the fake's delay holds it here)
+// message is a dashed pending bubble, WHILE the clear is still running (the fake SDK holds it in flight on the gate file)
 await page.waitForSelector("#content .turn-clearing", { timeout: 8000 }).catch(() => {});
 const mid = await page.evaluate((msg) => {
   const txt = (el) => (el.textContent || "");
@@ -106,12 +113,39 @@ const mid = await page.evaluate((msg) => {
   };
 }, cfg.msg);
 
-// the real kernel now runs the clear (a fresh episode) and answers the message. Wait, event-based, for the
-// agent's reply to render, the moment the report describes: the reply is below and the pill reads Ready.
-await page.waitForFunction((reply) => Array.from(document.querySelectorAll("#content .turn")).some((t) => (t.textContent || "").indexOf(reply) >= 0), cfg.reply, { timeout: 30000 }).catch(() => {});
-// give the trailing pushes (status ready, the boundary card, prune) a moment to settle
-await page.waitForFunction(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(() => r(true), 0)))), null, { timeout: 4000 });
-await page.waitForTimeout(800);
+// RELEASE the in-flight clear on an EVENT, now that the in-flight snapshot is read: the fake SDK is
+// waiting on this file, so creating it is what lets the /clear run; no timer decides the timing.
+fs.writeFileSync(cfg.gate, "");
+// Before reading, WAIT on the FRAMES so the after-read never races the paint (with the 800ms settle gone it
+// could read before the base's stuck chip was drawn, a false green there in a few runs of many). Wait until
+// the recorded frames show a chatTail arriving AFTER the last clear-card session frame (the fresh episode's
+// full replace), then ONE animation frame, so the settled tail (fixed head) or the chip the session frame
+// itself paints (pre-fix base) is on screen before we read. A TimeoutError is the expected no-chatTail case,
+// where that session frame already painted the chip; only a TimeoutError is swallowed.
+await page.waitForFunction(() => {
+  const fr = window.__frames || [];
+  let lastClearSession = -1;
+  for (let i = 0; i < fr.length; i++) {
+    const f = fr[i];
+    if (f && f.type === "session" && Array.isArray(f.kinds) && f.kinds.indexOf("clear") >= 0) lastClearSession = i;
+  }
+  if (lastClearSession < 0) return false;
+  for (let i = lastClearSession + 1; i < fr.length; i++) if (fr[i] && fr[i].type === "chatTail") return true;
+  return false;
+}, null, { timeout: 8000 }).catch((e) => { if (e.name !== "TimeoutError") throw e; });
+await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => r())));
+// Now POLL, event-based, to the settled ready state the report describes: the boundary card is up AND the
+// message has landed as its own row (not a queued bubble). A SYNCHRONOUS predicate (a plain boolean DOM read),
+// so Playwright actually polls it; a Promise-returning predicate would be evaluated once and never poll (the
+// lab-quality rule). Both products reach this state; the frame-wait above pins the paint and the assertions
+// below tell them apart.
+await page.waitForFunction((c) => {
+  const txt = (el) => (el.textContent || "");
+  const reply = Array.from(document.querySelectorAll("#content .turn")).some((t) => txt(t).indexOf(c.reply) >= 0);
+  const boundary = Array.from(document.querySelectorAll("#content .turn, #content .notice")).some((el) => txt(el).indexOf("Conversation cleared") >= 0 || txt(el).indexOf("fresh one starts") >= 0);
+  const landed = Array.from(document.querySelectorAll("#content .turn.turn-user:not(.echo) .user-bubble")).some((b) => txt(b).indexOf(c.msg) >= 0);
+  return reply && boundary && landed;
+}, { reply: cfg.reply, msg: cfg.msg }, { timeout: 30000 }).catch(() => {});
 
 const after = await page.evaluate((c) => {
   const txt = (el) => (el.textContent || "");
@@ -125,14 +159,16 @@ const after = await page.evaluate((c) => {
   const msgLanded = Array.from(document.querySelectorAll("#content .turn.turn-user:not(.echo) .user-bubble")).some((b) => txt(b).indexOf(msg) >= 0);
   const replyShown = Array.from(document.querySelectorAll("#content .turn")).some((t) => txt(t).indexOf(reply) >= 0);
   const boundaryCard = Array.from(document.querySelectorAll("#content .turn, #content .notice")).some((el) => txt(el).indexOf("Conversation cleared") >= 0 || txt(el).indexOf("fresh one starts") >= 0);
-  // any stray "/clear" text in a message bubble is the never-retiring echo, however the timing dressed it
-  // (a "sending…" echo, a "not delivered" bubble): the fresh episode's records carry the /clear NOWHERE
-  const clearTextAnywhere = Array.from(document.querySelectorAll("#content .turn .user-bubble, #content .turn-queued .queued-bubble, #content .turn.echo")).some((b) => txt(b).indexOf("/clear") >= 0);
+  // The regression signal: a STUCK "/clear" (the defect), NOT the LANDED /clear command row (the fixed
+  // state). With the CLI-shaped fixture the /clear lands as a command row (.turn-cmd, which carries a
+  // .user-bubble), so a "/clear text anywhere" read would false-match it; scope instead to the two STUCK
+  // forms, the optimistic pending chip (.turn-queued .slash-cmd-chip) and the kernel echo (.turn.echo).
+  const clearStuck = Array.from(document.querySelectorAll("#content .turn-queued .slash-cmd-chip, #content .turn.echo")).some((b) => txt(b).indexOf("/clear") >= 0);
   const turnTexts = Array.from(document.querySelectorAll("#content .turn")).map((t) => (txt(t) || "").trim().slice(0, 80));
   const chip = document.getElementById("status-chip");
   const pill = chip ? (chip.textContent || "").trim() : "";
   const composer = (document.getElementById("composer-input") || {}).value || "";
-  return { clearingRow, clearingText, clearChip, clearEcho, clearTextAnywhere, turnTexts, sendingGroup, msgInQueued, msgLanded, replyShown, boundaryCard, pill, composer };
+  return { clearingRow, clearingText, clearChip, clearEcho, clearStuck, turnTexts, sendingGroup, msgInQueued, msgLanded, replyShown, boundaryCard, pill, composer };
 }, cfg);
 
 const frames = await page.evaluate(() => window.__frames || []);
@@ -183,10 +219,11 @@ class ServedClearBatchRealKernel(unittest.TestCase):
         Path(proj, SID + ".jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
         cls.port = _free_port()
         cls.token = "testtok-clearbatch"
+        cls.gate = os.path.join(cls.lab, "clear-gate")   # the fake SDK waits on this file before running the /clear; the driver creates it after the in-flight snapshot
         # the fake Agent SDK on the kernel's import path, and the synthetic reply it answers the message with
         env = _lab.kernel_env(cls.lab, claude, dist, cls.port, cls.token,
                               PYTHONPATH=FAKE_SDK, ROMP_FAKE_SDK_REPLY=REPLY,
-                              ROMP_FAKE_SDK_DELAY="0.5")   # a realistic gap so the client paints the in-flight rows first
+                              ROMP_FAKE_SDK_GATE=cls.gate)   # the fake holds the /clear IN FLIGHT until the driver creates this file (an event, not a timer)
         cls.klog = os.path.join(cls.lab, "kernel.log")
         cls.kernel = subprocess.Popen([os.path.join(BIN, "romp-kernel")],
                                       stdout=open(cls.klog, "w"), stderr=subprocess.STDOUT, env=env)
@@ -216,7 +253,7 @@ class ServedClearBatchRealKernel(unittest.TestCase):
             open(console_log, "w").close()
             with open(cfg, "w") as f:
                 json.dump({"chat": "http://127.0.0.1:%d/chat?token=%s" % (self.port, self.token),
-                           "sid": SID, "msg": MSG, "reply": REPLY, "consoleLog": console_log}, f)
+                           "sid": SID, "msg": MSG, "reply": REPLY, "gate": self.gate, "consoleLog": console_log}, f)
             driver = os.path.join(self.lab, "driver.mjs")
             with open(driver, "w") as f:
                 f.write(DRIVER)
@@ -251,10 +288,11 @@ class ServedClearBatchRealKernel(unittest.TestCase):
         r = self._result()
         a = r["after"]
         table = "\n  after=" + json.dumps(a) + "\n  qids=" + json.dumps(r["qids"])
-        # THE regression signal, reliable at the base: the /clear writes no record, so any "/clear" text left
-        # in a bubble is the never-retiring echo the report describes (dressed "sending…" or "never delivered"
-        # by the moment's timing). Base: it rides the settled conversation → red; fixed: retired by qid → green.
-        self.assertFalse(a["clearTextAnywhere"], "the /clear echo is RETIRED, no stray '/clear' bubble rides the settled conversation" + table)
+        # THE regression signal, reliable at the base: a STUCK "/clear" (the optimistic pending chip or the
+        # kernel echo), NOT the landed /clear command row the CLI-shaped fixture now produces. Base (client
+        # boundary-retire reverted): a stuck /clear chip rides on, so red; fixed: it lands as a command row
+        # and no stuck chip remains, so green.
+        self.assertFalse(a["clearStuck"], "no STUCK '/clear' (optimistic chip or kernel echo) rides the settled conversation; the /clear is a LANDED command row" + table)
         self.assertFalse(a["clearingRow"], "the 'Clearing conversation…' row is gone once the clear has run" + table)
         self.assertFalse(a["clearingText"], "no 'Clearing conversation…' text anywhere (row or statusline)" + table)
         self.assertFalse(a["sendingGroup"], "no 'sending…' group left owed" + table)
@@ -264,6 +302,32 @@ class ServedClearBatchRealKernel(unittest.TestCase):
         self.assertTrue(a["replyShown"], "the agent's reply rendered" + table)
         self.assertTrue(a["boundaryCard"], "the 'Conversation cleared' boundary card marks the fresh episode" + table)
         self.assertEqual(a["composer"], "", "the composer is empty" + table)
+
+
+class FakeSdkRefusesWithoutClaudeConfigDir(unittest.TestCase):
+    """The fake claude_agent_sdk must FAIL LOUD rather than write transcripts under the real
+    ~/.claude when CLAUDE_CONFIG_DIR is unset. Loaded by file path under a private name so it never shadows the
+    real package in sys.modules for the other tests in the run."""
+    def _load_fake(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_fake_cas_probe", os.path.join(FAKE_SDK, "claude_agent_sdk", "__init__.py"))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_unset_claude_config_dir_raises_and_a_set_one_is_used(self):
+        fake = self._load_fake()
+        saved = os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        try:
+            with self.assertRaises(RuntimeError):
+                fake._proj_dir("/tmp/some-proj")     # unset -> refuse, never touch ~/.claude
+            os.environ["CLAUDE_CONFIG_DIR"] = "/tmp/hermetic-claude-root"
+            self.assertTrue(fake._proj_dir("/tmp/some-proj").startswith("/tmp/hermetic-claude-root/projects/"),
+                            "with the var set, transcripts go under the hermetic root")
+        finally:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            if saved is not None:
+                os.environ["CLAUDE_CONFIG_DIR"] = saved
 
 
 if __name__ == "__main__":

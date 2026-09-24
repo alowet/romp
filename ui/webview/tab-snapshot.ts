@@ -19,11 +19,11 @@ import { stripInline } from "./docreview";
 
 /** The tab's state fields, the chip's awaiting fields (kind, count, rows, peers: what an awaiting session waits on), the clock. */
 export interface SnapStatusLike extends TabStateLike, ChipStatusLike { sinceEpoch?: number | null }
-export interface SnapEventLike { kind?: string; md?: string; text?: string; ts?: string; t?: number }
+export interface SnapshotEventLike { kind?: string; md?: string; text?: string; ts?: string; t?: number }
 export interface SnapColor { bg: string; fg: string }
 export interface SnapSessionLike {
   name?: string; color?: SnapColor | null; status?: SnapStatusLike | null;
-  events?: ReadonlyArray<SnapEventLike> | null;
+  events?: ReadonlyArray<SnapshotEventLike> | null;
 }
 export interface SnapLedgerLike {
   summary?: string | null; workingNote?: string | null;
@@ -90,7 +90,7 @@ const oneLine = (s: unknown, max: number): string => {
   return t.length > max ? t.slice(0, max - 1) + "…" : t;
 };
 
-function eventEpoch(ev: SnapEventLike): number | null {
+function eventEpoch(ev: SnapshotEventLike): number | null {
   if (ev.ts) { const ms = Date.parse(ev.ts); if (!isNaN(ms)) return Math.floor(ms / 1000); }
   if (ev.kind === "postal-service" && ev.t != null) return Math.floor(ev.t);
   return null;

@@ -58,13 +58,29 @@ jobs:
     # anyone finds out, and a required check that hangs blocks merges silently.
     # T230b follow-up (the review's catch): the job cap must EXCEED the pytest phase plus the
     # 600 s per-test timeout plus setup, or a stall that begins late in the run is killed by
-    # this cap first - the identical silence the per-test timeout exists to end. Measured pytest
-    # phases run 160-300 s, so 15 min left ~100 s of headroom; 25 min = 300 + 600 + setup, with
-    # margin for a slow runner. The macOS cells (a manual dispatch) run the same suite in 17 to 25
-    # minutes on the image's slower runners: the 3.10 cell took 24 min 43 s on one dispatch and was
-    # cancelled at 25 min 27 s on the next (2026-09-16), a one-minute margin that can kill the
-    # release's combined proof for nothing. macOS gets 40; Linux keeps 25.
-    timeout-minutes: ${{ matrix.os == 'macos-latest' && 40 || 25 }}
+    # this cap first - the identical silence the per-test timeout exists to end. On 2026-09-03 the
+    # measured pytest phases ran 160-300 s, so 15 min left ~100 s of headroom and 25 min was
+    # 300 + 600 + setup with margin for a slow runner. The macOS cells (a manual dispatch or the
+    # weekly schedule) run the same suite on the image's slower runners, and the suite grows with
+    # every merge: 17 to 26 minutes on 2026-09-16 (the 3.10 cell cancelled at 25 min 27 s under a
+    # 25-minute cap), 33 to 35 minutes on the dispatch of 2026-09-24 03:48 UTC, and on the release
+    # dispatch five hours later (run 35976250043) the 3.13 cell finished green in 38 min 52 s while
+    # the 3.10 cell was cancelled at 40 min 20 s by the 40-minute cap with no failure in its log,
+    # having reached 90 percent 36 min 40 s into its pytest step. The tail to add is the 3.10 cell's
+    # own, not the 3.13 cell's: from its 90 percent mark to the end of its pytest step the 3.10 cell
+    # took 6 min 56 s and 9 min 46 s on runs 35952964334 and 35623182872, against 5 min 38 s and
+    # 4 min 51 s for 3.13 (the difference sits in one progress line after 90 percent, where the
+    # three StateIsolationOrder tests took 193 s and 279 s on 3.10), so the cut cell's suite sits
+    # near 43.5 to 46.5 minutes and the rule gives 54.5 to 57. macOS gets 60, the pin's ceiling
+    # (past an hour a hung cell eats the dispatch); that clears the rule by 3 to 5.5 minutes and
+    # leaves no room for another raise, so the next growth step for the 3.10 macOS cell is
+    # splitting or sharding it (a second cell over half the modules, or a matrix of shards, which
+    # changes the check list), not a higher cap. Linux gets 35 by the same rule: the 3.10 Linux
+    # cell took 19 min 34 s on the
+    # dispatch of 2026-09-24 03:48 UTC (run 35952964334) and the Linux cells 14 to 17 minutes on
+    # the release dispatch, so 25 left under six minutes where about 20 plus 10 plus setup is
+    # about 31.
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && 60 || 35 }}
     strategy:
       # One red cell must not hide the others: a 3.10-only break and a
       # macOS-only break look identical if the matrix stops at the first.
@@ -245,9 +261,12 @@ jobs:
     # (ten failures in one served class at 87 percent added about 4 min to the step), was CANCELLED at
     # 40 min 15 s inside the served step; attempt 2 on the same head passed in 37 min 03 s. 60 min, by the
     # rule: a served step of up to 38 min plus the 600 s per-test timeout plus about 2 min of earlier steps
-    # is about 50, with margin. After the raise the served step took 35.97 to 37.92 min over sixteen
-    # consecutive main runs; the closest call was the run on 23c2a9960, its served step ending 40 min 09 s
-    # after the job started. A separate served-lab job would save only the earlier steps, about 2 min
+    # is about 50, with margin. After the raise the served step took 31.62 to 39.15 min over the sixty
+    # green main runs from 2026-09-23 06:37 UTC to 2026-09-24 10:44 UTC (35.97 to 37.77 min over the
+    # sixteen consecutive runs from f824eb06 to f2108d89, and 37.92 on 23c2a9960 shortly before them);
+    # the closest call was the run on b598eae9, its served step ending 41 min 19 s after the job
+    # started, and with a step of up to 39 min the rule's figure is about 51, the pin's floor. A
+    # separate served-lab job would save only the earlier steps, about 2 min
     # (they are about 6 percent of the job), and keeps the same cap rule; what shortens the served phase
     # is shards across parallel jobs (a matrix, which changes the required-checks list), pytest -n inside
     # the one job (the labs that print frame and timing figures stay serial), or cheaper labs.

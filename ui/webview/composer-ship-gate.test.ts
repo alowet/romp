@@ -21,8 +21,14 @@ test("a send with ships in flight is gated by the confirm: send-without is expli
   assert.match(RENDER, /\{ label: "Wait for the upload", value: "wait" \}/);
   assert.match(RENDER, /\{ label: "Send without " \+ them, value: "now", danger: true \}/,
     "sending without the file is the marked-dangerous, explicit choice");
-  assert.match(RENDER, /if \(v === "now"\) sendComposer\(\{ pastShipGate: true \}\);/);
-  assert.match(RENDER, /else if \(v === "wait"\) \{ sendOnShip\.add\(sid\); renderComposerFiles\(sid\); \}/);
+  // the answer is for the session the dialog opened over (2026-09-24): the dialog stays up across a session switch,
+  // so a switched "Send without it" refuses out loud, on the warn toast, rather than send the open tab's draft; it
+  // points at that tab's box only while the box holds what the answer would have sent there; and "Wait" repaints
+  // the strip only under its own tab. The shape is pinned here; composer-ship-gate-exec.test.ts drives it.
+  assert.match(RENDER, /if \(v === "now"\) \{\s*\n\s*if \(activeId === sid\) sendComposer\(\{ pastShipGate: true \}\);\s*\n\s*else \{/);
+  assert.match(RENDER, /const kept = !!\(drafts\.get\(sid\) \|\| ""\)\.trim\(\) \|\| \(composerFiles\.get\(sid\) \|\| \[\]\)\.length > 0;/);
+  assert.match(RENDER, /warnToast\(\(name \? "The message on “" \+ name \+ "”" : "The message"\) \+ " was not sent: the open "\s*\n\s*\+ "tab changed while the upload dialog was up\."\s*\n\s*\+ \(name && kept \? " It's still in that tab's message box\." : ""\)\);/);
+  assert.match(RENDER, /else if \(v === "wait"\) \{ sendOnShip\.add\(sid\); if \(sid === activeId\) renderComposerFiles\(sid\); \}/);
 });
 
 test("the held send fires on the LAST ack — event-based — and a nack cancels it loudly", () => {
@@ -44,8 +50,9 @@ test("the OPEN gate dialog resolves itself on the last ack: closes and sends, no
   assert.match(RENDER, /const gateOpen = shipGateSid === owner;/);
   assert.match(RENDER, /if \(gateOpen\) \{ shipGateSid = null; closeConfirm\(null\); \}/,
     "the dialog dismisses itself the moment the last ship lands, then the send fires");
-  assert.match(RENDER, /shipGateSid = null; endReloadHoldIfIdle\(\);\n\s*if \(v === "now"\)/,
-    "any button (or cancel) un-registers the gate — the ack path can never resolve a closed dialog");
+  assert.match(RENDER, /if \(shipGateSid === sid\) shipGateSid = null;\n\s*endReloadHoldIfIdle\(\);\n\s*if \(v === "now"\)/,
+    "any button (or cancel) un-registers the gate — the ack path can never resolve a closed dialog — but only its own: "
+    + "another session's upload dialog replacing it has registered itself by the time this one's cancel runs");
   // a FAILED save also moots the dialog — it closes, but never auto-sends without the file
   assert.match(RENDER, /const gateWasOpen = shipGateSid === owner;/);
   assert.match(RENDER, /if \(gateWasOpen\) \{ shipGateSid = null; closeConfirm\(null\); \}/);

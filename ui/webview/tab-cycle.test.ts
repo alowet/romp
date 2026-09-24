@@ -91,8 +91,13 @@ test("palette-main.ts registers the pair, posting the pane the messages the VS C
   assert.match(MAIN, /registerCommand\(\{ id: "chat\.nextTab", title: "Go to the next session", run: \(\) => stepSession\("nextTab"\) \}\);/);
   assert.match(MAIN, /registerCommand\(\{ id: "chat\.prevTab", title: "Go to the previous session", run: \(\) => stepSession\("prevTab"\) \}\);/);
   assert.match(MAIN, /postMessage\(\{ type: "jumpSession", id: sid, gesture: true \}, "\*"\)/, "the per-tab hot key says so too");
-  assert.match(RENDER, /else if \(m\.type === "nextTab"\) asGesture\(\(\) => cycleTab\(1\)\);[^\n]*\n\s*else if \(m\.type === "prevTab"\) asGesture\(\(\) => cycleTab\(-1\)\);/,
-               "one arm for the shell's post and the VS Code host's, run as the reader's gesture");
+  // the arm stands down under a layer of the page (2026-09-24: the shell's check saw only the full-pane surfaces, and
+  // the VS Code command never passes through it); the braces keep the next arm's else off the inner if.
+  // tab-cycle-standdown-exec.test.ts runs the arm under each layer
+  assert.match(RENDER, /else if \(m\.type === "nextTab"\) \{ if \(!paneLayerOpen\(\)\) asGesture\(\(\) => cycleTab\(1\)\); \}[^\n]*\n\s*else if \(m\.type === "prevTab"\) \{ if \(!paneLayerOpen\(\)\) asGesture\(\(\) => cycleTab\(-1\)\); \}/,
+               "one arm for the shell's post and the VS Code host's, run as the reader's gesture unless a layer of the page is up");
+  assert.match(RENDER, /installSnapshotEscape\(window, \{\n\s*showing: \(\) => !!snapView,\n\s*typing: isTypingTarget,\n\s*layerOpen: \(\) => paneLayerOpen\(\) \|\| !!openCommentKey,/,
+               "the pair and the snapshot view's Escape read one list of the page's layers; the Escape also yields to an open comment thread");
   assert.match(RENDER, /if \(m\.gesture === true\) asGesture\(\(\) => setActive\(m\.id\)\); else setActive\(m\.id\);/, "a jump carries its gesture only when the sender says so");
   assert.match(RENDER, /const gesture = gestureHeld \|\| inInputEvent\(\);/, "notifyActive reads the flag");
   assert.match(RENDER, /function asGesture\(fn: \(\) => void\): void \{\n\s*const was = gestureHeld;\n\s*gestureHeld = true;\n\s*try \{ fn\(\); \} finally \{ gestureHeld = was; \}/);

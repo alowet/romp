@@ -140,10 +140,22 @@ await page.addInitScript(() => {
       if (m.wm && typeof m.wm === "object") window.__lastAny = m;
       if (m.type === "chatTail" && m.wm && typeof m.wm === "object") window.__lastTail = m;   // the SEND's last kernel chatTail. PR 2077 (kernel.py _tail_noop) stopped the kernel sending the no-change EMPTY tail after a delta, so current main sends ONE delta with events everywhere: the red-first replays THIS, not a trailing empty tail that no longer exists
       window.__wmLog.push({ type: m.type, wm: (m.wm && typeof m.wm === "object") ? m.wm : null, ev: Array.isArray(m.events) ? m.events.length : null, n: window.__frames }); } });
+  // the page's frame-* diag rows are read where the bundle FILES them (chatDiagRow's postMessage through the shim's
+  // acquireVsCodeApi), not where a socket sends them (round eleven, 2026-09-24): the shim queues a clientDiag row while its
+  // own socket is not open, and on a starved runner the local socket's redial after the drop below lagged the whole rest
+  // of the run while the remote session's frames rode the relay socket, so the refusal happened and its row was never
+  // sent; the hook on send read "none seen" of a refusal that was filed (reproduced by a CAPPED_CPU=50% run of this
+  // class; a routeWebSocket road that closes every redial cannot stand in for it, the mock opens each redial and the
+  // shim flushes its queue on the open). The shim defines acquireVsCodeApi after this init script runs, so a setter trap
+  // wraps it the moment it is defined.
+  const wrapApi = (fn) => function () { const o = fn(); const orig = o.postMessage; o.postMessage = function (m) {
+    try { if (m && m.type === "clientDiag" && m.surface === "chat" && /^frame-/.test(m.what || "")) window.__diag.push({ what: m.what, data: m.data }); } catch (e) {}
+    return orig.call(this, m); }; return o; };
+  let api;
+  Object.defineProperty(window, "acquireVsCodeApi", { configurable: true, get() { return api; }, set(fn) { api = typeof fn === "function" ? wrapApi(fn) : fn; } });
   const origSend = WebSocket.prototype.send;
   WebSocket.prototype.send = function (d) {
-    try { const m = JSON.parse(d); if (m && m.type === "sendMessage") window.__sent.push({ text: m.text, qid: m.qid, t: Date.now() });
-          if (m && m.type === "clientDiag" && m.surface === "chat" && /^frame-/.test(m.what || "")) window.__diag.push({ what: m.what, data: m.data }); } catch (e) {}
+    try { const m = JSON.parse(d); if (m && m.type === "sendMessage") window.__sent.push({ text: m.text, qid: m.qid, t: Date.now() }); } catch (e) {}
     if (!window.__sockets.includes(this)) window.__sockets.push(this);
     return origSend.call(this, d);
   };
@@ -326,6 +338,7 @@ if (on("G")) {
     // landed row survives. With the floor derived from window.__last.wm alone (the session-only base) instead of __lastAny,
     // the injection is only a MIXED reading of the page's real floor, so the re-posted delta APPLIES: it truncates the tail
     // and files frame-drops-landed, dropping the injected row (render.ts droppedLandedHuman). Red at that floor, green here.
+    injected.socketsAtRepost = await page.evaluate(() => window.__sockets.map((s) => [String(s.url).replace(/token=[^&]*/, "token=X").replace(/^ws:\/\/[^/]*/, "").slice(0, 60), s.readyState]));
     injected.reposted = await page.evaluate((bl) => {
       const fr = window.__lastTail;   // the SEND's last kernel chatTail; NOT a connect-time tail (guard: its live is above the base session frame's read at capture)
       if (!fr || !fr.wm || typeof fr.wm.live !== "number" || fr.wm.live <= bl) return null;

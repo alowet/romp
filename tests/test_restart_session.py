@@ -14,7 +14,8 @@ What this pins, on both sides of the backend seam:
     the registry row is never flipped dead, nothing is killed, no death record is written, and the session
     is live throughout: no surface can paint it dead on the way through. A RUNNING turn is cut — the
     reconnect is armed BEFORE the interrupt, so the arm exists before the interrupted turn's result fires
-    it — while a merely queued one is not cut at all. A dormant row has no process to replace and is simply
+    it, and the cut is the polite request alone, once per stop episode, never Stop's signals — while a
+    merely queued one is not cut at all. A dormant row has no process to replace and is simply
     connected. A sid romp has no record of, and a row that is not alive, refuse in words the user reads.
 
   * _restart_session, the door behind the WS restartSession op. It hands the work to the OWNING backend
@@ -80,8 +81,9 @@ class _Sess:
     def request_reconnect(self, defer=True):
         self.calls.append(("request_reconnect", defer))
 
-    def interrupt(self):
-        self.calls.append(("interrupt",))
+    def interrupt(self, climb=True):
+        self.calls.append(("interrupt",) if climb else ("interrupt", "polite only"))
+        return True
 
 
 class RelaunchPrimitive(unittest.TestCase):
@@ -107,7 +109,7 @@ class RelaunchPrimitive(unittest.TestCase):
         _reg(self.d)
         self.be.sessions[SID] = _Sess(self.calls, inflight=1)
         self.assertEqual(self.relaunch(), "")
-        self.assertEqual(self.calls, [("request_reconnect", True), ("interrupt",)],
+        self.assertEqual(self.calls, [("request_reconnect", True), ("interrupt", "polite only")],
                          "armed before the cut: the interrupted turn's result must find the arm standing")
 
     def test_a_queued_turn_with_nothing_running_is_not_interrupted(self):
@@ -158,6 +160,58 @@ class RelaunchPrimitive(unittest.TestCase):
         # inherit — so a backend never reads as relaunchable by omission
         self.assertIn("no way to relaunch", km._UNOWNED.relaunch(SID))
         self.assertIn("revive", km._UNOWNED.relaunch(SID))
+
+
+class _Loop:
+    """The session's event loop as interrupt() touches it: what it schedules is counted, never run."""
+
+    def __init__(self):
+        self.scheduled = 0
+
+    def call_soon_threadsafe(self, fn):
+        self.scheduled += 1
+
+
+class RelaunchNeverClimbsTheStopLadder(unittest.TestCase):
+    """A Restart asks a running turn to stop once, politely, and never signals the CLI (the post-merge review of
+    #2059, 2026-09-24). relaunch rode Stop's interrupt, which climbs control request, SIGINT, SIGKILL on each
+    press: clicking Restart again on a CLI that ignored the request killed it on the third click, or on the
+    second after an unsettled Stop, and the armed reconnect waits for a result that then never comes, so the
+    session was left with no CLI. A real SdkSession, its channel up and its turn ignoring every request; the
+    signal rung is recorded instead of sent."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.be = _backend(self.d)
+        _reg(self.d)
+        s = self.s = sb.SdkSession(self.be, sb.read_reg(Path(self.d), SID))
+        self.be.sessions[SID] = s
+        s.inflight = 1
+        s.loop, s.client = _Loop(), object()
+        self.signals = []
+        s._signal_cli = lambda sig, action: self.signals.append(action)
+        s.request_reconnect = lambda defer=True: None      # the arm; RelaunchPrimitive pins its order
+
+    def test_repeated_restarts_send_one_polite_request_and_no_signal(self):
+        for _ in range(3):
+            self.assertEqual(self.be.relaunch(SID), "")
+        self.assertEqual(self.signals, [], "a Restart never sends SIGINT or SIGKILL")
+        self.assertEqual(self.s.loop.scheduled, 1, "one control request for the episode, not one per click")
+
+    def test_a_restart_after_an_unsettled_stop_sends_nothing_more(self):
+        self.s.interrupt()                                  # Stop: the polite request, which the CLI ignores
+        for _ in range(2):
+            self.assertEqual(self.be.relaunch(SID), "")
+        self.assertEqual((self.signals, self.s.loop.scheduled), ([], 1))
+
+    def test_stop_still_climbs_past_a_restarts_request(self):
+        # the ladder is Stop's and stays (terminal parity): a Restart's request is the episode's polite rung, so
+        # the next Stop signals, and a Restart that sent nothing moved no rung: SIGINT still comes before SIGKILL
+        for _ in range(2):
+            self.assertEqual(self.be.relaunch(SID), "")
+        self.s.interrupt()
+        self.s.interrupt()
+        self.assertEqual(self.signals, ["sigint", "sigkill"])
 
 
 class _Be:

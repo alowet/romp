@@ -77,12 +77,26 @@ if log:
 if os.environ.get("JE_TEST_KILL_ALL") and judge in ("planner", "closer", "unblocker"):   # kill EVERY arm call (none ever serves): no usage row lands, so the budget stop must price kills from the floor
     import signal as _sig
     os.kill(os.getpid(), _sig.SIGALRM); sys.exit(1)
-_killdir = os.environ.get("JE_TEST_KILL_FIRST")                # kill-first knob: the FIRST planner and closer call (per judge; the test clears the dir between arms) dies
-if _killdir and judge in ("planner", "closer"):                # like a timer kill (empty stdout, returncode -SIGALRM), so the retry's re-sample road is exercised
+_kte = os.environ.get("JE_TEST_KILL_PLANNER_THEN_EMPTY")       # <dir>: the first PLANNER call's first attempt KILLS, its re-sample serves an EMPTY envelope (result "", last_call_fail None)
+if _kte and judge == "planner":                                # so killedCalls reads 1 (one real kill) where the old fak+retry-rec reads 2 (PR 2122 review medium 2)
     import signal as _sig
+    _mk = os.path.join(_kte, "planner")
+    if not os.path.exists(_mk):
+        open(_mk, "w").write("killed"); os.kill(os.getpid(), _sig.SIGALRM); sys.exit(1)
+    elif open(_mk).read() == "killed":
+        open(_mk, "w").write("emptied")
+        print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 7, "duration_api_ms": 5,
+                          "num_turns": 1, "result": "", "stop_reason": "end_turn", "session_id": "11111111-2222-4333-8444-555555555555",
+                          "total_cost_usd": 0.01, "usage": {"input_tokens": 10, "output_tokens": 5}}))
+        sys.exit(0)                                            # a served EMPTY reply on the re-sample: not a kill, not a pause
+_killdir = os.environ.get("JE_TEST_KILL_FIRST")                # kill-first knob: the FIRST planner/closer call dies for its first N attempts (per judge; the test clears the dir between arms)
+if _killdir and judge in ("planner", "closer"):                # like a timer kill (empty stdout, returncode -SIGALRM), so the retry's re-sample road is exercised. N per judge via JE_TEST_KILL_FIRST_<JUDGE> (default 1)
+    import signal as _sig
+    _thr = int(os.environ.get("JE_TEST_KILL_FIRST_%s" % judge.upper(), "1"))
     _marker = os.path.join(_killdir, judge)
-    if not os.path.exists(_marker):
-        open(_marker, "w").write("x")                          # only the first call of each judge kills; the re-sample (a fresh process) finds the marker and serves
+    _n = int(open(_marker).read()) if os.path.exists(_marker) else 0
+    if _n < _thr:                                              # kill the first call's first N attempts; the (N+1)th attempt and every later call serve
+        open(_marker, "w").write(str(_n + 1))
         _alog = os.environ.get("JE_TEST_ALARM_LOG")
         if _alog:
             open(_alog, "a").write("%s %d\n" % (judge, _sig.alarm(0)))   # the perl alarm the arm set: 240 at the harness alarm, 120 if the alarm-raise is removed
@@ -105,10 +119,15 @@ elif judge == "labeller":
                else "undone" if re.search(r"not done", text, re.I) else "finished")
     reply_text = json.dumps({"class": cls, "why": "synthetic"})
 elif judge == "closer":
-    reply_text = json.dumps({"done": [], "block": [{"goal": 1, "why": "the go-ahead is owed"}]} if (cand and flag)
-                            else {"done": [{"goal": 1, "why": "delivered"}], "block": []})
+    if os.environ.get("JE_TEST_CLOSER_NOOP"):
+        reply_text = json.dumps({"done": [], "block": []})     # a closer that files no verdict, so a minted top keeps NO done/block (the scored-boundary pin)
+    else:
+        reply_text = json.dumps({"done": [], "block": [{"goal": 1, "why": "the go-ahead is owed"}]} if (cand and flag)
+                                else {"done": [{"goal": 1, "why": "delivered"}], "block": []})
 elif judge == "planner":
-    if not menu_has:
+    if os.environ.get("JE_TEST_PLANNER_MINT"):
+        reply_text = json.dumps({"ops": [{"why": "a fresh ask this turn", "do": "mint", "text": "A turn-minted goal"}]})   # ALWAYS mint a new top (even on a non-empty menu), so an opener-less ending has an own-turn top with no verdict
+    elif not menu_has:
         reply_text = json.dumps({"ops": [{"why": "the ask", "do": "mint", "text": "The synthetic goal"}]})
     elif cand and flag:
         reply_text = json.dumps({"ops": [{"why": "the go-ahead is owed", "do": "block", "goal": 1}]})
@@ -505,6 +524,31 @@ class Harness(unittest.TestCase):
             self.assertNotIn("s3#work", store["placements"], "the turn unit at the cut is left to plan")
             self.assertNotIn("s4#work", store["placements"], "the turn unit after the cut is left to plan")
 
+    def test_own_turn_plannable_count_counts_only_work_and_live_units(self):
+        """The excuse fix (PR 2143): the count is only the units the ARM's planner plans with an UNCONDITIONAL model call from a
+        sealable own-turn position (work / live). A `prompt` (opener) is the opener judge's; a `nudge` is resolve-or-noop whose
+        own-turn instance is never sealed (so an unplanned one is one of the kernel's no-call roads, not a fault); a `delegation`
+        drives no planner call in the arm (no courier runs). So work + delegation counts 1 (only work), a NUDGE-ONLY own turn
+        counts 0 (excused), a work unit counts. The pre-fix code (phase != 'prompt') counted nudge and delegation: this reds it."""
+        import types as _t
+        session = {"turns": [[{"id": "s1"}, {"id": "s2"}, {"id": "s3"}, {"id": "s4"}]]}
+        jd = _t.SimpleNamespace()
+        jd.episode_floor = lambda fsid: None
+        jd._segs = lambda turn, store: turn
+        jd._unit_key = lambda seg, phase: "%s#%s" % (seg, phase)
+        jd._placed_key = lambda placements, key, live=None, floor=None: False   # none placed
+        store = {"placements": {}}
+        jd.plan_units = lambda session, store, floor=None, lazy_text=True: [("s1", "prompt", 100), ("s2", "nudge", 100), ("s3", "work", 100), ("s4", "delegation", 100)]
+        self.assertEqual(self.je.own_turn_plannable_count(jd, "fsid", session, store), 1, "only the work unit counts; prompt (opener), nudge and delegation (no courier in the arm) do not")
+        jd.plan_units = lambda session, store, floor=None, lazy_text=True: [("s2", "nudge", 100)]
+        self.assertEqual(self.je.own_turn_plannable_count(jd, "fsid", session, store), 0, "a nudge-only own turn counts zero: an unplanned own-turn nudge is a no-call road, not a fault")
+        jd.plan_units = lambda session, store, floor=None, lazy_text=True: [("s4", "delegation", 100)]
+        self.assertEqual(self.je.own_turn_plannable_count(jd, "fsid", session, store), 0, "a delegation-only own turn counts zero: the arm runs no courier, so it drives no planner call in any arm")
+        jd.plan_units = lambda session, store, floor=None, lazy_text=True: [("s3", "work", 100), ("s3b", "live", 100)]
+        jd._segs = lambda turn, store: [{"id": "s3"}, {"id": "s3b"}]
+        session = {"turns": [[{"id": "s3"}, {"id": "s3b"}]]}
+        self.assertEqual(self.je.own_turn_plannable_count(jd, "fsid", session, store), 2, "work and live both count: they reach plan_llm unconditionally")
+
     def test_a_minted_top_scores_by_the_seedstart_boundary_not_startt(self):
         """PR 2099 review low 3: a top the arm mints in the ending's own turn WITHOUT filing a done or block on it records as
         SCORED, by the seedStart cut boundary. For an opener-less ending startT is None, so reverting the boundary to startT
@@ -758,6 +802,7 @@ class Harness(unittest.TestCase):
                     d["plannableUnits"] = 0                  # the own turn had nothing for the planner: excused (comparability only)
                     if leak:
                         d["builds"] = leak_builds
+                        d["retry"] = {"firstAttemptKills": 1, "retryAttempts": 1, "recoveredCalls": 1, "killedCalls": 1}   # a per-ending retry record: the measure carries it into the attribution row (PR 2122 review point 4)
                 endings[x["id"]] = d
             Path(run_root, arm, "results.json").write_text(json.dumps(
                 {"arm": arm, "failures": 0, "buildsPerCard": 3, "finished": True, "callsByJudge": {"planner": 5, "closer": 5},
@@ -772,6 +817,8 @@ class Harness(unittest.TestCase):
         self.assertEqual(by["A"]["endings"], len(m["endings"]), "every ending is in the count; the excuse removes none")
         self.assertFalse(by["A"]["comparable"], "A has an ending the others planned (e_one): not comparable")
         self.assertTrue(by["B"]["comparable"] and by["C"]["comparable"], "B and C's only unplanned is the excused one: comparable")
+        arow = [a for a in by["A"]["attribution"] if a["id"] == e_leak][0]   # the measure carries the ending's per-ending retry into its attribution row (PR 2122 review point 4)
+        self.assertEqual((arow.get("retry") or {}).get("killedCalls"), 1, "the attribution row carries the ending's own retry record")
         table = (Path(run_root) / "table.md").read_text()
         self.assertIn("corpus-unplanned", table)
         self.assertIn("complete: all 3 expected arms finished", table)
@@ -839,6 +886,36 @@ class Harness(unittest.TestCase):
         em = captured["jd"].em
         self.assertLessEqual(len(em._ASM_CACHE), 1, "run_arm_inprocess evicts each ending: assembly cache flat, not %d of %d" % (len(em._ASM_CACHE), len(m["endings"])))
         self.assertLessEqual(len(em._JSONL_CACHE), 1, "run_arm_inprocess evicts each ending: record cache flat, not %d of %d" % (len(em._JSONL_CACHE), len(m["endings"])))
+
+    def test_a_nudge_only_unplanned_ending_reads_arms_comparable_via_the_parse(self):
+        """The excuse fix (PR 2143), report level: a run whose only unplanned-in-every-arm ending is NUDGE-ONLY (its own turn a romp
+        Nudge, which drives no planner model call on an absent/resolved goal) reads all arms COMPARABLE through the parse
+        fallback. The pre-fix count treated the nudge as a plannable unit and read every arm not comparable."""
+        nsid = "11111111-2222-4444-8888-00000000abcd"
+        g = nsid + ":g1"
+        recs = [uline(nsid, T0, "add a retry to the uploader", "nu0", None),
+                aline(nsid, T0 + 30, "Added the retry.", "na0", "nu0"),
+                uline(nsid, T0 + 600, "<!-- romp-injected --><!-- romp-goal-id: %s --> where does this stand?" % g, "nu1", "na0"),
+                aline(nsid, T0 + 630, "Still going.", "na1", "nu1")]
+        (self.pdir / (nsid + ".jsonl")).write_text("".join(json.dumps(r) + "\n" for r in recs))
+        (self.state / "names" / nsid).write_text("web\t%s\t#abcdef\n" % self.cwd)
+        dest, m = self._corpus(name="nudgecorpus")
+        ne = self._ending(m, nsid, 1)                        # the turn-1 ending: its own turn is the romp Nudge
+        run_root = os.path.join(self.td, "runs-nudge")
+        env = {k: os.environ.get(k) for k in ("XDG_STATE_HOME", "CLAUDE_CONFIG_DIR", "ROMP_CLAUDE_BIN")}
+        self.addCleanup(lambda: [os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v) for k, v in env.items()])
+        for arm in ("A", "B"):
+            self.je.run_arm_inprocess(dest, arm, None, run_root, None, self.fake, now=T0 + 10**6)
+        Path(run_root, "arms.json").write_text(json.dumps({"arms": ["A", "B"]}))
+        for arm in ("A", "B"):                               # the nudge ending planned nothing (its goal-id resolves to no node in the fresh seed -> the kernel's no-resolvable-target road, one of its three no-call roads); strip the recorded count to force the PARSE fallback (as the launch-head arms had none)
+            rp = Path(run_root, arm, "results.json"); r = json.loads(rp.read_text())
+            self.assertIn(ne["id"], r["endingsUnplanned"], "the nudge ending is unplanned in arm %s: %r" % (arm, r["endingsUnplanned"]))
+            for e in r["endings"].values():
+                e.pop("plannableUnits", None)
+            rp.write_text(json.dumps(r))
+        by = {r["arm"]: r for r in self.je.report(dest, run_root, str(self.state))}
+        self.assertIn(ne["id"], by["A"]["excusedEndings"], "the nudge-only ending is excused (own-turn nudge counts 0 plannable units, via the parse): %r" % by["A"]["excusedEndings"])
+        self.assertTrue(by["A"]["comparable"] and by["B"]["comparable"], "both arms read comparable: the only unplanned ending is a no-call nudge (a no-resolvable-target road)")
 
     def test_a_seal_boundary_fault_is_not_excused_and_marks_every_arm_not_comparable(self):
         """The grounded excuse's key case (the contributor's fixture, manager 2026-09-24): with the seed boundary set PAST the
@@ -1116,7 +1193,7 @@ class Harness(unittest.TestCase):
         ep.write_text(""); c4 = {}
         jd = fake_jd(lambda n: "fail" if n == 0 else "serve", judge="gister")
         self.je.install_call_retry(jd, ep, c4, attempts=3)
-        self.assertEqual((jd._judge_run_impl(judge="gister"), c4["firstAttemptKills"]), ("ok", 0), "a non-arm recovery is not an arm kill")
+        self.assertEqual((jd._judge_run_impl(judge="gister"), c4["firstAttemptKills"], c4["killedCalls"]), ("ok", 0, 0), "a non-arm recovery is not an arm kill and not counted in killedCalls (the arm-only guard; `if True` would count it) (PR 2122 review medium 3)")
         ep.write_text(""); c5 = {}
         jd = fake_jd(lambda n: "pause")
         self.je.install_call_retry(jd, ep, c5, attempts=3)
@@ -1132,6 +1209,7 @@ class Harness(unittest.TestCase):
         jd = fake_jd(lambda n: "fail" if n == 0 else "pause_stale")
         self.je.install_call_retry(jd, ep, c7, attempts=3)
         self.assertEqual((jd._judge_run_impl(judge="planner"), c7["firstAttemptKills"], c7["recoveredCalls"]), ("", 1, 0), "a pause after a kill ends the retry via the paused conjunct but is NOT counted a recovery")
+        self.assertEqual(c7["killedCalls"], 1, "ONE genuine kill: the wrapper counts kills directly, so a pause after a kill is not a second kill (fak+retry-rec would over-count it as 2) (PR 2122 review point 7)")
         self.assertEqual(self.je.count_failure_rows(ep), 0, "the earlier kill's row is still tagged out when the pause returns (not a final failure)")
         # a tagged (retried) row is skipped by BOTH counters, arm and non-arm
         ep.write_text(json.dumps({"judge": "planner", "err": "call", "note": "timeout", "retried": True}) + "\n"
@@ -1180,8 +1258,9 @@ class Harness(unittest.TestCase):
             return jd
         self.je.load_judge = patched
         self.addCleanup(lambda: setattr(self.je, "load_judge", orig))
-        self._restore_arm_env(("JE_TEST_KILL_FIRST", "JE_TEST_ALARM_LOG"))
+        self._restore_arm_env(("JE_TEST_KILL_FIRST", "JE_TEST_KILL_FIRST_PLANNER", "JE_TEST_ALARM_LOG"))
         os.environ["JE_TEST_KILL_FIRST"] = killdir
+        os.environ["JE_TEST_KILL_FIRST_PLANNER"] = "2"   # kill the first PLANNER call on its first TWO attempts (closer once), so the counters DIFFER: 2/3/2 (PR 2122 review point 6)
         os.environ["JE_TEST_ALARM_LOG"] = alarmlog
         res = []
         for arm in ("A", "B"):
@@ -1190,23 +1269,31 @@ class Harness(unittest.TestCase):
             res.append(self.je.run_arm_inprocess(dest, arm, None, run_root, None, self.fake, now=T0 + 10**6, builds=1))
         for r in res:
             self.assertEqual(r["failures"], 0, "the first-call kills recovered on re-sample: no failure (%r)" % r.get("failuresByKind"))
-            self.assertEqual((r["retry"]["firstAttemptKills"], r["retry"]["recoveredCalls"]), (2, 2), "the planner and closer first calls each killed once and recovered: %r" % r["retry"])
+            self.assertEqual((r["retry"]["firstAttemptKills"], r["retry"]["retryAttempts"], r["retry"]["recoveredCalls"]), (2, 3, 2),
+                             "planner killed twice + closer once, each recovered: fak/retry/rec = 2/3/2 (%r)" % r["retry"])
+            self.assertEqual(r["retry"]["killedCalls"], 3, "three genuine kills (2 planner + 1 closer), the wrapper's direct tally: %r" % r["retry"])
             self.assertEqual(r["failuresByKind"], {}, "nothing failed every attempt")
+            # the per-ending retry record: exactly one ending (the arm's first) carries the whole delta, and the endings sum to the arm total (PR 2122 review point 4)
+            per = [e.get("retry") or {} for e in r["endings"].values()]
+            self.assertEqual(sum(p.get("firstAttemptKills", 0) for p in per), 2, "the per-ending retry records sum to the arm's kills: %r" % per)
+            self.assertEqual(sum(p.get("retryAttempts", 0) for p in per), 3, "the per-ending re-samples sum to the arm total")
         Path(run_root, "arms.json").write_text(json.dumps({"arms": ["A", "B"]}))
         rows = self.je.report(dest, run_root, str(self.state))
         self.assertTrue(all(x["comparable"] for x in rows), "both arms recovered and read comparable")
-        # the review's fix named the three retry columns and the failures cell: the table shows the counters and a 0 failures cell (PR 2092 review low b)
+        # the three retry columns are asserted against counters that DIFFER (2/3/2), so a transposed or repeated print reds (PR 2122 review point 6)
         table = (Path(run_root) / "table.md").read_text()
         row = [l for l in table.splitlines() if l.startswith("| A |")][0]
         cells = [c.strip() for c in row.strip("|").split("|")]
-        self.assertEqual((cells[-4], cells[-3], cells[-2]), ("2", "2", "2"), "the table prints first-attempt kills / re-samples / recovered = 2/2/2 for the arm: %r" % row)
+        self.assertEqual((cells[-4], cells[-3], cells[-2]), ("2", "3", "2"), "the table prints first-attempt kills / re-samples / recovered = 2/3/2 for the arm: %r" % row)
         self.assertEqual(cells[-1], "0", "the failures cell reads 0 (comparable after recovery): %r" % row)
         for c in caps:
             self.assertEqual(c["jd"]._judge_run_impl.__name__, "_judge_run_impl", "the retry wrapper (_retrying) is restored to the module's original _judge_run_impl after the arm")
             self.assertEqual(c["jd"].CALL_ALARM_S, c["alarm"], "the module alarm is restored to its pre-arm value (120s)")
             self.assertEqual(c["alarm"], 120, "the module alarm before the arm is the production 120s")
-        observed = {int(l.split()[1]) for l in Path(alarmlog).read_text().splitlines() if l.strip()}
-        self.assertEqual(observed, {240}, "each killed call ran under the arm's HARNESS_ALARM_S (240s); the alarm-raise mutant would read 120: %r" % observed)
+        observed = [int(l.split()[1]) for l in Path(alarmlog).read_text().splitlines() if l.strip()]
+        # Linux alarm() rounds the remaining seconds, so a fake reached >0.5s after perl's alarm reads 239: assert each value is
+        # in (120, 240], which still reds without the alarm raise (that would read 120), without flaking on a loaded runner (PR 2122 review point 1)
+        self.assertTrue(observed and all(120 < v <= 240 for v in observed), "each killed call ran under the arm's HARNESS_ALARM_S (>120, <=240); the alarm-raise mutant reads 120: %r" % observed)
 
     def test_the_budget_stop_counts_killed_attempts_from_a_floor_when_no_row_landed(self):
         """PR 2122 review medium 3: a killed attempt writes no usage row, so with the ledger EMPTY the mean-cost estimate is 0
@@ -1220,6 +1307,7 @@ class Harness(unittest.TestCase):
         self.assertIsNotNone(res.get("stopped"), "the arm STOPS on the killed-attempt floor estimate though the ledger is empty")
         self.assertGreater(res["stopped"].get("killedAttempts", 0), 0, "the stop names the killed attempts it counted at the floor")
 
+    @unittest.skipIf(os.geteuid() == 0, "chmod-based unreadable/unwritable path does not stop root, so the assertRaises would fail")
     def test_tag_surfaces_a_read_failure_and_never_overwrites_the_ledger(self):
         """PR 2122 review low a: _tag's read path must SURFACE a read failure, never swallow it to an empty list and then write
         that over the ledger, destroying rows. With the errors file unreadable when the recovery tag reads it, the tag raises
@@ -1246,6 +1334,99 @@ class Harness(unittest.TestCase):
         finally:
             os.chmod(ep, 0o644)
         self.assertEqual(len(ep.read_text().splitlines()), 3, "the ledger's rows are preserved, never overwritten with an empty list on a failed read")
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod-based unreadable/unwritable path does not stop root, so the assertRaises would fail")
+    def test_tag_surfaces_a_write_failure_and_leaves_the_ledger_intact(self):
+        """PR 2122 review point 5: _tag's WRITE half. An unwritable directory makes the temp write fail; _tag surfaces it
+        (raises) rather than swallowing it, and never truncates the ledger with an in-place rewrite. A swallowed or in-place
+        write reds this."""
+        d = Path(self.td) / "tagwrite"; d.mkdir()
+        ep = d / "e.jsonl"
+        ep.write_text(json.dumps({"judge": "planner", "err": "x", "note": "one"}) + "\n")
+        ctx = types.SimpleNamespace(paused=False, last_call_fail=None)
+        jd = types.SimpleNamespace(_judge_ctx=ctx)
+        calls = {"n": 0}
+        def impl(*a, **k):
+            n = calls["n"]; calls["n"] += 1
+            if n == 0:
+                with ep.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"judge": "planner", "err": "call", "note": "kill"}) + "\n")
+                ctx.last_call_fail = {"note": "kill"}; return ""
+            os.chmod(d, 0o555)                                   # the recovery tag's temp WRITE into this dir will now fail
+            ctx.last_call_fail = None; return "ok"
+        jd._judge_run_impl = impl
+        self.je.install_call_retry(jd, ep, {}, attempts=3)
+        try:
+            with self.assertRaises(OSError):
+                jd._judge_run_impl(judge="planner")
+        finally:
+            os.chmod(d, 0o755)
+        self.assertEqual(len(ep.read_text().splitlines()), 2, "the ledger is intact (the kill row + the original), never truncated by a failed write")
+
+    def test_an_opener_less_minted_top_is_scored_by_the_boundary_at_the_call_site(self):
+        """PR 2122 review point 2: pin the SCORED rule at its CALL SITE, not only top_scored's unit test. For an opener-less
+        ending (startT None) whose own turn mints a top the arm files no verdict on, that top reads scored by the seedStart
+        boundary the call site passes; passing the turn start (None) there would drop it. Kill nothing; mint every planner call
+        and no-op the closer, so the only scored tops are the own-turn mints scored purely by the boundary."""
+        self._judge_written_stores()
+        dest, m = self._corpus(name="openerscore")
+        mp = Path(dest, "manifest.json"); mm = json.loads(mp.read_text())
+        for e in mm["endings"]:
+            e["startT"] = None                                   # read them as opener-less continuations; seedStart keeps the value build_corpus recorded (in this 2-turn fixture the turn's own start, e.g. T0+600, not the previous turn's end)
+        mp.write_text(json.dumps(mm))
+        self._restore_arm_env(("JE_TEST_PLANNER_MINT", "JE_TEST_CLOSER_NOOP"))
+        os.environ["JE_TEST_PLANNER_MINT"] = "1"; os.environ["JE_TEST_CLOSER_NOOP"] = "1"
+        res = self.je.run_arm_inprocess(dest, "current", None, os.path.join(self.td, "r-openerscore"), None, self.fake, now=T0 + 10**6, builds=1)
+        scored = [(eid, sfx) for eid, e in res["endings"].items() for b in e["builds"] for sfx, v in b.items() if v.get("scored")]
+        self.assertTrue(scored, "an opener-less ending's minted-no-verdict top scores by the seedStart boundary at the call site (the None-boundary revert reds this): %r"
+                        % {eid: e["builds"] for eid, e in res["endings"].items()})
+
+    def test_the_killed_count_ignores_a_served_empty_reply_after_a_kill(self):
+        """PR 2122 review medium 2: the budget's killed count is the wrapper's DIRECT tally, not firstAttemptKills +
+        retryAttempts - recoveredCalls. A kill followed by a served-EMPTY reply (not a kill, not a recovery) is ONE kill; the
+        old formula reads two. An arm-level run with that scenario and a tiny budget stops with killedAttempts == 1."""
+        dest, m = self._corpus(name="killempty")
+        kdir = os.path.join(self.td, "kte"); os.makedirs(kdir)
+        self._restore_arm_env(("JE_TEST_KILL_PLANNER_THEN_EMPTY",))
+        os.environ["JE_TEST_KILL_PLANNER_THEN_EMPTY"] = kdir
+        res = self.je.run_arm_inprocess(dest, "A", None, os.path.join(self.td, "r-killempty"), 0.001, self.fake, now=T0 + 10**6, builds=1)
+        st = res.get("stopped")
+        self.assertIsNotNone(st, "the tiny budget stops the arm after the first ending")
+        self.assertEqual(st["killedAttempts"], 1, "one real kill: a served-empty reply after the kill is NOT a second kill (the old fak+retry-rec formula reads 2)")
+
+    def test_the_budget_stop_prices_kills_at_the_mean_when_rows_landed(self):
+        """PR 2122 review point 3: the budget stop's MEAN-COST branch (rows landed) is pinned, not only the floor. A kill-first
+        run with landed rows adds the killed attempts at the mean call cost, so the stop's estimate EXCEEDS the ledger cost;
+        pricing kills at zero when a row landed would leave estCost == cost, which this reds."""
+        dest, m = self._corpus(name="killmean")
+        killdir = os.path.join(self.td, "killdir-mean"); os.makedirs(killdir)
+        self._restore_arm_env(("JE_TEST_KILL_FIRST", "JE_TEST_KILL_FIRST_PLANNER"))
+        os.environ["JE_TEST_KILL_FIRST"] = killdir
+        os.environ["JE_TEST_KILL_FIRST_PLANNER"] = "2"           # 3 kills over the first ending (planner x2 + closer x1), all recovered, with landed rows
+        res = self.je.run_arm_inprocess(dest, "A", None, os.path.join(self.td, "r-killmean"), 0.001, self.fake, now=T0 + 10**6, builds=1)
+        st = res.get("stopped")
+        self.assertIsNotNone(st, "the tiny budget stops the arm after the first ending")
+        self.assertGreater(res.get("calls") or 0, 0, "rows landed (the recovered calls), so the mean-cost branch is exercised, not the floor")
+        self.assertGreater(st["killedAttempts"], 0, "killed attempts were counted at the stop")
+        self.assertEqual(st["estCost"], round(st["cost"] + st["killedAttempts"] * res["cost"] / res["calls"], 4),
+                         "the estimate prices each killed attempt at the MEAN landed call cost (cost/calls), not the floor and not zero: %r" % st)
+
+    def test_a_partial_run_report_names_the_candidate_count_it_would_excuse(self):
+        """PR 2122 review point 9: on a PARTIAL run the corpus-unplanned line prints the candidate set (what WOULD be excused
+        once complete), not a false 0. Two expected arms, one present: the line names the 1 ending unplanned in every present
+        arm and that 1 would be a candidate once complete."""
+        dest, m = self._corpus(name="partialline")
+        e0 = m["endings"][0]["id"]
+        run_root = os.path.join(self.td, "runs-partialline"); os.makedirs(run_root)
+        Path(run_root, "arms.json").write_text(json.dumps({"arms": ["A", "B"]}))   # two expected; only A present -> incomplete
+        os.makedirs(os.path.join(run_root, "A"))
+        Path(run_root, "A", "results.json").write_text(json.dumps(
+            {"arm": "A", "failures": 0, "buildsPerCard": 3, "finished": True, "callsByJudge": {"planner": 5, "closer": 5},
+             "endingsUnplanned": [e0], "endings": {x["id"]: {"class": x["class"], "builds": [{}] * 3} for x in m["endings"]}}))
+        self.je.report(dest, run_root, str(self.state))
+        line = [l for l in (Path(run_root) / "table.md").read_text().splitlines() if l.startswith("corpus-unplanned")][0]
+        self.assertIn("1 ending(s) planned nothing in EVERY present arm", line, "the partial line names the candidate count, not a false 0: %r" % line)
+        self.assertIn("1 would be candidates", line)
 
     def test_a_crashed_ending_is_evicted_from_the_event_model_caches(self):
         """Verifier low (a): the crash-path eviction (the finally around the build) drops a crashed ending's document from both
@@ -1300,17 +1481,54 @@ class Harness(unittest.TestCase):
         self.assertEqual(cand["promptHashes"]["PLAN_SYS"], base["promptHashes"]["PLAN_SYS"], "a key the candidate did not swap keeps the shipped hash")
 
     def test_the_report_parse_restores_the_process_environment(self):
-        """Verifier low (c): the report-time parse loads a judge against a scratch state root (load_judge sets XDG_STATE_HOME,
-        CLAUDE_CONFIG_DIR, ROMP_CLAUDE_BIN and pops ROMP_STATE_DIR), then removes the scratch dir; it must restore the process
-        environment so nothing is left pointed at a deleted root."""
+        """Verifier low (c) + PR 2122 review: the report-time parse loads a judge against a scratch state root (load_judge sets
+        XDG_STATE_HOME, CLAUDE_CONFIG_DIR, ROMP_CLAUDE_BIN, pops ROMP_STATE_DIR, DEFAULTS ROMP_POSTAL_CLIENT_ONLY, grows sys.path
+        and loads the judge module against the scratch root), then removes the scratch dir; it must restore ALL of that so an
+        in-process caller (the tests) is left with nothing pointed at the deleted root."""
         dest, m = self._corpus(name="envrestore")
-        keys = ("XDG_STATE_HOME", "CLAUDE_CONFIG_DIR", "ROMP_CLAUDE_BIN", "ROMP_STATE_DIR")
-        self._restore_arm_env()
-        for k, v in {"XDG_STATE_HOME": "/sentinel/state", "CLAUDE_CONFIG_DIR": "/sentinel/claude", "ROMP_CLAUDE_BIN": "/sentinel/bin", "ROMP_STATE_DIR": "/sentinel/rompstate"}.items():
-            os.environ[k] = v
-        before = {k: os.environ.get(k) for k in keys}
+        import sys as _sys
+        keys = ("XDG_STATE_HOME", "CLAUDE_CONFIG_DIR", "ROMP_CLAUDE_BIN", "ROMP_STATE_DIR", "ROMP_POSTAL_CLIENT_ONLY")
+        self._restore_arm_env(("ROMP_POSTAL_CLIENT_ONLY",))
+        for k in keys:
+            os.environ.pop(k, None)                              # start with all UNSET so a leftover set-value is visible
+        for name in ("romp_judge_experiment_arm", "romp_logins", "secrets", "concurrent.futures"):
+            _sys.modules.pop(name, None)                         # load/pull these FRESH so they enter the difference set: the repo modules to pop, the stdlib pair (secrets, concurrent.futures) to LEAVE
+        before_env = {k: os.environ.get(k) for k in keys}
+        before_path = list(_sys.path); before_mods = set(_sys.modules)
         self.je.plannable_units_from_corpus(dest, m, [e["id"] for e in m["endings"][:2]])
-        self.assertEqual({k: os.environ.get(k) for k in keys}, before, "the report parse restores every env var it set, leaving nothing pointed at the deleted scratch root")
+        self.assertEqual({k: os.environ.get(k) for k in keys}, before_env, "the parse restores every env var it set or defaulted (ROMP_POSTAL_CLIENT_ONLY included), leaving nothing pointed at the deleted scratch root")
+        self.assertEqual(_sys.path, before_path, "the parse restores sys.path (load_judge inserts ROOT/tests)")
+        # only the REPOSITORY's own modules the parse loaded are popped; never a stdlib module (whose identity a pop breaks)
+        root = os.path.abspath(str(self.je.ROOT)) + os.sep
+        left_repo = {k for k in set(_sys.modules) - before_mods
+                     if (getattr(_sys.modules.get(k), "__file__", None) or "") and os.path.abspath(_sys.modules[k].__file__).startswith(root)}
+        self.assertEqual(left_repo, set(), "every repository module the parse loaded is popped: %r" % left_repo)
+        self.assertNotIn("romp_judge_experiment_arm", _sys.modules, "the arm judge module loaded against the scratch root is popped")
+        for std in ("secrets", "concurrent.futures"):           # freshly pulled by the parse (popped above), so they ARE in the difference set: a broad pop removes them and reds this
+            self.assertIn(std, _sys.modules, "a stdlib module the parse pulled in is NOT popped: %s (a broad pop would remove it, breaking its identity for later code)" % std)
+        # a caller that HELD set values must get them BACK, not popped: four keys to sentinels, ROMP_POSTAL_CLIENT_ONLY unset (PR 2134 review pin 2)
+        sentinels = {"XDG_STATE_HOME": "/sentinel/state", "CLAUDE_CONFIG_DIR": "/sentinel/claude", "ROMP_CLAUDE_BIN": "/sentinel/bin", "ROMP_STATE_DIR": "/sentinel/rompstate"}
+        for k, v in sentinels.items():
+            os.environ[k] = v
+        os.environ.pop("ROMP_POSTAL_CLIENT_ONLY", None)
+        self.je.plannable_units_from_corpus(dest, m, [e["id"] for e in m["endings"][:2]])
+        self.assertEqual({k: os.environ.get(k) for k in sentinels}, sentinels, "a caller's SET env values are restored, not popped (a pop-every-key restore reds this)")
+        self.assertIsNone(os.environ.get("ROMP_POSTAL_CLIENT_ONLY"), "an unset key stays unset")
+
+    def test_the_report_parse_does_not_disturb_a_caller_held_judge_module(self):
+        """PR 2134 review pin 3: a caller (run_arm_inprocess) already holds the judge module in sys.modules, bound to its own
+        state root. The parse must not RE-EXECUTE that module in place against the scratch root: after the parse the caller's
+        judge module is the SAME object with its state-root bindings (ERRORS) unchanged, not pointing into the deleted dir."""
+        import sys as _sys
+        dest, m = self._corpus(name="holdjudge")
+        self._restore_arm_env()
+        self.je.run_arm_inprocess(dest, "A", None, os.path.join(self.td, "r-hold"), None, self.fake, now=T0 + 10**6, builds=1)
+        held = _sys.modules.get("romp_judge_experiment_arm")
+        self.assertIsNotNone(held, "run_arm_inprocess leaves its judge module in sys.modules (the caller holds it)")
+        errors_before = held.ERRORS
+        self.je.plannable_units_from_corpus(dest, m, [e["id"] for e in m["endings"][:2]])
+        self.assertIs(_sys.modules.get("romp_judge_experiment_arm"), held, "the caller's judge module is the SAME object after the parse")
+        self.assertEqual(held.ERRORS, errors_before, "its state root is unchanged: the parse did not re-execute it in place against the (now deleted) scratch root")
 
     def test_the_failures_cell_names_the_unnamed_remainder_and_the_columns_read_not_recorded(self):
         """PR 2092/2099 lows: the failures cell names the remainder when the kinds sum to less than the count ('N unnamed', the

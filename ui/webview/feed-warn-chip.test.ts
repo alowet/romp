@@ -11,9 +11,9 @@ import * as path from "node:path";
 const FEED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.ts"), "utf8") + fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "card-sections.ts"), "utf8");   // the badges moved to card-sections.ts (round two of the box content PR: one builder for the card and the Needs you row)
 const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.css"), "utf8") + fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "card-sections.css"), "utf8");
 
-test("the warning chip is a button built once, riding the wrapping chip row", () => {
-  assert.match(FEED, /const chip = el\("button", "fask-warnchip"\);/,
-    "a BUTTON (focusable), not a span — it has a click action");
+test("the warning chip is a button where a click opens the detail and a span where nothing does, built once, riding the wrapping chip row", () => {
+  assert.match(FEED, /const chip = el\(env\.openWarns \? "button" : "span", "fask-warnchip"\);/,
+    "a BUTTON (focusable) on a page with a warn destination (the feed's overlay), a SPAN on one without (the chat page's row): no click is promised where none acts");
   assert.match(FEED, /const lbl = allDistill \? "distill failed" : "warning";/, "plain text label, no emoji/glyph");
   assert.match(FEED, /row2\.append\(idwrap, retryBadge, apiBadge, apiRetry, apiLogin, capLine, capBtn, jauthBadge, blkBadge, badges\)/);
   assert.match(FEED, /a\._badges = badges;/);
@@ -22,7 +22,7 @@ test("the warning chip is a button built once, riding the wrapping chip row", ()
 test("the click reads the card's CURRENT warns and opens the detail overlay (click-safe)", () => {
   // the handler is wired ONCE in build and reads _warnsData off the card element at click time, so the
   // incremental re-render (updateAskCard mutates in place) can never orphan the action mid-press.
-  assert.match(FEED, /chip\.dataset\.act = "sec-open-warns";/, "delegated: the act routes to the page's openWarns with the host's freshest item (the badges are rebuilt on every update)"); assert.match(FEED, /"sec-open-warns": \(el, ev\) => \{ ev\.stopImmediatePropagation\(\); const p = item\(el\); if \(p\) env\.openWarns\(p\.it, p\.it\.text \|\| ""\); \},/);
+  assert.match(FEED, /if \(env\.openWarns\) chip\.dataset\.act = "sec-open-warns";/, "delegated: the act routes to the page's openWarns with the host's freshest item (the badges are rebuilt on every update); a page without a destination gets a span that promises no click (the 0.17.1 fix)"); assert.match(FEED, /"sec-open-warns": \(el, ev\) => \{ ev\.stopImmediatePropagation\(\); const p = item\(el\); if \(p\) env\.openWarns\?\.\(p\.it, p\.it\.text \|\| ""\); \},/);
   assert.match(FEED, /openWarns: \(it, title\) => \{ if \(it\.warns && it\.warns\.length\) feedWarnModal\(title, it\.warns, \{ itemId: it\.itemId, sid: it\.sid \}, it\.failLog\); \},/);
   assert.match(FEED, /delegate\(card, sectionActs\(sectionEnv, \(\) => card\)\);/,
     "stopPropagation so the chip click never also opens the card modal");
@@ -34,7 +34,7 @@ test("updateAskCard toggles the chip on it.warns and refreshes the data it reads
   assert.match(FEED, /out\.push\(chip\);/);
   assert.match(FEED, /chip\.textContent = it\.warns\.length > 1 \? `\$\{lbl\} ×\$\{it\.warns\.length\}` : lbl;/,
     "multiple live warns show a count");
-  assert.match(FEED, /it\.warns\[it\.warns\.length - 1\]\.msg\) \+ "\\n— click for what happened and why"/,
+  assert.match(FEED, /it\.warns\[it\.warns\.length - 1\]\.msg\)\s*\n\s*\+ \(env\.openWarns \? "\\n— click for what happened and why" : ""\)/,
     "hover: the attempt history when one exists, else the latest msg — detail is a click away");
   assert.match(FEED, /tried \$\{f\.model\} — \$\{f\.note\}/,
     "each hover line is one attempt: model + literal error (the user 2026-08-18)");
@@ -91,7 +91,10 @@ test("the overlay lists each warn's kind/age and full detail", () => {
 
 test("the chip is a yellow pill and the overlay detail preserves its paragraphs", () => {
   assert.match(CSS, /\.fask-warnchip \{[^}]*color: #ffd166/);
-  assert.match(CSS, /\.fask-warnchip \{[^}]*cursor: pointer/);
+  assert.match(CSS, /button\.fask-warnchip \{ cursor: pointer; \}/, "the hand belongs to the button alone");
+  assert.match(CSS, /button\.fask-warnchip:hover \{ background:/, "and so does the hover tint");
+  assert.doesNotMatch(CSS, /\n\.fask-warnchip \{[^}]*cursor/, "the shared rule names no cursor: the chat page's span shows the default one");
+  assert.doesNotMatch(CSS, /\n\.fask-warnchip:hover/, "and no hover tint reaches the span (the contributor's note on the 0.17.1 fix: the span looked clickable)");
   assert.match(CSS, /\.fwarn-detail \{[^}]*white-space: pre-wrap/,
     "the what-happened/why-unexpected sections keep their blank-line structure");
 });

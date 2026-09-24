@@ -1249,7 +1249,7 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 /* A far host still holds a relayed question after its wait ended (feed.ts relayNote): the card's own dim line
    beside the sections (outside them, like the face), never a paragraph of the brief (the per-paragraph stamps
    map the brief's paragraphs) and never inside the distill element (the sections hide that without a brief). */
-.fask-relaynote { color: var(--dim); opacity: 1; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* .fask-relaynote lives in card-sections.css: the Needs you row draws the same line */
 /* standalone-completion modal: same tree vocabulary as ask cards; pending
    next-steps render as dim hollow rows, the paragraph as secondary detail */
 /* follow-up composer under a completed card's rows */

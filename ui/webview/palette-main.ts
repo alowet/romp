@@ -246,7 +246,9 @@ installMenuEcho();
   // served split test lists by (its CI run caught the first spelling, 2026-09-23).
   // The pair stands down while a full-pane surface holds the column — the picture viewer steps on the same arrows (it
   // ignores modified ones since the review, but a press must not do two things), the file view and browser own their
-  // keys — the list the pane's type-to-focus gate keeps. The message carries the reader's gesture: the pane's switch
+  // keys — the list the pane's type-to-focus gate keeps. The pane's own arm then stands down under the dialogs, menus
+  // and panels of its page (render.ts paneLayerOpen, 2026-09-24): this document cannot see those, and the VS Code
+  // command posts to the pane without passing here. The message carries the reader's gesture: the pane's switch
   // announces it as such, so the feed's current-session section follows at once (review, 2026-09-23).
   const fullPaneUp = (): boolean => {
     try { return !!chatPane()?.contentDocument?.querySelector("#romp-fileview, #romp-filebrowse, #romp-lightbox"); } catch (e) { return false; }

@@ -70,7 +70,7 @@ For scripts / agents:
 EOF
     _romp_cmd "romp url"                   -            "Print ONLY the tokened dashboard URL (for scripts; humans just run \`romp\`)"
     _romp_cmd "romp sessions [--json]"     -            "List the fleet with each session's state, colours and backend"
-    _romp_cmd "romp perf [--interval <s>|--json|log on|off]" - "Kernel performance counters as rates over two snapshots (pusher cycles, stage times, build cache hits, bytes sent, goal loads, judge passes, rss, cpu); --json one raw snapshot; log on|off flips the romp-perf stderr log without a restart"
+    _romp_cmd "romp perf [--interval <s>|--json|log on|off]" - "Kernel performance counters as rates over two snapshots (pusher cycles, stage times, build cache hits, parses by road, bytes sent, goal loads, judge passes, rss, cpu); --json one raw snapshot; log on|off flips the romp-perf stderr log without a restart"
     _romp_cmd "romp perf stacks [--json]" - "One stack per kernel thread right now (GET /perf?stacks=1): the thread's kind, its stage mark and its frames innermost last, so a slow boot names the lock a thread waits on; --json the raw rows"
     _romp_cmd "romp perf client [--minutes <n>|--json]" - "Browser-side performance of the open dashboards (client-diag.jsonl, surface perf): handler ms/min by frame type with window p50/p90/p99 and max, main-thread-free p90, long animation frames and their attributed callbacks, the worst minute, heap and DOM, the slowest frames — per dashboard and pane over the last <n> minutes (default 10)"
     _romp_cmd "romp api-health"            -            "The API-health signal across your sessions (GET /api-health as JSON: per-key/family retry rates and a thrash state)"
@@ -331,8 +331,9 @@ fi
 # `romp perf [--interval <s>] [--json]` / `romp perf log on|off` — the kernel's performance counters
 # (GET /perf), read as RATES from two snapshots taken <s> seconds apart (default 10): pusher cycles and
 # wakes per second, cycle time percentiles, the share of cycle time per stage, CPU split between the
-# pusher thread, the judge threads and the rest of the process, build cache hits vs rebuilds, bytes
-# sent per slot kind, goal-store loads per second, judge passes, rss. It exists so an optimization can
+# pusher thread, the judge threads and the rest of the process, build cache hits vs rebuilds, the
+# kernel's parse-store misses by road with the whole parses' bytes, bytes sent per slot kind,
+# goal-store loads per second, judge passes, rss. It exists so an optimization can
 # be checked against the LIVE kernel after each restart without attaching a profiler. --json prints one
 # raw snapshot (the shape is documented on the kernel's _PerfStats). `log on|off` flips the romp-perf
 # stderr log (POST /perf): before this the log needed ROMP_PERF in the kernel's environment at start,
@@ -798,6 +799,19 @@ for k in ("chat", "feed", "timeline", "feedJson"):     # feedJson: GET /feed.jso
     parts.append("%s %d built / %d cached%s"
                  % (k, built, cached, (" (%.0f ms avg%s)" % (ms / built, split)) if built else ""))
 print("builds    " + "   ".join(parts))
+# the kernel's parse-store misses by the road each took (2026-09-24): a fold reads the appended records and a serve or a
+# restore none of the transcript before its cut, so only the whole parses' leaf bytes are a parse cost. A kernel from
+# before the split booked the leaf's size at every miss; that figure is not printed, and the line says the split is absent
+by_road = (b.get("parses") or {}).get("byRoad")
+if isinstance(by_road, dict):
+    order = ["serve", "fold", "restore", "full", "bypass", "fallback"]
+    order += sorted(set(by_road) - set(order))
+    roads = ", ".join("%s %d" % (r, dl("parses", "byRoad", r)) for r in order if dl("parses", "byRoad", r))
+    head = "kernel %d misses%s   parsed whole %s" % (dl("parses", "kernel"), (" (%s)" % roads) if roads else "",
+                                                    kb(dl("parses", "wholeBytes")))
+else:
+    head = "kernel %d misses (no split by road: the kernel predates it)" % dl("parses", "kernel")
+print("parses    %s   judge %d misses   %d hits" % (head, dl("parses", "judge"), dl("parses", "hits")))
 parts = []
 for kind in ("full", "delta", "deduped"):
     slots = set((b.get("sends") or {}).get(kind, {})) | set((a.get("sends") or {}).get(kind, {}))

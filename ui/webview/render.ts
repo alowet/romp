@@ -3,8 +3,8 @@ import { GEAR_GLYPH, ICON_FORK } from "./icons";   // the fork control's glyph (
 import { sanitizeMd, userContentTarget } from "./md-sanitize";   // the one sanitizer every markdown surface shares, and the lookup for a message's own `#` links
 import { noticeBodyNodes, noticeAttachmentNodes, type NoticeAttachment } from "./notice-face";   // the notice face the feed card shows, for the approval box
 import { applySections, registerSectionHost, unregisterSectionHost, stateBadges, buildSectionElements, cardSpin, applySpin, applyDistillLanding, configureSectionSync, sectionActs,
-         type SectionEnv, type SectionItem, type BadgeItem, type SpinFields, type AskTreeNode } from "./card-sections";   // the card's sections, badges, swirl and landings: one builder with the feed card (plans/needs-you.md, the row carries what the card carries)
-import { applyDistillLine } from "./distiller-line";
+         applyRelayNote, type SectionEnv, type SectionItem, type BadgeItem, type SpinFields, type AskTreeNode } from "./card-sections";   // the card's sections, badges, swirl and landings: one builder with the feed card (plans/needs-you.md, the row carries what the card carries)
+import { applyDistillLine, distillInputs } from "./distiller-line";
 import { relAge, refreshAges } from "./feed-age";   // the age words and the live pass over the row's stamped ages
 import hljs from "highlight.js/lib/core";
 import bash from "highlight.js/lib/languages/bash";
@@ -48,7 +48,7 @@ import { flash } from "./actions";   // its own line: the import above is pinned
 import { awaitWord, awaitBreakdown, groupRows, rowIds, waitsNote, listBreakdown, keptWord, GROUP_TITLE, ROW_KINDS, workingFor, type AwaitRow } from "./spin-caption";
 import { CHIP_LABEL, chipWords, statusChip, type ChipState } from "./status-chip";   // the session status chip: its words and its classes, the one builder the bar and the tag overview's rows share (T322b)
 import { isClearCmd, isNewCmd, openTopTitles, clearConfirmDetail, endConfirmDetail, RENAME_SUBLINE, END_SESSION_STANDING } from "./clear-confirm";
-import { addRestartRow, restartInterrupts, settleRestart } from "./restart-row";   // the one Restart session row, shared with the Sessions pane's menu
+import { addRestartRow, settleRestart } from "./restart-row";   // the one Restart session row, shared with the Sessions pane's menu
 import { prebuildPlan, type ViewState } from "./prebuild";
 import { historyMarks, historyBands, windowSpans, HIST_H, HIST_GAP } from "./glow-history";
 import { newSkeletonState, applyTabOrderSkeleton, onStatus, holdStatus, onFull, onDismiss, onSocketUp, nextPrefetch, renderKind } from "./skeleton-tabs";
@@ -7960,7 +7960,7 @@ function showTabMenu(e: MouseEvent, id: string, copy?: string) {   // `copy`: th
   addMenuSep(menu);
   addRestartRow(menu, id, {
     name: s?.name || id,
-    working: restartInterrupts(st?.state),
+    state: st?.state,
     titles: openTopTitles(ledgers.get(id)?.tree),
     icon: ctxIcon("restart", false),
     confirm: (title, detail, buttons, cb) => showConfirm(title, detail, buttons, cb),
@@ -8145,7 +8145,7 @@ function focusComposerOrAsk(): boolean {
 // has focus: ←/→ step between tabs, ↑/↓ scroll the transcript. Deliberately
 // yields to anything more specific —
 //   • a typing target (textarea/input/contenteditable) keeps its native caret;
-//   • an open picker/confirm overlay (.picker-overlay) owns its own keys;
+//   • a shown picker/confirm overlay (pickerOverlayUp) owns its own keys;
 //   • a handler that already acted (defaultPrevented) wins — a FOCUSED tab's
 //     onTabKey (which also does ↑/↓ row-jumps) and the live-ask card both
 //     preventDefault before this bubbles to window.
@@ -8161,7 +8161,7 @@ function isTypingTarget(t: EventTarget | null): boolean {
 window.addEventListener("keydown", (e) => {
   if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
   if (isTypingTarget(e.target)) return;
-  if (document.querySelector(".picker-overlay")) return;   // #picker / #confirm open
+  if (pickerOverlayUp()) return;   // #picker / #confirm up (shown: the picker hides in place)
   if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
     if (!activeId) { if (pickFirstVisibleTab()) e.preventDefault(); return; }   // from the unfocused pane: the first visible tab (T357)
     if (order.length < 2) return;
@@ -8219,10 +8219,10 @@ function typeFromAnywhereTarget(e: Event): HTMLTextAreaElement | null {
   if (!ta || ta.disabled || document.activeElement === ta) return null;   // no box / read-only session / already in the box (covers key repeat; a paste there is native)
   if (isTypingTarget(e.target) || isTypingTarget(document.activeElement)) return null;
   if (activeId && liveAsks.has(activeId)) return null;   // the live-ask card owns input while it is up (digits are its number keys)
-  if (ctxMenuEl || document.querySelector(".picker-overlay")) return null;   // an open menu / #picker / #confirm owns the keys
+  if (ctxMenuEl || pickerOverlayUp()) return null;   // an open menu / a shown #picker / #confirm owns the keys
   if (document.getElementById("romp-fileview") || document.getElementById("romp-filebrowse")
       || document.getElementById("romp-lightbox")) return null;   // full-pane surfaces own their keys
-  if (document.querySelector("#rsettings:not([hidden]), #ra-back:not([hidden]), #rkeys-back, .meta-menu")) return null;   // the pane's own modals + meta menus own their keys (a letter typed there must never land in the draft)
+  if (document.querySelector("#rsettings:not([hidden]), #ranalytics-back:not([hidden]), #rkeys-back, .meta-menu")) return null;   // the pane's own modals (settings, its Token usage panel) + meta menus own their keys (a letter typed there must never land in the draft)
   if (composerNoteHolds()) return null;   // the box just changed hands under the user — no focus steal, the note flashes; a click re-binds (T236). Nothing to cancel either: a key on the bare body has nothing to insert into.
   return ta;
 }
@@ -11392,6 +11392,16 @@ function pickerVisible(): boolean {
   return !!o && o.style.display !== "none";
 }
 
+/** A picker overlay is SHOWN, which is not the same as present. The dialogs on the overlay's chrome (the confirms, the
+ *  move and fork prompts, the break-out dialog, the MCP panel) are removed when they close, but the new-session picker
+ *  is built once and closePicker only hides it. So querySelector(".picker-overlay") stayed true for the rest of the
+ *  page's life after the picker's first use, and every check that read it dropped its keys with nothing on screen:
+ *  the session pair, the snapshot view's Escape, the bare arrows, typing and pasting from anywhere (review,
+ *  2026-09-24). The display rule is pickerVisible's. */
+function pickerOverlayUp(): boolean {
+  return Array.from(document.querySelectorAll<HTMLElement>(".picker-overlay")).some((o) => o.style.display !== "none");
+}
+
 function closePicker() {
   const o = document.getElementById("picker");
   if (o) o.style.display = "none";
@@ -13473,12 +13483,22 @@ function leaveSnapshot(): void {
 // document at capture, kernel.py _LANDING_ESC_JS) has closed, marked and stopped an Escape aimed at one of
 // its panels, which live in the shell document, out of this page's sight (the log, usage and network
 // panels). Nothing else claims Escape while the view shows: the transcript is hidden.
+/** A layer of this page is up: a menu, a citation preview, a SHOWN picker or confirm overlay (the upload confirm, the
+ *  new-session picker, the move prompt: pickerOverlayUp), the pane's own panels (the settings card, its Token usage
+ *  panel), a full-pane surface. The session pair's message arm reads it and must not switch the session behind any of
+ *  them; the view's Escape below yields to the same list and, as before, to an open comment thread. The pair switches
+ *  past both comment popovers alike, the thread and the new-comment box: a switch closes either (setActive: a popover
+ *  belongs to its session's view) and keeps its draft, and a thread counted here held the keys dead from the
+ *  composer, even one a reload had reopened unasked (review, 2026-09-24). */
+function paneLayerOpen(): boolean {
+  return !!(ctxMenuEl || metaMenuEl || citePreviewEl) || pickerOverlayUp()
+    || !!document.querySelector("#rsettings:not([hidden]), #ranalytics-back:not([hidden])")
+    || !!(document.getElementById("romp-fileview") || document.getElementById("romp-filebrowse") || document.getElementById("romp-lightbox"));
+}
 installSnapshotEscape(window, {
   showing: () => !!snapView,
   typing: isTypingTarget,
-  layerOpen: () => !!(ctxMenuEl || metaMenuEl || citePreviewEl || openCommentKey || document.querySelector(".picker-overlay"))
-    || !!document.querySelector("#rsettings:not([hidden]), #ra-back:not([hidden])")
-    || !!(document.getElementById("romp-fileview") || document.getElementById("romp-filebrowse") || document.getElementById("romp-lightbox")),
+  layerOpen: () => paneLayerOpen() || !!openCommentKey,
   leave: leaveSnapshot,
 });
 /** Paint (or refresh) the view of `snapView`. False when that section is not on the strip any more: snapView
@@ -15377,10 +15397,10 @@ function noticeSectionsFor(row: HTMLElement, n: ChatNotice): boolean {
     (row.querySelector(".ntc-attach") as HTMLElement).after(secsRow, se.secs, se.awaitSpin, se.checklist, badges);   // after the attachment, before the note and the buttons
     registerSectionHost(n.itemId, row);   // the item's twin set: a press on the card's toggles or the row's reaches both (card-sections.ts)
   } else if (!want && rowAny._distill) {
-    for (const k of ["_secs", "_checklist", "_badges", "_awaitSpin"]) (rowAny[k] as HTMLElement).remove();
+    for (const k of ["_secs", "_checklist", "_badges", "_awaitSpin", "_relayNote"]) (rowAny[k] as HTMLElement | undefined)?.remove();
     (row.querySelector(".ntc-secs-row") as HTMLElement | null)?.remove();
     row.querySelector(".ntc-more")?.remove();   // the line the disclosure rode is gone; the body's own pass remakes it if the body overflows
-    for (const k of ["_bgBtn", "_takeBtn", "_stallBtn", "_subBtn", "_taskBtn", "_taskLbl", "_bgBody", "_distill", "_stallBody", "_secs", "_checklist", "_badges", "_awaitSpin", "_awaitWhy", "_it", "_sectionEnv", "_distillShown"]) delete rowAny[k];
+    for (const k of ["_bgBtn", "_takeBtn", "_stallBtn", "_subBtn", "_taskBtn", "_taskLbl", "_bgBody", "_distill", "_stallBody", "_secs", "_checklist", "_badges", "_awaitSpin", "_awaitWhy", "_relayNote", "_it", "_sectionEnv", "_distillShown"]) delete rowAny[k];
     unregisterSectionHost(n.itemId, row);
     const body = row.querySelector<HTMLElement>(".ntc-body"); if (body) body.style.display = "";
   }
@@ -15388,30 +15408,38 @@ function noticeSectionsFor(row: HTMLElement, n: ChatNotice): boolean {
 }
 // the row's LINE, the element the disclosure measures and clamps: the distill line on a row wearing the card's sections, else the markdown body
 function noticeLineOf(row: HTMLElement): HTMLElement | null { return ((row as any)._distill as HTMLElement | undefined) ?? row.querySelector<HTMLElement>(".ntc-body"); }
-// what the chat page hands the shared section builder (card-sections.ts SectionEnv): no collapsed-by-default preference here, a sub-goal
-// row's text jumps to the row's work anchor within this page (the modal's other zones are the feed's), no PR repo for a row's links, the
+// what the chat page hands the shared section builder (card-sections.ts SectionEnv): the feed's Collapsed default read from this page's copy
+// of the settings (below), a sub-goal row's text jumps to the row's work anchor within this page (the modal's other zones are the feed's), no PR repo for a row's links, the
 // page's clock with the card's age words (no recency tint; the live pass below repaints the stamps), the page's own way to open a peer's
 // session, and its landings: a click on the line or a paragraph scrolls this page to the turn where the text was written (the row is the
 // active session's, so the turn is in this page), a line without an anchor says so in the landing toast and files the miss with the shell,
 // and the warning chip opens nothing here (its hover carries the evidence; the feed has the detail overlay)
 const noticeNowSec = (): number => Math.floor(Date.now() / 1000);
+// the feed's Collapsed default (feedPrefs, "romp:settings" collapsed === true): the row's default section follows it everywhere, through the
+// settings fan-out (the browser shell and a standalone chat tab share the origin's storage; a VS Code chat webview gets the gear's whole
+// settings object relayed by the extension host and writes its own copy, installSettingsSync); only the PICKS stay per page in VS Code, since
+// the section channel does not cross its webviews (a contributor's second note on PR 2124: the card opened nothing under Collapsed while the
+// row opened Summary; the contributor's note on the fix: the flag does reach a VS Code chat webview)
+function noticeCollapsedPref(): boolean { try { return JSON.parse(localStorage.getItem("romp:settings") || "{}").collapsed === true; } catch { return false; } }
 const noticeSectionEnv: SectionEnv = {
-  collapsed: () => false,
+  collapsed: () => noticeCollapsedPref(),   // the feed's Collapsed default, read from this page's copy of the settings (the origin's shared storage in the browser, the relayed copy in VS Code)
   wireNode: (_it, node, _mark, txt, wire) => {
     if (!wire || !node.anchorUuid) return;
-    txt.classList.add("nav"); txt.title = "jump to where this was worked on";
+    txt.classList.add("lz-nav"); txt.title = "jump to where this was worked on";   // lz-nav: the pointer and the hover the checklist's sheet gives a landing text (nav had no rule on this page)
     txt.dataset.act = "sec-landing"; txt.dataset.uuid = node.anchorUuid;   // delegated on #notices (sectionActs → landing → scrollToAnchor)
   },
   repoOf: () => null,
   durNodes: (since) => { if (!since || since <= 0) return []; const sp = el("span", "ntc-age fask-dur"); stampAgeOnRow(sp, since); return [" · ", sp]; },
   openSession: (sid) => { vscodeApi?.postMessage({ type: "openSession", id: sid }); },
   nowSec: noticeNowSec, relAge: (sec) => relAge(sec), ageTint: () => "", clockHM: (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-  landing: (_it, target) => { scrollToAnchor(target.anchorUuid); },
+  landing: (_it, target) => {   // as the other landers: a fresh navigation re-arms the one-per-navigation flash, the quoted span aligns the landing when the
+    flashedAnchor = null; pendingAnchorQuote = target.quote ?? null; pendingAnchorClick = true;   // frame carries one, and the click marks the attempt as the reader's
+    scrollToAnchor(target.anchorUuid);   // (a contributor's post-merge note on PR 2124: the row's landing scrolled to the turn's anchor alone, no quoted span, no repeat flash)
+  },
   noAnchor: (it) => {
     landToast("couldn't locate this in the transcript — no anchor was recorded for this card");
     try { window.parent?.postMessage({ romp: "notify", kind: "locate", text: "Couldn't jump to this summary: no anchor was recorded for this card", sid: it.sid, itemId: it.itemId }, "*"); } catch { /* no shell */ }
   },
-  openWarns: () => { /* no warn-detail overlay on the chat page: the chip's hover carries the evidence */ },
   // after a re-apply from a pick or the channel (card-sections.ts reapplyHosts), what the apply alone leaves stale on this page: the items-level
   // face and the More pass (round three of the box content PR: a pick left More standing over a hidden line, or missing over a clipped one)
   afterApply: (a) => { noticeRowLevelFace(a); noticeMoreButton(a, noticeLineOf(a)); },
@@ -15445,11 +15473,15 @@ function updateNoticeRow(row: NoticeRowEl, n: ChatNotice, sid: string): void {
   if (sections) {
     const it = { ...n, sid, text: n.title } as unknown as SectionItem & BadgeItem & SpinFields;
     rowAny._it = it;
-    const dCompleted = n.distillState === "completed", dBlocked = n.distillState === "blocked" || (!n.distillState && !!(n.blockSummary || "").trim());
+    // the card's rule, settled in one place (distiller-line.ts distillInputs): a stall floor files under needs_input with no distill state and no
+    // brief yet, which reads blocked, so the row shows the Distilling caption where the card does (a contributor's post-merge note on PR 2124: the
+    // row's own copy of the rule read it as neither, and the row showed no line and no caption)
+    const { completed: dCompleted, blocked: dBlocked } = distillInputs(n.distillState, n.column || "");
     const shown = applyDistillLine(rowAny._distill as HTMLElement, dCompleted, dBlocked, n.summary, n.blockSummary);
     applyDistillLanding(rowAny, it, shown, dCompleted, dBlocked, noticeSectionEnv);   // the paragraphs with their stamps and landings, the stale note, the line's link
     const spin = cardSpin(it, dCompleted, dBlocked, noticeSectionEnv); applySpin(rowAny, it, spin, noticeSectionEnv);   // the card's swirl caption ("Analyzing…" on a re-judging card)
     applySections(rowAny, it, !!shown, noticeSectionEnv);
+    applyRelayNote(rowAny, n);   // the relayed question a far host still holds: the card's own dim line, drawn on the row too (the row carries what the card carries)
     noticeRowLevelFace(row);   // below the full context the line stands whatever the pick (the level class is set before the rows are updated)
     if (body) body.style.display = "none";   // the brief rides the distill line now
     if (badgesEl) { badgesEl.replaceChildren(...stateBadges(it, noticeSectionEnv, spin.caption)); badgesEl.style.display = badgesEl.childNodes.length ? "" : "none"; }
@@ -15477,7 +15509,9 @@ function noticeMoreButton(row: HTMLElement, body: HTMLElement | null): void {
   let b = row.querySelector<HTMLButtonElement>(".ntc-more");
   const overflows = !!body && body.style.display !== "none" && body.scrollHeight > body.clientHeight + 1;
   const open = row.classList.contains("ntc-open");
-  if (!overflows && !open) { if (b) b.remove(); return; }
+  // no line, or a hidden one (a Background or sub-goal pick at the full context hides the distill line): no button, whatever the open state,
+  // which is kept so Summary picked back restores Less (a contributor's second note on PR 2124: Less stood over a hidden line)
+  if (!body || body.style.display === "none" || (!overflows && !open)) { if (b) b.remove(); return; }
   if (!b) { b = document.createElement("button"); b.className = "ntc-btn ntc-more"; b.dataset.act = "ntc-more"; (body?.closest(".ntc-secs") ?? body)?.after(b); }   // after the sections container when the line is the distill line (the box content round), so the button stands whichever section is open
   b.textContent = open ? "Less" : "More"; (b as any)._idle = b.textContent;
 }
@@ -15560,14 +15594,16 @@ function renderNotices(): void {
   if (!host) return;
   const s = activeId && !snapView ? liveSession(activeId) : null;
   const rows: ChatNotice[] = (s && s.status && s.status.notices) || [];
-  if (!s || !activeId || !rows.length || !settings.needsBox) { host.replaceChildren(); host.style.display = "none"; return; }   // the gear's Needs you box switch hides it; the ring stays
+  // the box emptied whole (a switch to a session with no rows, the gear's Needs you switch off, a snapshot view): every row leaves the item's
+  // twin set before replaceChildren detaches it, since the drop loop below never runs on this road (the verifier of PR 2141, round one)
+  if (!s || !activeId || !rows.length || !settings.needsBox) { for (const r of Array.from(host.querySelectorAll<HTMLElement>(".ntc-row"))) unregisterSectionHost(r.dataset.item || "", r); host.replaceChildren(); host.style.display = "none"; return; }   // the gear's Needs you box switch hides it; the ring stays
   host.style.display = "";
   let bar = host.querySelector<HTMLElement>(".ntc-bar");
   if (!bar) { bar = buildNoticeBar(); host.prepend(bar); }
   const lab = bar.querySelector<HTMLElement>(".ntc-label"); if (lab) lab.textContent = "Needs you · " + rows.length;
   applyNoticeBoxLevel(host, s.id, rows);   // the level the page holds for this session (a credential row floors it), before the rows so a fresh row lands under the right classes
   const want = new Set(rows.map((n) => n.itemId));
-  for (const r of Array.from(host.querySelectorAll<HTMLElement>(".ntc-row"))) if (!want.has(r.dataset.item || "")) r.remove();
+  for (const r of Array.from(host.querySelectorAll<HTMLElement>(".ntc-row"))) if (!want.has(r.dataset.item || "")) { unregisterSectionHost(r.dataset.item || "", r); r.remove(); }   // a dropped row leaves the item's twin set (card-sections.ts) as it leaves the box
   let prev: HTMLElement = bar;   // the rows follow the bar (the header and the gear), in the frame's order
   for (const n of rows) {
     let row = host.querySelector<NoticeRowEl>(noticeRowSelector(n.itemId).replace("#notices ", ""));
@@ -17427,8 +17463,9 @@ function routeUserMessage(sid: string, text: string, cites: Citation[] | undefin
   // during a socket outage, and a refused Codex /clear needs the entry for the warn handler to restore. A
   // transcript-resetting /clear writes NO user record for itself, so it never LANDS and, in a same-second
   // batch, is never OVERTAKEN either, so its bubble ends on the CLEAR BOUNDARY instead (the fresh episode it
-  // forks), which reconcileOptimistic pairs to it (the `clear` flag, gated OFF for Codex: a Codex /clear is
-  // refused, reaches no boundary, and its bubble ends the ordinary way on that refusal). The kernel retires
+  // forks), which reconcileOptimistic pairs to it (the `clear` flag, gated OFF for Codex: a Codex /clear runs
+  // the native clear instead, so it reaches no clear boundary and its bubble ends the ordinary way, on the
+  // acknowledging chip when the clear runs and on the refusal when it fails). The kernel retires
   // its OWN /clear echo at the same boundary, by the taken copy's id (sdk_backend.retire_clear_echoes).
   else { vscodeApi.postMessage({ type: "sendMessage", id: sid, text, qid, ...att }); registerOptimistic(sid, text, imgPaths, qid, paths, isClearCmd(text) && liveSession(sid)?.status?.backend !== "codex"); }
   // One breadcrumb per composer send (client-diag.jsonl): sid, when, how long, which route — never the
@@ -19983,8 +20020,13 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     const body = document.querySelector("#mcp-panel .mcp-list") as HTMLElement | null;
     if (body && mcpPanelSid) loadMcpPanel(mcpPanelSid, body);   // refetch — never an optimistic row
   }
-  else if (m.type === "nextTab") asGesture(() => cycleTab(1));    // the shell's session pair or the VS Code host's command: the reader's own act, whichever posted it
-  else if (m.type === "prevTab") asGesture(() => cycleTab(-1));
+  // The pair stands down while a layer of this page is up (paneLayerOpen), and HERE, not only in the shell: the
+  // shell's check saw the full-pane surfaces alone, so under the upload confirm the chord switched the session and
+  // "Send without it" then sent the other session's draft, and the VS Code view's command, which posts straight to
+  // this arm, switched under the picture viewer (review, 2026-09-24). The braces keep the next arm's else off the
+  // inner if.
+  else if (m.type === "nextTab") { if (!paneLayerOpen()) asGesture(() => cycleTab(1)); }    // the shell's session pair or the VS Code host's command: the reader's own act, whichever posted it
+  else if (m.type === "prevTab") { if (!paneLayerOpen()) asGesture(() => cycleTab(-1)); }
   else if (m.type === "settingRefused" && typeof m.text === "string" && m.text) {
     // the kernel refused a gesture this page posted (its store could not be read): the optimistic state ends
     // on THIS event, not on the next push, and the reason toasts (the warn toast is this pane's soft-refusal
@@ -20062,7 +20104,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     if (row) {
       // `held` (the second executed review of PR 1935, 2026-09-21): the words went out but the dismissal's write refused: the row
       // stays with its buttons spent and says so; a plain success drops the row; a refusal re-arms it and says why
-      if (m.ok && !m.held) { row.remove(); const host = document.getElementById("notices"); if (host && !host.querySelector(".ntc-row")) host.style.display = "none"; }
+      if (m.ok && !m.held) { unregisterSectionHost(m.itemId, row); row.remove(); const host = document.getElementById("notices"); if (host && !host.querySelector(".ntc-row")) host.style.display = "none"; }
       else {
         if (!m.ok) for (const b of Array.from(row.querySelectorAll("button")) as HTMLButtonElement[]) { b.disabled = false; b.textContent = (b as any)._idle || b.textContent; }
         const e = row.querySelector<HTMLElement>(".ntc-err");
@@ -20763,15 +20805,36 @@ function setupComposer() {
       const what = shipping === 1 ? "An attachment is" : shipping + " attachments are";
       const them = shipping === 1 ? "it" : "them";
       shipGateSid = sid;                       // the last-ship ack resolves the open dialog itself
+      // The answer is for `sid`, the session the dialog opened over, never whichever one is open when it is
+      // clicked (the post-merge review of 2026-09-24): the dialog stays up across a switch that never passes its
+      // backdrop (a session's hot key, the switcher, a feed card's jump), and "Send without it" re-enters
+      // sendComposer, which reads the OPEN box, so it sent the other session's draft. Switched away, it sends
+      // nothing and says so, and it says the message is still in that tab's box only while the box holds what this
+      // answer would have sent there (text, or a file that finished uploading; the switch stashed the text): a
+      // session that ended under the dialog took its draft with it, and a box holding only the upload had nothing
+      // to send. "Wait" still arms `sid`'s hold (its last ack releases it, or says so from another tab), and
+      // repaints the files strip only while `sid` is the open tab: the strip belongs to the open tab's box.
       showConfirm(what + " still uploading",
                   "Send now and your message goes without " + them + ". Or just wait — it sends "
                   + "itself the moment the upload finishes.",
                   [{ label: "Wait for the upload", value: "wait" },
                    { label: "Send without " + them, value: "now", danger: true }],
                   (v) => {
-                    shipGateSid = null; endReloadHoldIfIdle();
-                    if (v === "now") sendComposer({ pastShipGate: true });
-                    else if (v === "wait") { sendOnShip.add(sid); renderComposerFiles(sid); }
+                    // clear the registration only while it names this dialog's session: a newer dialog cancels this
+                    // one as it opens (showConfirm), and another session's upload dialog has registered itself by then
+                    if (shipGateSid === sid) shipGateSid = null;
+                    endReloadHoldIfIdle();
+                    if (v === "now") {
+                      if (activeId === sid) sendComposer({ pastShipGate: true });
+                      else {
+                        const name = sessions.get(sid)?.name || tabMeta.get(sid)?.name;
+                        const kept = !!(drafts.get(sid) || "").trim() || (composerFiles.get(sid) || []).length > 0;
+                        warnToast((name ? "The message on “" + name + "”" : "The message") + " was not sent: the open "
+                                  + "tab changed while the upload dialog was up."
+                                  + (name && kept ? " It's still in that tab's message box." : ""));
+                      }
+                    }
+                    else if (v === "wait") { sendOnShip.add(sid); if (sid === activeId) renderComposerFiles(sid); }
                   });
       return;
     }

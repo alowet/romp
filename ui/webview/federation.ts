@@ -173,8 +173,11 @@ export function prefixInbound(host: string, msg: any): any {
   if (Array.isArray(out.owedIds)) out.owedIds = out.owedIds.map((x: any) => prefixNoticeId(host, x));   // the reorder frame's owed ids, the same way
   // a session frame's approval-box rows (status.notices, the chat's #notices box) carry notice ids too: prefixed like the feed's
   // cards, so a remote host's noticeActionDone (prefixed above) finds the row it answers (the review of PR 1890, medium 2)
+  // …and a row's delegation origin and awaiting peers, the same rewrite a feed card gets (_prefixOriginAndPeers): the row's badge
+  // takes data-sid from origin.peerSid and the chat page sends it as the click's id, so a bare sid opened the sender on the LOCAL
+  // kernel (a contributor's post-merge note on PR 2124, 2026-09-24)
   if (out.status && typeof out.status === "object" && !Array.isArray(out.status) && Array.isArray(out.status.notices))
-    out.status = { ...out.status, notices: out.status.notices.map((n: any) => (n && typeof n === "object" && typeof n.itemId === "string") ? { ...n, itemId: prefixNoticeId(host, n.itemId) } : n) };
+    out.status = { ...out.status, notices: out.status.notices.map((n: any) => (n && typeof n === "object" && typeof n.itemId === "string") ? _prefixOriginAndPeers(host, { ...n, itemId: prefixNoticeId(host, n.itemId) }) : n) };
   for (const k of OBJ_SID)
     if (Array.isArray(out[k]))
       out[k] = out[k].map((o: any) => _prefixIdBearing(host, o, "sid"));
@@ -227,6 +230,41 @@ export function prefixInbound(host: string, msg: any): any {
   return out;
 }
 
+/** The delegation origin and the awaiting peers of a card OR a chat-box row, rewritten in place on a copy the caller owns.
+ *  A feed card's delegation origin (asks[].origin, and status.notices[].origin on a session frame): peerHost empty means the
+ *  SENDER is local to the card's own kernel; attribute it to that host and prefix peerSid so the click routes there. A set
+ *  peerHost means the sender lives on some OTHER host (that kernel recorded which): keep it, and keep peerSid bare, since the
+ *  viewer may be that very host, where the bare uuid opens directly. The awaiting box's delegation peers (awaiting.peers) take
+ *  the same rule: a peer the card's own kernel resolved (host "") is LOCAL TO THAT KERNEL, so attribute it here and prefix its
+ *  sid for routing; an already-hosted peer passes through untouched (the user 2026-08-23). The delegated-to badge (handoffTo:
+ *  peer, peerSid, peerHost) takes the origin's rule, since its click routes the same way (the verifier of PR 2141, round one);
+ *  the tracked delegation's recipients (delegTracked: sid, name, host) take the awaiting peers' rule, since the badge's click
+ *  takes its target from the entry's sid (a contributor's note on PR 2141, round two); waitingOn carries a peer's NAME,
+ *  display text with no click, and is left alone. One helper for both shapes: the notices rows
+ *  had the item id prefixed and nothing else, so a remote row's sender opened on the local kernel (a contributor's post-merge
+ *  note on PR 2124, 2026-09-24). */
+function _prefixOriginAndPeersInPlace(host: string, out: any): void {
+  if (out.origin && typeof out.origin === "object" && typeof out.origin.peerSid === "string" && !out.origin.peerHost)
+    out.origin = { ...out.origin, peerHost: host, peerSid: prefixId(host, out.origin.peerSid) };
+  if (out.handoffTo && typeof out.handoffTo === "object" && typeof out.handoffTo.peerSid === "string" && !out.handoffTo.peerHost)
+    out.handoffTo = { ...out.handoffTo, peerHost: host, peerSid: prefixId(host, out.handoffTo.peerSid) };
+  if (out.awaiting && typeof out.awaiting === "object" && Array.isArray(out.awaiting.peers))
+    out.awaiting = { ...out.awaiting, peers: out.awaiting.peers.map((p: Record<string, unknown>) =>
+      p && typeof p === "object" && typeof p.sid === "string" && !p.host
+        ? { ...p, host, sid: prefixId(host, p.sid) } : p) };
+  if (Array.isArray(out.delegTracked))
+    out.delegTracked = out.delegTracked.map((p: Record<string, unknown>) =>
+      p && typeof p === "object" && typeof p.sid === "string" && !p.host
+        ? { ...p, host, sid: prefixId(host, p.sid) } : p);
+}
+/** The same rewrite on a fresh copy of `o` (a notices row already copied by the caller is passed through it too). */
+export function _prefixOriginAndPeers(host: string, o: any): any {
+  if (!o || typeof o !== "object") return o;
+  const out: any = { ...o };
+  _prefixOriginAndPeersInPlace(host, out);
+  return out;
+}
+
 /** Prefix an object's id field (`sid`/`id`) AND its display `name`, returning a copy (or the object
  *  unchanged if it isn't a prefixable object). */
 function _prefixIdBearing(host: string, o: any, idKey: string): any {
@@ -234,19 +272,7 @@ function _prefixIdBearing(host: string, o: any, idKey: string): any {
   const out: any = { ...o, [idKey]: prefixId(host, o[idKey]) };
   if (typeof out.name === "string") out.name = prefixId(host, out.name);
   out.itemId = prefixNoticeId(host, out.itemId);   // a NOTICE card's item id is prefixed like its sid; a goal card's id stays bare (T287)
-  // A feed card's delegation origin (asks[].origin): peerHost empty means the SENDER is local to the
-  // card's own kernel — attribute it to that host, and prefix peerSid so the click routes there. A
-  // set peerHost means the sender lives on some OTHER host (that kernel recorded which); keep it,
-  // and keep peerSid bare — the viewer may be that very host, where the bare uuid opens directly.
-  if (out.origin && typeof out.origin === "object" && typeof out.origin.peerSid === "string" && !out.origin.peerHost)
-    out.origin = { ...out.origin, peerHost: host, peerSid: prefixId(host, out.origin.peerSid) };
-  // The awaiting box's delegation peers (asks[].awaiting.peers) — same rule as origin: a peer the
-  // card's own kernel resolved (host "") is LOCAL TO THAT KERNEL, so attribute it here and prefix
-  // its sid for routing; an already-hosted peer passes through untouched (the user 2026-08-23).
-  if (out.awaiting && typeof out.awaiting === "object" && Array.isArray(out.awaiting.peers))
-    out.awaiting = { ...out.awaiting, peers: out.awaiting.peers.map((p: Record<string, unknown>) =>
-      p && typeof p === "object" && typeof p.sid === "string" && !p.host
-        ? { ...p, host, sid: prefixId(host, p.sid) } : p) };
+  _prefixOriginAndPeersInPlace(host, out);
   // a timeline lane's fork parent (sessions[].branch.fromId): the view looks it up against PREFIXED
   // lane ids (vidx), so an unprefixed remote parent silently missed and the branch connector never
   // drew for remote lanes (found 2026-08-17 auditing the merge)

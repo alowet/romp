@@ -5820,6 +5820,13 @@ class SdkSession:
             if isinstance(_own, str) and _own:
                 self._own_turn_clear_qid = _own
                 self._clearing = True
+        elif reg.get("clearingTaken") or reg.get("clearingOwnTurn"):
+            # the restart did NOT keep this CLI, so that /clear never runs and its echo is a genuine loss
+            # (_reseed_echoes / _mark_dropped_echoes). DROP the stale mirror keys so a LATER restart over a
+            # different, host-kept CLI cannot relight the bracket from them (a Clearing row with nothing
+            # clearing). Written here rather than via _persist_echoes: the session is not yet registered, so
+            # _persist_echoes would skip these keys, and the drop is the only way to clear them now.
+            self.backend._update_reg_dropping(self.sid, drop=("clearingTaken", "clearingOwnTurn"))
         self._input_wake: asyncio.Event | None = None
         self._cur_ask_fut: asyncio.Future | None = None
         self._ask_serial = asyncio.Lock()            # ONE live ask per session: the SDK dispatches every control
@@ -6114,7 +6121,7 @@ class SdkSession:
             except Exception:
                 self.backend._log("persist queue (%s): %s" % (self.name, traceback.format_exc()))
 
-    def interrupt(self):
+    def interrupt(self, climb=True):
         """Escalating stop (the user 2026-07-10, terminal parity). The old body was `if self.loop and
         self.client: <control request>` — a wedged CLI ignored the request ('no current client', 14
         deep in manager.log while nimbus sat unresponsive) and a missing client made the press a
@@ -6122,9 +6129,20 @@ class SdkSession:
         recovery. Now every press climbs interrupt_action's ladder — control request, SIGINT the CLI,
         SIGKILL (its stream death runs the existing crash-heal + resume) — and every rung logs what it
         did. The episode resets when a turn settles or a fresh turn starts, so a later stop is polite
-        again."""
+        again.
+
+        climb=False is a Restart's ask (SdkBackend.relaunch): the polite rung when this episode has not
+        used it, and never a signal. A restart is not a kill, and a CLI the ladder killed under an armed
+        reconnect left the session with no CLI, since the reconnect waits for a result that never comes
+        (the post-merge review of #2059, 2026-09-24). False when that ask sent nothing."""
         with self._lock:
-            action, self._intr_level = interrupt_action(self._intr_level, bool(self.loop and self.client))
+            action, level = interrupt_action(self._intr_level, bool(self.loop and self.client))
+            if climb or action == "control":
+                self._intr_level = level
+        if not climb and action != "control":
+            self.backend._log("interrupt (%s): a restart asks a turn to stop politely only; %s not sent"
+                              % (self.name, action))
+            return False
         if action == "control":
             # Flip the in-flight flag SYNCHRONOUSLY, here on the kernel thread, before scheduling the async
             # _do_interrupt. The kernel stamps _interrupt_clicked and pushes the instant it returns from this
@@ -6134,8 +6152,9 @@ class SdkSession:
             self._interrupted = True
             self.loop.call_soon_threadsafe(
                 lambda: asyncio.ensure_future(self._do_interrupt()))
-            return
+            return True
         self._signal_cli(signal.SIGINT if action == "sigint" else signal.SIGKILL, action)
+        return True
 
     def _signal_cli(self, sig, action):
         """Deliver an escalated interrupt as a real signal to this session's own CLI (the child of THIS
@@ -6416,6 +6435,15 @@ class SdkSession:
         self._intr_level = 0
         self._compacting = False   # an abandoned /compact turn can't emit its boundary/result on the dead client
         self._clearing = False     # same: an abandoned /clear turn can't emit its init/result either
+        # A /clear this abandoned client had TAKEN can never flip now, so drop its take-tracking too, not just
+        # the bracket: leaving _taken_clear_qids / _own_turn_clear_qid would let the next unrelated turn's
+        # settle drain retire its echo (hiding the loss), and their persisted mirror would relight the bracket
+        # on a later restart over a host-kept CLI. Re-persist so the reg mirror drops them as well.
+        _had_take = bool(self._taken_clear_qids or self._own_turn_clear_qid)
+        self._taken_clear_qids = []
+        self._own_turn_clear_qid = None
+        if _had_take:
+            self.backend._persist_echoes(self.sid)
         self._mark("waiting")
         self.backend.retire_live_work(self.sid)    # the abandoned turn's stream is gone with its client
         if stranded and not self.resume_sid:
@@ -8649,6 +8677,7 @@ class SdkSession:
                     if taken_clear == getattr(self, "_own_turn_clear_qid", None):
                         self._own_turn_clear_qid = None    # the flip retired it: the settle backstop has nothing to do
                     self.backend.retire_clear_echoes(self.sid, taken_clear)
+                    self.backend._persist_echoes(self.sid)   # mirror the POP even if the retire removed no echo, else reg['clearingTaken'] keeps the spent qid
                 if clearing:
                     # The CLI zeroed total_cost_usd and modelUsage at this instant (a /clear resets both,
                     # same lifecycle); reset the spend watermarks on the EVENT rather than waiting for the
@@ -9161,7 +9190,7 @@ class SdkSession:
                                  ("the 'waiting' state write", lambda: self._mark("waiting"))]
                 if own_clear:   # the no-flip /clear echo retire (guarded like the other file/lock steps; still ahead of the woken feeder)
                     _settle_steps.append(("the /clear echo retire", lambda: self.backend.retire_clear_echoes(self.sid, own_clear)))
-                elif _had_taken:   # a swallowed /clear was drained without a retire: mirror the emptied take list so a restart restores nothing stale
+                if own_clear or _had_taken:   # mirror the emptied take list even if the retire above removed no echo (a no-op retire skips its own persist), so a restart restores nothing stale
                     _settle_steps.append(("the /clear take mirror", lambda: self.backend._persist_echoes(self.sid)))
                 for what, step in _settle_steps:
                     try:
@@ -15298,11 +15327,14 @@ class SdkBackend:
         self._poke()
         return True
 
-    def interrupt(self, sid: str) -> bool:
+    def interrupt(self, sid: str, climb: bool = True) -> bool:
         s = self.sessions.get(sid)
         if not s:
             return False
-        s.interrupt()
+        if climb:
+            s.interrupt()
+        elif not s.interrupt(climb=False):       # a Restart's ask (relaunch): nothing was sent, so nothing to mark
+            return False
         append_state(self.state_dir, sid, "idle", int(time.time()) - 1, by="interrupt")
         self._poke()
         return True
@@ -15809,7 +15841,9 @@ class SdkBackend:
         A RUNNING TURN IS CUT, and the dashboard's confirm says so before it gets here: the reconnect is
         ARMED first and the turn is then interrupted, so the arm exists before the interrupted turn's
         result fires it (the deferred reconnect the ResultMessage handler runs — the CLI is never torn
-        down under a live turn, whichever order the two land in). A queued-but-not-started turn is not
+        down under a live turn, whichever order the two land in). The interrupt is the polite control
+        request, once per stop episode, and never Stop's SIGINT or SIGKILL: a Restart clicked again on a CLI
+        ignoring the request waits for the turn to end instead of killing it. A queued-but-not-started turn is not
         interrupted: there is nothing running to cut, and the armed reconnect fires at the next turn end.
 
         A session with no live object (dormant, or one this kernel has not started this life) has no
@@ -15828,10 +15862,13 @@ class SdkBackend:
         with s._lock:
             running = s.inflight > 0          # a turn in flight NOW (busy() also counts a queued one: nothing to cut there)
         s.request_reconnect()                 # armed first — see the docstring's order
-        if running:
-            self.interrupt(sid)
+        # the polite rung only, never Stop's ladder: a click again while the CLI ignores the request must not
+        # signal it (SdkSession.interrupt's climb=False; the post-merge review of #2059, 2026-09-24)
+        asked = running and self.interrupt(sid, climb=False)
         self._log("relaunch (%s): %s; its CLI is replaced by a fresh one resuming the same conversation"
-                  % (s.name, "the running turn is cut" if running else "idle, reconnecting now"))
+                  % (s.name, "the running turn is cut" if asked else
+                     "the running turn was already asked to stop, and the fresh CLI comes up when it ends" if running else
+                     "idle, reconnecting now"))
         self._poke()
         return ""
 

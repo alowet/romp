@@ -58,6 +58,8 @@ test("the line comes back untouched the moment the card settles again", () => {
   // Withheld, not discarded: nothing about the payload changes while it is hidden, so a card that settles
   // back to exactly where it was renders exactly what it had before.
   assert.deepEqual(distillInputs("blocked", "needs_input"), { completed: false, blocked: true });
+  assert.deepEqual(distillInputs(null, "needs_input"), { completed: false, blocked: true }, "a stall floor: filed under needs_input with no distill state, it reads blocked, so the card and the Needs you row both show the Distilling caption until its brief lands");
+  assert.deepEqual(distillInputs(undefined, "needs_input"), { completed: false, blocked: true });
   assert.deepEqual(distillInputs("completed", "completed"), { completed: true, blocked: false });
   const { completed, blocked } = distillInputs("blocked", "needs_input");
   assert.equal(distillText(completed, blocked, null, "Decide: consolidate the Internals pages or not"),

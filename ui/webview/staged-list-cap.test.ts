@@ -327,9 +327,10 @@ test("a batched /clear gets its optimistic bubble flagged to end at the boundary
   ], "both get an optimistic bubble; only the /clear is flagged to end at the boundary");
 });
 
-test("a batched /clear on a Codex session is NOT flagged (it is refused, so its bubble ends the ordinary way)", () => {
-  // gate off for Codex only (as /new at render.ts ~20393): a Codex /clear reaches no boundary, so it is not
-  // flagged and its bubble ends on the refusal/warn-handler, which needs the entry to exist to restore the box.
+test("a batched /clear on a Codex session is NOT flagged (it runs the native clear, so its bubble ends the ordinary way)", () => {
+  // gate off for Codex only (as /new at render.ts ~20393): a Codex /clear runs the native clear, reaching no
+  // clear boundary, so it is not flagged; its bubble ends on the acknowledging chip when the clear runs and,
+  // when it fails, on the refusal/warn-handler, which needs the entry to exist to restore the box.
   const { H, api } = world();
   H.backend = "codex";
   api.flushStaged(A, { text: "/clear", cites: [] });

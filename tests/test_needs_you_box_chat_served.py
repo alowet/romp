@@ -456,7 +456,8 @@ if (fr) {
     const cardSel = '.fitem.ask[data-key="a:' + cfg.g6 + '"]';
     const w5 = await writeStore((st) => { st.nodes[cfg.g6].background = cfg.background; st.nodes[cfg.g6].distilledMt = briefNow() + 3;
       st.nodes[cfg.g6].origin = { peer: cfg.api, peerName: "api", goalId: cfg.api + ":g1" };
-      st.nodes[cfg.g6].warns = [{ kind: "brief-failed", t: Math.floor(Date.now() / 1000) - 60, msg: "the first brief could not be written", detail: "the model returned nothing" }];   // the warning chip (the verifier's round two: the lab drove the origin badge alone)
+      st.nodes[cfg.g6].warns = [{ kind: "brief-failed", t: Math.floor(Date.now() / 1000) - 60, msg: "the first brief could not be written", detail: "the model returned nothing" }];   // the warning chip (the verifier's round two: the lab drove the origin badge alone); the kernel's distill pass is off (setUpClass), so the fixture stands
+      st.nodes[cfg.g6].relayCarried = "a question to api is still parked on the far host: it went on before it could be withdrawn";   // the relayed question a far host still holds: the card's own dim line, drawn on the row too (a contributor's post-merge note on PR 2124)
       st.nodes[cfg.g6c] = { id: cfg.g6c, text: cfg.g6cText, parentId: cfg.g6, nodeComplete: false, blocked: false, cleared: false, trail: [], t: Math.floor(Date.now() / 1000), log: [] }; st.status[cfg.g6c] = "working"; });
     Object.assign(out.content, await builtRecord(cfg.g6, w5, cfg.longBrief));   // { id, floor, built }: the kernel's build past the write
     const vis = "const vis = (x) => !!x && getComputedStyle(x).display !== 'none' && x.getBoundingClientRect().height > 0;";
@@ -466,12 +467,16 @@ if (fr) {
       const t = c.querySelector(".fcard-title"); const d = c.querySelector(".fask-secs > .fask-distill");
       return { title: t ? (t.textContent || "").trim() : null, distill: d ? (d.textContent || "").trim() : null,
                badges: Array.from(c.querySelectorAll(".fask-row2 .fask-badges > *")).filter(vis).map((x) => (x.textContent || "").trim()),   // the badge slot's children: the same read as the row's (symmetric, the verifier's round two)
+               chip: (() => { const ch = c.querySelector(".fask-warnchip"); return ch ? { tag: ch.tagName, cursor: getComputedStyle(ch).cursor, act: ch.dataset.act || null } : null; })(),   // the warning chip's face: the hand where a click opens the detail
+               relay: (() => { const rn = c.querySelector(".fask-relaynote"); return rn ? { text: (rn.textContent || "").trim(), shown: vis(rn) } : null; })(),   // the relayed question's own line
                toggles: Array.from(c.querySelectorAll(".fask-row3 > .fask-secbtn")).filter(vis).map((x) => ({ label: (x.textContent || "").trim(), pressed: x.getAttribute("aria-pressed") })),
                bodies: { bg: vis(c.querySelector(".fask-bg-body")), distill: vis(d), stall: vis(c.querySelector(".fask-stall-body")), tree: vis(c.querySelector(".fask-checklist")) } }; }, cardSel);
     const readRow = () => fr.evaluate((s) => { const r = document.querySelector(s); if (!r) return null; const vis = (x) => !!x && getComputedStyle(x).display !== "none" && x.getBoundingClientRect().height > 0;
       const t = r.querySelector(".ntc-title"); const d = r.querySelector(".ntc-secs > .fask-distill"); const secsRow = r.querySelector(".ntc-secs-row");
       return { title: t ? (t.textContent || "").trim() : null, distill: d ? (d.textContent || "").trim() : null, clamp: d ? getComputedStyle(d).webkitLineClamp : null,
                badges: Array.from(r.querySelectorAll(".ntc-badges > *")).filter(vis).map((x) => (x.textContent || "").trim()),
+               chip: (() => { const ch = r.querySelector(".fask-warnchip"); return ch ? { tag: ch.tagName, cursor: getComputedStyle(ch).cursor, act: ch.dataset.act || null } : null; })(),   // the row's chip: a span, the default cursor, no act
+               relay: (() => { const rn = r.querySelector(".fask-relaynote"); return rn ? { text: (rn.textContent || "").trim(), shown: vis(rn) } : null; })(),   // the same line on the row, outside its sections
                togglesShown: vis(secsRow), toggles: secsRow ? Array.from(secsRow.querySelectorAll(".fask-secbtn")).filter(vis).map((x) => ({ label: (x.textContent || "").trim(), pressed: x.getAttribute("aria-pressed") })) : null,
                bodies: { bg: vis(r.querySelector(".fask-bg-body")), distill: vis(d), stall: vis(r.querySelector(".fask-stall-body")), tree: vis(r.querySelector(".fask-checklist")) },
                nameOrAge: !!r.querySelector(".fname, .ftime, .fask-row2"), buttons: Array.from(r.querySelectorAll(".ntc-actions button")).map((b) => (b.textContent || "").trim()) }; }, rowSel(cfg.g6));
@@ -509,12 +514,30 @@ if (fr) {
       const vis = (x) => !!x && getComputedStyle(x).display !== "none" && x.getBoundingClientRect().height > 0;
       return { more: !!m && vis(m), moreLabel: m ? m.textContent : null, line: vis(d), clamp: d ? getComputedStyle(d).webkitLineClamp : null, clipped: !!d && d.scrollHeight > d.clientHeight + 1, bg: vis(bg) }; }, rowSel(cfg.g6));
     out.content.pick = { before: await moreOf() };
+    // the CLOSED direction first (the first note on PR 2124: a pick re-applied the sections and left More stale on the closed row): Background hides
+    // the line and More goes with it, Summary picked back brings the clipped line with More; then the OPEN direction (the 0.17.1 fix, a contributor's
+    // second note: Less stood over the line a Background pick hid): More pressed, the brief open, Background hides the line and its Less goes with it,
+    // Summary picked back brings the open brief with Less (the open state kept), then Less closes it. Both directions, since the More pass run only
+    // for an open row passes the open one alone (the contributor's note on the fix)
+    out.content.pick.closedBg = { pressed: await pressRow("Background"), row: await rowPressed("Background"), face: await moreOf() };
+    out.content.pick.closedSummary = { pressed: await pressRow("Summary"), row: await rowPressed("Summary"), face: await moreOf() };
+    await fr.evaluate((s) => { const m = document.querySelector(s + " .ntc-more"); if (m) m.click(); }, rowSel(cfg.g6));
+    out.content.pick.opened = await fr.waitForFunction((s) => { const r = document.querySelector(s); return !!r && r.classList.contains("ntc-open"); }, rowSel(cfg.g6), { timeout: 10000 }).then(() => true).catch(() => false);
+    out.content.pick.beforeOpen = await moreOf();
     out.content.pick.pressedBg = await pressRow("Background"); out.content.pick.rowBg = await rowPressed("Background"); out.content.pick.afterBg = await moreOf();
     out.content.pick.pressedSummary = await pressRow("Summary"); out.content.pick.rowSummary = await rowPressed("Summary"); out.content.pick.afterSummary = await moreOf();
+    await fr.evaluate((s) => { const m = document.querySelector(s + " .ntc-more"); if (m) m.click(); }, rowSel(cfg.g6));   // Less: the brief folds back
+    out.content.pick.closed = await fr.waitForFunction((s) => { const r = document.querySelector(s); return !!r && !r.classList.contains("ntc-open"); }, rowSel(cfg.g6), { timeout: 10000 }).then(() => true).catch(() => false);
     await openNeedsBox(fr, 1);
     out.content.pick.itemsBefore = await moreOf();
     out.content.pick.cardBg = await pressCard("Background"); out.content.pick.rowFollowedBg = await rowPressed("Background");   // the card's pick reaches the row's toggles (hidden at the items) over the channel
     out.content.pick.itemsAfterCardBg = await moreOf();
+    // a REPAINT with Background picked (the same note: the items face after a repaint was unpinned): a store write that moves a field the row
+    // carries (the background paragraph itself, its family stamped), waited for on the row's own background body, then the items face read again
+    const w7 = await writeStore((st) => { st.nodes[cfg.g6].background = cfg.background + " The second loader reads the first's fixtures."; st.nodes[cfg.g6].distilledMt = briefNow() + 9; });
+    out.content.pick.repaint = await builtRecord(cfg.g6, w7, cfg.longBrief);
+    out.content.pick.repainted = await fr.waitForFunction((s) => { const r = document.querySelector(s); const b = r && r.querySelector(".fask-bg-body"); return !!b && (b.textContent || "").includes("second loader reads"); }, rowSel(cfg.g6), { timeout: 30000 }).then(() => true).catch(() => false);   // the row repainted with the new paragraph
+    out.content.pick.itemsAfterRepaint = await moreOf();
     await pressCard("Summary"); await rowPressed("Summary");
     await openNeedsBox(fr, 2);
     // 6d. THE STAMPS AND THE LANDINGS (round two of the box content PR): the brief becomes two paragraphs with two parts, the second part
@@ -550,11 +573,36 @@ if (fr) {
       // 6g. A LIVE COLLAPSED FLIP CROSSES THE CHANNEL (the verifier's round two: the whole-map post was executed by no test): the feed's Collapsed
       // preference flipped from the shell's storage (the feed hears the storage event and clears every pick through the shared setter, which posts
       // the map) empties the row's picks too: Background open on both a moment ago, the row's Background reads unpressed
+      // the pick is made on the ROW here (the 0.17.1 fix, a contributor's second note: a row pick outlived every feed map that lacked it, since the feed
+      // answered the row's set with nothing; the feed acknowledges it now, so the flip's map clears it on both documents)
+      const pressRow2 = (label) => fr2.evaluate((a) => { const r = document.querySelector(a.sel); const b = r && Array.from(r.querySelectorAll(".ntc-secs-row .fask-secbtn")).find((x) => (x.textContent || "").trim() === a.label); if (b) b.click(); return !!b; }, { sel: rowSel(cfg.g6), label });
+      const cardIs2 = (label, pressed) => ff2.waitForFunction((a) => { const c = document.querySelector(a.sel); const b = c && Array.from(c.querySelectorAll(".fask-row3 > .fask-secbtn")).find((x) => (x.textContent || "").trim() === a.label); return !!b && b.getAttribute("aria-pressed") === a.pressed; }, { sel: cardSel, label, pressed }, { timeout: 10000 }).then(() => true).catch(() => false);
+      await ff2.evaluate((s) => { const c = document.querySelector(s); const b = c && Array.from(c.querySelectorAll(".fask-row3 > .fask-secbtn")).find((x) => (x.textContent || "").trim() === "Summary"); if (b) b.click(); }, cardSel);   // the reload scene's card pick closed first
+      await cardIs2("Summary", "true");
+      out.content.collapsed = { rowPick: await pressRow2("Background"), cardFollowed: await cardIs2("Background", "true") };
       const prefs = await shell.evaluate(() => { try { return JSON.parse(localStorage.getItem("romp:settings") || "{}"); } catch (e) { return {}; } });
       await shell.evaluate((p) => { localStorage.setItem("romp:settings", JSON.stringify(Object.assign({}, p, { collapsed: true }))); }, prefs);
-      out.content.collapsed = { rowCleared: await fr2.waitForFunction((a) => { const r = document.querySelector(a.sel); const b = r && Array.from(r.querySelectorAll(".ntc-secs-row .fask-secbtn")).find((x) => (x.textContent || "").trim() === "Background"); return !!b && b.getAttribute("aria-pressed") === "false"; }, { sel: rowSel(cfg.g6) }, { timeout: 15000 }).then(() => true).catch(() => false) };
+      out.content.collapsed.rowCleared = await fr2.waitForFunction((a) => { const r = document.querySelector(a.sel); const b = r && Array.from(r.querySelectorAll(".ntc-secs-row .fask-secbtn")).find((x) => (x.textContent || "").trim() === "Background"); return !!b && b.getAttribute("aria-pressed") === "false"; }, { sel: rowSel(cfg.g6) }, { timeout: 15000 }).then(() => true).catch(() => false);
+      // two kernel payloads AFTER the flip, each an event and never a wall-clock wait (the manager's read of the fix PR): a store write that moves the
+      // row's brief (the line's text is written on every update whatever is open; a closed background body is not), the kernel's build past the write
+      // carrying that brief, and the row's own repaint carrying the new sentence; a pick the feed had not acknowledged came back with the first of
+      // them (the defect re-imposed it per payload); then the row's toggles are read again
+      out.content.collapsed.payloads = [];
+      for (const word of ["third", "fourth"]) {   // loop-ok: two writes
+        const brief = cfg.twoParaBrief + " The " + word + " loader reads the fixtures of the one before.";
+        const w = await writeStore((st) => { st.nodes[cfg.g6].blockSummary = brief; st.nodes[cfg.g6].briefedMt = briefNow() + 10 + out.content.collapsed.payloads.length; });
+        const rec = await builtRecord(cfg.g6, w, brief);
+        rec.repainted = await fr2.waitForFunction((a) => { const r = document.querySelector(a.sel); const b = r && r.querySelector(".ntc-distill"); return !!b && (b.textContent || "").includes(a.word + " loader reads"); }, { sel: rowSel(cfg.g6), word }, { timeout: 30000 }).then(() => true).catch(() => false);
+        out.content.collapsed.payloads.push(rec);
+      }
+      out.content.collapsed.rowLater = await readT(fr2, rowSel(cfg.g6), ".ntc-secs-row .fask-secbtn");
       out.content.collapsed.card = await readT(ff2, cardSel, ".fask-row3 > .fask-secbtn"); out.content.collapsed.row = await readT(fr2, rowSel(cfg.g6), ".ntc-secs-row .fask-secbtn");
       await shell.evaluate((p) => { localStorage.setItem("romp:settings", JSON.stringify(p)); }, prefs);   // the preference back
+      // the flip BACK with NO pick held (the manager's read of the fix PR): the feed's clear finds its map unchanged and posts none, so each document
+      // re-applies its own hosts from its own storage listener (the chat page re-renders the box on the settings key: render.ts setupSettings), and the
+      // row's default returns to Summary at once, with no payload between; an event wait on the toggle, never a sleep
+      out.content.collapsed.backRow = await fr2.waitForFunction((a) => { const r = document.querySelector(a.sel); const b = r && Array.from(r.querySelectorAll(".ntc-secs-row .fask-secbtn")).find((x) => (x.textContent || "").trim() === "Summary"); return !!b && b.getAttribute("aria-pressed") === "true"; }, { sel: rowSel(cfg.g6) }, { timeout: 10000 }).then(() => true).catch(() => false);
+      out.content.collapsed.backCard = await cardIs2("Summary", "true");
       await ff2.evaluate((s) => { const c = document.querySelector(s); const b = c && Array.from(c.querySelectorAll(".fask-row3 > .fask-secbtn")).find((x) => (x.textContent || "").trim() === "Summary"); if (b) b.click(); }, cardSel);   // back to the summary on both
     }
   }
@@ -571,7 +619,7 @@ await browser.close();
 """
 
 
-# the driver's budget. Its bounded waits sum to about 2800 s serially (every helper counted PER CALL, the round-one verifier of PR 2105: the
+# the driver's budget. Its bounded waits sum to about 2950 s serially (every helper counted PER CALL, the round-one verifier of PR 2105: the
 # kernel's four 90 s deadlines, the 60 s row, card and credential-row waits, the 30 s and 15 s waits of the brief helpers per call, the fold
 # helper's three 5 s waits per call, the shorter button, dialog, level, settings-card and frame waits, the frame loops), more than any per-test ceiling the runner gives (CI's served-page step runs pytest with --timeout=600, thread method), so
 # the cap cannot be the sum: it is the ceiling less the SETUP the same per-test timer wraps (pytest-timeout's thread method times the first
@@ -686,7 +734,11 @@ class NeedsYouBoxChatServed(unittest.TestCase):
              "kind": "coordinate", "origin": "TESTHOST", "via": "peer", "at": int(time.time()) - 600}))
         cls.port = _free_port()
         cls.token = "testtok-needsbox"
-        env = _lab.kernel_env(cls.lab, claude, dist, cls.port, cls.token, ROMP_HOST_NAME="TESTHOST")
+        # the distill pass OFF (the verifier's round on the 0.17.1 fix PR): this lab writes every brief, paragraph part and warn itself, and the
+        # kernel's briefer, through a CLI the lab points at /bin/false, regenerated the question's brief on every pass and gave up every third
+        # one, keeping the text, blanking its parts and writing its own brief-failed warn over the fixture's (read from a kept store: the give-up
+        # warn naming 45 failed calls, briefParts None); the stamps scene's premise held or fell by where a read fell in that cycle
+        env = _lab.kernel_env(cls.lab, claude, dist, cls.port, cls.token, ROMP_HOST_NAME="TESTHOST", ROMP_DISTILLER="0")
         cls.klog = os.path.join(cls.lab, "kernel.log")
         cls.kernel = subprocess.Popen([os.path.join(BIN, "romp-kernel")], stdout=open(cls.klog, "w"), stderr=subprocess.STDOUT, env=env)
         for _ in range(120):
@@ -1044,7 +1096,12 @@ class NeedsYouBoxChatServed(unittest.TestCase):
         self.assertEqual(row["distill"], LONG_BRIEF); self.assertTrue(row["bodies"]["distill"], "shown at the items level: %r" % row)
         self.assertEqual(row["clamp"], "4", "clamped there like the brief was, More past it: %r" % row)
         self.assertEqual(row["badges"], card["badges"], "the card's badges on the row (before: none): %r vs %r" % (row, card))
+        self.assertEqual((card.get("chip") or {}).get("tag"), "BUTTON", "the card's warning chip is the button that opens the detail: %r" % card.get("chip"))
+        self.assertEqual((card.get("chip") or {}).get("cursor"), "pointer", "and shows the hand: %r" % card.get("chip"))
+        self.assertEqual(((row.get("chip") or {}).get("tag"), (row.get("chip") or {}).get("act"), (row.get("chip") or {}).get("cursor")), ("SPAN", None, "auto"), "the row's chip is a span with no act and the default cursor (the contributor's note on the 0.17.1 fix: the shared rule gave the span the hand and the hover tint): %r" % row.get("chip"))
         self.assertEqual(row["badges"], ["\u21aa from api", "distill failed"], "the delegation's origin and the warning chip (every warn the distiller's own), as the card words them: %r" % row["badges"])
+        self.assertEqual(card.get("relay"), {"text": "a question to api is still parked on the far host: it went on before it could be withdrawn", "shown": True}, "the card draws the relayed question a far host still holds as its own dim line: %r" % card.get("relay"))
+        self.assertEqual(row.get("relay"), card.get("relay"), "and so does the row, through the same helper (before: the note rode the row's wire and key and was never drawn): %r vs %r" % (row.get("relay"), card.get("relay")))
         self.assertFalse(row["togglesShown"], "the section toggles wait for the full context: %r" % row)
         self.assertFalse(row["nameOrAge"], "no session name and no age on the row (the box is the session's own): %r" % row)
         self.assertEqual(row["buttons"], ["Reply", "Clear"])
@@ -1078,13 +1135,23 @@ class NeedsYouBoxChatServed(unittest.TestCase):
     def test_a_section_pick_re_runs_the_rows_more_pass(self):
         """Round three of the box content PR (a contributor's review): a pick re-applied the sections and left the row's More stale, standing with
         nothing to open once the line was hidden and missing once the line came back clipped. The chat page's afterApply hook (card-sections.ts
-        SectionEnv, called last in every re-apply) runs the More pass. No store write between a press and its read."""
+        SectionEnv, called last in every re-apply) runs the More pass. No store write between a press and its read. Both directions (the
+        contributor's note on the 0.17.1 fix: the open direction alone let a pass run only for an open row through): the CLOSED row first
+        (Background: the line hidden, More gone; Summary: the clipped line with More), then the OPEN row (More pressed: Less goes with the
+        hidden line and comes back with it)."""
         c = self._content(); pk = c.get("pick") or {}
-        self.assertTrue(pk.get("pressedBg") and pk.get("rowBg"), "Background pressed on the row: %r" % {k: v for k, v in pk.items() if not isinstance(v, dict)})
         self.assertTrue((pk.get("before") or {}).get("more"), "the premise: the long brief's line is clipped and More stands: %r" % pk.get("before"))
-        self.assertEqual(((pk.get("afterBg") or {}).get("line"), (pk.get("afterBg") or {}).get("more")), (False, False), "Background open: the line hidden and its More gone with it (before: More stood and opened nothing): %r" % pk.get("afterBg"))
+        cb = pk.get("closedBg") or {}; cs = pk.get("closedSummary") or {}
+        self.assertTrue(cb.get("pressed") and cb.get("row"), "Background pressed on the CLOSED row: %r" % cb)
+        self.assertEqual(((cb.get("face") or {}).get("line"), (cb.get("face") or {}).get("more")), (False, False), "closed row, Background open: the line hidden and More gone (the first note on PR 2124: More stood stale; a pass run only for an open row leaves it): %r" % cb.get("face"))
+        self.assertTrue(cs.get("pressed") and cs.get("row"), "Summary pressed back on the closed row: %r" % cs)
+        self.assertEqual(((cs.get("face") or {}).get("line"), (cs.get("face") or {}).get("more"), (cs.get("face") or {}).get("moreLabel")), (True, True, "More"), "the clipped line back with its More: %r" % cs.get("face"))
+        self.assertTrue(pk.get("opened") and (pk.get("beforeOpen") or {}).get("moreLabel") == "Less", "More pressed: the brief open, the button reads Less: %r" % pk.get("beforeOpen"))
+        self.assertTrue(pk.get("pressedBg") and pk.get("rowBg"), "Background pressed on the row: %r" % {k: v for k, v in pk.items() if not isinstance(v, dict)})
+        self.assertEqual(((pk.get("afterBg") or {}).get("line"), (pk.get("afterBg") or {}).get("more")), (False, False), "Background open: the line hidden and its button gone with it, Less included (the 0.17.1 fix; before: Less stood over the hidden line): %r" % pk.get("afterBg"))
         self.assertTrue(pk.get("pressedSummary") and pk.get("rowSummary"), "Summary pressed back: %r" % {k: v for k, v in pk.items() if not isinstance(v, dict)})
-        self.assertEqual(((pk.get("afterSummary") or {}).get("line"), (pk.get("afterSummary") or {}).get("clipped"), (pk.get("afterSummary") or {}).get("more")), (True, True, True), "the clipped line back with its More (before: no More until a repaint): %r" % pk.get("afterSummary"))
+        self.assertEqual(((pk.get("afterSummary") or {}).get("line"), (pk.get("afterSummary") or {}).get("moreLabel")), (True, "Less"), "the open brief back with Less (the open state kept across the picks): %r" % pk.get("afterSummary"))
+        self.assertTrue(pk.get("closed"), "Less folds it back for the scenes after")
 
     def test_the_items_level_shows_the_clamped_line_whatever_the_pick(self):
         """The manager's ruling on the contributor's review (round three): the items level always shows the card's distill line, clamped with More,
@@ -1095,6 +1162,10 @@ class NeedsYouBoxChatServed(unittest.TestCase):
         self.assertTrue(pk.get("cardBg") and pk.get("rowFollowedBg"), "Background picked on the card while the row stands at the items: %r" % {k: v for k, v in pk.items() if not isinstance(v, dict)})
         ia = pk.get("itemsAfterCardBg") or {}
         self.assertEqual((ia.get("line"), ia.get("clamp"), ia.get("more"), ia.get("bg")), (True, "4", True, False), "still the clamped line with More and no paragraph (before: the row showed the whole paragraph unclamped with no More): %r" % ia)
+        self._built(pk.get("repaint") or {}, "the repaint with Background picked")
+        self.assertTrue(pk.get("repainted"), "the row repainted with the new background paragraph (the premise): %r" % {k: v for k, v in pk.items() if not isinstance(v, dict)})
+        ir = pk.get("itemsAfterRepaint") or {}
+        self.assertEqual((ir.get("line"), ir.get("clamp"), ir.get("more"), ir.get("bg")), (True, "4", True, False), "and after a repaint with Background picked, the same items face (a contributor's second note: unpinned before; without the level face in the update the repaint showed the paragraph): %r" % ir)
 
     def test_the_rows_paragraph_stamps_read_the_cards_and_a_part_without_a_time_reads_under_a_minute(self):
         """Round two of the box content PR (the verifier): the row stamped a part with no event time with an age counted from the epoch,
@@ -1130,10 +1201,16 @@ class NeedsYouBoxChatServed(unittest.TestCase):
         The feed's Collapsed preference flipped live clears every pick through the setter, which posts the map: the row, Background open a
         moment before, reads it unpressed."""
         c = self._content(); cl = c.get("collapsed") or {}
-        self.assertTrue(cl.get("rowCleared"), "the row's Background unpressed after the feed's live Collapsed flip (the map crossed the channel; before: nothing executed the post): %r" % cl)
+        self.assertTrue(cl.get("rowPick") and cl.get("cardFollowed"), "Background picked on the ROW, the card following: %r" % {k: v for k, v in cl.items() if not isinstance(v, list)})
+        self.assertTrue(cl.get("rowCleared"), "the row's Background unpressed after the feed's live Collapsed flip: the feed acknowledged the row's pick, so the flip's map clears it (the 0.17.1 fix; before: the row re-imposed its pick over every map that lacked it): %r" % cl)
         self.assertEqual([t["pressed"] for t in (cl.get("card") or [])], ["false", "false", "false"], "the card shows no section under the Collapsed default: %r" % cl.get("card"))
-        self.assertEqual([t["label"] for t in (cl.get("row") or [])][:1], ["Background"], "the row's toggles read: %r" % cl.get("row"))
-        self.assertEqual((cl.get("row") or [{}])[0].get("pressed"), "false")
+        self.assertEqual([t["pressed"] for t in (cl.get("row") or [])], ["false", "false", "false"], "and so does the row: its default reads the same Collapsed flag in the browser (before: the row opened Summary): %r" % cl.get("row"))
+        for i, rec in enumerate(cl.get("payloads") or []):
+            self._built(rec, "payload %d after the flip" % (i + 1))
+            self.assertTrue(rec.get("repainted"), "payload %d after the flip repainted the row's background paragraph (the event the later read waits on): %r" % (i + 1, rec))
+        self.assertEqual(len(cl.get("payloads") or []), 2, "two payloads observed after the flip: %r" % cl.get("payloads"))
+        self.assertEqual([t["pressed"] for t in (cl.get("rowLater") or [])], ["false", "false", "false"], "and stays so two payloads later (before: re-imposed per payload): %r" % cl.get("rowLater"))
+        self.assertEqual((cl.get("backRow"), cl.get("backCard")), (True, True), "the flip back with no pick held: no map crosses (the feed's map is unchanged), and each document returns its default to Summary from its own storage listener, no payload between: %r" % {k: cl.get(k) for k in ("backRow", "backCard")})
 
     def test_the_open_section_is_one_state_across_a_shell_reload(self):
         """The verifier's medium (2): three feed-only writers of the section choice never crossed the channel, so after a reload the card opened

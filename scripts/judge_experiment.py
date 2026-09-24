@@ -58,11 +58,13 @@ FAILURE_KINDS = ("parse", "give-up", "pass-crash", "call", "auth", "rate-limited
 #   (`history-unreadable` aside) cannot fire on the arm's road (it hands the judges a store it just wrote and read), and are named only so a
 #   future road that can reach them counts them.
 # A transient arm-judge model call (a 120s-alarm kill with empty stdout, an empty reply, an error envelope) leaves a `call`
-# failure row that marks the arm not comparable. The candidate arm's longer closer/planner menus hit that kill more often
-# than the baseline's by chance, not by verdict (the 2026-09-22 clean pilot: 2 timeouts baseline, 5 candidate), so the paid
-# arms came out not-comparable for a reason the measure does not care about. The harness re-samples a transiently-failed call
-# up to CALL_ATTEMPTS times (identically for every arm) and gives each attempt HARNESS_ALARM_S rather than the module's 120s,
-# so a slow-but-real closer menu finishes; a call that fails EVERY attempt still counts. See install_call_retry.
+# failure row that marks the arm not comparable. A served call's duration tracks its OUTPUT size, so the kill falls more often
+# on the candidate arm's longer closer/planner replies (the 2026-09-22 clean pilot: 2 timeouts baseline, 5 candidate) -- not a
+# uniform coin flip: it is a SELECTION effect, symmetric in mechanism but not in realization, and re-sampling a killed long
+# reply can shift which done/block verdicts land (plans/judge-prompt-experiments.md line 49). The harness re-samples a
+# transiently-failed call up to CALL_ATTEMPTS times (identically for every arm) and gives each attempt HARNESS_ALARM_S rather
+# than the module's 120s, so a slow-but-real closer menu finishes; a call that fails EVERY attempt still counts. See
+# install_call_retry.
 CALL_ATTEMPTS = 3
 HARNESS_ALARM_S = 240
 KILL_COST_FLOOR_USD = 0.02    # a per killed-attempt cost FLOOR for the budget stop when the usage ledger has no landed row to price a kill (a kill writes no usage row): about the pilot's per-ending mean 0.198 over its ~10 calls per ending, so a kill-heavy arm with zero landed rows still stops (PR 2122 review medium 3)
@@ -864,13 +866,16 @@ def install_call_retry(jd, errors_path, counters=None, attempts=CALL_ATTEMPTS):
     (count_failure_rows and count_non_arm_failure_rows skip a tagged row), so the ledger still shows every first-attempt kill
     while comparability counts only a call that failed EVERY attempt. `counters` (a dict) tallies, for the measured (arm)
     judges only: firstAttemptKills (calls whose first attempt was a transient kill), retryAttempts (re-samples made),
-    recoveredCalls (calls that served a NON-EMPTY reply after a kill; a pause or stand-down after a kill is NOT a recovery).
-    A served reply, or a pause/stand-down "" (jd._judge_ctx.paused: the rate gate, a scratch or auth pause), returns at once
-    and is never retried. Returns the saved original for the caller to restore in its finally."""
+    recoveredCalls (calls that served a NON-EMPTY reply after a kill; a pause or stand-down after a kill is NOT a recovery),
+    killedCalls (EVERY killed attempt: an attempt with last_call_fail set and NOT paused, so a pause after a kill counts as
+    one kill, not two; this is the count the budget stop prices, not firstAttemptKills+retryAttempts-recoveredCalls, which
+    over-counts a pause-after-kill, PR 2122 review). A served reply, or a pause/stand-down "" (jd._judge_ctx.paused: the rate
+    gate, a scratch or auth pause), returns at once and is never retried. Returns the saved original for the caller to restore
+    in its finally."""
     saved = jd._judge_run_impl
     ep = Path(errors_path)
     ctr = counters if counters is not None else {}
-    for key in ("firstAttemptKills", "retryAttempts", "recoveredCalls"):
+    for key in ("firstAttemptKills", "retryAttempts", "recoveredCalls", "killedCalls"):
         ctr.setdefault(key, 0)
     def _lines():
         if not ep.exists():
@@ -919,6 +924,8 @@ def install_call_retry(jd, errors_path, counters=None, attempts=CALL_ATTEMPTS):
                     return out
                 if not ranges and arm:
                     ctr["firstAttemptKills"] += 1
+                if arm:
+                    ctr["killedCalls"] += 1              # this attempt was a genuine kill (last_call_fail set, not paused): counted directly, so a later pause is not miscounted a kill (PR 2122 review)
                 ranges.append((before, len(_lines())))
             for s, e in ranges[:-1]:                                     # every attempt failed: the LAST rows are the one real failure, tag the earlier ones
                 _tag(s, e)
@@ -953,15 +960,37 @@ def seal_pre_cut_adopt(jd, fsid, session, store, cut_t):
     return sealed
 
 
+# The planner-unit kinds a MODEL-CALL fault would silence: the excuse counts only the units THE ARM's planner plans with an
+# UNCONDITIONAL planner MODEL CALL from a sealable own-turn position. plan_units yields five phases; only these two reach
+# plan_llm unconditionally once the unit is applied (kernel/judge.py _plan_session), and are reachable by the pre-cut seal, so
+# an unplanned one in the own turn is a fault (a seal-boundary fault, a dead planner):
+#   work  an ended segment's work   -> always a planner call
+#   live  an open segment's re-plan  -> always a planner call
+# EXCLUDED (an unplanned own-turn instance is NOT a fault, so it never blocks the excuse):
+#   prompt      the OPENER judge's unit (a workless opening message) -- never a planner call.
+#   nudge       a romp Nudge on a goal: resolve-or-noop. It CAN drive a planner call (plan_llm) on a still-working goal, so it
+#               is not excluded as never-plannable; but the seal reaches only PRE-CUT units, so an OWN-TURN nudge is never
+#               sealed -- if the arm left it unplanned (its own record: no planner call), the nudge took one of the kernel's
+#               three no-call roads (no resolvable target in the store; the moot retirement when the goal is already done; the
+#               goal not open, e.g. view-cleared), never a missed call. (kernel/judge.py _plan_session nudge branch.)
+#   delegation  a peer segment filed under the COURIER's goal. The ARM runs no courier (run_arm_inprocess never plants one), and
+#               store_before drops the own turn's bare seg_id placement, so the delegation branch reads its target UNSET and
+#               `continue`s with NO planner call in EVERY arm. An unplanned own-turn delegation is thus a HARNESS LIMITATION
+#               symmetric across arms, not a fault -- delegation endings' planner behaviour is unmeasured by the experiment
+#               (named as a residual in the plan).
+_PLANNER_CALL_PHASES = ("work", "live")
+
+
 def own_turn_plannable_count(jd, fsid, session, store):
-    """The PLANNER-served units of the ending's OWN final turn (the parse's last turn), before any seal. The ground for the
+    """The planner-MODEL-CALL units of the ending's OWN final turn (the parse's last turn), before any seal. The ground for the
     corpus-unplanned excuse (manager 2026-09-24): an ending unplanned in every arm is excused ONLY when this count is zero, so
     the excuse rests on the ending's own content, not on cross-arm agreement (which cannot tell a nothing-to-plan turn from one
-    a harness fault silenced in every arm). Read from the parsed turn, NEVER the seed boundary, whose fault this catches: a seed
-    boundary at or past the cut seals the own turn's units, so a count taken AFTER the seal reads zero for a faulted ending,
-    while this count, over the last turn's own segments, still finds them. A `prompt` unit is the opener judge's (a workless
-    opening message, kernel/judge.py); it is not a planner unit, so an ending whose own turn yields only a prompt had nothing
-    for the planner and counts zero. A unit the seed store already places is not counted."""
+    a harness fault silenced in every arm). Counts only the kinds that drive a planner model call from a sealable own-turn
+    position (`_PLANNER_CALL_PHASES`: work / live); a `prompt` (opener), a `nudge` (resolve-or-noop; an own-turn nudge is never
+    sealed, so an unplanned one is one of the kernel's no-call roads, not a fault) and a `delegation` (the arm runs no courier,
+    so it never drives a planner call in any arm) are NOT counted, per the premise stated at _PLANNER_CALL_PHASES. Read from the parsed turn, NEVER the seed boundary, whose fault this catches: a seed boundary at or
+    past the cut seals the own turn's units, so a count taken AFTER the seal reads zero for a faulted ending, while this count,
+    over the last turn's own segments, still finds them. A unit the seed store already places is not counted."""
     turns = session.get("turns") or []
     if not turns:
         return 0
@@ -972,7 +1001,7 @@ def own_turn_plannable_count(jd, fsid, session, store):
     n = 0
     for u in jd.plan_units(session, store, floor=floor, lazy_text=True):
         seg_id, phase = u[0], u[1]
-        if seg_id not in last_ids or phase == "prompt":                              # not the own turn, or an opener unit: not a planner unit
+        if seg_id not in last_ids or phase not in _PLANNER_CALL_PHASES:              # not the own turn, or a kind that does not drive a planner call from a sealable position (prompt/nudge)
             continue
         if not jd._placed_key(placements, jd._unit_key(seg_id, phase), live, floor=floor):
             n += 1
@@ -1153,8 +1182,7 @@ def run_arm_inprocess(corpus, arm, prompts_file, run_root, budget_usd, claude_bi
             finally:
                 jd.em.evict_document(str(path))   # crash OR success: drop this ending from both event-model caches (low a, 2026-09-24)
             cost, n, _ = ledger_cost(usage)
-            killed = (retry_counters.get("firstAttemptKills", 0) + retry_counters.get("retryAttempts", 0)
-                      - retry_counters.get("recoveredCalls", 0))   # attempts a timeout KILLED: billed by the API but ABSENT from the usage ledger (no row)
+            killed = retry_counters.get("killedCalls", 0)         # attempts a timeout KILLED (the wrapper's direct tally): billed by the API but ABSENT from the usage ledger; NOT fak+retry-rec, which over-counts a pause after a kill (PR 2122 review)
             per_kill = (cost / n) if n else KILL_COST_FLOOR_USD    # the mean landed call cost, else a documented floor when NO row landed (est would be 0 and never stop, PR 2122 review medium 3)
             est = cost + killed * per_kill                         # count the unseen killed attempts toward the stop, so a kill-heavy arm still stops even with an empty ledger (PR 2092 review, 2026-09-24)
             if budget_usd is not None and est > budget_usd * BUDGET_OVERRUN:
@@ -1172,7 +1200,7 @@ def run_arm_inprocess(corpus, arm, prompts_file, run_root, budget_usd, claude_bi
         except Exception as e:
             results["costError"] = type(e).__name__    # a ledger read that raises is RECORDED, not swallowed: a reader tells a free arm from a broken tally
         results["nonArmFailures"] = count_non_arm_failure_rows(errors_path)   # excluded from comparability, surfaced beside it (review 2026-09-22 PR 2022)
-        results["retry"] = retry_counters                          # firstAttemptKills / retryAttempts / recoveredCalls, so the comparability claim is visible (manager 2026-09-23)
+        results["retry"] = retry_counters                          # firstAttemptKills / retryAttempts / recoveredCalls / killedCalls, so the comparability claim is visible (manager 2026-09-23)
         results["failuresByKind"] = failure_rows_by_kind(errors_path)   # the remaining (arm, un-retried) failures by kind: a lone `parse` stays named
         results["callsByJudge"] = calls_by_judge(usage)                  # per-judge call counts: an arm with a silent MEASURED_JUDGE is not comparable (manager 2026-09-23)
         flush()                                      # results.json is written in the finally, whatever raised in the loop or after it
@@ -1466,8 +1494,22 @@ def plannable_units_from_corpus(corpus, manifest, ending_ids, now=None):
     by_id = {e["id"]: e for e in manifest["endings"]}
     now = int(time.time()) if now is None else int(now)
     counts = {}
-    env_keys = ("XDG_STATE_HOME", "CLAUDE_CONFIG_DIR", "ROMP_CLAUDE_BIN", "ROMP_STATE_DIR")   # load_judge sets/pops these; restore them so the report does not leave the process pointed at the deleted scratch root (PR 2121 verifier low c, 2026-09-24)
+    env_keys = ("XDG_STATE_HOME", "CLAUDE_CONFIG_DIR", "ROMP_CLAUDE_BIN", "ROMP_STATE_DIR", "ROMP_POSTAL_CLIENT_ONLY")   # load_judge sets/pops/defaults these; restore them so the report leaves nothing pointed at the deleted scratch root (PR 2121 low c + PR 2122 review)
     saved_env = {k: os.environ.get(k) for k in env_keys}
+    saved_path = list(sys.path)                              # load_judge inserts ROOT/tests; restore the path
+    root_str = str(ROOT) + os.sep
+    self_file = os.path.abspath(__file__)
+    def _repo_mods():                                        # every LOADED module whose file lives in the repository (never a stdlib
+        out = {}                                             # module, whose identity a pop would break), except this running module
+        for k, mod in list(sys.modules.items()):
+            f = getattr(mod, "__file__", None) or ""
+            fa = os.path.abspath(f) if f else ""
+            if fa and fa != self_file and fa.startswith(root_str):
+                out[k] = mod
+        return out
+    saved_repo = _repo_mods()                                # SAVE and REMOVE the caller's repository modules so load_judge builds FRESH objects instead of
+    for k in saved_repo:                                     # re-executing the caller's in place, which would leave the caller's judge module bound to the
+        del sys.modules[k]                                   # deleted scratch root (the tests hold it through run_arm_inprocess) (PR 2134 review pin 3)
     scratch = Path(tempfile.mkdtemp(prefix="je-report-parse-"))
     try:
         state = scratch / "state"
@@ -1486,9 +1528,13 @@ def plannable_units_from_corpus(corpus, manifest, ending_ids, now=None):
             finally:
                 jd.em.evict_document(str(path))
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-        for k, v in saved_env.items():                       # restore before the scratch root is gone, whatever raised
+        for k, v in saved_env.items():                       # restore the process env load_judge set/pops/defaults
             os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        sys.path[:] = saved_path
+        for k in _repo_mods():                               # pop the parse's OWN repository modules (built fresh against the scratch root: the judge module, the event model, and the repository modules the loader pulls in, e.g. kernel/credentials.py, kernel/logins.py, tests/romp_load.py); never a stdlib module (queue, concurrent.futures, secrets...), whose identity a pop would break (PR 2134 review medium 1 + pin 3)
+            sys.modules.pop(k, None)
+        sys.modules.update(saved_repo)                       # put the caller's repository modules back UNCHANGED (same objects, original state roots), so a caller that already held the judge module keeps it
+        shutil.rmtree(scratch, ignore_errors=True)           # AFTER the restores, which do not need the scratch dir
     return counts
 
 
@@ -1608,7 +1654,8 @@ def report(corpus, run_root, live_state, figure=None):
     note = ("Scoring: each card's column is the STRICT MAJORITY of %s per arm (a value per build, an unscored build as a "
             "sentinel; no strict majority means no column); a flap is a card whose per-build columns disagree. Comparability "
             "EXCLUDES only the non-arm reshaping and summarizing judges (%s); every other failure row counts (the failures "
-            "cell shows the non-arm count beside it). Leaks and false interrupts are split by class in measures.json under "
+            "cell shows the non-arm count beside it, names any rowless remainder as `N unnamed`, and names crashed endings as "
+            "`N ending(s) crashed` beside their pass-crash rows). Leaks and false interrupts are split by class in measures.json under "
             "TWO keyings: leaksByClass / falseInterruptsByClass on the manifest's heuristic class, and leaksByLabellerClass / "
             "falseInterruptsByLabellerClass on the labeller's class (labellerKeying names the source; an unlabeled bucket "
             "carries the rest so both sum to the totals). Offer, question and undone are the loose-ended strata, finished the "

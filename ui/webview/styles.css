@@ -1169,7 +1169,7 @@ body.chat-theme-yatharth .tab.active.colored:not(.tab-blocked) {
 #notices.ntc-l0 .ntc-more { display: none; }   /* the disclosure shows wherever its line does: at the items level the distill line is clamped and More opens it (plans/needs-you.md, the row carries what the card carries) */
 #notices:not(.ntc-l2) .ntc-row .ntc-secs-row { display: none; }   /* the card's section toggles at the full context only; at the items level the open section's body shows under the title */
 .ntc-row .ntc-secs-row { margin-top: 2px; }
-.ntc-row .ntc-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 0.86em; }
+.ntc-row .ntc-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }   /* no size of its own: the chips size themselves (card-sections.css), and a size here made the row's 14 percent smaller than the card's */
 .ntc-row .ntc-distill { font-size: 0.86em; opacity: 0.85; white-space: pre-wrap; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }   /* the card's line, clamped in the box like the brief was (the box is a strip; the card has the pane), More past it at either level */
 .ntc-row.ntc-open .ntc-distill { display: block; -webkit-line-clamp: unset; overflow: visible; }   /* the disclosure open: the clamp lifted */
 #notices:not(.ntc-l2) .ntc-row.ntc-fault .ntc-body { display: -webkit-box; }   /* the credential row's body, the fault's explanation, shows at the items too (the box arc's round three: it hid with every body) */

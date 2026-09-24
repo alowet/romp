@@ -1,6 +1,6 @@
 // The feed's SEARCH filter (the user 2026-08-23): a footer search box that live-filters the board to
-// sessions whose NAME matches the typed text — host prefix included, so "snape" finds every session on
-// that machine and "snape:api" narrows to one. Compact by default (a "Search" button, the footer's
+// sessions whose NAME matches the typed text — host prefix included, so "TESTHOST" finds every session on
+// that machine and "TESTHOST:api" narrows to one. Compact by default (a "Search" button, the footer's
 // word-button vocabulary), expanding to an inline input on click — progressive disclosure, like every
 // feed surface. Pure matching lives here so node --test executes the rule without a DOM.
 

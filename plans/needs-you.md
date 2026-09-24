@@ -230,7 +230,21 @@ the item, so which section is open is one state and never a second copy. The ses
 session's own page. The kernel's row carries every field the card's sections read, from the same feed item. The one open section is one state across the shell's two documents: every write to the choice goes through the shared module's setter, which carries it over a channel from the feed page (the owner, which persists it) to the chat page (a follower, which asks for the map when it loads), so after a reload the row opens what the card opens. In VS Code the chat and feed webviews are separate origins and the channel crosses nothing: each page keeps its own choice there, and a fallback through the extension host is deferred to after the release (the freeze of 2026-09-23). Two changes to the card itself rode the shared builder (the reviews of
 2026-09-24): the card's badges, its distill line and paragraphs, its awaited peers and its sub-goal triangles route their clicks through one
 binding on the card (actions.ts delegate), so they wear the repository's short press pulse like every delegated control; and the provenance
-anchor paints a separator between each of its facts, "from a · delegated to b · delegated to c", the handoff and a tracked delegation included.
+anchor paints a separator between each of its facts, "from a · delegated to b · delegated to c", the handoff and a tracked delegation included. The feed
+answers a row's pick with an acknowledgement, and the chat page holds its own pick only until that word arrives (a stale acknowledgement
+spares a newer pick), so the maps that lack the pick afterwards, the Collapsed clear and the prune once the item leaves, govern both
+documents (the 0.17.1 fix). A flip with no pick held leaves the map unchanged, so no map crosses: the feed's setter re-applies its
+cards anyway (a caller that is not quiet gets the re-apply, since the default the cards resolve against moved), and the chat page
+re-renders the box from its own listener on the settings key, so the default follows at once in both documents with no payload
+between. The row's default section follows the feed's Collapsed flag everywhere, through the settings fan-out: the browser shell and
+a standalone chat tab read the origin's shared storage, and a VS Code chat webview gets the gear's whole settings object relayed by the
+extension host and writes its own copy, so its rows follow the flag as its cards do; only the picks stay per page in VS Code, since the
+section channel does not cross its webviews. On the feed, a
+sub-goal row's text and mark keep the modal's own click zones (wireNodeZones) rather than the delegated acts; on the chat page every
+rebuilt click is delegated. The chat page lands the line, the paragraphs and a sub-goal's text in its own transcript (the turn the
+kernel's anchor names, aligned on the quoted span when the frame carries one, with the turn's flash re-armed as every lander does)
+and repaints the stamped ages live in its one-second pass; the relayed question a far host still holds is drawn on the row as on the
+card, through one helper both pages call after the sections.
 
 Every clear or undo account the kernel sends carries its Undo stack (`batches`: the ids an earlier undo left owed first, then the
 clears log's batches by stamp, newest first; `owedBatch`: the owed ids alone; `batchesTotal`: the count of log batches before the
@@ -305,6 +319,24 @@ standing set's: the log is append-only within an episode, so the longer parse is
 first, and a shorter file arrives only through the absent arm, which records length zero; a memoized fault returning through a memo hit
 after a different fault files its judge row, so one row per episode holds across every ending.
 
+### Two fixes after the box content round (2026-09-24, a contributor's post-merge note on PR 2124)
+
+- **A remote row's sender opens on its own kernel.** A session frame's `status.notices` rows are the chat box's rows, and
+  federation prefixes them like the feed's cards in EVERY id-bearing field, not the item id alone: the delegation origin
+  (`origin.peerSid` prefixed and `origin.peerHost` set to the frame's host when the card's kernel recorded the sender as its
+  own, an empty `peerHost`) and the awaiting box's peers (`awaiting.peers[].sid` and `host`, the same rule). One helper does
+  the rewrite for a feed card and for a notices row (`_prefixOriginAndPeers`, called by `_prefixIdBearing` and by the
+  `status.notices` pass in `prefixInbound`), so the badge's `data-sid` carries the host and `routeOutbound` sends the click
+  to that kernel. Before, the row's badge carried the bare sid and the click opened the sender on the LOCAL kernel. The
+  delegated-to badge (`handoffTo`: peer, peerSid, peerHost) takes the origin's rule in the same helper, since its click routes
+  the same way; `waitingOn` carries a peer's NAME, display text with no click, and stays as it is.
+- **The section registry is exact.** The twin set per item (`card-sections.ts`, `hosts`) holds a host only while its
+  element shows the item: the feed unregisters a card where it drops it from its maps (a clear's finish, a session's cards
+  leaving, the focused copy's exit, the board and the section emptying, a card leaving the payload), and the chat page
+  unregisters a row where `renderNotices` drops it and where a completed action removes it. Nothing waits for the next read
+  of the same item or for a Collapsed flip; `sectionHostsRaw` is the test-only view of the set that drops nothing as it reads,
+  so a pin can say the registry holds nothing for an id that left the payload.
+
 ### Completed is safe to clear unread
 
 Nothing left undone, offered as a next step, or asked about may land in Completed: those are Needs you's. That is the
@@ -342,6 +374,10 @@ relies on: a card in Completed asks nothing of the user, so a Clear all over Com
   `test_held_mail_chat_served.py`, `test_kernel_mobile.py` re-pointed to the words and the token.
 - Phase three: a chat lab for the box (a row per item that is not a hard block; Reply and Clear each remove
   theirs; the switch hides the box and leaves the ring).
+- The two fixes after the box content round: `federation-notice.test.ts` (a remote session frame whose row carries a
+  local-sender origin and awaiting peers: prefixed sid, the host as peerHost, the click routed to that host);
+  `feed-render-incremental.test.ts` (a card leaves the payload and `sectionHostsRaw` holds nothing for its id, no pick and
+  no flip between; a detached host is read by the raw view and dropped by `sectionHosts`).
 
 ## Privacy
 

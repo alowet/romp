@@ -11,12 +11,16 @@ exactly as the send-bubble lab appends records, never a hand-injected browser fr
 
 The one behaviour the labs turn on: a `/clear` turn emits an `init` SystemMessage carrying a FRESH
 session_id (a new episode), which the real kernel reads as the /clear boundary (SdkSession._on_message:
-lastSid flips, the clearing bracket ends, the fed /clear's echo retires by qid). A plain message emits
-an init carrying the RESUMED id (no flip) and writes a user record + an assistant reply under the current
-episode's file. SYNTHETIC only: invented reply text, placeholder uuids, hostname TESTHOST.
+lastSid flips, the clearing bracket ends). Like CLI 2.1.280, the /clear then writes the fresh episode's
+record GROUP within milliseconds of the init: an isMeta session caveat, the /clear command-name wrapper
+(the record that LANDS the slash send), and a local-command-stdout record, so the /clear renders as a
+landed command row rather than a stuck chip. A plain message emits an init carrying the RESUMED id (no
+flip) and writes a user record + an assistant reply under the current episode's file. SYNTHETIC only:
+invented reply text, placeholder uuids, hostname TESTHOST.
 
 Environment knobs (read by the client, set by the lab):
   ROMP_FAKE_SDK_REPLY   the assistant reply text for a plain message (default a synthetic line)
+  ROMP_FAKE_SDK_GATE    a file path the /clear turn waits to exist before it runs (the lab creates it to release the in-flight clear)
 """
 import asyncio
 import json
@@ -124,7 +128,13 @@ def _iso(t):
 
 
 def _proj_dir(cwd):
-    root = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    # FAIL LOUD, never touch the real store: with CLAUDE_CONFIG_DIR UNSET the transcripts would be written
+    # under the developer's real ~/.claude. The one user (the served lab) always sets it via kernel_env, so
+    # this is a safety net, not a normal path: refuse rather than write outside the hermetic root.
+    root = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not root:
+        raise RuntimeError("fake claude_agent_sdk: CLAUDE_CONFIG_DIR is unset; refusing to write transcripts "
+                           "under the real ~/.claude store (set CLAUDE_CONFIG_DIR to a hermetic root)")
     return os.path.join(root, "projects", re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(os.path.expanduser(cwd or "~"))))
 
 
@@ -199,20 +209,57 @@ class ClaudeSDKClient:
         return {"commands": []}
 
     async def receive_messages(self):
-        delay = float(os.environ.get("ROMP_FAKE_SDK_DELAY") or 0.0)
+        # A /clear is held IN FLIGHT on an EVENT, not a timer: if ROMP_FAKE_SDK_GATE names a path, the /clear turn
+        # waits until that file exists (the served lab creates it AFTER capturing the in-flight snapshot), so the
+        # test controls exactly when the clear runs; the lab then POLLS the client's recorded frames for the
+        # settled state. Bounded (~15s): a lab that forgets to create the gate RAISES below rather than running
+        # the /clear late or hanging.
+        gate = os.environ.get("ROMP_FAKE_SDK_GATE") or ""
         while True:
             turn = await self._turnq.get()
             text = _turn_text(turn)
             clear = _is_clear(text)
-            if delay:
-                await asyncio.sleep(delay)   # a realistic gap so the client paints the in-flight rows first
+            if clear and gate:
+                for _ in range(300):   # loop-ok: bounded (~15s) wait for the test to create the gate file
+                    if os.path.exists(gate):
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    raise RuntimeError(
+                        "fake claude_agent_sdk: ROMP_FAKE_SDK_GATE file %r never appeared after ~15s; "
+                        "the served lab must create it to release the in-flight /clear" % gate)
             if clear:
                 # a /clear mints a FRESH episode: the init carries a NEW session_id → the kernel flips
-                # lastSid and ends the clearing bracket. /clear writes NO user record for itself.
+                # lastSid and ends the clearing bracket. CLI 2.1.280 then writes a fresh-episode record GROUP
+                # within milliseconds of the init (the earlier fixture wrote NOTHING here, so the /clear never
+                # landed and rode on as a stuck chip): an isMeta session caveat (harness noise the kernel
+                # skips), the /clear COMMAND-NAME wrapper (the record that LANDS a slash send, matched under
+                # kernel/session_backend.py command_text_key, so the /clear renders as a LANDED command row),
+                # and a local-command-stdout record (its output).
                 self._fsid = "fsid-" + _uuid.uuid4().hex[:12]
                 self._parent = None
                 yield SystemMessage("init", {"model": "claude-fable-5-1", "permissionMode": "acceptEdits",
                                              "session_id": self._fsid})
+                now = int(time.time())
+                path = _transcript(self._cwd, self._fsid)
+                cav = "u-" + _uuid.uuid4().hex[:10]
+                _append(path, {"type": "user", "timestamp": _iso(now), "uuid": cav, "parentUuid": None,
+                               "isMeta": True, "sessionId": self._fsid,
+                               "message": {"role": "user", "content":
+                                           "Caveat: The messages below were generated by the user while running "
+                                           "local commands. DO NOT respond to these messages or otherwise consider "
+                                           "them in your response unless the user explicitly asks you to."}})
+                cmd = "u-" + _uuid.uuid4().hex[:10]
+                _append(path, {"type": "user", "timestamp": _iso(now), "uuid": cmd, "parentUuid": cav,
+                               "sessionId": self._fsid,
+                               "message": {"role": "user", "content":
+                                           "<command-name>/clear</command-name>\n<command-message>clear"
+                                           "</command-message>\n<command-args></command-args>"}})
+                out = "u-" + _uuid.uuid4().hex[:10]
+                _append(path, {"type": "user", "timestamp": _iso(now), "uuid": out, "parentUuid": cmd,
+                               "sessionId": self._fsid,
+                               "message": {"role": "user", "content": "<local-command-stdout></local-command-stdout>"}})
+                self._parent = out
                 yield ResultMessage(subtype="success", is_error=False, num_turns=1, session_id=self._fsid,
                                     total_cost_usd=0.0)
                 continue

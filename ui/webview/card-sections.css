@@ -126,9 +126,14 @@
   color: var(--check-bg); border: 1px solid var(--check-ring); }   /* the ring follows the themed ✓ (T226 review) */
 .fask-warnchip { flex: 0 0 auto; font-size: 0.66em; font-weight: 700; letter-spacing: 0.04em;
   padding: 1px 6px; border-radius: var(--radius-pill); line-height: 1.4; font-family: inherit;
-  color: #ffd166; border: 1px solid rgba(255, 209, 102, 0.6); background: transparent; cursor: pointer; }
-.fask-warnchip:hover { background: rgba(255, 209, 102, 0.14); }
+  color: #ffd166; border: 1px solid rgba(255, 209, 102, 0.6); background: transparent; }
+/* the hand and the hover tint belong to the chip that opens the detail overlay (the feed's button); the chat page's chip is a span whose
+   hover carries the whole evidence, and it promises no click (the contributor's note on the 0.17.1 fix: the span showed the hand and the tint) */
+button.fask-warnchip { cursor: pointer; }
+button.fask-warnchip:hover { background: rgba(255, 209, 102, 0.14); }
 .fsum-stale { font-style: italic; opacity: 0.62; font-size: 0.92em; margin-bottom: 3px; }
+/* the relayed question a far host still holds (applyRelayNote): the card's own dim line beside the sections, on the row too */
+.fask-relaynote { color: var(--dim); opacity: 1; white-space: pre-wrap; overflow-wrap: anywhere; }
 /* the swirl's spin, defined in the sheet both pages import so the row's glyph and caption spin on the chat page too (round three of the box content PR) */
 @keyframes fask-swirl-spin { to { transform: rotate(-360deg); } }
 @media (prefers-reduced-motion: reduce) { .fask-awaiting-swirl { animation: none; } }

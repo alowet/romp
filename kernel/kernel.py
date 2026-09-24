@@ -496,6 +496,10 @@ class _PerfStats:
     # signature could not be taken
     CHAT_MISS = _CHAT_SIG_LABELS + ("cold", "nosig")
     SEND_KINDS = ("full", "delta", "deduped")
+    # parses.byRoad: the road a kernel parse-store miss took (em._assemble's mode_out), and the roads among them that walk
+    # the transcript from its first record, the only ones whose leaf size parses.wholeBytes adds (see parse)
+    PARSE_ROADS = ("serve", "fold", "restore", "full", "bypass", "fallback")
+    WHOLE_ROADS = ("full", "bypass", "fallback")
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -558,9 +562,11 @@ class _PerfStats:
             #                                 consecutive lost spawns, orphans of a dead kernel swept at boot, its workers' CPU (also
             #                                 folded into cpu_ms_sum, as the in-process workers' is) and its last done line   # tierStarts: judge tier threads started (T404: 0 while tracking is off)
             # cold event-model parses this kernel ran (T323 stage 1): the kernel's own _parse misses, per session
-            # (sid8) and in total, plus the bytes of the files parsed; the judges' misses ride the snapshot from
-            # jd.parse_misses(). The acceptance number of the lazy-transcript work: a boot with no client parses zero.
-            self.parses = {"kernel": 0, "hits": 0, "bytes": 0, "bySid": {}}   # kernel-asked cold parses; total/judge from jd
+            # (sid8) and in total; the judges' misses ride the snapshot from jd.parse_misses(). The acceptance number of the
+            # lazy-transcript work: a boot with no client parses zero. A miss is not a whole parse (2026-09-24): byRoad
+            # splits the misses by the road the parse took, and wholeBytes adds the leaf's size on the WHOLE_ROADS only.
+            self.parses = {"kernel": 0, "hits": 0, "wholeBytes": 0, "byRoad": dict.fromkeys(self.PARSE_ROADS, 0),
+                           "bySid": {}}                    # kernel-asked cold parses; total/judge from jd
             self.http = {}
             # the file preview popover's slice cache (T351): hits and misses of GET /file?slice=1, the bytes it served,
             # and the entries the pusher's path warmed ahead of a hover
@@ -882,12 +888,19 @@ class _PerfStats:
         with self.lock:
             self.parses["hits"] += 1
 
-    def parse(self, sid, nbytes=0):
-        """One COLD parse the kernel's _parse asked for (a shared-store miss that ran em.parse_session)."""
+    def parse(self, sid, nbytes=0, road="full"):
+        """One COLD parse the kernel's _parse asked for (a shared-store miss that ran em.parse_session), under the road
+        em._assemble took. Until 2026-09-24 every miss added the leaf's whole size to parses.bytes, so a fold that read
+        one appended record of a 100 MB leaf was booked as 100 MB parsed, and /perf read as whole re-parses what were
+        mostly folds (a synthetic lab kernel: 69 misses booked as 7.18 GB, 6 of the 84 misses in all whole parses).
+        `nbytes` (the leaf's size) counts toward wholeBytes on a WHOLE_ROADS road only, whatever the caller passed."""
         with self.lock:
             p = self.parses
             p["kernel"] += 1
-            p["bytes"] += int(nbytes or 0)
+            r = p["byRoad"]
+            r[road] = r.get(road, 0) + 1              # a road outside PARSE_ROADS is named too: _assemble's modes are few
+            if road in self.WHOLE_ROADS:
+                p["wholeBytes"] += int(nbytes or 0)
             k = str(sid or "")[:8]
             if len(p["bySid"]) < 1024 or k in p["bySid"]:
                 p["bySid"][k] = p["bySid"].get(k, 0) + 1
@@ -1100,8 +1113,8 @@ class _PerfStats:
             builds["chat"]["bySession"] = sorted(              # the per-session timer, sids only, the largest max first
                 ({"sid": sid, **row} for sid, row in self.chat_by_session.items()),
                 key=lambda r: -(r["max"] or 0.0))
-            parses = {"kernel": self.parses["kernel"], "hits": self.parses["hits"], "bytes": self.parses["bytes"],
-                      "bySid": dict(self.parses["bySid"])}
+            parses = {"kernel": self.parses["kernel"], "hits": self.parses["hits"], "wholeBytes": self.parses["wholeBytes"],
+                      "byRoad": dict(self.parses["byRoad"]), "bySid": dict(self.parses["bySid"])}
             sends = {k: {sl: {"count": e[0], "bytes": e[1]} for sl, e in d.items()}
                      for k, d in self.sends.items()}
             judge = dict(self.judge)
@@ -1210,8 +1223,9 @@ class _PerfStats:
                 "fileSlice": file_slice,                   # T351: the preview popover's slice cache (hit / miss / bytes / warm)
                 "glossary": glossary_stats,                # T351 stage 2: files parsed, frames / terms / bytes BUILT per cycle, entries cut, files refused
                 # T323: cold parses through the ONE parse store (stage 2): total = every miss (whoever asked), kernel =
-                # the display's asks among them, judge = the rest, hits = the display's asks served from the store,
-                # sharedHits = every hit. A boot with no client reads kernel 0.
+                # the display's asks among them (byRoad: by the road each took; wholeBytes: the leaf sizes of the whole
+                # ones, 2026-09-24), judge = the rest, hits = the display's asks served from the store, sharedHits =
+                # every hit. A boot with no client reads kernel 0.
                 "parses": dict(parses, total=int(getattr(jd, "parse_misses", lambda: 0)()),
                                judge=max(0, int(getattr(jd, "parse_misses", lambda: 0)()) - parses["kernel"]),
                                sharedHits=int(getattr(jd, "parse_hits", lambda: 0)())),
@@ -36055,7 +36069,8 @@ def _parse(path, sid, now):
     states = str(jd.STATE / "states" / (sid + ".jsonl"))   # the kernel's states log path (the judges default to the same file)
     session = jd.parsed_session(sid, [path], now, asm_mode_out=_mode, stats=stats, states=states,
                                 sdk_human=_display_sdk_human(sid))
-    _parse_mode[path] = _mode[-1] if _mode else "full"
+    road = _mode[-1] if _mode else "full"           # a serve or a whole parse that raised appends "fallback" after it: the last ran
+    _parse_mode[path] = road
     # The fileset key this parse was SERVED under (jd.parsed_session `stats["key"]`: the [mtime, size] row of every file it
     # read, taken before the read, so the content is at least as new as the rows say), stamped on the tree for the chat
     # frame's watermark (_chat_wm, 2026-09-22). The tree is the shared cache object and the stamp is idempotent for it: one
@@ -36065,11 +36080,16 @@ def _parse(path, sid, now):
         session["_txKey"] = _tx[0]
     try:
         if stats.get("miss"):
-            try:
-                size = os.stat(path).st_size
-            except OSError:
-                size = 0
-            _PERF_STATS.parse(sid, size)             # a cold parse the KERNEL's ask ran (T323: /perf parses.kernel)
+            # a cold parse the KERNEL's ask ran (T323: /perf parses.kernel), under the road it took; the leaf's size is a
+            # parse cost only on a road that walked it from the first record (2026-09-24: a fold reads the appended bytes,
+            # a serve or a restore none of the pre-cut transcript, and booking the leaf at every miss read them as whole)
+            size = 0
+            if road in _PerfStats.WHOLE_ROADS:
+                try:
+                    size = os.stat(path).st_size
+                except OSError:
+                    size = 0
+            _PERF_STATS.parse(sid, size, road=road)
         else:
             _PERF_STATS.parse_hit()
     except Exception:
@@ -51790,7 +51810,12 @@ def _ws_inflate(data, cap):
             if total > cap:
                 return None, "a compressed message that inflates past %d bytes" % cap
             out.append(piece)
-            if not z.unconsumed_tail:
+            # the stream ended, or its input is spent. A message may end in a BFINAL block (RFC 7692 §7.2.3.4), which
+            # leaves the tail appended above past the stream's end, and once an earlier piece filled the step CPython
+            # keeps such leftovers in unconsumed_tail as well as unused_data: stopping on the tail alone called again on
+            # the ended stream, got nothing, and refused a legal message as not inflating (post-merge review of #2106,
+            # 2026-09-24)
+            if z.eof or not z.unconsumed_tail:
                 break
             if not piece:                        # no output and input left over: zlib is not moving (cannot happen with a
                 return None, "a compressed message that does not inflate"   # positive max_length, guarded so the loop cannot spin)
@@ -74833,6 +74858,11 @@ class Handler(BaseHTTPRequestHandler):
         for hn in ("Upgrade", "Connection", "Sec-WebSocket-Key", "Sec-WebSocket-Version",
                    "Sec-WebSocket-Protocol", "Sec-WebSocket-Extensions"):
             v = self.headers.get(hn)
+            if hn == "Sec-WebSocket-Extensions" and hasattr(self.headers, "get_all"):
+                # the list may come as several lines (RFC 6455 §11.3.2), which the direct handshake reads together: the
+                # remote must see them all, or an offer past the first line upgrades plain through the hub where it
+                # negotiated direct (review of #2106, 2026-09-23). Key and Version may not repeat, so they stay one read
+                v = ", ".join(self.headers.get_all(hn) or []) or v
             if v:
                 lines.append("%s: %s" % (hn, v))
         try:

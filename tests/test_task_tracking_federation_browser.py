@@ -235,6 +235,16 @@ catch (e) { console.error("browser-launch-failed: " + e); process.exit(3); }
 const ctx = await browser.newContext({ viewport: { width: 1400, height: 900 } });
 const page = await ctx.newPage();
 const errors = [];
+// a load's FIRST merged feed frame, as an event (round ten): a binding the feed frame's init script calls once per load, which
+// the /tunnels hold below waits on; a reload arms a fresh one. Round nine held the list 1.5 s from the reload call, and a
+// starved runner's reload outlived the seconds, so the list landed before the frame (the v0.17.0 cut's local run, and
+// every run under a half-core quota).
+let firstFrame = null;
+const armFirstFrame = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); firstFrame = { promise, resolve }; };
+armFirstFrame();
+await page.exposeFunction("__ttFirstFeedFrame", () => { if (firstFrame) firstFrame.resolve(); });
+// the slow-load road (the reproduction by delay): the feed frame's document answers late, as on a starved runner
+if (cfg.slowFeedLoadMs) await page.route((u) => u.pathname === "/feed", async (route) => { await new Promise((r) => setTimeout(r, cfg.slowFeedLoadMs)); await route.continue(); });
 page.on("pageerror", (e) => errors.push("page: " + e.message));
 page.on("console", (m) => { if (m.type() === "error") errors.push("console: " + m.text().slice(0, 300)); });
 // the shell's bell: every notify the feed pane posts up, so a card's warn ringing is observable here; installed before any
@@ -248,16 +258,17 @@ await page.addInitScript(() => {
   if (!location.pathname.startsWith("/feed")) return;
   const w = window; w.__ttFrames = [];
   const before = () => { try { return { marks: JSON.parse(localStorage.getItem("romp:cardNotified") || "[]").length, sec: Object.keys(JSON.parse(localStorage.getItem("romp:feedview") || "{}").sec || {}).length }; } catch { return { marks: -1, sec: -1 }; } };
-  const note = (m, via) => { if (m && m.type === "feed") w.__ttFrames.push({ via, off: m.off === true, hostsUnread: m.hostsUnread === true, offHosts: Array.isArray(m.offHosts) ? m.offHosts.slice() : null, pendingHosts: Array.isArray(m.pendingHosts) ? m.pendingHosts.slice() : null, askIds: Array.isArray(m.asks) ? m.asks.map((a) => a.itemId) : [], before: before() }); };
+  const note = (m, via) => { if (m && m.type === "feed" && !w.__ttFirstSeen) { w.__ttFirstSeen = true; try { const fn = window.__ttFirstFeedFrame; if (fn) fn(); } catch (e) {} }
+    if (m && m.type === "feed") w.__ttFrames.push({ via, off: m.off === true, hostsUnread: m.hostsUnread === true, offHosts: Array.isArray(m.offHosts) ? m.offHosts.slice() : null, pendingHosts: Array.isArray(m.pendingHosts) ? m.pendingHosts.slice() : null, askIds: Array.isArray(m.asks) ? m.asks.map((a) => a.itemId) : [], before: before() }); };
   window.addEventListener("message", (e) => note(e.data, "window"));
   let fed;
   Object.defineProperty(w, "__rompFed", { configurable: true, get() { return fed; }, set(v) { fed = v; try { if (v && typeof v.onFrame === "function") v.onFrame((e) => note(e.data, "fed")); } catch {} } });
 });
-// the first /tunnels answer HELD (round nine, the deterministic race): the local kernel's push lands on its open socket before
-// the answer, so a load's first merged frame is built with no remote host in hand; every manager's poll in the 1.5 s after a
-// load is delayed until then, and the rest pass through untouched
-let holdUntil = 0;
-await page.route("**/tunnels", async (route) => { const wait = holdUntil - Date.now(); if (wait > 0) await new Promise((r) => setTimeout(r, wait)); await route.continue(); });
+// the first /tunnels answer of a load is HELD until that load's first merged feed frame is on record (round ten: the event
+// round nine's 1.5 s approximated): the local kernel's push lands on its open socket and the frame is built with no remote
+// host in hand, then the list goes through, and every later poll passes at once. Bounded at 20 s, so a page that never
+// builds a frame fails on its own assertion instead of hanging here.
+await page.route("**/tunnels", async (route) => { const armed = firstFrame; if (armed) await Promise.race([armed.promise, new Promise((r) => setTimeout(r, 20000))]); await route.continue(); });
 await page.goto(cfg.landing);
 await page.waitForSelector("#rail-gear", { timeout: 20000 });
 const frameBy = async (part) => { let f = page.frames().find((x) => x.url().includes(part)); for (let i = 0; i < 100 && !f; i++) { await page.waitForTimeout(100); f = page.frames().find((x) => x.url().includes(part)); } return f; };
@@ -271,7 +282,7 @@ const hookFeed = async () => {   // the hook is the init script's; this finds th
   return f;
 };
 let feedF = await hookFeed();
-const reload = async () => { holdUntil = Date.now() + 1500; await page.reload(); await page.waitForSelector("#rail-gear", { timeout: 20000 }); feedF = await hookFeed(); };
+const reload = async () => { armFirstFrame(); await page.reload(); await page.waitForSelector("#rail-gear", { timeout: 20000 }); feedF = await hookFeed(); };
 const frames = () => feedF.evaluate(() => window.__ttFrames);
 const lastFrame = () => feedF.evaluate(() => { const f = window.__ttFrames; return f.length ? f[f.length - 1] : null; });
 const waitFrame = (pred, why) => feedF.waitForFunction((p) => { const f = window.__ttFrames; const last = f.length ? f[f.length - 1] : null; return !!last && (new Function("f", "return (" + p + ")(f)"))(last); }, pred.toString(), { timeout: 30000 }).catch(() => { errors.push("timeout: " + why); });
@@ -383,6 +394,7 @@ class ServedTaskTrackingFederation(QueuedLab):
             stale_old = "w|%s:old|%d|distill" % (SID_ON, now - 900)     # the shape before round seven: no segment at all
             with open(cfg, "w") as f:
                 json.dump({"landing": base + "/?token=" + self.token, "hostOnCtl": "http://127.0.0.1:%d" % host_on.port,
+                           "slowFeedLoadMs": getattr(self, "SLOW_FEED_MS", 0),
                            "hostOffCtl": "http://127.0.0.1:%d" % host_off.port, "hostOff": "HOSTOFF", "hostOn": "HOSTON",
                            "offCard": off1["itemId"], "onCard0": on0["itemId"], "onCard2": on2["itemId"],
                            "staleOnMark": stale_on, "staleLocalMark": stale_local, "staleOldMark": stale_old}, f)
@@ -482,6 +494,7 @@ class ServedTaskTrackingFederation(QueuedLab):
         self.assertTrue(any(m.startswith("w|" + c["onCard0"] + "|") for m in marks) and any(m.startswith("w|" + c["onCard2"] + "|") for m in marks), "HOSTON's marks stand" + table)
 
     def test_the_page_threw_nothing_and_every_frame_carried_the_per_host_lists(self):
+        # round ten: the first-frame claim below is what a starved runner broke under the 1.5 s hold (see the SlowLoad class)
         r = self._result(); table = "\n  " + json.dumps(r["errors"]) + "\n  frames: " + json.dumps(r["frames"])[:2000]
         self.assertEqual([e for e in r["errors"] if e.startswith("page:")], [], "no uncaught error in the page" + table)
         merged = [f for f in r["frames"] + r["b2"]["frames"] + r["d"]["frames"] if f["offHosts"] is not None]
@@ -501,3 +514,14 @@ class ServedTaskTrackingFederation(QueuedLab):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServedTaskTrackingFederationSlowLoad(ServedTaskTrackingFederation):
+    """The same lab with the feed frame's document answering 3 s late on every load: a starved runner's reload, the shape of
+    the v0.17.0 cut's local red and of every run under a half-core quota (2026-09-24). The first merged frame of each reload
+    must still be built before the host list is in hand, because the hold is on the frame, not on a clock; under round
+    nine's 1.5 s hold this class reds on the first-frame assertion (the reproduction by delay, executed at the base)."""
+    _r = None
+    _fakes = None
+    SLOW_FEED_MS = 3000
+

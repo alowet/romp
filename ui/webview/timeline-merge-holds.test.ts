@@ -1,5 +1,5 @@
 // The federated timeline's merge holds and prefix coverage (the user 2026-08-17, whose dashboard —
-// freshly reloaded with snape newly attached — showed most local sessions bar-less, connectors from
+// freshly reloaded with TESTHOST newly attached — showed most local sessions bar-less, connectors from
 // a session that wasn't running, and idle remote lanes). Three exact defects, pinned here:
 // 1. BOOT BARS RACE: the merged BARS emission was gated only on the local LANES snapshot, so a
 //    remote's bars landing first emitted a merged-without-local payload — and the panel's applyBars

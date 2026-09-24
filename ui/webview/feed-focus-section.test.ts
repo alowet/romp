@@ -105,7 +105,7 @@ test("the section's cards are SECOND elements: its own caches under 'f:' keys, t
   assert.doesNotMatch(sec, /\baskEls\b|\bgroupEls\b/, "never the board's caches — no card below moves because of the section");
   // the same update gate as the board (feed-card-gate.ts)
   assert.match(sec, /const ik = cardInputsKey\(e\.ask, gate\);\s*\n\s*if \(cardNeedsUpdate\(card as any, e\.ask, ik\)\) \{ updateAskCard\(card, e\.ask\); \(card as any\)\._ik = ik; \}/);
-  assert.match(sec, /function removeFocusSection\(\): void \{\s*\n\s*const sec = document\.getElementById\("feed-focus"\) as any;\s*\n\s*if \(sec\) \{ \(sec\._rule as HTMLElement \| undefined\)\?\.remove\(\); sec\.remove\(\); \}[^\n]*\n\s*fsAskEls\.clear\(\); fsGroupEls\.clear\(\);/,
+  assert.match(sec, /function removeFocusSection\(\): void \{\s*\n\s*const sec = document\.getElementById\("feed-focus"\) as any;\s*\n\s*if \(sec\) \{ \(sec\._rule as HTMLElement \| undefined\)\?\.remove\(\); sec\.remove\(\); \}[^\n]*\n\s*for \(const \[id, f\] of Array\.from\(fsAskEls\)\) unregisterSectionHost\(id, f\);[^\n]*\n\s*fsAskEls\.clear\(\); fsGroupEls\.clear\(\);/,
     "the section leaves with its rule, which is its sibling since the divider moved under the box (the user 2026-09-19)");
   // the rule is built with the section and placed after it, before the board, every render
   assert.match(sec, /sec\.append\(head, empty, cols\);\s*\n\s*\(sec as any\)\._rule = rule;/, "the rule is not a child of the section");
@@ -180,7 +180,9 @@ test("Clear, its 180 ms finish and Undo resolve by ITEM across both copies, neve
   assert.doesNotMatch(FEED, /if \(askEls\.get\(it\.itemId\) === card && card\.classList\.contains\("dismissing"\)\)/, "the element-identity guard is gone from the ask card's finish");
   assert.match(FEED, /for \(const c of groupTwins\(cur\.turnId\)\) c\.classList\.add\("dismissing"\);/, "…and the group card's");
   assert.match(FEED, /for \(const c of cardTwins\(it\.itemId\)\) c\.classList\.remove\("dismissing"\);/, "Undo restores both copies");
-  assert.match(FEED, /const f = fsAskEls\.get\(m\.itemId\);[\s\S]*?leaving\.push\(\[f, \(\) => fsAskEls\.get\(m\.itemId\) === f, \(\) => fsAskEls\.delete\(m\.itemId\)\]\);/, "the session-wide Clear takes the copies along");
+  assert.match(FEED, /const f = fsAskEls\.get\(m\.itemId\);[\s\S]*?leaving\.push\(\[f, \(\) => fsAskEls\.get\(m\.itemId\) === f, \(\) => \{ fsAskEls\.delete\(m\.itemId\); unregisterSectionHost\(m\.itemId, f\); \}\]\);/, "the session-wide Clear takes the copies along, out of the registry too");
+  assert.match(FEED, /if \(c\) leaving\.push\(\[c, \(\) => askEls\.get\(m\.itemId\) === c, \(\) => \{ askEls\.delete\(m\.itemId\); unregisterSectionHost\(m\.itemId, c\); \}\]\);/, "…and the board's card leaves the registry the same way (a contributor's note on PR 2141: the board-card branch had no covering test)");
+  assert.match(FEED, /for \(const id of Array\.from\(fsAskEls\.keys\(\)\)\) if \(!desired\.has\("f:a:" \+ id\)\) \{ const f = fsAskEls\.get\(id\); f\?\.remove\(\); if \(f\) unregisterSectionHost\(id, f\); fsAskEls\.delete\(id\); \}/, "a copy whose card left the focused session's view leaves the registry as it leaves the section (the same note)");
   assert.match(FEED, /for \(const \[tid, g\] of Array\.from\(fsGroupEls\)\) \{/, "…group copies too");
 });
 

@@ -1033,31 +1033,35 @@ test("a /clear entry ends at its CLEAR BOUNDARY, one boundary per entry in press
   assert.equal(r.keep.length, 1, "the message rides on to its own landing");
 });
 
-test("a SOLO /clear of a small session (head-only fresh episode, constant system:head, NO clear card) retires the /clear entry", () => {
-  // The MEDIUM the review caught: the fresh episode of a small-session solo /clear carries the CONSTANT
-  // system:head head card and NO clear card, so a bare all-uuid overlap fork test sees system:head shared and
-  // fires nothing, and the /clear bubble hangs until the producer's episode tick later mints a card. The
-  // transcript-TURN fork test catches it: the page held real turns, the fresh episode shares none.
+test("clearBoundarySeen forks on the fresh episode's own transcript turn, never on a frame with no turn", () => {
+  // The fresh episode a solo /clear forks carries the CLI's /clear command record (a user transcript turn)
+  // and shares NONE of the page's held turns: that turn, not emptiness, is the fork signal. A frame with no
+  // transcript turn (an empty or overlay-only build, a kept-resident refusal) is NOT a boundary, so it never
+  // ends a /clear entry that has not run (the earlier code read an empty/head-only frame as a fork).
   const prev: TailEvent[] = [
     { kind: "system", uuid: "system:head" },
     { kind: "user", uuid: "u1", md: "tidy the imports" },
     { kind: "assistant", uuid: "a1", md: "done" },
   ];
-  const freshHeadOnly: TailEvent[] = [{ kind: "system", uuid: "system:head" }];   // constant head card, no clear card, no turns
-  assert.equal(clearBoundarySeen(prev, freshHeadOnly), true,
-    "a head-only fresh episode is a fork even though system:head is shared and there is no clear card");
-  assert.equal(clearBoundarySeen(prev, []), true, "an empty fresh episode after a real conversation is a fork too");
+  // the fresh episode carries its own /clear command record (a user turn), sharing none of the held turns
+  const freshWithClearCmd: TailEvent[] = [{ kind: "system", uuid: "system:head" }, { kind: "user", uuid: "cmd-fresh", md: "/clear" }];
+  assert.equal(clearBoundarySeen(prev, freshWithClearCmd), true,
+    "a fresh episode carrying its own /clear command turn, sharing none of the held turns, is a fork");
+  // an empty or head-only fresh episode carries NO transcript turn → NOT a boundary
+  assert.equal(clearBoundarySeen(prev, [{ kind: "system", uuid: "system:head" }]), false,
+    "a head-only fresh episode carries no transcript turn, so it is not a boundary");
+  assert.equal(clearBoundarySeen(prev, []), false, "an empty frame is not a boundary");
   // an APPEND (a new real turn on the same transcript) shares the held turns → NOT a boundary
   assert.equal(clearBoundarySeen(prev, [...prev, { kind: "assistant", uuid: "a2", md: "more" }]), false,
     "an append shares the held turns → not a boundary (the /clear bubble is not retired on an append)");
   // a window slide (the tail re-windows past WIRE_TAIL, first uuid changes, same transcript) still shares a tail turn
   assert.equal(clearBoundarySeen(prev, [{ kind: "system", uuid: "system:head" }, { kind: "assistant", uuid: "a1", md: "done" }, { kind: "assistant", uuid: "a3", md: "later" }]), false,
     "a window slide keeps some held turn → not a boundary");
-  // a >=2-episode /clear brings a NEW clear card → boundary the ordinary way
+  // a >=2-episode /clear brings a NEW clear card → boundary the ordinary way (independent of the turn test)
   assert.equal(clearBoundarySeen(prev, [{ kind: "clear", uuid: "clear:fresh" }, { kind: "system", uuid: "system:head" }]), true, "a new clear card is a boundary");
   // and the entry actually RETIRES when the detected boundary is passed to reconcilePending
   const clearEntry = newPending("/clear", undefined, 1_700_000_000_050, "echo:solo", undefined, true);
-  const r = reconcilePending(freshHeadOnly, [clearEntry], clearBoundarySeen(prev, freshHeadOnly));
-  assert.deepEqual(r.cleared.map((p) => p.qid), ["echo:solo"], "the solo /clear entry retires at the head-only fresh episode");
+  const r = reconcilePending(freshWithClearCmd, [clearEntry], clearBoundarySeen(prev, freshWithClearCmd));
+  assert.deepEqual(r.cleared.map((p) => p.qid), ["echo:solo"], "the solo /clear entry retires at the fresh episode carrying its /clear command turn");
   assert.equal(r.keep.length, 0);
 });

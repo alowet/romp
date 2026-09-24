@@ -24,7 +24,7 @@ import { listenForFrames } from "./frame-listener";
 import { openGear } from "./gear-host";
 import { menuCard, addMenuItem, showMenuCard, openConfirmBox } from "./ctx-menu";
 import { openTopTitles, endConfirmDetail, RENAME_SUBLINE, END_SESSION_STANDING } from "./clear-confirm";
-import { addRestartRow, restartInterrupts, settleRestart } from "./restart-row";
+import { addRestartRow, settleRestart } from "./restart-row";
 
 type Color = { bg: string; fg: string } | null;
 interface LedgerNode {
@@ -895,7 +895,7 @@ function showSessionMenu(x: number, y: number, sid: string, viaKeyboard: boolean
   // never off the node under the cursor, which the next push rebuilds (this pane's own rule, above).
   addRestartRow(menu, sid, {
     name: displayName(sid),
-    working: restartInterrupts(sessionRow(sid)?.status?.state),
+    state: sessionRow(sid)?.status?.state,
     titles: openTopTitles((sessionRow(sid)?.ledger?.tree || []) as any),   // the live ledger at click time, as Delete reads it
     confirm: (title, detail, buttons, cb) => openConfirmBox(title, detail, buttons, cb),
     post: () => vscodeApi?.postMessage({ type: "restartSession", id: sid }),

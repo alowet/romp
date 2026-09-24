@@ -283,6 +283,37 @@ class Reader(unittest.TestCase):
         (op, got), fails = recv_message(cframe(deflate(body, wbits=15), rsv1=True), inflate_=True)
         self.assertEqual((op, got, fails), (0x1, body, []))
 
+    def test_a_message_ending_in_a_final_block_inflates_past_one_piece(self):
+        # RFC 7692 §7.2.3.4 lets a sender end a message in a BFINAL block, so the tail the reader appends lands after the
+        # stream's end. Once an earlier piece has filled the step, CPython keeps those leftover bytes in unconsumed_tail
+        # even after the stream ends, and a reader stopping only on an empty unconsumed_tail refused the message as one
+        # that does not inflate (post-merge review of #2106, 2026-09-24). The sync-flushed shape is the control: it passed
+        body = varied_json(25000)
+        self.assertGreater(len(body), 2 * km._WS_INFLATE_STEP)
+        z = zlib.compressobj(6, zlib.DEFLATED, -15)
+        shapes = {"sync-flushed, tail stripped": deflate(body),
+                  "the RFC's shape: sync-flushed, then an empty final block": deflate(body) + TAIL + b"\x03\x00",
+                  "one stream finished with Z_FINISH": z.compress(body) + z.flush(zlib.Z_FINISH)}
+        for name, payload in shapes.items():
+            (op, got), fails = recv_message(cframe(payload, rsv1=True), inflate_=True)
+            # length and content compared apart: a failing equality on megabytes renders its diff for minutes
+            self.assertEqual((op, fails), (0x1, []), name)
+            self.assertEqual(len(got), len(body), name)
+            self.assertTrue(got == body, name)
+
+    def test_a_final_block_message_past_the_cap_is_still_refused(self):
+        # the piece that reaches the stream's end is counted against the cap before the loop may stop on it
+        saved = km._WS_MAX_MESSAGE
+        km._WS_MAX_MESSAGE = 3 * km._WS_INFLATE_STEP // 2
+        try:
+            body = varied_json(17500)
+            self.assertTrue(km._WS_MAX_MESSAGE < len(body) < 2 * km._WS_INFLATE_STEP, len(body))
+            z = zlib.compressobj(6, zlib.DEFLATED, -15)
+            got, fails = recv_message(cframe(z.compress(body) + z.flush(zlib.Z_FINISH), rsv1=True), inflate_=True)
+            self.assertEqual((got, [c for c, _ in fails]), ((None, None), [1009]))
+        finally:
+            km._WS_MAX_MESSAGE = saved
+
     def test_rsv1_from_a_client_that_negotiated_nothing_ends_the_read(self):
         got, fails = recv_message(cframe(deflate(self.BODY), rsv1=True), inflate_=False)
         self.assertEqual(got, (None, None))
@@ -596,6 +627,24 @@ class RelayExecuted(unittest.TestCase):
             b0, payload = _Reader(s, rest).frame()
             self.assertEqual(b0, want_b0)
             self.assertEqual((inflate(payload) if want_b0 == 0xC1 else payload).decode("utf-8"), text)
+
+    def test_an_offer_on_a_second_extension_line_reaches_the_remote(self):
+        # RFC 6455 §11.3.2 lets the list come as several header lines, which the direct handshake reads together
+        # (EndToEnd's repeated-lines test); the relay forwarded the first line only, so this offer upgraded plain through
+        # the hub where it negotiated direct (review of #2106, 2026-09-23)
+        wid = "w-relay-twolines"
+        status, headers, s, rest = upgrade(self.hub.server_address[1], ["x-webkit-deflate-frame", "permessage-deflate; client_max_window_bits"],
+                                           path="/remote/gpu1/ws?app=feed&wid=%s&token=%s" % (wid, km.TOKEN))
+        self.socks.append(s)
+        self.assertEqual(status, 101)
+        self.assertEqual(headers.get("sec-websocket-extensions"), ACCEPT)
+        remote_client = kernel_client(wid)
+        self.assertEqual(remote_client.get("deflate"), {"wbits": 15, "bounded": False})
+        text = big_text()
+        remote_client["send"](text)
+        b0, payload = _Reader(s, rest).frame()
+        self.assertEqual(b0, 0xC1)
+        self.assertEqual(inflate(payload).decode("utf-8"), text)
 
 
 if __name__ == "__main__":

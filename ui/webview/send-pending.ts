@@ -15,8 +15,9 @@ import { markerLabel } from "./time-marker";
 //   - the user's ✕ (render.ts's qx delegate drops the entry),
 //   - for a transcript-resetting /clear (which lands NO record and, in a same-second batch, is never
 //     overtaken either), the CLEAR BOUNDARY: the fresh episode the /clear forks, carried in as
-//     `clearBoundary`, ends one /clear entry per boundary in press order (a Codex /clear is refused, so it
-//     is not flagged and ends the ordinary way, on the refusal).
+//     `clearBoundary`, ends one /clear entry per boundary in press order (a Codex /clear runs the native
+//     clear instead, so it is not flagged and ends the ordinary way, on the acknowledging chip when the
+//     clear runs and on the refusal when it fails).
 // A kernel PROVISIONAL (its echo atom, its queued bubble) only COVERS one of ours for the push it is
 // visible on — the durable record is the kernel's (a persisted echo, the dropped marking, the fed-text
 // guard in prune_live), but if it blinks, ours steps straight back in; a copy seen after the press also
@@ -96,11 +97,12 @@ export type PendingSend = {
                        //   a queued copy after the press that no earlier same-text send claimed): the send
                        //   reached it, so a connection drop before or after cannot have lost it — `lost` is
                        //   cleared and never set again
-  clear?: boolean;     // a transcript-resetting /clear (on a non-Codex backend): it writes NO record of its own, so it
-                       //   never LANDS and is never OVERTAKEN in a same-second batch. Its bubble ends on the CLEAR
+  clear?: boolean;     // a transcript-resetting /clear (on a non-Codex backend): it writes no record IN THE CONVERSATION
+                       //   IT CLEARS, so its echo there never lands, and in a same-second batch is never OVERTAKEN. Its bubble ends on the CLEAR
                        //   BOUNDARY instead (the fresh episode the /clear forks in, carried to reconcilePending as
-                       //   clearBoundary), one boundary per /clear entry in press order. A Codex /clear is refused (no
-                       //   boundary), so it is NOT flagged here and its bubble ends the ordinary way, on the refusal
+                       //   clearBoundary), one boundary per /clear entry in press order. A Codex /clear runs the native
+                       //   clear (no clear boundary), so it is NOT flagged here and its bubble ends the ordinary way, on
+                       //   the acknowledging chip when the clear runs and on the refusal when it fails
 };
 
 /** The slice of a chat event the decisions read (render.ts's ChatEvent is a superset). */
@@ -419,9 +421,10 @@ const isTranscriptTurn = (e: TailEvent): boolean =>
 /** Did THIS push carry a /clear's CLEAR BOUNDARY (the fresh episode a /clear forks) relative to what the
  *  page held (`prevEvents`)? Two shapes: a NEW clear card (kind "clear", a uuid not already resident: the
  *  >=2-episode case), OR a FORK: the page held a real conversation (some transcript turns) and the fresh
- *  episode shares NONE of them. The fork branch is what catches a SOLO /clear of a small session, whose
- *  fresh episode the kernel mints empty or head-only (no clear card, and the constant system:head shared),
- *  so a bare all-uuid overlap test (sharesAnyUuid) never sees it. render.ts gates this on an APPLIED frame. */
+ *  episode, which itself carries at least one transcript TURN (the /clear's own command record the CLI writes
+ *  in the fresh episode, or a following send), shares NONE of the held turns. Requiring a turn in the fresh
+ *  episode keeps a frame that carries none (an empty or overlay-only build, a kept-resident refusal) from
+ *  reading as a boundary and ending a /clear entry that never ran. render.ts gates this on an APPLIED frame. */
 export function clearBoundarySeen(prevEvents: TailEvent[] | undefined, msgEvents: TailEvent[] | undefined): boolean {
   const prev = prevEvents || [], msg = msgEvents || [];
   const prevClear = new Set(prev.filter((e) => e.kind === "clear").map((e) => e.uuid));
@@ -429,6 +432,7 @@ export function clearBoundarySeen(prevEvents: TailEvent[] | undefined, msgEvents
   const prevTurns = prev.filter(isTranscriptTurn);
   if (!prevTurns.length) return false;             // no conversation was held → nothing forked (a first build, an empty session)
   const msgTurns = new Set(msg.filter(isTranscriptTurn).map((e) => e.uuid));
+  if (!msgTurns.size) return false;                // the fresh episode carries no transcript turn (an empty or overlay-only frame, a kept-resident refusal) → not a real boundary
   return !prevTurns.some((e) => msgTurns.has(e.uuid));   // the fresh episode shares none of the held turns → a fork
 }
 

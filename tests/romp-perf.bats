@@ -40,7 +40,8 @@ setup() {
     # while they ran, 1 MB sent as chat
     # full frames, one GET /feed.json build (150 ms) against 4 of its cache hits, 100 goal loads, 2 judge
     # passes totalling 2400 ms, 5 /tick requests and 3 WebSocket connects. B's lifetime figures (cycle_ms_max 900, ms_mean 1012.5) differ from the window's
-    # (ring max 700, mean 1200) so a line printing the wrong one is caught.
+    # (ring max 700, mean 1200) so a line printing the wrong one is caught. The kernel's parse store: 6 misses (5 folds and
+    # 1 whole parse of a 20 MB leaf), 8 hits, and 2 misses by the judges.
     cat > "$SNAP_A" <<'JSON'
 {"now": 1000.0, "since": 900.0, "uptime_s": 100.0, "log": false,
  "process": {"rss_kb": 409600, "threads": 40, "cpu_s": 60.0, "pid": 4242},
@@ -52,6 +53,8 @@ setup() {
  "sends": {"full": {"chat": {"count": 10, "bytes": 1000000}}, "delta": {"chat": {"count": 100, "bytes": 50000}}, "deduped": {"feed": {"count": 90, "bytes": 9000000}}},
  "goals": {"loads": 1000, "saves": 200, "writes": 50},
  "judge": {"passes": 30, "ms_sum": 30000.0, "ms_last": 1000.0, "ms_mean": 1000.0, "cpu_ms_sum": 2000.0, "cpu_ms_workers": 1500.0},
+ "parses": {"kernel": 10, "hits": 50, "wholeBytes": 2097152, "byRoad": {"serve": 2, "fold": 5, "restore": 1, "full": 2, "bypass": 0, "fallback": 0},
+            "bySid": {}, "total": 14, "judge": 4, "sharedHits": 60},
  "http": {"GET /tick": {"count": 50, "ms": 25.0}, "GET /sessions": {"count": 5, "ms": 10.0}}}
 JSON
     cat > "$SNAP_B" <<'JSON'
@@ -65,6 +68,8 @@ JSON
  "sends": {"full": {"chat": {"count": 12, "bytes": 2048576}}, "delta": {"chat": {"count": 120, "bytes": 60000}}, "deduped": {"feed": {"count": 108, "bytes": 10800000}}},
  "goals": {"loads": 1100, "saves": 220, "writes": 55},
  "judge": {"passes": 32, "ms_sum": 32400.0, "ms_last": 1200.0, "ms_mean": 1012.5, "cpu_ms_sum": 2050.0, "cpu_ms_workers": 1540.0},
+ "parses": {"kernel": 16, "hits": 58, "wholeBytes": 23068672, "byRoad": {"serve": 2, "fold": 10, "restore": 1, "full": 3, "bypass": 0, "fallback": 0},
+            "bySid": {}, "total": 22, "judge": 6, "sharedHits": 70},
  "http": {"GET /tick": {"count": 55, "ms": 27.5}, "GET /sessions": {"count": 5, "ms": 10.0}, "GET /ws": {"count": 3, "ms": 0.0}}}
 JSON
     # C: a kernel that restarted five seconds into the window — new pid, new `since`, counters reset
@@ -170,6 +175,30 @@ teardown() { rm -rf "$TEST_DIR"; }
     [[ "$output" == *"GET /ws 3"* ]]                     # a WebSocket row: count only …
     [[ "$output" != *"GET /ws 3 ("* ]]                   # … never a fabricated 0.0 ms avg
     [[ "$output" != *"/sessions"* ]]                     # no requests in the window: not listed
+}
+
+@test "romp perf: the parses line splits the kernel's misses by road and prints only the whole parses' bytes" {
+    run "$ROMP_SCRIPT" perf --interval 0
+    [ "$status" -eq 0 ]
+    # 6 misses in the window, 5 folds and 1 whole parse, whose 20 MB leaf is the only parse cost (2.0 MB/s over 10 s);
+    # the roads that did not move in the window are not listed (2026-09-24)
+    [[ "$output" == *"parses    kernel 6 misses (fold 5, full 1)   parsed whole 2.0 MB/s   judge 2 misses   8 hits"* ]]
+}
+
+@test "romp perf: a kernel from before the split by road prints its misses and says so, never its per-miss bytes" {
+    # the older shape: no byRoad, and `bytes` booked the leaf's size at every miss (here nine times the whole parses')
+    for s in A B; do
+        src="SNAP_$s"
+        python3 -c 'import json, sys
+d = json.load(open(sys.argv[1])); p = d["parses"]
+p["bytes"] = 9 * p.pop("wholeBytes"); p.pop("byRoad")
+json.dump(d, open(sys.argv[2], "w"))' "${!src}" "$TEST_DIR/old-$s.json"
+    done
+    SNAP_A="$TEST_DIR/old-A.json" SNAP_B="$TEST_DIR/old-B.json" run "$ROMP_SCRIPT" perf --interval 0
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"parses    kernel 6 misses (no split by road: the kernel predates it)   judge 2 misses   8 hits"* ]]
+    [[ "$output" != *"parsed whole"* ]]
+    [[ "$output" != *"18.0 MB/s"* ]]                     # the old per-miss figure is not printed as a parse cost
 }
 
 @test "romp perf: a restart inside the window is said, not subtracted into negative rates" {

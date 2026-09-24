@@ -672,7 +672,8 @@ class PerfCountsColdParses(unittest.TestCase):
         km._PERF_STATS.parse(SID_OLD, 10)
         km._PERF_STATS.parse(SID_NEW, 5)
         snap = km._PERF_STATS.snapshot()
-        self.assertEqual((snap["parses"]["kernel"], snap["parses"]["bytes"]), (3, 1249), "the kernel's own asks (stage 2 splits the counters)")
+        # bytes is wholeBytes since 2026-09-24 (only a whole parse books the leaf); these three ride the default road, full
+        self.assertEqual((snap["parses"]["kernel"], snap["parses"]["wholeBytes"]), (3, 1249), "the kernel's own asks (stage 2 splits the counters)")
         self.assertIsInstance(snap["parses"]["total"], int)
         self.assertEqual(snap["parses"]["bySid"], {SID_OLD[:8]: 2, SID_NEW[:8]: 1})
         self.assertIsInstance(snap["parses"]["judge"], int)

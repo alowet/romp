@@ -309,7 +309,7 @@ class TimelineViews(unittest.TestCase):
             self._attach("alpha", {"active": "all", "hidden": [], "tags": [
                 {"id": "g9", "name": "team", "color": "#DD42FF",
                  "members": [{"host": "", "sid": "rs1"}, {"host": "beta", "sid": "rs2"},
-                             {"host": "snape", "sid": "00000000-aaaa-bbbb-cccc-000000000001"}]}]})
+                             {"host": "TESTHOST", "sid": "00000000-aaaa-bbbb-cccc-000000000001"}]}]})
             v = km._views_client()
             self.assertEqual(v["remoteTags"], [{
                 "id": "alpha:g9", "host": "alpha", "name": "team", "color": "#DD42FF",
