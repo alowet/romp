@@ -76,12 +76,16 @@ export const RESTART_STANDING = "It keeps its name, its place and its whole conv
 
 // The restart confirm's detail, shown ONLY when the session is working (an idle one restarts with no
 // dialog at all): what the click interrupts, named the way the End dialog names what it drops — the open
-// tops are what the running turn is about, so they say more than "a turn" does.
-export function restartConfirmDetail(titles: string[]): string {
-  if (!titles.length) return "The turn it is running now is cut off. " + RESTART_STANDING;
+// tops are what the running turn is about, so they say more than "a turn" does. `asking` is a session
+// waiting on your answer to a prompt: the question goes with the turn, and the dialog says so (the
+// review of the restart row, 2026-09-24, which found the dialog silent about it).
+export function restartConfirmDetail(titles: string[], asking = false): string {
+  const cut = asking ? "The turn it is running now is cut off, and the question it is asking you goes away with it. "
+    : "The turn it is running now is cut off. ";
+  if (!titles.length) return cut + RESTART_STANDING;
   const list = titles.join(", ");
   const shown = list.length > 140 ? list.slice(0, 139) + "…" : list;
   const n = titles.length;
   return (n === 1 ? "It is working on 1 open card: " : "It is working on " + n + " open cards: ")
-    + shown + ". The turn it is running now is cut off. " + RESTART_STANDING;
+    + shown + ". " + cut + RESTART_STANDING;
 }

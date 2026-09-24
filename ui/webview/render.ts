@@ -48,7 +48,7 @@ import { flash } from "./actions";   // its own line: the import above is pinned
 import { awaitWord, awaitBreakdown, groupRows, rowIds, waitsNote, listBreakdown, keptWord, GROUP_TITLE, ROW_KINDS, workingFor, type AwaitRow } from "./spin-caption";
 import { CHIP_LABEL, chipWords, statusChip, type ChipState } from "./status-chip";   // the session status chip: its words and its classes, the one builder the bar and the tag overview's rows share (T322b)
 import { isClearCmd, isNewCmd, openTopTitles, clearConfirmDetail, endConfirmDetail, RENAME_SUBLINE, END_SESSION_STANDING } from "./clear-confirm";
-import { addRestartRow, restartInterrupts, settleRestart } from "./restart-row";   // the one Restart session row, shared with the Sessions pane's menu
+import { addRestartRow, settleRestart } from "./restart-row";   // the one Restart session row, shared with the Sessions pane's menu
 import { prebuildPlan, type ViewState } from "./prebuild";
 import { historyMarks, historyBands, windowSpans, HIST_H, HIST_GAP } from "./glow-history";
 import { newSkeletonState, applyTabOrderSkeleton, onStatus, holdStatus, onFull, onDismiss, onSocketUp, nextPrefetch, renderKind } from "./skeleton-tabs";
@@ -7960,7 +7960,7 @@ function showTabMenu(e: MouseEvent, id: string, copy?: string) {   // `copy`: th
   addMenuSep(menu);
   addRestartRow(menu, id, {
     name: s?.name || id,
-    working: restartInterrupts(st?.state),
+    state: st?.state,
     titles: openTopTitles(ledgers.get(id)?.tree),
     icon: ctxIcon("restart", false),
     confirm: (title, detail, buttons, cb) => showConfirm(title, detail, buttons, cb),
