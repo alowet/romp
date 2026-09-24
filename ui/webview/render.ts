@@ -20805,15 +20805,36 @@ function setupComposer() {
       const what = shipping === 1 ? "An attachment is" : shipping + " attachments are";
       const them = shipping === 1 ? "it" : "them";
       shipGateSid = sid;                       // the last-ship ack resolves the open dialog itself
+      // The answer is for `sid`, the session the dialog opened over, never whichever one is open when it is
+      // clicked (the post-merge review of 2026-09-24): the dialog stays up across a switch that never passes its
+      // backdrop (a session's hot key, the switcher, a feed card's jump), and "Send without it" re-enters
+      // sendComposer, which reads the OPEN box, so it sent the other session's draft. Switched away, it sends
+      // nothing and says so, and it says the message is still in that tab's box only while the box holds what this
+      // answer would have sent there (text, or a file that finished uploading; the switch stashed the text): a
+      // session that ended under the dialog took its draft with it, and a box holding only the upload had nothing
+      // to send. "Wait" still arms `sid`'s hold (its last ack releases it, or says so from another tab), and
+      // repaints the files strip only while `sid` is the open tab: the strip belongs to the open tab's box.
       showConfirm(what + " still uploading",
                   "Send now and your message goes without " + them + ". Or just wait — it sends "
                   + "itself the moment the upload finishes.",
                   [{ label: "Wait for the upload", value: "wait" },
                    { label: "Send without " + them, value: "now", danger: true }],
                   (v) => {
-                    shipGateSid = null; endReloadHoldIfIdle();
-                    if (v === "now") sendComposer({ pastShipGate: true });
-                    else if (v === "wait") { sendOnShip.add(sid); renderComposerFiles(sid); }
+                    // clear the registration only while it names this dialog's session: a newer dialog cancels this
+                    // one as it opens (showConfirm), and another session's upload dialog has registered itself by then
+                    if (shipGateSid === sid) shipGateSid = null;
+                    endReloadHoldIfIdle();
+                    if (v === "now") {
+                      if (activeId === sid) sendComposer({ pastShipGate: true });
+                      else {
+                        const name = sessions.get(sid)?.name || tabMeta.get(sid)?.name;
+                        const kept = !!(drafts.get(sid) || "").trim() || (composerFiles.get(sid) || []).length > 0;
+                        warnToast((name ? "The message on “" + name + "”" : "The message") + " was not sent: the open "
+                                  + "tab changed while the upload dialog was up."
+                                  + (name && kept ? " It's still in that tab's message box." : ""));
+                      }
+                    }
+                    else if (v === "wait") { sendOnShip.add(sid); if (sid === activeId) renderComposerFiles(sid); }
                   });
       return;
     }
