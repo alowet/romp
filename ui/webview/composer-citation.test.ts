@@ -313,10 +313,10 @@ test("an unclaimed printable keystroke drops the cursor into the composer — na
   assert.match(gates, /if \(isTypingTarget\(e\.target\) \|\| isTypingTarget\(document\.activeElement\)\) return null;/);
   // the pane's own modals and meta menus own their keys, and a dropdown's type-ahead is typing: a
   // letter typed in the settings modal must never land in the hidden draft (review 2026-09-02)
-  assert.match(gates, /document\.querySelector\("#rsettings:not\(\[hidden\]\), #ra-back:not\(\[hidden\]\), #rkeys-back, \.meta-menu"\)/);
+  assert.match(gates, /document\.querySelector\("#rsettings:not\(\[hidden\]\), #ranalytics-back:not\(\[hidden\]\), #rkeys-back, \.meta-menu"\)/);
   assert.match(RENDER, /elm\.tagName === "SELECT"/, "SELECT is a typing target");
   assert.match(gates, /if \(activeId && liveAsks\.has\(activeId\)\) return null;/);
-  assert.match(gates, /if \(ctxMenuEl \|\| document\.querySelector\("\.picker-overlay"\)\) return null;/);
+  assert.match(gates, /if \(ctxMenuEl \|\| pickerOverlayUp\(\)\) return null;/);
   assert.match(gates, /romp-fileview[\s\S]*romp-filebrowse[\s\S]*romp-lightbox/);
   // NEVER preventDefault: the point is that the native keystroke inserts into the newly focused
   // box, so the composer's own input bookkeeping (draft, slash menu) sees ordinary typing

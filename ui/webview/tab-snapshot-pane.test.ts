@@ -168,8 +168,9 @@ function lift(): (H: Hooks) => Api {
       getElementById: (id) => id === "content" ? H.content : id === "tabs" ? H.bar : id === "composer-input" ? H.composer : id === "composer-send" ? H.sendBtn : H.content.byId(id),
       createElement: (tag) => new H.FakeEl(tag),
       createTextNode: (t) => { const n = new H.FakeEl("#text"); n.textContent = t; return n; },
-      querySelector: (sel) => (sel === ".picker-overlay" && H.pickerOpen ? new H.FakeEl("div", "picker-overlay") : null),
+      querySelector: () => null,   // the pane's panels: none open here
     };
+    const pickerOverlayUp = () => H.pickerOpen;   // render.ts's shown-overlay check (tab-cycle-standdown-exec.test.ts runs the real one)
     const window = { addEventListener: (t, f, cap) => { (cap ? H.winCap : H.winBub).push(f); } };
     const Date = { now: () => H.nowMs };
     const delegate = (root, handlers) => { H.delegates.push({ root, handlers }); };

@@ -8145,7 +8145,7 @@ function focusComposerOrAsk(): boolean {
 // has focus: ←/→ step between tabs, ↑/↓ scroll the transcript. Deliberately
 // yields to anything more specific —
 //   • a typing target (textarea/input/contenteditable) keeps its native caret;
-//   • an open picker/confirm overlay (.picker-overlay) owns its own keys;
+//   • a shown picker/confirm overlay (pickerOverlayUp) owns its own keys;
 //   • a handler that already acted (defaultPrevented) wins — a FOCUSED tab's
 //     onTabKey (which also does ↑/↓ row-jumps) and the live-ask card both
 //     preventDefault before this bubbles to window.
@@ -8161,7 +8161,7 @@ function isTypingTarget(t: EventTarget | null): boolean {
 window.addEventListener("keydown", (e) => {
   if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
   if (isTypingTarget(e.target)) return;
-  if (document.querySelector(".picker-overlay")) return;   // #picker / #confirm open
+  if (pickerOverlayUp()) return;   // #picker / #confirm up (shown: the picker hides in place)
   if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
     if (!activeId) { if (pickFirstVisibleTab()) e.preventDefault(); return; }   // from the unfocused pane: the first visible tab (T357)
     if (order.length < 2) return;
@@ -8219,10 +8219,10 @@ function typeFromAnywhereTarget(e: Event): HTMLTextAreaElement | null {
   if (!ta || ta.disabled || document.activeElement === ta) return null;   // no box / read-only session / already in the box (covers key repeat; a paste there is native)
   if (isTypingTarget(e.target) || isTypingTarget(document.activeElement)) return null;
   if (activeId && liveAsks.has(activeId)) return null;   // the live-ask card owns input while it is up (digits are its number keys)
-  if (ctxMenuEl || document.querySelector(".picker-overlay")) return null;   // an open menu / #picker / #confirm owns the keys
+  if (ctxMenuEl || pickerOverlayUp()) return null;   // an open menu / a shown #picker / #confirm owns the keys
   if (document.getElementById("romp-fileview") || document.getElementById("romp-filebrowse")
       || document.getElementById("romp-lightbox")) return null;   // full-pane surfaces own their keys
-  if (document.querySelector("#rsettings:not([hidden]), #ra-back:not([hidden]), #rkeys-back, .meta-menu")) return null;   // the pane's own modals + meta menus own their keys (a letter typed there must never land in the draft)
+  if (document.querySelector("#rsettings:not([hidden]), #ranalytics-back:not([hidden]), #rkeys-back, .meta-menu")) return null;   // the pane's own modals (settings, its Token usage panel) + meta menus own their keys (a letter typed there must never land in the draft)
   if (composerNoteHolds()) return null;   // the box just changed hands under the user — no focus steal, the note flashes; a click re-binds (T236). Nothing to cancel either: a key on the bare body has nothing to insert into.
   return ta;
 }
@@ -11392,6 +11392,16 @@ function pickerVisible(): boolean {
   return !!o && o.style.display !== "none";
 }
 
+/** A picker overlay is SHOWN, which is not the same as present. The dialogs on the overlay's chrome (the confirms, the
+ *  move and fork prompts, the break-out dialog, the MCP panel) are removed when they close, but the new-session picker
+ *  is built once and closePicker only hides it. So querySelector(".picker-overlay") stayed true for the rest of the
+ *  page's life after the picker's first use, and every check that read it dropped its keys with nothing on screen:
+ *  the session pair, the snapshot view's Escape, the bare arrows, typing and pasting from anywhere (review,
+ *  2026-09-24). The display rule is pickerVisible's. */
+function pickerOverlayUp(): boolean {
+  return Array.from(document.querySelectorAll<HTMLElement>(".picker-overlay")).some((o) => o.style.display !== "none");
+}
+
 function closePicker() {
   const o = document.getElementById("picker");
   if (o) o.style.display = "none";
@@ -13473,12 +13483,22 @@ function leaveSnapshot(): void {
 // document at capture, kernel.py _LANDING_ESC_JS) has closed, marked and stopped an Escape aimed at one of
 // its panels, which live in the shell document, out of this page's sight (the log, usage and network
 // panels). Nothing else claims Escape while the view shows: the transcript is hidden.
+/** A layer of this page is up: a menu, a citation preview, a SHOWN picker or confirm overlay (the upload confirm, the
+ *  new-session picker, the move prompt: pickerOverlayUp), the pane's own panels (the settings card, its Token usage
+ *  panel), a full-pane surface. The session pair's message arm reads it and must not switch the session behind any of
+ *  them; the view's Escape below yields to the same list and, as before, to an open comment thread. The pair switches
+ *  past both comment popovers alike, the thread and the new-comment box: a switch closes either (setActive: a popover
+ *  belongs to its session's view) and keeps its draft, and a thread counted here held the keys dead from the
+ *  composer, even one a reload had reopened unasked (review, 2026-09-24). */
+function paneLayerOpen(): boolean {
+  return !!(ctxMenuEl || metaMenuEl || citePreviewEl) || pickerOverlayUp()
+    || !!document.querySelector("#rsettings:not([hidden]), #ranalytics-back:not([hidden])")
+    || !!(document.getElementById("romp-fileview") || document.getElementById("romp-filebrowse") || document.getElementById("romp-lightbox"));
+}
 installSnapshotEscape(window, {
   showing: () => !!snapView,
   typing: isTypingTarget,
-  layerOpen: () => !!(ctxMenuEl || metaMenuEl || citePreviewEl || openCommentKey || document.querySelector(".picker-overlay"))
-    || !!document.querySelector("#rsettings:not([hidden]), #ra-back:not([hidden])")
-    || !!(document.getElementById("romp-fileview") || document.getElementById("romp-filebrowse") || document.getElementById("romp-lightbox")),
+  layerOpen: () => paneLayerOpen() || !!openCommentKey,
   leave: leaveSnapshot,
 });
 /** Paint (or refresh) the view of `snapView`. False when that section is not on the strip any more: snapView
@@ -19990,8 +20010,13 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     const body = document.querySelector("#mcp-panel .mcp-list") as HTMLElement | null;
     if (body && mcpPanelSid) loadMcpPanel(mcpPanelSid, body);   // refetch — never an optimistic row
   }
-  else if (m.type === "nextTab") asGesture(() => cycleTab(1));    // the shell's session pair or the VS Code host's command: the reader's own act, whichever posted it
-  else if (m.type === "prevTab") asGesture(() => cycleTab(-1));
+  // The pair stands down while a layer of this page is up (paneLayerOpen), and HERE, not only in the shell: the
+  // shell's check saw the full-pane surfaces alone, so under the upload confirm the chord switched the session and
+  // "Send without it" then sent the other session's draft, and the VS Code view's command, which posts straight to
+  // this arm, switched under the picture viewer (review, 2026-09-24). The braces keep the next arm's else off the
+  // inner if.
+  else if (m.type === "nextTab") { if (!paneLayerOpen()) asGesture(() => cycleTab(1)); }    // the shell's session pair or the VS Code host's command: the reader's own act, whichever posted it
+  else if (m.type === "prevTab") { if (!paneLayerOpen()) asGesture(() => cycleTab(-1)); }
   else if (m.type === "settingRefused" && typeof m.text === "string" && m.text) {
     // the kernel refused a gesture this page posted (its store could not be read): the optimistic state ends
     // on THIS event, not on the next push, and the reason toasts (the warn toast is this pane's soft-refusal

@@ -57,7 +57,7 @@ test("both defaults run ONE gate list — typeFromAnywhereTarget — never a dup
   const keydown = RENDER.slice(RENDER.indexOf('window.addEventListener("keydown"', typeAt), RENDER.indexOf("\n}", typeAt));
   assert.match(keydown, /const ta = typeFromAnywhereTarget\(e\);\s*\n\s*if \(!ta\) return;/);
   // and neither re-implements a gate inline
-  const inline = /isTypingTarget|picker-overlay|romp-fileview|romp-filebrowse|romp-lightbox|rsettings|ra-back|rkeys-back|meta-menu|liveAsks|ctxMenuEl|composerNoteHolds|ta\.disabled/;
+  const inline = /isTypingTarget|picker-overlay|pickerOverlayUp|romp-fileview|romp-filebrowse|romp-lightbox|rsettings|ranalytics-back|rkeys-back|meta-menu|liveAsks|ctxMenuEl|composerNoteHolds|ta\.disabled/;
   assert.doesNotMatch(block, inline, "the paste handler carries no gate of its own");
   assert.doesNotMatch(keydown, inline, "the keydown handler carries no gate of its own");
 });
@@ -76,9 +76,9 @@ test("it stands down when the box is focused, a typing target is active, or any 
   // the live-ask card, an open context menu / #picker / #confirm, the full-pane surfaces, the pane's
   // modals + meta menus, and the T236 hand-over note — each one a gate the keystroke already had
   assert.match(g, /if \(activeId && liveAsks\.has\(activeId\)\) return null;/);
-  assert.match(g, /if \(ctxMenuEl \|\| document\.querySelector\("\.picker-overlay"\)\) return null;/);
+  assert.match(g, /if \(ctxMenuEl \|\| pickerOverlayUp\(\)\) return null;/, "a SHOWN overlay: the picker hides in place (tab-cycle-standdown-exec.test.ts)");
   assert.match(g, /document\.getElementById\("romp-fileview"\) \|\| document\.getElementById\("romp-filebrowse"\)\s*\n\s*\|\| document\.getElementById\("romp-lightbox"\)\) return null;/);
-  assert.match(g, /document\.querySelector\("#rsettings:not\(\[hidden\]\), #ra-back:not\(\[hidden\]\), #rkeys-back, \.meta-menu"\)\) return null;/);
+  assert.match(g, /document\.querySelector\("#rsettings:not\(\[hidden\]\), #ranalytics-back:not\(\[hidden\]\), #rkeys-back, \.meta-menu"\)\) return null;/);
   assert.match(g, /if \(composerNoteHolds\(\)\) return null;/);
   assert.match(g, /return ta;\s*$/, "the box comes back only once every gate has passed");
 });
