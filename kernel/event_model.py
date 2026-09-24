@@ -984,7 +984,7 @@ def set_checkpoint_dir(fn):
     with _ASM_CKPT_LOCK:
         _ASM_CHAIN_REFUSED_PATHS.clear()                  # a rebind forgets a refusal recorded against another directory's document
         _ASM_LAST_WRITE_CUT.clear()
-        _ASM_DOC_MEMO.clear(); _ASM_DOC_MEMO_BYTES[0] = 0   # nor does the seeded walk's memoized document (round two)
+        _ASM_DOC_MEMO.clear(); _ASM_DOC_MEMO_BYTES[0] = 0   # nor does a memoized assembly document, the seeded walk's or the restore's (round two)
     with _CKPT_LOCK:
         _CKPT_PENDING.clear(); _CKPT_SEQ.clear(); _FOLD_DIRTY.clear(); _CKPT_DOC_FOLDS.clear(); _DROP_OWED.clear()
         _RETIRED_FOLDS.clear()                            # a retirement never outlives a state rebind (round two, low 2)
@@ -4645,7 +4645,7 @@ def file_rewound(path, rompuuid=None, sdk_human=None, own=True):
     if rompuuid is not None and _CKPT_DIR_FN is not None:
         _standing = _asm_refusal_stands(path)              # one sidecar read per call (low 4)
         doc = None if _standing else _asm_ckpt_load(path, rompuuid, sdk_human, [str(path)], {}, quiet_inputs=True, own=own,
-                                                    memo=True)   # the decode once per process per document (2026-09-15)
+                                                    memo="seeded")   # the decode once per process per document (2026-09-15)
         if _standing:                                     # the cold walk, no proof, while the mark stands (round two); a reader
             _asm_stat("seeded:refusedStanding" if own else "foreign:refusedStanding")   # that does not own the leaf counts its own
         if doc is not None and not _tail_chains_onto_the_document(path, doc):
@@ -5692,8 +5692,9 @@ _ASM_CKPT_STATS = {"written": 0, "restored": 0, "fallbacks": {}, "skipped": {}, 
 #                                          skipped per the writer's reason
 _ASM_CKPT_LOCK = threading.Lock()
 _ASM_CKPT_SAID = set()             # (path, reason) said once per process
-_ASM_DOC_MEMO = {}                 # document path -> ((size, mtime_ns), decoded document): the seeded walk's decode served once per
-#                                   process for a document whose bytes stand (2026-09-15); only the read, gunzip and JSON decode are
+_ASM_DOC_MEMO = {}                 # document path -> ((size, mtime_ns), decoded document): the seeded walk's and the restore road's
+#                                   decode (2026-09-15; the restore's since 2026-09-24) served once per process for a document whose
+#                                   bytes stand, a shared object no reader writes into; only the read, gunzip and JSON decode are
 #                                   memoized, every stat check and the guard read in the load stay per call (they are the freshness
 #                                   proof), and a document is memoized only once those checks PASSED (a refused one takes no slot)
 _ASM_DOC_MEMO_MULTIPLE = 10        # what a decoded assembly document weighs resident against its COMPRESSED bytes on disk: measured
@@ -6016,6 +6017,10 @@ def _asm_ckpt_note(path, reason, detail=""):
             pass
     cp = _asm_ckpt_file(path)
     if cp is not None:
+        with _ASM_CKPT_LOCK:                              # the document goes, and nothing of it stays memoized: here rather than in
+            _asm_doc_memo_drop(str(cp))                   #  the load's refusal alone, since the restore's own proofs (identity,
+        #                                                   coverage, a row the index cannot decode) refuse a document the load
+        #                                                   already memoized (2026-09-24, the restore road reads through the memo)
         try:
             cp.unlink()
             _asm_removed("fallback:" + str(reason))
@@ -6046,7 +6051,8 @@ def asm_checkpoint_stats():
         cv = out["converge"] = dict(out["converge"]); cv["skipped"] = dict(cv["skipped"])
     with _ASM_CKPT_LOCK:
         out["asmDocMemo"] = {"entries": len(_ASM_DOC_MEMO), "bytes": _ASM_DOC_MEMO_BYTES[0], "capBytes": _ASM_DOC_MEMO_CAP,
-                             "multiple": _ASM_DOC_MEMO_MULTIPLE}   # the seeded walk's document memo (unrelated to checkpoints.docMemo)
+                             "multiple": _ASM_DOC_MEMO_MULTIPLE}   # the document memo the seeded walk and the restore share (unrelated to
+        #                                                                 checkpoints.docMemo)
         out["parse"] = dict(_ASM_STATS)               # the parse's roads (T398): serve, fold, restore, full (with its reason), bypass,
     return out                                        #  fallback, and every g:<reason> demotion, so a whole parse names its road
 
@@ -6893,20 +6899,22 @@ def _restore_prefix_atoms(pre_atoms, rompuuid, rows, fsids, source_files=None):
     return out
 
 
-def _asm_ckpt_load(leaf_path, rompuuid, sdk_human, candidate_files, links, quiet_inputs=False, own=True, memo=False):
+def _asm_ckpt_load(leaf_path, rompuuid, sdk_human, candidate_files, links, quiet_inputs=False, own=True, memo=None):
     """The verified document for `leaf_path`, or None after a counted fallback (a document that exists and does not
-    verify) or quietly when there is none. `memo` True serves the decode (the read, the gunzip, the JSON parse) from
-    `_ASM_DOC_MEMO` when the document file's size and mtime stand, counted `seeded:asmDocMemo`; the verification below runs on
-    the memoized document exactly as on a fresh one, a decode is memoized only once it passed, and an owner's note drops it (2026-09-15: the judges' seeded walk over a leaf named by several sessions'
-    episode rows decoded the same document once per naming session per pass). `own` False is a reader over ANOTHER session's document (the judges' cross-session
-    walk, 2026-09-15): a document that does not verify for it is refused quietly, counted under the parse's `foreign:<reason>`,
-    never noted and never unlinked; the note, which removes the document so the owner's next settle rewrites it, belongs to
-    the owner's own parse, the one reader whose inputs (its owner bit above all) are the document's."""
+    verify) or quietly when there is none. `memo` names the road that may be served the decode (the read, the gunzip, the
+    JSON parse) from `_ASM_DOC_MEMO` when the document file's size and mtime stand, counted `<memo>:asmDocMemo`: "seeded" for
+    the judges' seeded walk (2026-09-15: a leaf named by several sessions' episode rows decoded the same document once per
+    naming session per pass), "restore" for the restore road (2026-09-24: every restore after a descent, rewrite or nonleaf
+    demotion decoded the same unchanged document again, 61 percent of a lab's restore time at 120 MB). The verification below
+    runs on the memoized document exactly as on a fresh one, a decode is memoized only once it passed, and an owner's note
+    drops it. A memoized document is SHARED by every later load: no caller writes into it. `own` False is a reader over
+    ANOTHER session's document (the judges' cross-session walk, 2026-09-15): a document that does not verify for it is
+    refused quietly, counted under the parse's `foreign:<reason>`, never noted and never unlinked; the note, which removes
+    the document so the owner's next settle rewrites it, belongs to the owner's own parse, the one reader whose inputs (its
+    owner bit above all) are the document's."""
     def fail(reason, detail=""):
         if own:
-            _asm_ckpt_note(leaf_path, reason, detail)
-            with _ASM_CKPT_LOCK:                          # the note removed the document: nothing of it stays memoized
-                _asm_doc_memo_drop(str(cp))
+            _asm_ckpt_note(leaf_path, reason, detail)     # the note removes the document and drops its memoized decode
         else:
             _asm_stat("foreign:" + str(reason))
         return None
@@ -6921,7 +6929,7 @@ def _asm_ckpt_load(leaf_path, rompuuid, sdk_human, candidate_files, links, quiet
             with _ASM_CKPT_LOCK:
                 ent = _ASM_DOC_MEMO.get(str(cp))
             if ent is not None and ent[0] == mkey:
-                doc = ent[1]; _asm_stat("seeded:asmDocMemo")
+                doc = ent[1]; _asm_stat(memo + ":asmDocMemo")
             else:
                 memo_key = mkey
         if doc is None:
@@ -7137,7 +7145,12 @@ def _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_
         _asm_stat("restore:refusedStanding")             # refused for the tail's shape at this very stat: no proof, no rewrite (round two)
         return None
     _t0 = time.perf_counter()
-    doc = _asm_ckpt_load(leaf_path, rompuuid, sdk_human, candidate_files, links)
+    doc = _asm_ckpt_load(leaf_path, rompuuid, sdk_human, candidate_files, links, memo="restore")
+    #                                                     through the memo (2026-09-24): a restore after a descent, rewrite or
+    #                                                     nonleaf demotion loads the document the boot's restore or a walk already
+    #                                                     decoded, unchanged, and decoded it whole again every time (1,725 of
+    #                                                     2,831 ms over nine restores at 120 MB in a lab); the load's checks still
+    #                                                     run per call, so the memo serves the decode and never the proof
     _restore_ms("load", _t0)                              # the load's return, a document or a counted refusal (T401 (4))
     if doc is None:
         return None
@@ -7173,7 +7186,9 @@ def _asm_restore_inner(key, leaf_path, candidate_files, links, rompuuid, postal_
             _t0 = time.perf_counter()
             index = LazyIndex(doc, rompuuid, leaf_path, cache_key=key)
             pre_turns = _pre_turns_of(doc, index)
-            doc["atoms"] = None                                # the rows live in the index as bytes from here
+            doc = dict(doc, atoms=None)                        # the rows live in the index as bytes from here: dropped from a COPY,
+            #                                                    since the load's document is the memo's (2026-09-24), and a None
+            #                                                    written into it would refuse the next restore as `rows` and parse whole
             with _MAT_LOCK:
                 _ASM_INDEX_STATS["restoredTurns"] += len(pre_turns)
             _restore_ms("index", _t0)

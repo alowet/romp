@@ -106,8 +106,8 @@ class Harness(unittest.TestCase):
         with em._ASM_CKPT_LOCK:
             em._HYDRATED.clear(); em._HYDRATED_BYTES[0] = 0
         em._LAZY_FILES.clear()
-        memo = getattr(em, "_ASM_DOC_MEMO", None)          # the seeded walk's document memo (2026-09-15); getattr so a copy of
-        if memo is not None:                               #  this file at an older base reds on behaviour, not on the name
+        memo = getattr(em, "_ASM_DOC_MEMO", None)          # the document memo the seeded walk and the restore share; getattr
+        if memo is not None:                               #  so a copy of this file at an older base reds on behavior, not on the name
             with em._ASM_CKPT_LOCK:
                 memo.clear()
                 getattr(em, "_ASM_DOC_MEMO_BYTES", [0])[0] = 0
@@ -2329,15 +2329,16 @@ class SeededDocumentMemo(Harness):
             rewound, fails = jd._per_file_rewound(sid, files)
             self.assertEqual(fails, 0); sets.append(rewound)
         self.assertEqual(sets, [answer, answer, answer], "the three walks agree with the memo road's answer")
-        read = em.read_bytes_report().get(doc_path, 0)
-        self.assertEqual(read, size, "the document decoded ONCE for three walks: %d bytes read of a %d byte document (the base read it three times)" % (read, size))
-        self.assertEqual(em.asm_checkpoint_stats()["parse"].get("seeded:asmDocMemo", 0) - hits0, 2, "two walks served from the memo")
+        read = em.read_bytes_report().get(doc_path, 0)             # the one decode is the restore's before the walks, since the restore
+        #                                                             reads through the same memo (2026-09-24): the walks read none of it
+        self.assertEqual(read, 0, "the document decoded ONCE, by the restore, for three walks: %d bytes read of a %d byte document (the base read it three times)" % (read, size))
+        self.assertEqual(em.asm_checkpoint_stats()["parse"].get("seeded:asmDocMemo", 0) - hits0, 3, "all three walks served from the memo")
 
     def test_a_memo_hit_still_reads_the_leafs_guard_bytes(self):
         jd, b_sid, b_leaf, namers, leaves, answer = self._world("gd", idx=2)
         doc_path = str(em._asm_ckpt_file(str(b_leaf)))
         self._restored_first(b_leaf, b_sid)
-        jd._per_file_rewound(namers[0], [str(leaves[namers[0]])])                    # the miss primes the memo
+        jd._per_file_rewound(namers[0], [str(leaves[namers[0]])])                    # a hit: the restore filled the memo (2026-09-24)
         doc = json.loads(gzip.decompress(pathlib.Path(doc_path).read_bytes()))        # the document's own cut and guard
         cut_off, _pre_n, guard_hex = doc["files"][b_sid]["cut"]; guard = bytes.fromhex(guard_hex)
         self.assertTrue(guard)
@@ -2357,7 +2358,7 @@ class SeededDocumentMemo(Harness):
         jd, b_sid, b_leaf, namers, leaves, answer = self._world("ip", idx=3)
         doc_path = str(em._asm_ckpt_file(str(b_leaf))); size = os.path.getsize(doc_path)
         self._restored_first(b_leaf, b_sid)
-        jd._per_file_rewound(namers[0], [str(leaves[namers[0]])])                    # the miss primes the memo
+        jd._per_file_rewound(namers[0], [str(leaves[namers[0]])])                    # a hit: the restore filled the memo (2026-09-24)
         st0 = os.stat(doc_path)
         data = bytearray(pathlib.Path(doc_path).read_bytes()); data[-1] ^= 0x01        # one byte flipped, the size the same
         pathlib.Path(doc_path).write_bytes(bytes(data)); os.utime(doc_path, ns=(st0.st_atime_ns, st0.st_mtime_ns + 1_000_000_000))
@@ -2429,6 +2430,8 @@ class SeededDocumentMemo(Harness):
         self.addCleanup(setattr, em, "_ASM_DOC_MEMO_CAP", saved)
         with em._READ_BYTES_LOCK:
             em._READ_BYTES.clear()
+        with em._ASM_CKPT_LOCK:                                                         # the restores memoized all three under the default
+            em._ASM_DOC_MEMO.clear(); em._ASM_DOC_MEMO_BYTES[0] = 0                     #  ceiling (2026-09-24): the walks fill it under this one
         for jd, b_sid, b_leaf, namers, leaves, answer in worlds:
             rewound, fails = jd._per_file_rewound(namers[0], [str(leaves[namers[0]])])
             self.assertEqual((fails, rewound), (0, answer))

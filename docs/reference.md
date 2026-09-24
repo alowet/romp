@@ -2464,7 +2464,10 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   `multiple`, the measured 10 a decoded document weighs against its gzipped
   bytes, and `capBytes`, a ceiling on that weight of MemTotal / 512 floored at
   64 MiB, `ROMP_ASM_DOC_MEMO_CAP_MB`; unrelated to `checkpoints.docMemo`, the
-  fold documents' read memo), `full` with
+  fold documents' read memo), `restore:asmDocMemo` (a restore whose document
+  decode was served from the same memo, since 2026-09-24: a restore after a
+  descent, rewrite or nonleaf demotion over a document the memo still holds
+  reads none of it, and its checks run per restore as a walk's do), `full` with
   `full:demoted` (an entry the gates demoted, the `g:<reason>` beside it:
   `descent` when the new leaf does not chain to the old through the delta,
   `rewrite` when the leaf's record entry was replaced by a from-zero read
